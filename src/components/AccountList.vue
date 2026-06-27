@@ -1,0 +1,593 @@
+<script setup lang="ts">
+import { computed } from "vue";
+import type { CodexSwitcherSettings } from "../services/codex";
+import type { CodexAccount } from "../types/codex";
+import PlanBadge from "./PlanBadge.vue";
+
+const props = defineProps<{
+  accounts: CodexAccount[];
+  currentId: string;
+  selectedAccountIds: Set<string>;
+  settings: CodexSwitcherSettings;
+  expandedLayout: boolean;
+  loading: boolean;
+  switchingId: string;
+  deletingId: string;
+  exportingId: string;
+  quotaRefreshingId: string;
+}>();
+
+const emit = defineEmits<{
+  (event: "toggle-account", id: string): void;
+  (event: "toggle-pin", account: CodexAccount): void;
+  (event: "drag-start", account: CodexAccount): void;
+  (event: "drop-account", account: CodexAccount): void;
+  (event: "open-phone", account: CodexAccount): void;
+  (event: "reset-credit", account: CodexAccount): void;
+  (event: "open-binding", account: CodexAccount): void;
+  (event: "open-official-url", url: string): void;
+  (event: "open-edit", account: CodexAccount): void;
+  (event: "switch-account", account: CodexAccount): void;
+  (event: "refresh-quota", account: CodexAccount): void;
+  (event: "open-export", account: CodexAccount): void;
+  (event: "confirm-delete", account: CodexAccount): void;
+  (event: "open-add", tab: string): void;
+}>();
+
+const gridClass = computed(() => {
+  const columns = [3, 4, 5].includes(props.settings.maxColumns) ? props.settings.maxColumns : 3;
+  return {
+    [`columns-${columns}`]: true,
+    expanded: props.expandedLayout,
+  };
+});
+
+function isPinned(account: CodexAccount): boolean {
+  return (props.settings.pinnedAccountIds || []).includes(account.id);
+}
+
+function handleDragStart(event: DragEvent, account: CodexAccount): void {
+  event.dataTransfer?.setData("text/plain", account.id);
+  if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+  emit("drag-start", account);
+}
+
+function isApiKeyAccount(account: CodexAccount): boolean {
+  return account.auth_mode === "apikey" || Boolean(account.openai_api_key || account.openaiApiKey);
+}
+
+function displayName(account: CodexAccount): string {
+  return account.account_name || account.email || account.id || "未命名账号";
+}
+
+function boundOAuthAccount(account: CodexAccount): CodexAccount | undefined {
+  if (!account.bound_oauth_account_id) return undefined;
+  return props.accounts.find((item) => item.id === account.bound_oauth_account_id);
+}
+
+function boundOAuthName(account: CodexAccount): string {
+  const bound = boundOAuthAccount(account);
+  return bound ? displayName(bound) : "未绑定";
+}
+
+function canShowQuota(account: CodexAccount): boolean {
+  if (!props.settings.monitorQuota) return false;
+  if (!isApiKeyAccount(account)) return true;
+  return Boolean(boundOAuthAccount(account));
+}
+
+function shouldShowQuota(account: CodexAccount): boolean {
+  return canShowQuota(account) && Boolean(account.quota);
+}
+
+function shouldShowQuotaError(account: CodexAccount): boolean {
+  return canShowQuota(account) && Boolean(account.quota_error);
+}
+
+function scalarText(value: unknown): string | undefined {
+  if (typeof value === "string") return value.trim() || undefined;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return undefined;
+}
+
+function jwtPayload(token: string | undefined): Record<string, unknown> | undefined {
+  const payload = token?.split(".")[1];
+  if (!payload) return undefined;
+  try {
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    return JSON.parse(window.atob(padded)) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
+function jwtClaim(token: string | undefined, claim: string): string | undefined {
+  return scalarText(jwtPayload(token)?.[claim]);
+}
+
+function jwtAuthClaim(token: string | undefined, claim: string): string | undefined {
+  const auth = jwtPayload(token)?.["https://api.openai.com/auth"];
+  if (!auth || typeof auth !== "object" || Array.isArray(auth)) return undefined;
+  return scalarText((auth as Record<string, unknown>)[claim]);
+}
+
+function accountStatusSource(account: CodexAccount): CodexAccount {
+  return account.subscription_active_until ||
+    account.access_token_expires_at ||
+    jwtAuthClaim(account.tokens.id_token, "chatgpt_subscription_active_until") ||
+    jwtClaim(account.tokens.access_token, "exp") ||
+    jwtClaim(account.tokens.id_token, "exp")
+    ? account
+    : boundOAuthAccount(account) ?? account;
+}
+
+function accountSubscriptionUntil(account: CodexAccount): string | undefined {
+  const source = accountStatusSource(account);
+  return (
+    source.subscription_active_until ||
+    jwtAuthClaim(source.tokens.id_token, "chatgpt_subscription_active_until")
+  );
+}
+
+function accountTokenExpiresAt(account: CodexAccount): string | undefined {
+  const source = accountStatusSource(account);
+  return (
+    source.access_token_expires_at ||
+    jwtClaim(source.tokens.access_token, "exp") ||
+    jwtClaim(source.tokens.id_token, "exp")
+  );
+}
+
+function shortAccountId(account: CodexAccount): string {
+  const value = account.id || account.email || displayName(account);
+  if (value.length <= 8) return value;
+  return `${value.slice(0, 3)}****${value.slice(-3)}`;
+}
+
+function normalizePlanKey(planType?: string): string {
+  const normalized = (planType || "").trim().toLowerCase();
+  if (!normalized) return "free";
+  if (normalized.includes("api")) return "api_key";
+  if (normalized.includes("enterprise")) return "enterprise";
+  if (normalized.includes("business")) return "business";
+  if (normalized.includes("team")) return "team";
+  if (normalized.includes("edu")) return "edu";
+  if (normalized.includes("go")) return "go";
+  if (normalized.includes("plus")) return "plus";
+  if (normalized.includes("pro")) return "pro";
+  if (normalized.includes("free")) return "free";
+  return normalized;
+}
+
+function normalizeAuthFilePlan(value?: string): "prolite" | "promax" | undefined {
+  const normalized = (value || "").trim().toLowerCase().replace(/[_\s]+/g, "-");
+  if (["prolite", "pro-lite", "pro-5x", "codex-pro-5x"].includes(normalized)) return "prolite";
+  if (["promax", "pro-max", "pro-20x", "codex-pro-20x"].includes(normalized)) return "promax";
+  return undefined;
+}
+
+function planDisplayName(planType?: string): string {
+  const key = normalizePlanKey(planType);
+  if (key === "enterprise") return "ENTERPRISE";
+  if (key === "business") return "BUSINESS";
+  if (key === "team") return "TEAM";
+  if (key === "edu") return "EDU";
+  if (key === "go") return "GO";
+  if (key === "plus") return "PLUS";
+  if (key === "pro") return "PRO";
+  if (key === "api_key") return "API_KEY";
+  if (key === "free") return "FREE";
+  return (planType || "FREE").trim().toUpperCase();
+}
+
+function planLabel(account: CodexAccount): string {
+  if (isApiKeyAccount(account)) return "API_KEY";
+  const base = planDisplayName(account.plan_type);
+  if (base !== "PRO") return base;
+  const authPlan = normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type);
+  return authPlan === "prolite" ? "PRO 5X" : "PRO 20X";
+}
+
+function planClass(account: CodexAccount): string {
+  const badgeKey = badgeTypeKey(account);
+  const styleName =
+    props.settings.badgeStyles?.[badgeKey] ||
+    props.settings.badgeStyle ||
+    "classic";
+  const style = `badge-${styleName}`;
+  if (isApiKeyAccount(account)) return `api ${style}`;
+  const key = normalizePlanKey(account.plan_type);
+  if (key === "pro") {
+    const proClass =
+      normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type) === "prolite"
+        ? "pro-lite"
+        : "pro-max";
+    return `${proClass} ${style}`;
+  }
+  return `${key} ${style}`;
+}
+
+function badgeTypeKey(account: CodexAccount): string {
+  if (isApiKeyAccount(account)) return "api";
+  const key = normalizePlanKey(account.plan_type);
+  if (key === "pro") {
+    return normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type) === "prolite"
+      ? "proLite"
+      : "proMax";
+  }
+  if (key === "plus") return "plus";
+  if (["team", "business", "enterprise", "edu", "go"].includes(key)) return "team";
+  return "free";
+}
+
+function accountLoginLine(account: CodexAccount): string {
+  if (isApiKeyAccount(account)) return `API Key: ${maskSecret(account.openai_api_key || account.openaiApiKey)}`;
+  return `使用 OAuth 登录 | 用户 ID: ${shortAccountId(account)}`;
+}
+
+function apiBaseUrl(account: CodexAccount): string {
+  return (account.api_base_url || account.apiBaseUrl)?.trim() ?? "";
+}
+
+function apiBaseUrlLine(account: CodexAccount): string {
+  const value = apiBaseUrl(account);
+  return value ? `Base URL: ${value}` : "Base URL: 未设置";
+}
+
+function apiOfficialUrl(account: CodexAccount): string {
+  return (account.api_official_url || account.apiOfficialUrl)?.trim() ?? "";
+}
+
+function maskSecret(value?: string): string {
+  const trimmed = value?.trim() ?? "";
+  if (!trimmed) return "未保存";
+  if (trimmed.length <= 10) return `${trimmed.slice(0, 3)}****`;
+  return `${trimmed.slice(0, 6)}****${trimmed.slice(-4)}`;
+}
+
+function canUseResetCredit(account: CodexAccount): boolean {
+  return shouldShowQuota(account) && resetCreditCount(account) > 0;
+}
+
+function resetCreditCount(account: CodexAccount): number {
+  const count = account.quota?.reset_credits_available;
+  return Number.isFinite(count) ? Math.max(0, Number(count)) : 0;
+}
+
+function quotaWindowLabel(minutes?: number, fallback = "5h"): string {
+  if (!minutes) return fallback;
+  if (minutes % (60 * 24) === 0) return `${minutes / 60 / 24} Day`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
+}
+
+function quotaColor(value?: number): string {
+  const percentage = value ?? 0;
+  if (percentage >= 70) return "#22c55e";
+  if (percentage >= 40) return "#f59e0b";
+  return "#ef4444";
+}
+
+function quotaResetLabel(value?: string | number): string {
+  if (!value) return "等待刷新";
+  const timestamp = Number(value);
+  const date = Number.isFinite(timestamp)
+    ? new Date(timestamp > 10_000_000_000 ? timestamp : timestamp * 1000)
+    : new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  const diff = date.getTime() - Date.now();
+  const abs = Math.max(0, diff);
+  const day = Math.floor(abs / 86_400_000);
+  const hour = Math.floor((abs % 86_400_000) / 3_600_000);
+  const minute = Math.floor((abs % 3_600_000) / 60_000);
+  const left = day > 0 ? `${day}d ${hour}h ${minute}m` : `${hour}h ${minute}m`;
+  return `${left} (${formatDateTime(value)})`;
+}
+
+function expiryDaysLabel(value?: string): string {
+  if (!value) return "";
+  const date = normalizeDate(value);
+  if (!date) return "";
+  const days = Math.max(0, Math.ceil((date.getTime() - Date.now()) / 86_400_000));
+  return `${days}天`;
+}
+
+function tokenExpiryStatus(value?: string): "valid" | "expired" {
+  const date = normalizeDate(value);
+  if (!date) return "valid";
+  return date.getTime() <= Date.now() ? "expired" : "valid";
+}
+
+function normalizeDate(value?: string | number | null): Date | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const numeric = typeof value === "number" ? value : Number(value);
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric > 10_000_000_000 ? numeric : numeric * 1000)
+    : new Date(String(value));
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
+function formatDateTime(value?: string | number | null): string {
+  const date = normalizeDate(value);
+  if (!date) return "";
+  const pad = (input: number) => String(input).padStart(2, "0");
+  return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(
+    date.getHours(),
+  )}:${pad(date.getMinutes())}`;
+}
+
+function formatTime(value?: number | null): string {
+  if (!value) return "从未使用";
+  return formatDateTime(value);
+}
+</script>
+
+<template>
+  <a-spin class="accounts-spin" :loading="loading" dot>
+    <section v-if="accounts.length" class="account-grid" :class="gridClass">
+      <a-card
+        v-for="account in accounts"
+        :key="account.id"
+        class="account-card"
+        :class="{ active: account.id === currentId, pinned: isPinned(account), draggable: settings.sortMode === 'custom' }"
+        :bordered="false"
+        :draggable="settings.sortMode === 'custom'"
+        @dragstart="handleDragStart($event, account)"
+        @dragover.prevent
+        @drop="emit('drop-account', account)"
+      >
+        <div class="account-head">
+          <div class="account-title">
+            <a-checkbox
+              class="account-check"
+              :model-value="selectedAccountIds.has(account.id)"
+              @change="emit('toggle-account', account.id)"
+            />
+            <span class="account-name" :title="displayName(account)">
+              {{ displayName(account) }}
+            </span>
+          </div>
+          <div class="account-head-actions">
+            <a-tooltip v-if="!isApiKeyAccount(account) && canUseResetCredit(account)" content="可用重置次数">
+              <button
+                class="reset-credit-pill"
+                type="button"
+                :disabled="quotaRefreshingId === account.id"
+                @click.stop="emit('reset-credit', account)"
+              >
+                <icon-thunderbolt />
+                {{ resetCreditCount(account) }}
+              </button>
+            </a-tooltip>
+            <a-tooltip :content="isPinned(account) ? '取消置顶' : '置顶账号'">
+              <button
+                class="pin-button"
+                :class="{ active: isPinned(account) }"
+                type="button"
+                @click.stop="emit('toggle-pin', account)"
+              >
+                <icon-pushpin />
+              </button>
+            </a-tooltip>
+            <PlanBadge :label="planLabel(account)" :badge-class="planClass(account)" />
+          </div>
+        </div>
+
+        <div class="account-summary">
+          <div v-if="isApiKeyAccount(account)" class="chip-line">
+            <a-button class="soft-chip" size="mini" @click="emit('open-binding', account)">
+              <template #icon><icon-link /></template>
+              {{ boundOAuthName(account) === "未绑定" ? "绑定 OAuth" : boundOAuthName(account) }}
+            </a-button>
+          </div>
+
+          <div class="login-line">{{ accountLoginLine(account) }}</div>
+          <div v-if="isApiKeyAccount(account)" class="login-line full-url" :title="apiBaseUrl(account)">
+            {{ apiBaseUrlLine(account) }}
+          </div>
+          <button
+            v-if="isApiKeyAccount(account) && apiOfficialUrl(account)"
+            class="official-link"
+            type="button"
+            :title="apiOfficialUrl(account)"
+            @click="emit('open-official-url', apiOfficialUrl(account))"
+          >
+            <icon-link />
+            官网地址：{{ apiOfficialUrl(account) }}
+          </button>
+        </div>
+
+        <div class="account-health">
+          <template v-if="shouldShowQuota(account) && account.quota">
+            <div v-if="account.quota.hourly_window_present !== false" class="quota-block">
+              <div class="quota-head">
+                <span><icon-clock-circle /> {{ quotaWindowLabel(account.quota.hourly_window_minutes, '5h') }}</span>
+                <strong :style="{ color: quotaColor(account.quota.hourly_percentage) }">
+                  {{ account.quota.hourly_percentage }}%
+                </strong>
+              </div>
+              <div class="quota-bar">
+                <span
+                  :style="{
+                    width: `${Math.max(0, Math.min(100, account.quota.hourly_percentage))}%`,
+                    background: quotaColor(account.quota.hourly_percentage),
+                  }"
+                />
+              </div>
+              <div class="quota-time">{{ quotaResetLabel(account.quota.hourly_reset_time) }}</div>
+            </div>
+
+            <div v-if="account.quota.weekly_window_present !== false" class="quota-block">
+              <div class="quota-head">
+                <span><icon-calendar /> {{ quotaWindowLabel(account.quota.weekly_window_minutes, 'Weekly') }}</span>
+                <strong :style="{ color: quotaColor(account.quota.weekly_percentage) }">
+                  {{ account.quota.weekly_percentage }}%
+                </strong>
+              </div>
+              <div class="quota-bar">
+                <span
+                  :style="{
+                    width: `${Math.max(0, Math.min(100, account.quota.weekly_percentage))}%`,
+                    background: quotaColor(account.quota.weekly_percentage),
+                  }"
+                />
+              </div>
+              <div class="quota-time">{{ quotaResetLabel(account.quota.weekly_reset_time) }}</div>
+            </div>
+          </template>
+          <div v-else-if="shouldShowQuotaError(account) && account.quota_error" class="quota-error">
+            {{ account.quota_error.message }}
+          </div>
+
+          <div v-if="accountSubscriptionUntil(account)" class="status-card status-valid">
+            <span>
+              <icon-calendar />
+              有效期 {{ expiryDaysLabel(accountSubscriptionUntil(account)) }}
+            </span>
+            <strong>{{ formatDateTime(accountSubscriptionUntil(account)) }}</strong>
+          </div>
+
+          <div v-if="accountTokenExpiresAt(account)" class="status-card status-token-expired">
+            <span>
+              <icon-clock-circle />
+              Token {{ tokenExpiryStatus(accountTokenExpiresAt(account)) === "expired" ? "失效" : "有效" }}
+            </span>
+            <strong>{{ formatDateTime(accountTokenExpiresAt(account)) }}</strong>
+          </div>
+        </div>
+
+        <footer class="card-footer">
+          <div class="footer-meta">
+            <span>{{ formatTime(account.last_used) }}</span>
+            <button
+              v-if="!isApiKeyAccount(account) && account.bound_phone"
+              class="footer-phone"
+              type="button"
+              @click="emit('open-phone', account)"
+            >
+              <icon-phone />
+              {{ account.bound_phone }}
+            </button>
+          </div>
+          <div class="card-actions">
+            <a-tooltip v-if="!isApiKeyAccount(account)" content="绑定手机">
+              <a-button size="small" title="绑定手机" @click="emit('open-phone', account)">
+                <template #icon><icon-phone /></template>
+              </a-button>
+            </a-tooltip>
+            <a-tooltip content="编辑">
+              <a-button size="small" title="编辑" @click="emit('open-edit', account)">
+                <template #icon><icon-edit /></template>
+              </a-button>
+            </a-tooltip>
+            <a-tooltip content="切换">
+              <a-button
+                size="small"
+                title="切换"
+                :loading="switchingId === account.id"
+                @click="emit('switch-account', account)"
+              >
+                <template #icon><icon-play-arrow /></template>
+              </a-button>
+            </a-tooltip>
+            <a-tooltip v-if="!isApiKeyAccount(account)" content="刷新额度">
+              <a-button
+                size="small"
+                title="刷新额度"
+                :loading="quotaRefreshingId === account.id"
+                @click="emit('refresh-quota', account)"
+              >
+                <template #icon><icon-refresh /></template>
+              </a-button>
+            </a-tooltip>
+            <a-tooltip v-if="canUseResetCredit(account)" content="重置额度">
+              <a-button
+                size="small"
+                title="重置额度"
+                :loading="quotaRefreshingId === account.id"
+                @click="emit('reset-credit', account)"
+              >
+                <template #icon><icon-thunderbolt /></template>
+              </a-button>
+            </a-tooltip>
+            <a-tooltip content="导出">
+              <a-button
+                size="small"
+                title="导出"
+                :loading="exportingId === account.id"
+                @click="emit('open-export', account)"
+              >
+                <template #icon><icon-download /></template>
+              </a-button>
+            </a-tooltip>
+            <a-tooltip content="删除">
+              <a-button
+                size="small"
+                title="删除"
+                :loading="deletingId === account.id"
+                @click="emit('confirm-delete', account)"
+              >
+                <template #icon><icon-delete /></template>
+              </a-button>
+            </a-tooltip>
+          </div>
+        </footer>
+      </a-card>
+    </section>
+
+    <section v-else class="empty-wrap">
+      <div class="empty-panel">
+        <div class="empty-copy">
+          <span class="empty-kicker">本机还没有可切换账号</span>
+          <h2>先放进一个 Codex 登录态</h2>
+          <p>
+            导入 OAuth Token / JSON，或添加 API Key。保存后这里会显示账号卡片，
+            之后就可以一键切换并写回本机 Codex 配置。
+          </p>
+          <div class="empty-actions">
+            <a-button type="primary" size="large" @click="emit('open-add', 'token')">
+              <template #icon><icon-import /></template>
+              导入 Token / JSON
+            </a-button>
+            <a-button size="large" @click="emit('open-add', 'apikey')">
+              <template #icon><icon-plus /></template>
+              添加 API Key
+            </a-button>
+          </div>
+          <div class="empty-steps" aria-label="账号添加流程">
+            <span>粘贴凭据</span>
+            <span>保存账号</span>
+            <span>切换 Codex</span>
+          </div>
+        </div>
+
+        <div class="empty-preview" aria-hidden="true">
+          <div class="preview-card preview-card-main">
+            <div class="preview-head">
+              <span class="preview-dot" />
+              <span class="preview-name">account@example.com</span>
+              <span class="preview-badge">OAUTH</span>
+            </div>
+            <div class="preview-line wide" />
+            <div class="preview-line" />
+            <div class="preview-footer">
+              <span />
+              <span />
+              <span />
+            </div>
+          </div>
+          <div class="preview-card preview-card-back">
+            <div class="preview-head">
+              <span class="preview-dot muted" />
+              <span class="preview-name">api****610</span>
+              <span class="preview-badge api">API_KEY</span>
+            </div>
+            <div class="preview-line wide" />
+            <div class="preview-line short" />
+          </div>
+        </div>
+      </div>
+    </section>
+  </a-spin>
+</template>
