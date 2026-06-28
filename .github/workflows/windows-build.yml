@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   windows:
@@ -42,11 +42,25 @@ jobs:
           Get-ChildItem -Path "src-tauri/target/release/bundle" -Recurse |
             Select-Object FullName, Length, LastWriteTime
 
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: codex-switcher-windows-x64
-          if-no-files-found: error
-          path: |
-            src-tauri/target/release/bundle/**/*.exe
-            src-tauri/target/release/bundle/**/*.msi
+      - name: Publish Windows release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "windows-latest"
+          $title = "Windows Latest"
+          $notes = "Automated Windows build for $env:GITHUB_SHA"
+          $assets = Get-ChildItem -Path "src-tauri/target/release/bundle" -Recurse -Include "*.exe", "*.msi" |
+            Select-Object -ExpandProperty FullName
+          if (-not $assets) {
+            throw "No Windows installer assets found."
+          }
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title $title --notes $notes --target $env:GITHUB_SHA --latest=false
+          } else {
+            gh release edit $tag --title $title --notes $notes --target $env:GITHUB_SHA --latest=false
+          }
+          gh release upload $tag @assets --clobber
