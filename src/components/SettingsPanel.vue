@@ -13,6 +13,7 @@ const props = defineProps<{
   saving: boolean;
   backupLoading: boolean;
   backupWorking: boolean;
+  backupProgress: number;
 }>();
 
 const emit = defineEmits<{
@@ -20,6 +21,7 @@ const emit = defineEmits<{
   (event: "open-path", path: string): void;
   (event: "reset-config"): void;
   (event: "export-backup"): void;
+  (event: "refresh-backups"): void;
   (event: "restore-backup", backup: CodexSwitcherBackupFile): void;
   (event: "delete-backup", backup: CodexSwitcherBackupFile): void;
 }>();
@@ -38,6 +40,12 @@ function formatFileSize(bytes: number): string {
     index += 1;
   }
   return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
+}
+
+function backupButtonText(): string {
+  if (!props.backupWorking) return "手动备份";
+  const progress = Math.max(0, Math.min(100, Math.round(props.backupProgress || 0)));
+  return `手动备份 ${progress}%`;
 }
 
 </script>
@@ -172,11 +180,15 @@ function formatFileSize(bytes: number): string {
           <div class="backup-actions">
             <a-button type="primary" :loading="backupWorking" @click="emit('export-backup')">
               <template #icon><icon-download /></template>
-              手动备份
+              {{ backupButtonText() }}
             </a-button>
             <a-button @click="openPath(appPaths?.backupDir)">
               <template #icon><icon-folder /></template>
               打开备份目录
+            </a-button>
+            <a-button :loading="backupLoading" @click="emit('refresh-backups')">
+              <template #icon><icon-refresh /></template>
+              刷新
             </a-button>
           </div>
           <a-spin :loading="backupLoading" dot>
@@ -191,7 +203,7 @@ function formatFileSize(bytes: number): string {
                 </div>
                 <div class="backup-item-actions">
                   <a-popconfirm
-                    content="确认使用这个 ZIP 备份恢复账号与设置？"
+                    content="确认使用这个 ZIP 备份恢复账号、设置与所有 Codex 会话记录？"
                     @ok="emit('restore-backup', backup)"
                   >
                     <a-button :disabled="backupWorking">
@@ -216,7 +228,7 @@ function formatFileSize(bytes: number): string {
               </div>
               <div class="backup-empty-copy">
                 <strong>还没有备份</strong>
-                <span>点击“手动备份”会把账号、设置、徽章、排序与会话数据打包成 ZIP。</span>
+                <span>点击“手动备份”会把账号、设置、徽章、排序与所有 Codex 会话记录打包成 ZIP。</span>
                 <code>{{ appPaths?.backupDir || "~/.codex_switcher/backup" }}</code>
               </div>
             </div>

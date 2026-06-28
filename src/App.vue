@@ -15,7 +15,6 @@ import {
   deleteCodexAccount,
   deleteCodexSwitcherBackup,
   exportCodexAccounts,
-  exportCodexSwitcherBackup,
   getCodexSwitcherPaths,
   getCodexSwitcherSettings,
   getCurrentCodexAccount,
@@ -28,6 +27,7 @@ import {
   resetCodexConfigToml,
   restoreCodexSwitcherBackup,
   restartCodexApp,
+  startCodexSwitcherBackup,
   startCodexOAuthLogin,
   switchCodexAccount,
   submitCodexOAuthCallbackUrl,
@@ -39,6 +39,7 @@ import {
   updateCodexApiKeyCredentials,
   type CodexExportFormat,
   type CodexSwitcherBackupFile,
+  type CodexSwitcherBackupProgressEvent,
   type CodexSwitcherPaths,
   type CodexSwitcherSettings,
 } from "./services/codex";
@@ -78,6 +79,7 @@ const nextQuotaRefreshAt = ref(0);
 const nowMs = ref(Date.now());
 const addModalVisible = ref(false);
 const badgeStyleVisible = ref(false);
+const privacyMasked = ref(false);
 const addTab = ref("oauth");
 const tokenInput = ref("");
 const fileInput = ref<HTMLInputElement | null>(null);
@@ -89,6 +91,14 @@ const appPaths = ref<CodexSwitcherPaths | null>(null);
 const backupFiles = ref<CodexSwitcherBackupFile[]>([]);
 const backupLoading = ref(false);
 const backupWorking = ref(false);
+const backupProgressVisible = ref(false);
+const backupProgress = ref(0);
+const backupProgressMessage = ref("");
+const backupProgressTitle = ref("正在备份");
+const backupProgressStatus = ref<"running" | "completed" | "failed">("running");
+const backupButtonText = computed(() =>
+  backupWorking.value ? `备份 ${Math.round(backupProgress.value)}%` : "备份",
+);
 const expandedLayout = ref(false);
 let windowResizeTimer: number | undefined;
 const settings = reactive<CodexSwitcherSettings>({
@@ -113,6 +123,7 @@ const oauthCallbackInput = ref("");
 const oauthPreparing = ref(false);
 const oauthCompleting = ref(false);
 const oauthError = ref("");
+const oauthCallbackReceived = ref(false);
 let oauthUnlisten: UnlistenFn | null = null;
 
 interface OAuthCallbackEvent {
@@ -181,6 +192,7 @@ const switchRepairProgress = ref(0);
 const switchRepairResult = ref<CodexSessionVisibilityRepairSummary | null>(null);
 const switchRepairError = ref("");
 const switchRepairTargetName = ref("");
+let switchRepairCloseTimer: number | undefined;
 const repairMode = ref<CodexSessionVisibilityRepairMode>("quick");
 const repairInstanceScope = ref<"target" | "all">("target");
 const repairSessionScope = ref<"all" | "selected">("all");
@@ -357,6 +369,24 @@ function isApiKeyAccount(account: CodexAccount): boolean {
 
 function displayName(account: CodexAccount): string {
   return account.account_name || account.email || account.id;
+}
+
+function maskDisplayText(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (trimmed.includes("@")) {
+    const [name, domain] = trimmed.split("@");
+    if (!domain) return `${name.slice(0, 2)}***`;
+    if (name.length <= 3) return `${name[0] ?? "*"}***@${domain}`;
+    return `${name.slice(0, 2)}***${name.slice(-1)}@${domain}`;
+  }
+  if (trimmed.length <= 3) return `${trimmed[0]}***`;
+  return `${trimmed.slice(0, 2)}***${trimmed.slice(-2)}`;
+}
+
+function displayNameForUi(account: CodexAccount): string {
+  const name = displayName(account);
+  return privacyMasked.value ? maskDisplayText(name) : name;
 }
 
 function boundOAuthName(account: CodexAccount): string {
@@ -549,6 +579,32 @@ function maskExportJson(value: string): string {
       /(eyJ[\w.-]{16,}|rt_[\w.-]{8,}|sk-[\w.-]{8,}|proxy-[\w.-]{8,})/g,
       (match) => maskSecret(match),
     );
+  }
+}
+
+function exportJsonSummary(value: string): string {
+  if (!value.trim()) return "暂无可导出的 JSON";
+  try {
+    const parsed = JSON.parse(value);
+    const rootType = Array.isArray(parsed) ? "数组" : "对象";
+    const accountCount = Array.isArray(parsed)
+      ? parsed.length
+      : Array.isArray(parsed?.accounts)
+        ? parsed.accounts.length
+        : 1;
+    const keys = Array.isArray(parsed) ? [] : Object.keys(parsed ?? {});
+    const keySummary = keys.length ? `字段：${keys.slice(0, 6).join("、")}${keys.length > 6 ? "..." : ""}` : "";
+    return [
+      "{",
+      `  // JSON 已默认折叠，点击“预览”查看完整内容`,
+      `  // 根类型：${rootType}`,
+      `  // 账号数量：${accountCount}`,
+      keySummary ? `  // ${keySummary}` : "",
+      "  ...",
+      "}",
+    ].filter(Boolean).join("\n");
+  } catch {
+    return "{\n  // JSON 已默认折叠，点击“预览”查看完整内容\n  ...\n}";
   }
 }
 
@@ -834,6 +890,7 @@ async function handleRefreshAllQuotas(showMessage = true): Promise<void> {
 }
 
 async function runSwitchSessionRepair(account: CodexAccount): Promise<void> {
+  clearSwitchRepairCloseTimer();
   switchRepairTargetName.value = displayName(account);
   switchRepairVisible.value = true;
   switchRepairProgress.value = 12;
@@ -849,6 +906,7 @@ async function runSwitchSessionRepair(account: CodexAccount): Promise<void> {
     });
     switchRepairResult.value = summary;
     switchRepairProgress.value = 100;
+    scheduleSwitchRepairAutoClose();
   } catch (error) {
     switchRepairError.value = errorText(error);
     switchRepairProgress.value = 100;
@@ -957,6 +1015,18 @@ async function copyBatchExportText(): Promise<void> {
   } catch {
     Message.error("复制失败，请手动选择内容复制");
   }
+}
+
+function downloadBatchExportText(): void {
+  const blob = new Blob([batchExportText.value], { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  const suffix = exportFormat.value === "cockpit_tools" ? "" : `_${exportFormat.value}`;
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  link.download = `codex-switcher-batch${suffix}_${timestamp}.json`;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 function handleDragStart(account: CodexAccount): void {
@@ -1090,6 +1160,7 @@ async function prepareOAuthLogin(): Promise<void> {
     oauthLoginId.value = response.loginId;
     oauthUrl.value = response.authUrl;
     oauthCallbackInput.value = "";
+    oauthCallbackReceived.value = false;
   } catch (error) {
     oauthError.value = errorText(error);
   } finally {
@@ -1129,6 +1200,7 @@ async function completeOAuthLoginFlow(loginId: string): Promise<void> {
     oauthLoginId.value = "";
     oauthUrl.value = "";
     oauthCallbackInput.value = "";
+    oauthCallbackReceived.value = false;
     await loadAccounts();
     Message.success(`已添加 ${displayName(account)}`);
   } catch (error) {
@@ -1145,7 +1217,7 @@ async function handleOAuthCallbackSubmit(): Promise<void> {
     return;
   }
   if (!oauthCallbackInput.value.trim()) {
-    Message.error("请粘贴回调地址");
+    await completeOAuthLoginFlow(oauthLoginId.value);
     return;
   }
   try {
@@ -1153,6 +1225,7 @@ async function handleOAuthCallbackSubmit(): Promise<void> {
       loginId: oauthLoginId.value,
       callbackUrl: oauthCallbackInput.value.trim(),
     });
+    oauthCallbackReceived.value = true;
     await completeOAuthLoginFlow(oauthLoginId.value);
   } catch (error) {
     oauthError.value = errorText(error);
@@ -1386,6 +1459,25 @@ function sessionApproxTokens(sessionId: string): string {
     : "-- tokens";
 }
 
+function clearSwitchRepairCloseTimer(): void {
+  if (!switchRepairCloseTimer) return;
+  window.clearTimeout(switchRepairCloseTimer);
+  switchRepairCloseTimer = undefined;
+}
+
+function closeSwitchRepairModal(): void {
+  clearSwitchRepairCloseTimer();
+  switchRepairVisible.value = false;
+}
+
+function scheduleSwitchRepairAutoClose(): void {
+  clearSwitchRepairCloseTimer();
+  switchRepairCloseTimer = window.setTimeout(() => {
+    switchRepairVisible.value = false;
+    switchRepairCloseTimer = undefined;
+  }, 3000);
+}
+
 async function openSessionFolder(path: string): Promise<void> {
   try {
     await openPathInFileManager(path);
@@ -1477,17 +1569,80 @@ async function handleRestoreSessions(): Promise<void> {
   await loadSessions();
 }
 
-async function handleExportBackup(): Promise<void> {
+function createBackupTaskId(): string {
+  return `backup-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function handleExportBackup(
+  successPrefix = "已生成 ZIP 备份",
+  title = "正在备份数据",
+): Promise<void> {
+  if (backupWorking.value) {
+    Message.info("已有备份任务正在运行");
+    return;
+  }
   backupWorking.value = true;
+  backupProgressVisible.value = true;
+  backupProgress.value = 0;
+  backupProgressMessage.value = "正在启动备份任务...";
+  backupProgressTitle.value = title;
+  backupProgressStatus.value = "running";
+  const taskId = createBackupTaskId();
+  const unlistenRef: { current: UnlistenFn | null } = { current: null };
+  let backupTimeout: number | undefined;
+  let backupCompleted = false;
   try {
-    const backup = await exportCodexSwitcherBackup();
+    let resolveBackup!: (backup: CodexSwitcherBackupFile) => void;
+    let rejectBackup!: (error: Error) => void;
+    const backupPromise = new Promise<CodexSwitcherBackupFile>((resolve, reject) => {
+      resolveBackup = resolve;
+      rejectBackup = reject;
+    });
+    backupTimeout = window.setTimeout(() => {
+      rejectBackup(new Error("备份超时，请稍后重试或检查会话目录是否过大"));
+    }, 10 * 60 * 1000);
+    unlistenRef.current = await listen<CodexSwitcherBackupProgressEvent>(
+      "codex-switcher-backup-progress",
+      (event) => {
+        const payload = event.payload;
+        if (!payload || payload.taskId !== taskId) return;
+        backupProgress.value = Math.max(0, Math.min(100, Number(payload.progress) || 0));
+        backupProgressMessage.value = payload.message || "正在备份...";
+        backupProgressStatus.value = payload.status;
+        if (payload.status === "completed" && payload.backupFile) {
+          resolveBackup(payload.backupFile);
+        } else if (payload.status === "completed") {
+          rejectBackup(new Error("备份完成但未返回备份文件信息"));
+        }
+        if (payload.status === "failed") {
+          rejectBackup(new Error(payload.message || "备份失败"));
+        }
+      },
+    );
+    await startCodexSwitcherBackup(taskId);
+    const backup = await backupPromise;
     await loadBackups();
-    Message.success(`已生成 ZIP 备份：${backup.name}`);
+    backupCompleted = true;
+    Message.success(`${successPrefix}：${backup.name}`);
   } catch (error) {
+    backupProgressStatus.value = "failed";
+    backupProgress.value = 100;
+    backupProgressMessage.value = errorText(error);
     Message.error(`导出备份失败：${errorText(error)}`);
   } finally {
+    if (backupTimeout) window.clearTimeout(backupTimeout);
+    unlistenRef.current?.();
     backupWorking.value = false;
+    if (backupCompleted) {
+      window.setTimeout(() => {
+        if (!backupWorking.value) backupProgressVisible.value = false;
+      }, 1200);
+    }
   }
+}
+
+async function handleExportSessionBackup(): Promise<void> {
+  await handleExportBackup("已备份所有会话", "正在备份所有会话");
 }
 
 async function handleRestoreBackup(backup: CodexSwitcherBackupFile): Promise<void> {
@@ -1568,6 +1723,10 @@ watch([sortedAccounts, () => settings.pageSize], () => {
   selectedAccountIds.value = new Set([...selectedAccountIds.value].filter((id) => visible.has(id)));
 });
 
+watch(switchRepairVisible, (visible) => {
+  if (!visible) clearSwitchRepairCloseTimer();
+});
+
 onMounted(() => {
   quotaCountdownTimer = window.setInterval(() => {
     nowMs.value = Date.now();
@@ -1584,6 +1743,8 @@ onMounted(() => {
       Message.error(`OAuth 回调失败：${payload.message}`);
       return;
     }
+    oauthCallbackReceived.value = true;
+    Message.info("已收到 OAuth 回调，正在保存账号");
     await completeOAuthLoginFlow(payload.loginId);
   }).then((unlisten) => {
     oauthUnlisten = unlisten;
@@ -1594,6 +1755,7 @@ onUnmounted(() => {
   oauthUnlisten?.();
   window.removeEventListener("resize", handleWindowResize);
   if (windowResizeTimer) window.clearTimeout(windowResizeTimer);
+  clearSwitchRepairCloseTimer();
   if (quotaTimer) window.clearInterval(quotaTimer);
   if (quotaCountdownTimer) window.clearInterval(quotaCountdownTimer);
 });
@@ -1612,7 +1774,7 @@ onUnmounted(() => {
       <a-tag color="arcoblue">全部 {{ accounts.length }}</a-tag>
       <a-tag color="green">OAuth {{ oauthCount }}</a-tag>
       <a-tag color="orange">API Key {{ apiKeyCount }}</a-tag>
-      <span v-if="currentAccount">当前：{{ displayName(currentAccount) }}</span>
+      <span v-if="currentAccount">当前：{{ displayNameForUi(currentAccount) }}</span>
     </section>
 
     <section class="command-bar">
@@ -1630,6 +1792,13 @@ onUnmounted(() => {
         </a-button>
       </div>
       <div v-if="activeView === 'accounts'" class="command-actions">
+        <a-button @click="privacyMasked = !privacyMasked">
+          <template #icon>
+            <icon-eye-invisible v-if="privacyMasked" />
+            <icon-eye v-else />
+          </template>
+          {{ privacyMasked ? "已隐藏" : "隐私" }}
+        </a-button>
         <a-button @click="badgeStyleVisible = true">
           <template #icon><icon-palette /></template>
           徽章样式
@@ -1717,6 +1886,7 @@ onUnmounted(() => {
       :deleting-id="deletingId"
       :exporting-id="exportingId"
       :quota-refreshing-id="quotaRefreshingId"
+      :privacy-masked="privacyMasked"
       @toggle-account="toggleAccount"
       @toggle-pin="toggleAccountPin"
       @drag-start="handleDragStart"
@@ -1789,6 +1959,10 @@ onUnmounted(() => {
             <template #icon><icon-refresh /></template>
             刷新
           </a-button>
+          <a-button :loading="backupWorking" @click="handleExportSessionBackup">
+            <template #icon><icon-download /></template>
+            {{ backupButtonText }}
+          </a-button>
           <a-button :loading="sessionRepairing" type="primary" @click="handleRepairSessions">
             <template #icon><icon-tool /></template>
             修复可见性
@@ -1852,12 +2026,10 @@ onUnmounted(() => {
                   :model-value="selectedSessionIds.has(session.id)"
                   @change="toggleSession(session.id)"
                 />
-                <div class="session-main">
-                  <div class="session-title-line">
-                    <strong :title="session.title">{{ session.title }}</strong>
-                  </div>
-                  <span :title="session.path">{{ session.path }}</span>
-                  <small>会话 ID: {{ session.id }}</small>
+                <div class="session-main session-main-name-only">
+                  <strong class="session-name-only" :title="session.title">
+                    {{ session.title || "未命名会话" }}
+                  </strong>
                 </div>
                 <div class="session-stat">
                   <span class="token-count">{{ sessionApproxTokens(session.id) }}</span>
@@ -1906,13 +2078,45 @@ onUnmounted(() => {
       :saving="savingSettings"
       :backup-loading="backupLoading"
       :backup-working="backupWorking"
+      :backup-progress="backupProgress"
       @save="saveSettings"
       @open-path="openSessionFolder"
       @reset-config="confirmResetConfig"
       @export-backup="handleExportBackup"
+      @refresh-backups="loadBackups"
       @restore-backup="handleRestoreBackup"
       @delete-backup="handleDeleteBackup"
     />
+
+    <a-modal
+      v-model:visible="backupProgressVisible"
+      :title="backupProgressTitle"
+      :footer="false"
+      :closable="true"
+      :mask-closable="true"
+      width="420px"
+    >
+      <div class="backup-progress-panel">
+        <a-progress
+          :percent="backupProgress / 100"
+          :status="backupProgressStatus === 'failed' ? 'danger' : backupProgressStatus === 'completed' ? 'success' : 'normal'"
+        />
+        <div
+          class="backup-progress-message"
+          :class="{ failed: backupProgressStatus === 'failed' }"
+        >
+          {{ backupProgressMessage }}
+        </div>
+        <a-button
+          v-if="backupProgressStatus !== 'running'"
+          type="primary"
+          long
+          @click="backupProgressVisible = false"
+        >
+          关闭
+        </a-button>
+      </div>
+    </a-modal>
 
     <a-modal
       v-model:visible="switchRepairVisible"
@@ -1939,7 +2143,7 @@ onUnmounted(() => {
           <span>{{ switchRepairError }}</span>
         </div>
         <div class="form-actions">
-          <a-button type="primary" @click="switchRepairVisible = false">关闭</a-button>
+          <a-button type="primary" @click="closeSwitchRepairModal">关闭</a-button>
         </div>
       </div>
     </a-modal>
@@ -1957,6 +2161,9 @@ onUnmounted(() => {
               点击下方按钮，在浏览器中完成 OpenAI 账号 OAuth 授权。
             </a-typography-paragraph>
             <div v-if="oauthError" class="oauth-error">{{ oauthError }}</div>
+            <div v-else-if="oauthCallbackReceived" class="oauth-success">
+              已收到浏览器回调，正在保存账号；如果刚才失败，可以点击“我已授权”重试保存。
+            </div>
             <div class="oauth-link-block">
               <label>授权链接</label>
               <div class="oauth-url-row">
@@ -1986,11 +2193,11 @@ onUnmounted(() => {
                 <a-button
                   type="primary"
                   :loading="oauthCompleting"
-                  :disabled="!oauthCallbackInput.trim()"
+                  :disabled="!oauthLoginId"
                   @click="handleOAuthCallbackSubmit"
                 >
                   <template #icon><icon-check /></template>
-                  我已授权
+                  {{ oauthCallbackReceived && !oauthCallbackInput.trim() ? "重试保存" : "我已授权" }}
                 </a-button>
               </div>
             </div>
@@ -2070,7 +2277,7 @@ onUnmounted(() => {
                     :key="oauth.id"
                     :value="oauth.id"
                   >
-                    {{ displayName(oauth) }}
+                    {{ displayNameForUi(oauth) }}
                   </a-option>
                 </a-select>
               </a-form-item>
@@ -2176,10 +2383,11 @@ onUnmounted(() => {
           </div>
         </div>
         <a-textarea
-          :model-value="exportPreviewVisible ? exportText : maskExportJson(exportText)"
-          class="token-textarea"
+          :model-value="exportPreviewVisible ? exportText : exportJsonSummary(exportText)"
+          class="token-textarea export-json-viewer"
+          :class="{ collapsed: !exportPreviewVisible }"
           readonly
-          :auto-size="{ minRows: 10, maxRows: 18 }"
+          :auto-size="exportPreviewVisible ? { minRows: 10, maxRows: 18 } : { minRows: 6, maxRows: 6 }"
         />
       </div>
     </a-modal>
@@ -2217,13 +2425,18 @@ onUnmounted(() => {
               <template #icon><icon-copy /></template>
               复制
             </a-button>
+            <a-button type="primary" @click="downloadBatchExportText">
+              <template #icon><icon-download /></template>
+              下载
+            </a-button>
           </div>
         </div>
         <a-textarea
-          :model-value="batchExportPreviewVisible ? batchExportText : maskExportJson(batchExportText)"
-          class="token-textarea"
+          :model-value="batchExportPreviewVisible ? batchExportText : exportJsonSummary(batchExportText)"
+          class="token-textarea export-json-viewer"
+          :class="{ collapsed: !batchExportPreviewVisible }"
           readonly
-          :auto-size="{ minRows: 10, maxRows: 18 }"
+          :auto-size="batchExportPreviewVisible ? { minRows: 10, maxRows: 18 } : { minRows: 6, maxRows: 6 }"
         />
       </div>
     </a-modal>
@@ -2236,7 +2449,7 @@ onUnmounted(() => {
     >
       <div class="modal-form">
         <a-typography-paragraph v-if="phoneAccount">
-          给 {{ displayName(phoneAccount) }} 保存一个绑定手机号，后续会直接显示在账号卡片上。
+          给 {{ displayNameForUi(phoneAccount) }} 保存一个绑定手机号，后续会直接显示在账号卡片上。
         </a-typography-paragraph>
         <a-form :model="phoneForm" layout="vertical">
           <a-form-item label="手机号">
@@ -2275,7 +2488,7 @@ onUnmounted(() => {
                 :key="oauth.id"
                 :value="oauth.id"
               >
-                {{ displayName(oauth) }}
+                {{ displayNameForUi(oauth) }}
               </a-option>
             </a-select>
           </a-form-item>
