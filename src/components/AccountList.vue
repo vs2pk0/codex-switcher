@@ -523,15 +523,19 @@ function formatTime(value?: number | null): string {
             :class="{ single: !(accountSubscriptionUntil(account) && accountTokenExpiresAt(account)) }"
           >
             <div v-if="accountSubscriptionUntil(account)" class="status-card status-valid">
-              <span>{{ statusTitle(account) }}</span>
-              <strong>{{ expiryDaysLabel(accountSubscriptionUntil(account)) || "已记录" }}</strong>
-              <small>{{ formatDateTime(accountSubscriptionUntil(account)) }}</small>
+              <span>
+                <icon-calendar />
+                {{ statusTitle(account) }} {{ expiryDaysLabel(accountSubscriptionUntil(account)) || "已记录" }}
+              </span>
+              <strong>{{ formatDateTime(accountSubscriptionUntil(account)) }}</strong>
             </div>
 
             <div v-if="accountTokenExpiresAt(account)" class="status-card status-token-expired">
-              <span>凭证状态</span>
-              <strong>{{ tokenExpiryStatus(accountTokenExpiresAt(account)) === "expired" ? "需更新" : "可用" }}</strong>
-              <small>{{ formatDateTime(accountTokenExpiresAt(account)) }}</small>
+              <span>
+                <icon-clock-circle />
+                Token {{ tokenExpiryStatus(accountTokenExpiresAt(account)) === "expired" ? "失效" : "可用" }}
+              </span>
+              <strong>{{ formatDateTime(accountTokenExpiresAt(account)) }}</strong>
             </div>
           </div>
         </div>
