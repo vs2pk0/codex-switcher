@@ -42,6 +42,14 @@ export interface CodexSwitcherBackupFile {
   sizeBytes: number;
 }
 
+export interface CodexSwitcherBackupProgressEvent {
+  taskId: string;
+  status: "running" | "completed" | "failed";
+  progress: number;
+  message: string;
+  backupFile?: CodexSwitcherBackupFile | null;
+}
+
 export function listCodexAccounts(): Promise<CodexAccount[]> {
   return invoke("list_codex_accounts");
 }
@@ -201,6 +209,10 @@ export function getCodexSwitcherPaths(): Promise<CodexSwitcherPaths> {
 
 export function exportCodexSwitcherBackup(): Promise<CodexSwitcherBackupFile> {
   return invoke("export_codex_switcher_backup");
+}
+
+export function startCodexSwitcherBackup(taskId: string): Promise<string> {
+  return invoke("start_codex_switcher_backup", { taskId });
 }
 
 export function listCodexSwitcherBackups(): Promise<CodexSwitcherBackupFile[]> {

@@ -2,7 +2,7 @@ mod account;
 mod oauth;
 mod session;
 
-use account::{AccountStore, CodexAccount, CodexQuota};
+use account::{AccountStore, ApiKeyAccountBindingInput, CodexAccount, CodexQuota};
 use oauth::CodexOAuthLoginStartResponse;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -132,6 +132,16 @@ struct CodexSwitcherBackupFile {
     size_bytes: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexSwitcherBackupProgressEvent {
+    task_id: String,
+    status: String,
+    progress: u8,
+    message: String,
+    backup_file: Option<CodexSwitcherBackupFile>,
+}
+
 #[tauri::command]
 fn list_codex_accounts() -> Result<Vec<CodexAccount>, String> {
     AccountStore::default().list_accounts()
@@ -162,15 +172,15 @@ fn add_codex_account_with_api_key(
     bound_oauth_account_id: Option<String>,
     bound_oauth_use_local_gateway: Option<bool>,
 ) -> Result<CodexAccount, String> {
-    AccountStore::default().add_api_key_account_with_binding(
+    AccountStore::default().add_api_key_account_with_binding(ApiKeyAccountBindingInput {
         api_key,
         api_base_url,
         api_provider_name,
         api_official_url,
         account_name,
         bound_oauth_account_id,
-        bound_oauth_use_local_gateway.unwrap_or(false),
-    )
+        bound_oauth_use_local_gateway: bound_oauth_use_local_gateway.unwrap_or(false),
+    })
 }
 
 #[tauri::command]
@@ -293,8 +303,7 @@ fn open_path_in_file_manager(path: String) -> Result<(), String> {
 }
 
 fn start_oauth_callback_listener(app_handle: AppHandle, login_id: String) -> Result<(), String> {
-    let listener = TcpListener::bind("127.0.0.1:1455")
-        .map_err(|error| format!("OAuth 回调端口 1455 启动失败: {}", error))?;
+    let listener = bind_oauth_callback_listener()?;
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("OAuth 回调监听配置失败: {}", error))?;
@@ -326,13 +335,20 @@ fn start_oauth_callback_listener(app_handle: AppHandle, login_id: String) -> Res
                         Ok(()) => (
                             true,
                             "已收到 OAuth 回调，正在保存账号".to_string(),
-                            "<html><body><h2>Codex OAuth 授权完成</h2><p>可以回到 Codex Switcher 了。</p></body></html>",
+                            oauth_callback_html(
+                                true,
+                                "授权回调已收到",
+                                "正在回到 Codex Switcher 保存账号，本页面将自动关闭。",
+                            ),
                         ),
-                        Err(error) => (
-                            false,
-                            error,
-                            "<html><body><h2>Codex OAuth 授权失败</h2><p>请回到应用重试或手动粘贴回调地址。</p></body></html>",
-                        ),
+                        Err(error) => {
+                            let html = oauth_callback_html(
+                                false,
+                                "授权回调失败",
+                                "请回到 Codex Switcher 重试，或复制地址栏里的完整回调地址手动完成。",
+                            );
+                            (false, error, html)
+                        }
                     };
                     let body = html.as_bytes();
                     let _ = write!(
@@ -369,6 +385,182 @@ fn start_oauth_callback_listener(app_handle: AppHandle, login_id: String) -> Res
         }
     });
     Ok(())
+}
+
+fn oauth_callback_html(success: bool, title: &str, description: &str) -> String {
+    let status_class = if success { "success" } else { "error" };
+    let icon = if success { "✓" } else { "!" };
+    let countdown_html = if success {
+        r#"<div class="countdown">正在尝试关闭页面，<span id="countdown">3</span> 秒后自动清空标签页。</div>"#
+    } else {
+        ""
+    };
+    let auto_close_script = if success {
+        r#"
+        <script>
+          (function () {
+            var seconds = 3;
+            var countdown = document.getElementById('countdown');
+            var closeButton = document.getElementById('closeButton');
+            function tryClose() {
+              try { window.open('', '_self'); } catch (_) {}
+              try { window.close(); } catch (_) {}
+            }
+            function blankFallback() {
+              try { window.location.replace('about:blank'); } catch (_) {}
+            }
+            closeButton && closeButton.addEventListener('click', function () {
+              tryClose();
+              window.setTimeout(blankFallback, 300);
+            });
+            var timer = window.setInterval(function () {
+              seconds -= 1;
+              if (countdown) countdown.textContent = String(Math.max(seconds, 0));
+              tryClose();
+              if (seconds <= 0) {
+                window.clearInterval(timer);
+                blankFallback();
+              }
+            }, 1000);
+            window.setTimeout(tryClose, 250);
+          })();
+        </script>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex OAuth</title>
+    <style>
+      :root {{
+        color-scheme: light;
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+        background: #f5f7fb;
+        color: #111827;
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{
+        min-height: 100vh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        padding: 28px;
+        background:
+          radial-gradient(circle at 16% 12%, rgba(37, 99, 235, 0.16), transparent 34%),
+          radial-gradient(circle at 84% 18%, rgba(14, 165, 168, 0.18), transparent 30%),
+          linear-gradient(180deg, #f8fbff 0%, #eef4fb 100%);
+      }}
+      .card {{
+        width: min(480px, 100%);
+        padding: 34px 32px 30px;
+        border: 1px solid #dbe4ef;
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.92);
+        text-align: center;
+      }}
+      .icon {{
+        width: 64px;
+        height: 64px;
+        margin: 0 auto 18px;
+        display: grid;
+        place-items: center;
+        border-radius: 999px;
+        font-size: 34px;
+        font-weight: 800;
+      }}
+      .success .icon {{
+        color: #047857;
+        background: linear-gradient(135deg, #d1fae5, #ecfdf5);
+      }}
+      .error .icon {{
+        color: #dc2626;
+        background: linear-gradient(135deg, #fee2e2, #fff1f2);
+      }}
+      h1 {{
+        margin: 0;
+        font-size: 28px;
+        line-height: 1.25;
+        letter-spacing: -0.02em;
+      }}
+      p {{
+        margin: 14px 0 0;
+        color: #526174;
+        font-size: 16px;
+        line-height: 1.7;
+      }}
+      .actions {{
+        margin-top: 24px;
+        display: flex;
+        justify-content: center;
+        gap: 12px;
+      }}
+      button {{
+        border: 0;
+        border-radius: 10px;
+        padding: 11px 18px;
+        cursor: pointer;
+        color: #fff;
+        font-weight: 700;
+        background: linear-gradient(135deg, #2563eb, #0ea5a8);
+      }}
+      .hint {{
+        margin-top: 16px;
+        color: #8a97a8;
+        font-size: 13px;
+      }}
+      .countdown {{
+        margin-top: 14px;
+        color: #64748b;
+        font-size: 14px;
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="card {status_class}">
+      <div class="icon">{icon}</div>
+      <h1>{title}</h1>
+      <p>{description}</p>
+      {countdown_html}
+      <div class="actions">
+        <button id="closeButton" onclick="window.close()">关闭页面</button>
+      </div>
+      <div class="hint">如果浏览器拦截自动关闭，可以直接关闭此标签页。</div>
+    </main>
+    {auto_close_script}
+  </body>
+</html>"#,
+    )
+}
+
+fn bind_oauth_callback_listener() -> Result<TcpListener, String> {
+    let mut last_error = None;
+    for _ in 0..20 {
+        match TcpListener::bind(("127.0.0.1", oauth::CALLBACK_PORT)) {
+            Ok(listener) => return Ok(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                last_error = Some(error);
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "OAuth 回调端口 {} 启动失败: {}",
+                    oauth::CALLBACK_PORT,
+                    error
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "OAuth 回调端口 {} 启动失败: {}",
+        oauth::CALLBACK_PORT,
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "端口被占用".to_string())
+    ))
 }
 
 fn open_path_with_system(path: &PathBuf) -> Result<std::process::ExitStatus, String> {
@@ -488,24 +680,101 @@ fn get_codex_switcher_paths() -> Result<CodexSwitcherPaths, String> {
 
 #[tauri::command]
 fn export_codex_switcher_backup() -> Result<CodexSwitcherBackupFile, String> {
+    export_codex_switcher_backup_with_progress(|_, _| {})
+}
+
+#[tauri::command]
+fn start_codex_switcher_backup(app_handle: AppHandle, task_id: String) -> Result<String, String> {
+    let task_id = task_id.trim().to_string();
+    if task_id.is_empty() {
+        return Err("备份任务 ID 不能为空".to_string());
+    }
+    let emit_task_id = task_id.clone();
+    thread::spawn(move || {
+        emit_backup_progress(
+            &app_handle,
+            &emit_task_id,
+            "running",
+            1,
+            "正在准备备份任务...",
+            None,
+        );
+        let result = export_codex_switcher_backup_with_progress(|progress, message| {
+            emit_backup_progress(
+                &app_handle,
+                &emit_task_id,
+                "running",
+                progress,
+                message,
+                None,
+            );
+        });
+        match result {
+            Ok(backup_file) => emit_backup_progress(
+                &app_handle,
+                &emit_task_id,
+                "completed",
+                100,
+                "备份完成",
+                Some(backup_file),
+            ),
+            Err(error) => {
+                emit_backup_progress(&app_handle, &emit_task_id, "failed", 100, &error, None)
+            }
+        }
+    });
+    Ok(task_id)
+}
+
+fn emit_backup_progress(
+    app_handle: &AppHandle,
+    task_id: &str,
+    status: &str,
+    progress: u8,
+    message: &str,
+    backup_file: Option<CodexSwitcherBackupFile>,
+) {
+    let _ = app_handle.emit(
+        "codex-switcher-backup-progress",
+        CodexSwitcherBackupProgressEvent {
+            task_id: task_id.to_string(),
+            status: status.to_string(),
+            progress: progress.min(100),
+            message: message.to_string(),
+            backup_file,
+        },
+    );
+}
+
+fn export_codex_switcher_backup_with_progress<F>(
+    mut progress: F,
+) -> Result<CodexSwitcherBackupFile, String>
+where
+    F: FnMut(u8, &str),
+{
+    progress(5, "正在读取账号、设置与会话信息...");
+    let codex_session_summary = codex_session_backup_summary(&default_codex_home());
     let backup = serde_json::json!({
         "app": "Codex Switcher",
-        "version": 1,
+        "version": 2,
         "exportedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "accounts": list_codex_accounts()?,
         "currentAccount": get_current_codex_account()?,
         "settings": read_switcher_settings()?,
+        "codexSessions": codex_session_summary,
     });
+    progress(15, "正在生成备份清单...");
     let content = serde_json::to_string_pretty(&backup)
         .map_err(|error| format!("序列化备份失败: {}", error))?;
     let backup_dir = switcher_backup_dir();
     std::fs::create_dir_all(&backup_dir).map_err(|error| format!("创建备份目录失败: {}", error))?;
     let filename = format!(
         "codex-switcher-backup-{}.zip",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
+        chrono::Local::now().format("%Y%m%d-%H%M%S-%3f")
     );
     let backup_path = backup_dir.join(filename);
-    write_switcher_backup_zip(&backup_path, &content)?;
+    write_switcher_backup_zip(&backup_path, &content, &mut progress)?;
+    progress(98, "正在刷新备份文件信息...");
     backup_file_info(&backup_path)
 }
 
@@ -535,6 +804,7 @@ fn restore_codex_switcher_backup(backup_path: String) -> Result<Vec<CodexAccount
     let file = std::fs::File::open(&path).map_err(|error| format!("打开备份失败: {}", error))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|error| format!("读取 ZIP 备份失败: {}", error))?;
+    restore_backup_archive_files(&mut archive)?;
     let mut backup_json = String::new();
     archive
         .by_name("backup.json")
@@ -744,7 +1014,15 @@ fn ensure_switcher_data_dirs() -> Result<(), String> {
     Ok(())
 }
 
-fn write_switcher_backup_zip(backup_path: &Path, backup_json: &str) -> Result<(), String> {
+fn write_switcher_backup_zip<F>(
+    backup_path: &Path,
+    backup_json: &str,
+    progress: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(u8, &str),
+{
+    progress(20, "正在创建 ZIP 文件...");
     let file = std::fs::File::create(backup_path)
         .map_err(|error| format!("创建 ZIP 备份失败: {}", error))?;
     let mut zip = zip::ZipWriter::new(file);
@@ -755,8 +1033,19 @@ fn write_switcher_backup_zip(backup_path: &Path, backup_json: &str) -> Result<()
         .map_err(|error| format!("写入备份 JSON 失败: {}", error))?;
     zip.write_all(backup_json.as_bytes())
         .map_err(|error| format!("写入备份 JSON 失败: {}", error))?;
+    progress(30, "正在写入 Codex Switcher 数据...");
     let root = switcher_data_dir();
-    add_directory_to_backup_zip(&mut zip, &root, &root, &switcher_backup_dir(), options)?;
+    add_directory_to_backup_zip(
+        &mut zip,
+        &root,
+        &root,
+        "data",
+        Some(&switcher_backup_dir()),
+        options,
+    )?;
+    progress(50, "正在写入 Codex 会话记录...");
+    add_codex_sessions_to_backup_zip(&mut zip, options, progress)?;
+    progress(92, "正在压缩并完成 ZIP...");
     zip.finish()
         .map_err(|error| format!("完成 ZIP 备份失败: {}", error))?;
     Ok(())
@@ -766,10 +1055,11 @@ fn add_directory_to_backup_zip(
     zip: &mut zip::ZipWriter<std::fs::File>,
     root: &Path,
     current: &Path,
-    excluded_dir: &Path,
+    archive_prefix: &str,
+    excluded_dir: Option<&Path>,
     options: zip::write::FileOptions,
 ) -> Result<(), String> {
-    if !current.exists() || current.starts_with(excluded_dir) {
+    if !current.exists() || excluded_dir.is_some_and(|dir| current.starts_with(dir)) {
         return Ok(());
     }
     for entry in std::fs::read_dir(current)
@@ -778,24 +1068,171 @@ fn add_directory_to_backup_zip(
         let path = entry
             .map_err(|error| format!("读取备份数据文件失败: {}", error))?
             .path();
-        if path.starts_with(excluded_dir) {
+        if excluded_dir.is_some_and(|dir| path.starts_with(dir)) {
             continue;
         }
         if path.is_dir() {
-            add_directory_to_backup_zip(zip, root, &path, excluded_dir, options)?;
+            add_directory_to_backup_zip(zip, root, &path, archive_prefix, excluded_dir, options)?;
             continue;
         }
         let relative = path
             .strip_prefix(root)
             .map_err(|error| format!("计算备份相对路径失败: {}", error))?;
-        let name = format!("data/{}", relative.to_string_lossy().replace('\\', "/"));
-        zip.start_file(name, options)
-            .map_err(|error| format!("写入备份文件失败: {}", error))?;
-        let mut file =
-            std::fs::File::open(&path).map_err(|error| format!("读取备份文件失败: {}", error))?;
-        std::io::copy(&mut file, zip).map_err(|error| format!("写入备份文件失败: {}", error))?;
+        let name = format!(
+            "{}/{}",
+            archive_prefix.trim_matches('/'),
+            relative.to_string_lossy().replace('\\', "/")
+        );
+        add_file_to_backup_zip(zip, &path, &name, options)?;
     }
     Ok(())
+}
+
+fn add_file_to_backup_zip(
+    zip: &mut zip::ZipWriter<std::fs::File>,
+    path: &Path,
+    archive_name: &str,
+    options: zip::write::FileOptions,
+) -> Result<(), String> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    zip.start_file(archive_name, options)
+        .map_err(|error| format!("写入备份文件失败: {}", error))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("读取备份文件失败: {}", error))?;
+    std::io::copy(&mut file, zip).map_err(|error| format!("写入备份文件失败: {}", error))?;
+    Ok(())
+}
+
+fn add_codex_sessions_to_backup_zip(
+    zip: &mut zip::ZipWriter<std::fs::File>,
+    options: zip::write::FileOptions,
+    progress: &mut impl FnMut(u8, &str),
+) -> Result<(), String> {
+    let codex_home = default_codex_home();
+    progress(55, "正在备份会话文件...");
+    add_directory_to_backup_zip(
+        zip,
+        &codex_home.join("sessions"),
+        &codex_home.join("sessions"),
+        "codex/sessions",
+        None,
+        options,
+    )?;
+    progress(82, "正在备份会话回收站...");
+    add_directory_to_backup_zip(
+        zip,
+        &codex_home.join(".codex-switcher").join("session-trash"),
+        &codex_home.join(".codex-switcher").join("session-trash"),
+        "codex/session-trash",
+        None,
+        options,
+    )?;
+    progress(88, "正在备份会话索引...");
+    for filename in ["session_index.jsonl", "session_index.jsonl.bak"] {
+        add_file_to_backup_zip(
+            zip,
+            &codex_home.join(filename),
+            &format!("codex/{}", filename),
+            options,
+        )?;
+    }
+    Ok(())
+}
+
+fn codex_session_backup_summary(codex_home: &Path) -> Value {
+    serde_json::json!({
+        "sessionsDir": codex_home.join("sessions").to_string_lossy().to_string(),
+        "sessionFiles": count_files_under(&codex_home.join("sessions")),
+        "trashedSessionFiles": count_files_under(&codex_home.join(".codex-switcher").join("session-trash")),
+        "includesSessionIndex": codex_home.join("session_index.jsonl").is_file(),
+    })
+}
+
+fn count_files_under(path: &Path) -> usize {
+    if !path.exists() {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                count_files_under(&path)
+            } else if path.is_file() {
+                1
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
+fn restore_backup_archive_files(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+) -> Result<(), String> {
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|error| format!("读取 ZIP 文件条目失败: {}", error))?;
+        if file.is_dir() {
+            continue;
+        }
+        let Some(target) = backup_entry_restore_target(file.name()) else {
+            continue;
+        };
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("创建恢复目录失败 ({}): {}", parent.display(), error))?;
+        }
+        let mut output = std::fs::File::create(&target)
+            .map_err(|error| format!("创建恢复文件失败 ({}): {}", target.display(), error))?;
+        std::io::copy(&mut file, &mut output)
+            .map_err(|error| format!("恢复备份文件失败 ({}): {}", target.display(), error))?;
+    }
+    Ok(())
+}
+
+fn backup_entry_restore_target(name: &str) -> Option<PathBuf> {
+    let normalized = name.replace('\\', "/");
+    let path = Path::new(&normalized);
+    if path.is_absolute()
+        || normalized
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return None;
+    }
+    let codex_home = default_codex_home();
+    normalized
+        .strip_prefix("codex/sessions/")
+        .map(|relative| codex_home.join("sessions").join(relative))
+        .or_else(|| {
+            normalized
+                .strip_prefix("codex/session-trash/")
+                .map(|relative| {
+                    codex_home
+                        .join(".codex-switcher")
+                        .join("session-trash")
+                        .join(relative)
+                })
+        })
+        .or_else(|| {
+            ["session_index.jsonl", "session_index.jsonl.bak"]
+                .into_iter()
+                .find_map(|filename| {
+                    (normalized == format!("codex/{}", filename)).then(|| codex_home.join(filename))
+                })
+        })
+        .or_else(|| {
+            normalized
+                .strip_prefix("data/")
+                .map(|relative| switcher_data_dir().join(relative))
+        })
 }
 
 fn backup_file_info(path: &Path) -> Result<CodexSwitcherBackupFile, String> {
@@ -1000,6 +1437,40 @@ fn compact_http_body(body: &str) -> String {
     compact.chars().take(300).collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{backup_entry_restore_target, default_codex_home, switcher_data_dir};
+
+    #[test]
+    fn backup_restore_target_accepts_known_backup_roots() {
+        assert_eq!(
+            backup_entry_restore_target("codex/sessions/2026/session.jsonl"),
+            Some(default_codex_home().join("sessions/2026/session.jsonl"))
+        );
+        assert_eq!(
+            backup_entry_restore_target("codex/session_index.jsonl"),
+            Some(default_codex_home().join("session_index.jsonl"))
+        );
+        assert_eq!(
+            backup_entry_restore_target("data/accounts.json"),
+            Some(switcher_data_dir().join("accounts.json"))
+        );
+    }
+
+    #[test]
+    fn backup_restore_target_rejects_unsafe_paths() {
+        for name in [
+            "/tmp/evil.jsonl",
+            "codex/sessions/../../evil.jsonl",
+            "codex/session-trash//evil.jsonl",
+            "data/../config.toml",
+            "backup.json",
+        ] {
+            assert_eq!(backup_entry_restore_target(name), None);
+        }
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -1028,6 +1499,7 @@ pub fn run() {
             reset_codex_config_toml,
             get_codex_switcher_paths,
             export_codex_switcher_backup,
+            start_codex_switcher_backup,
             list_codex_switcher_backups,
             restore_codex_switcher_backup,
             delete_codex_switcher_backup,

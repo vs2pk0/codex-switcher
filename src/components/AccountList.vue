@@ -15,6 +15,7 @@ const props = defineProps<{
   deletingId: string;
   exportingId: string;
   quotaRefreshingId: string;
+  privacyMasked: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -60,6 +61,36 @@ function displayName(account: CodexAccount): string {
   return account.account_name || account.email || account.id || "未命名账号";
 }
 
+function maskEmail(value: string): string {
+  const [name, domain] = value.split("@");
+  if (!domain) return maskMiddle(value);
+  if (name.length <= 3) return `${name[0] ?? "*"}***@${domain}`;
+  return `${name.slice(0, 2)}***${name.slice(-1)}@${domain}`;
+}
+
+function maskPhone(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length <= 7) return maskMiddle(trimmed);
+  return `${trimmed.slice(0, 3)}***${trimmed.slice(-4)}`;
+}
+
+function maskMiddle(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length <= 3) return trimmed ? `${trimmed[0]}***` : "";
+  return `${trimmed.slice(0, 2)}***${trimmed.slice(-2)}`;
+}
+
+function displayIdentity(value: string): string {
+  if (!props.privacyMasked) return value;
+  if (value.includes("@")) return maskEmail(value);
+  return maskMiddle(value);
+}
+
+function displayAccountName(account: CodexAccount): string {
+  const raw = displayName(account);
+  return displayIdentity(raw);
+}
+
 function boundOAuthAccount(account: CodexAccount): CodexAccount | undefined {
   if (!account.bound_oauth_account_id) return undefined;
   return props.accounts.find((item) => item.id === account.bound_oauth_account_id);
@@ -67,7 +98,7 @@ function boundOAuthAccount(account: CodexAccount): CodexAccount | undefined {
 
 function boundOAuthName(account: CodexAccount): string {
   const bound = boundOAuthAccount(account);
-  return bound ? displayName(bound) : "未绑定";
+  return bound ? displayAccountName(bound) : "未绑定";
 }
 
 function canShowQuota(account: CodexAccount): boolean {
@@ -226,6 +257,10 @@ function accountLoginLine(account: CodexAccount): string {
   return `使用 OAuth 登录 | 用户 ID: ${shortAccountId(account)}`;
 }
 
+function displayPhone(value: string): string {
+  return props.privacyMasked ? maskPhone(value) : value;
+}
+
 function apiBaseUrl(account: CodexAccount): string {
   return (account.api_base_url || account.apiBaseUrl)?.trim() ?? "";
 }
@@ -344,8 +379,8 @@ function formatTime(value?: number | null): string {
               :model-value="selectedAccountIds.has(account.id)"
               @change="emit('toggle-account', account.id)"
             />
-            <span class="account-name" :title="displayName(account)">
-              {{ displayName(account) }}
+            <span class="account-name" :title="displayAccountName(account)">
+              {{ displayAccountName(account) }}
             </span>
           </div>
           <div class="account-head-actions">
@@ -467,7 +502,7 @@ function formatTime(value?: number | null): string {
               @click="emit('open-phone', account)"
             >
               <icon-phone />
-              {{ account.bound_phone }}
+              {{ displayPhone(account.bound_phone) }}
             </button>
           </div>
           <div class="card-actions">

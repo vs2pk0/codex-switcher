@@ -88,6 +88,17 @@ pub struct CodexAccount {
 }
 
 #[derive(Debug, Clone)]
+pub struct ApiKeyAccountBindingInput {
+    pub api_key: String,
+    pub api_base_url: Option<String>,
+    pub api_provider_name: Option<String>,
+    pub api_official_url: Option<String>,
+    pub account_name: Option<String>,
+    pub bound_oauth_account_id: Option<String>,
+    pub bound_oauth_use_local_gateway: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct AccountStore {
     storage_dir: PathBuf,
     codex_home: PathBuf,
@@ -288,26 +299,20 @@ impl AccountStore {
 
     pub fn add_api_key_account_with_binding(
         &self,
-        api_key: String,
-        api_base_url: Option<String>,
-        api_provider_name: Option<String>,
-        api_official_url: Option<String>,
-        account_name: Option<String>,
-        bound_oauth_account_id: Option<String>,
-        bound_oauth_use_local_gateway: bool,
+        input: ApiKeyAccountBindingInput,
     ) -> Result<CodexAccount, String> {
         let account = self.add_api_key_account(
-            api_key,
-            api_base_url,
-            api_provider_name,
-            api_official_url,
-            account_name,
+            input.api_key,
+            input.api_base_url,
+            input.api_provider_name,
+            input.api_official_url,
+            input.account_name,
         )?;
-        if normalize_optional(bound_oauth_account_id.as_deref()).is_some() {
+        if normalize_optional(input.bound_oauth_account_id.as_deref()).is_some() {
             self.update_api_key_bound_oauth_account(
                 &account.id,
-                bound_oauth_account_id,
-                bound_oauth_use_local_gateway,
+                input.bound_oauth_account_id,
+                input.bound_oauth_use_local_gateway,
             )
         } else {
             Ok(account)

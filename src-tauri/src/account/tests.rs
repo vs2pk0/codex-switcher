@@ -1,5 +1,6 @@
 use super::{
-    codex_restart_commands, codex_restart_delay_ms, AccountStore, CodexAccount, CodexQuota,
+    codex_restart_commands, codex_restart_delay_ms, AccountStore, ApiKeyAccountBindingInput,
+    CodexAccount, CodexQuota,
 };
 use serde_json::json;
 use std::fs;
@@ -373,15 +374,15 @@ fn adds_api_key_account_with_existing_oauth_binding() {
         .remove(0);
 
     let api = store
-        .add_api_key_account_with_binding(
-            "sk-add-bound-123456".to_string(),
-            Some("https://relay.example/v1".to_string()),
-            Some("Relay".to_string()),
-            None,
-            Some("Relay Key".to_string()),
-            Some(oauth.id.clone()),
-            false,
-        )
+        .add_api_key_account_with_binding(ApiKeyAccountBindingInput {
+            api_key: "sk-add-bound-123456".to_string(),
+            api_base_url: Some("https://relay.example/v1".to_string()),
+            api_provider_name: Some("Relay".to_string()),
+            api_official_url: None,
+            account_name: Some("Relay Key".to_string()),
+            bound_oauth_account_id: Some(oauth.id.clone()),
+            bound_oauth_use_local_gateway: false,
+        })
         .expect("add bound api key account");
 
     assert_eq!(
@@ -409,15 +410,15 @@ fn unbinding_api_key_oauth_clears_cached_quota() {
         .expect("import oauth")
         .remove(0);
     let api = store
-        .add_api_key_account_with_binding(
-            "sk-quota-bound-123456".to_string(),
-            Some("https://relay.example/v1".to_string()),
-            Some("Relay".to_string()),
-            None,
-            Some("Relay Key".to_string()),
-            Some(oauth.id.clone()),
-            false,
-        )
+        .add_api_key_account_with_binding(ApiKeyAccountBindingInput {
+            api_key: "sk-quota-bound-123456".to_string(),
+            api_base_url: Some("https://relay.example/v1".to_string()),
+            api_provider_name: Some("Relay".to_string()),
+            api_official_url: None,
+            account_name: Some("Relay Key".to_string()),
+            bound_oauth_account_id: Some(oauth.id.clone()),
+            bound_oauth_use_local_gateway: false,
+        })
         .expect("add bound api key account");
     store
         .update_account_quota(&api.id, test_quota())
@@ -451,15 +452,15 @@ fn deleting_bound_oauth_account_clears_api_key_binding_and_quota() {
         .expect("import oauth")
         .remove(0);
     let api = store
-        .add_api_key_account_with_binding(
-            "sk-delete-bound-123456".to_string(),
-            Some("https://relay.example/v1".to_string()),
-            Some("Relay".to_string()),
-            None,
-            Some("Relay Key".to_string()),
-            Some(oauth.id.clone()),
-            false,
-        )
+        .add_api_key_account_with_binding(ApiKeyAccountBindingInput {
+            api_key: "sk-delete-bound-123456".to_string(),
+            api_base_url: Some("https://relay.example/v1".to_string()),
+            api_provider_name: Some("Relay".to_string()),
+            api_official_url: None,
+            account_name: Some("Relay Key".to_string()),
+            bound_oauth_account_id: Some(oauth.id.clone()),
+            bound_oauth_use_local_gateway: false,
+        })
         .expect("add bound api key account");
     store
         .update_account_quota(&api.id, test_quota())

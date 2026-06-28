@@ -173,7 +173,7 @@ impl SessionStore {
             }
             sessions.push(record);
         }
-        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         Ok(sessions)
     }
 
@@ -253,7 +253,7 @@ impl SessionStore {
                     .unwrap_or_default(),
             });
         }
-        records.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
+        records.sort_by_key(|record| std::cmp::Reverse(record.deleted_at));
         Ok(records)
     }
 
@@ -533,7 +533,9 @@ impl SessionStore {
                 Ok(content) => content,
                 Err(_) => continue,
             };
-            let Some(next) = rewrite_session_meta_provider(&content, target_provider, rewrite_all_meta)? else {
+            let Some(next) =
+                rewrite_session_meta_provider(&content, target_provider, rewrite_all_meta)?
+            else {
                 continue;
             };
             if !backup_created {
@@ -1065,7 +1067,9 @@ fn build_session_record(path: &Path, content: &str) -> Result<CodexSessionRecord
 
 fn extract_session_id(content: &str) -> Option<String> {
     for line in content.lines() {
-        let value: Value = serde_json::from_str(line).ok()?;
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         if value.get("type").and_then(Value::as_str) != Some("session_meta") {
             continue;
         }
@@ -1084,18 +1088,105 @@ fn extract_session_id(content: &str) -> Option<String> {
 
 fn extract_title(content: &str) -> Option<String> {
     for line in content.lines() {
-        let value: Value = serde_json::from_str(line).ok()?;
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         if value.get("type").and_then(Value::as_str) == Some("session_meta") {
             continue;
         }
-        if let Some(text) = find_text(&value) {
-            let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            if !compact.is_empty() {
-                return Some(compact.chars().take(60).collect());
+        if !is_user_message_value(&value) {
+            continue;
+        }
+        if let Some(title) = normalize_session_title(find_text(&value)) {
+            return Some(title);
+        }
+    }
+
+    for line in content.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+            continue;
+        }
+        if let Some(title) = normalize_session_title(find_text(&value)) {
+            return Some(title);
+        }
+    }
+    None
+}
+
+fn normalize_session_title(text: Option<String>) -> Option<String> {
+    let raw = text?;
+    let source = extract_user_request_text(&raw).unwrap_or(raw);
+    let visible_lines = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take_while(|line| !line.starts_with("<image "))
+        .collect::<Vec<_>>();
+    let compact = visible_lines
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() || is_internal_session_title(&compact) {
+        return None;
+    }
+    Some(compact.chars().take(60).collect())
+}
+
+fn extract_user_request_text(text: &str) -> Option<String> {
+    for marker in [
+        "## My request for Codex:",
+        "My request for Codex:",
+        "## 我的请求：",
+        "## 我的请求:",
+    ] {
+        if let Some((_, after_marker)) = text.split_once(marker) {
+            let cleaned = after_marker.trim();
+            if !cleaned.is_empty() {
+                return Some(cleaned.to_string());
             }
         }
     }
     None
+}
+
+fn is_user_message_value(value: &Value) -> bool {
+    value
+        .get("payload")
+        .and_then(|payload| payload.get("role"))
+        .and_then(Value::as_str)
+        == Some("user")
+        || value.get("role").and_then(Value::as_str) == Some("user")
+}
+
+fn is_internal_session_title(text: &str) -> bool {
+    let normalized = text.trim().to_lowercase();
+    normalized.starts_with("<permissions instructions>")
+        || normalized.starts_with("# files mentioned by the user")
+        || normalized.starts_with("files mentioned by the user:")
+        || (normalized.contains("codex-clipboard-") && normalized.contains("/var/folders/"))
+        || normalized.starts_with("<environment_context>")
+        || normalized.starts_with("<app-context>")
+        || normalized.starts_with("<collaboration_mode>")
+        || normalized.starts_with("<personality_spec>")
+        || normalized.starts_with("<skills_instructions>")
+        || normalized.starts_with("<plugins_instructions>")
+        || normalized.starts_with("<extremely_important>")
+        || normalized.starts_with("<system>")
+        || normalized.starts_with("<developer>")
+        || normalized.starts_with("<command-name>")
+        || normalized.starts_with("<local-command-stdout>")
+        || normalized.starts_with("<turn_aborted>")
+        || normalized.starts_with("# agents.md instructions")
+        || normalized.starts_with("knowledge cutoff:")
+        || normalized.starts_with("current date:")
+        || normalized.contains("filesystem sandboxing defines")
+        || normalized.contains("you are codex")
+        || normalized.contains("you have superpowers")
+        || normalized.contains("primary agent in a team of agents")
 }
 
 fn extract_project_name(content: &str) -> Option<String> {
@@ -1222,7 +1313,7 @@ fn now_timestamp() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionStore;
+    use super::{extract_title, SessionStore};
     use std::fs;
     use std::process::Command;
     use tempfile::tempdir;
@@ -1282,6 +1373,55 @@ mod tests {
         let sessions = store.list_sessions(None, None).expect("list sessions");
 
         assert_eq!(sessions[0].project_name, "operator-end-cloud");
+    }
+
+    #[test]
+    fn extracts_title_from_user_message_before_internal_prompt_text() {
+        let content = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<EXTREMELY_IMPORTANT> You have superpowers."}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"提取账号切换与添加功能"}]}}"#
+        );
+
+        assert_eq!(
+            extract_title(content).as_deref(),
+            Some("提取账号切换与添加功能")
+        );
+    }
+
+    #[test]
+    fn skips_agents_instruction_user_message_for_title() {
+        let content = concat!(
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions\n\n<INSTRUCTIONS>...</INSTRUCTIONS>"}]}}"##,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"更新安卓和PC国旗"}]}}"#
+        );
+
+        assert_eq!(extract_title(content).as_deref(), Some("更新安卓和PC国旗"));
+    }
+
+    #[test]
+    fn extracts_title_from_request_after_file_mentions() {
+        let content = r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# Files mentioned by the user:\n\n## codex-clipboard-demo.png: /var/folders/demo/codex-clipboard-demo.png\n\n## My request for Codex:\n会话显示的还是奇怪，仔细分析修改下\n<image name=[Image #1] path=\"/tmp/demo.png\">"}]}}"##;
+
+        assert_eq!(
+            extract_title(content).as_deref(),
+            Some("会话显示的还是奇怪，仔细分析修改下")
+        );
+    }
+
+    #[test]
+    fn skips_file_mentions_without_request_marker_for_title() {
+        let content = concat!(
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# Files mentioned by the user:\n\n## codex-clipboard-demo.png: /var/folders/demo/codex-clipboard-demo.png"}]}}"##,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"OAuth 授权端口改成 16666"}]}}"#
+        );
+
+        assert_eq!(
+            extract_title(content).as_deref(),
+            Some("OAuth 授权端口改成 16666")
+        );
     }
 
     #[test]

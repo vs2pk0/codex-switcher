@@ -11,6 +11,9 @@ const AUTH_ENDPOINT: &str = "https://auth.openai.com/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const SCOPES: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
+// OpenAI Codex OAuth app currently only accepts the original localhost callback.
+// Changing this to another port (for example 16666) causes the authorize page to fail.
+pub const CALLBACK_PORT: u16 = 1455;
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const ORIGINATOR: &str = "codex_vscode";
 
@@ -22,10 +25,12 @@ pub struct CodexOAuthLoginStartResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OAuthTokenResponse {
+    #[serde(rename = "id_token", alias = "idToken")]
     pub id_token: String,
+    #[serde(rename = "access_token", alias = "accessToken")]
     pub access_token: String,
+    #[serde(rename = "refresh_token", alias = "refreshToken")]
     pub refresh_token: Option<String>,
 }
 
@@ -142,6 +147,7 @@ fn build_auth_url(state: &str, code_challenge: &str) -> Result<String, String> {
         .append_pair("scope", SCOPES)
         .append_pair("code_challenge", code_challenge)
         .append_pair("code_challenge_method", "S256")
+        .append_pair("prompt", "login")
         .append_pair("id_token_add_organizations", "true")
         .append_pair("codex_cli_simplified_flow", "true")
         .append_pair("state", state)
@@ -226,7 +232,7 @@ fn generate_code_challenge(code_verifier: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{start_oauth_login, submit_callback_url};
+    use super::{start_oauth_login, submit_callback_url, OAuthTokenResponse};
 
     #[test]
     fn oauth_start_builds_openai_pkce_authorize_url() {
@@ -239,7 +245,11 @@ mod tests {
         assert!(response
             .auth_url
             .contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
+        assert!(response
+            .auth_url
+            .contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
         assert!(response.auth_url.contains("code_challenge_method=S256"));
+        assert!(response.auth_url.contains("prompt=login"));
         assert!(response.auth_url.contains("state="));
     }
 
@@ -251,5 +261,23 @@ mod tests {
             .expect_err("state should fail");
 
         assert!(error.contains("state"));
+    }
+
+    #[test]
+    fn token_response_accepts_openai_snake_case_fields() {
+        let tokens: OAuthTokenResponse = serde_json::from_str(
+            r#"{
+              "id_token": "id-token",
+              "access_token": "access-token",
+              "refresh_token": "refresh-token",
+              "token_type": "Bearer",
+              "expires_in": 3600
+            }"#,
+        )
+        .expect("parse token response");
+
+        assert_eq!(tokens.id_token, "id-token");
+        assert_eq!(tokens.access_token, "access-token");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("refresh-token"));
     }
 }
