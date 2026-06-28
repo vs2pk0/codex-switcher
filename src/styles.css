@@ -1063,32 +1063,25 @@ textarea {
 
 .account-health {
   display: grid;
-  gap: 8px;
-  margin-top: 12px;
+  gap: 6px;
+  margin-top: 10px;
 }
 
 .quota-panel {
   display: grid;
-  gap: 8px;
-  padding: 10px;
-  border: 1px solid rgba(85, 113, 156, 0.14);
-  border-radius: 10px;
-  background:
-    linear-gradient(135deg, rgba(37, 99, 235, 0.045), rgba(20, 184, 166, 0.035)),
-    #f8fafc;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 
 .quota-panel-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  display: none;
 }
 
 .quota-panel-head span {
-  color: #101827;
-  font-size: 13px;
-  font-weight: 820;
+  display: none;
 }
 
 .quota-panel-head small {
@@ -1099,8 +1092,8 @@ textarea {
 
 .quota-metrics {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: 1fr;
+  gap: 6px;
 }
 
 .quota-metrics.single {
@@ -1109,12 +1102,12 @@ textarea {
 
 .quota-metric {
   display: grid;
-  gap: 7px;
+  gap: 6px;
   min-width: 0;
-  padding: 9px;
+  padding: 8px 9px;
   border: 1px solid rgba(85, 113, 156, 0.13);
   border-radius: 9px;
-  background: rgba(255, 255, 255, 0.78);
+  background: rgba(248, 250, 252, 0.52);
 }
 
 .quota-metric-top {
@@ -1516,9 +1509,9 @@ textarea {
 
 .card-footer {
   display: grid;
-  gap: 12px;
+  gap: 10px;
   margin-top: auto;
-  padding-top: 14px;
+  padding-top: 10px;
   border-top: 1px solid rgba(85, 113, 156, 0.18);
 }
 
@@ -1537,6 +1530,11 @@ textarea {
   gap: 8px;
 }
 
+.account-grid.expanded.columns-5 .card-actions {
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 4px;
+}
+
 .card-actions .arco-btn {
   width: 100%;
   min-width: 0;
@@ -1548,6 +1546,16 @@ textarea {
   box-shadow: none;
 }
 
+.account-grid.expanded.columns-5 .card-actions .arco-btn {
+  height: 26px;
+  border-radius: 6px;
+  font-size: 14px;
+}
+
+.account-grid.expanded.columns-5 .card-actions .arco-btn .arco-icon {
+  font-size: 14px;
+}
+
 .card-actions .arco-btn:hover {
   color: #2563eb;
   background: #eaf2ff;
@@ -1555,7 +1563,7 @@ textarea {
 
 .status-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: 1fr;
   gap: 8px;
 }
 
@@ -1564,52 +1572,62 @@ textarea {
 }
 
 .status-card {
-  display: grid;
-  gap: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   min-width: 0;
-  min-height: 52px;
+  min-height: 36px;
   padding: 8px 10px;
   border: 1px solid rgba(85, 113, 156, 0.14);
-  border-radius: 9px;
+  border-radius: 8px;
   color: #40516a;
-  background: #f8fafc;
+  background: rgba(248, 250, 252, 0.7);
   font-size: 12px;
 }
 
 .status-card span {
-  color: #7b8aa0;
-  font-size: 11px;
-  font-weight: 780;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: #40516a;
+  font-size: 13px;
+  font-weight: 820;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .status-card strong {
   overflow: hidden;
-  color: #101827;
-  font-size: 16px;
-  font-weight: 840;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.status-card small {
-  overflow: hidden;
-  color: #65748a;
+  color: #526176;
   font-family:
     "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: 720;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .status-valid {
-  border-color: rgba(245, 158, 11, 0.2);
-  background: rgba(255, 251, 235, 0.72);
+  border-color: rgba(245, 158, 11, 0.28);
+  color: #c2410c;
+  background: rgba(255, 247, 237, 0.75);
+}
+
+.status-valid span {
+  color: #c2410c;
 }
 
 .status-token-expired {
-  border-color: rgba(37, 99, 235, 0.18);
-  background: rgba(239, 246, 255, 0.72);
+  border-color: rgba(37, 99, 235, 0.22);
+  color: #2563eb;
+  background: rgba(239, 246, 255, 0.78);
+}
+
+.status-token-expired span {
+  color: #2563eb;
 }
 
 .empty-wrap {
