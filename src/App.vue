@@ -585,27 +585,42 @@ function maskExportJson(value: string): string {
 function exportJsonSummary(value: string): string {
   if (!value.trim()) return "暂无可导出的 JSON";
   try {
-    const parsed = JSON.parse(value);
-    const rootType = Array.isArray(parsed) ? "数组" : "对象";
-    const accountCount = Array.isArray(parsed)
-      ? parsed.length
-      : Array.isArray(parsed?.accounts)
-        ? parsed.accounts.length
-        : 1;
-    const keys = Array.isArray(parsed) ? [] : Object.keys(parsed ?? {});
-    const keySummary = keys.length ? `字段：${keys.slice(0, 6).join("、")}${keys.length > 6 ? "..." : ""}` : "";
-    return [
-      "{",
-      `  // JSON 已默认折叠，点击“预览”查看完整内容`,
-      `  // 根类型：${rootType}`,
-      `  // 账号数量：${accountCount}`,
-      keySummary ? `  // ${keySummary}` : "",
-      "  ...",
-      "}",
-    ].filter(Boolean).join("\n");
+    const parsed = maskSensitiveJson(JSON.parse(value));
+    return collapsedJsonPreview(parsed);
   } catch {
-    return "{\n  // JSON 已默认折叠，点击“预览”查看完整内容\n  ...\n}";
+    return value.trim() || "暂无可导出的 JSON";
   }
+}
+
+function collapsedJsonPreview(value: unknown, depth = 0): string {
+  const indent = "  ".repeat(depth);
+  const nextIndent = "  ".repeat(depth + 1);
+  if (Array.isArray(value)) {
+    if (!value.length) return "[]";
+    const previewItems = value.slice(0, 3).map((item, index) => {
+      const comma = index < Math.min(value.length, 3) - 1 || value.length > 3 ? "," : "";
+      return `${nextIndent}${collapsedJsonPreview(item, depth + 1)}${comma}`;
+    });
+    const rest = value.length > 3 ? [`${nextIndent}/* ... ${value.length - 3} more */`] : [];
+    return ["[", ...previewItems, ...rest, `${indent}]`].join("\n");
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (!entries.length) return "{}";
+    const visibleEntries = entries.slice(0, 8);
+    const previewEntries = visibleEntries.map(([key, item], index) => {
+      const suffix = Array.isArray(item)
+        ? `[${item.length} items]`
+        : item && typeof item === "object"
+          ? "{...}"
+          : JSON.stringify(item) ?? "null";
+      const comma = index < visibleEntries.length - 1 || entries.length > 8 ? "," : "";
+      return `${nextIndent}"${key}": ${suffix}${comma}`;
+    });
+    const rest = entries.length > 8 ? [`${nextIndent}/* ... ${entries.length - 8} more */`] : [];
+    return ["{", ...previewEntries, ...rest, `${indent}}`].join("\n");
+  }
+  return JSON.stringify(value);
 }
 
 function maskSensitiveJson(value: unknown): unknown {
@@ -2150,60 +2165,80 @@ onUnmounted(() => {
 
     <a-modal
       v-model:visible="addModalVisible"
-      title="添加 Codex Switcher 账号"
+      title="接入新账号"
       :footer="false"
-      width="760px"
+      width="820px"
+      modal-class="add-account-modal"
     >
-      <a-tabs v-model:active-key="addTab" @change="handleAddTabChange">
+      <div class="add-account-intro">
+        <div>
+          <span class="modal-eyebrow">Account Setup</span>
+          <h3>选择一种方式，把账号接到 Codex Switcher</h3>
+        </div>
+        <p>推荐使用浏览器授权；如果已经有本地 token、JSON 或 API Key，也可以直接导入。</p>
+      </div>
+      <a-tabs v-model:active-key="addTab" class="add-account-tabs" @change="handleAddTabChange">
         <a-tab-pane key="oauth" title="OAuth 授权">
-          <div class="modal-form oauth-form">
-            <a-typography-paragraph>
-              点击下方按钮，在浏览器中完成 OpenAI 账号 OAuth 授权。
-            </a-typography-paragraph>
-            <div v-if="oauthError" class="oauth-error">{{ oauthError }}</div>
-            <div v-else-if="oauthCallbackReceived" class="oauth-success">
-              已收到浏览器回调，正在保存账号；如果刚才失败，可以点击“我已授权”重试保存。
-            </div>
-            <div class="oauth-link-block">
-              <label>授权链接</label>
-              <div class="oauth-url-row">
-                <a-input v-model="oauthUrl" readonly placeholder="正在准备授权链接..." />
-                <a-button @click="copyOAuthUrl">
-                  <template #icon><icon-copy /></template>
-                </a-button>
+          <div class="oauth-connect-layout">
+            <aside class="oauth-guide-card">
+              <span class="modal-eyebrow">Browser Flow</span>
+              <h4>浏览器登录，自动带回授权结果</h4>
+              <ul>
+                <li>先生成一次性授权链接</li>
+                <li>在浏览器完成 OpenAI 登录</li>
+                <li>回调成功后应用会自动保存账号</li>
+              </ul>
+              <div class="oauth-guide-note">
+                如果浏览器没有自动回到应用，可复制地址栏里的 localhost 回调地址继续。
               </div>
-            </div>
-            <a-button
-              type="primary"
-              long
-              size="large"
-              :loading="oauthPreparing"
-              @click="oauthUrl ? openOAuthUrl() : prepareOAuthLogin()"
-            >
-              <template #icon><icon-globe /></template>
-              {{ oauthUrl ? "在浏览器中打开" : "生成授权链接" }}
-            </a-button>
-            <div class="oauth-link-block">
-              <label>手动输入回调地址</label>
-              <div class="oauth-url-row">
-                <a-input
-                  v-model="oauthCallbackInput"
-                  placeholder="粘贴完整回调地址，例如：http://localhost:1455/auth/callback?code=...&state=..."
-                />
+            </aside>
+            <div class="modal-form oauth-form">
+              <div v-if="oauthError" class="oauth-error">{{ oauthError }}</div>
+              <div v-else-if="oauthCallbackReceived" class="oauth-success">
+                回调已收到，正在写入账号；如果保存失败，可以点下方按钮重试。
+              </div>
+              <div class="oauth-primary-action">
                 <a-button
                   type="primary"
-                  :loading="oauthCompleting"
-                  :disabled="!oauthLoginId"
-                  @click="handleOAuthCallbackSubmit"
+                  long
+                  size="large"
+                  :loading="oauthPreparing"
+                  @click="oauthUrl ? openOAuthUrl() : prepareOAuthLogin()"
                 >
-                  <template #icon><icon-check /></template>
-                  {{ oauthCallbackReceived && !oauthCallbackInput.trim() ? "重试保存" : "我已授权" }}
+                  <template #icon><icon-globe /></template>
+                  {{ oauthUrl ? "继续打开授权页" : "生成并打开授权" }}
+                </a-button>
+                <a-button v-if="oauthUrl" @click="copyOAuthUrl">
+                  <template #icon><icon-copy /></template>
+                  复制链接
                 </a-button>
               </div>
+              <div class="oauth-link-block compact">
+                <label>当前授权地址</label>
+                <a-input v-model="oauthUrl" readonly placeholder="点击上方按钮后生成授权地址" />
+              </div>
+              <div class="oauth-manual-box">
+                <div>
+                  <strong>手动完成</strong>
+                  <span>浏览器未自动返回时，把 localhost 回调地址粘贴到这里。</span>
+                </div>
+                <div class="oauth-url-row">
+                  <a-input
+                    v-model="oauthCallbackInput"
+                    placeholder="http://localhost:1455/auth/callback?code=...&state=..."
+                  />
+                  <a-button
+                    type="primary"
+                    :loading="oauthCompleting"
+                    :disabled="!oauthLoginId"
+                    @click="handleOAuthCallbackSubmit"
+                  >
+                    <template #icon><icon-check /></template>
+                    {{ oauthCallbackReceived && !oauthCallbackInput.trim() ? "重试保存" : "完成接入" }}
+                  </a-button>
+                </div>
+              </div>
             </div>
-            <a-alert type="info">
-              完成授权后会自动回到应用保存账号；如果浏览器没有自动返回，可以粘贴 localhost 回调地址继续。
-            </a-alert>
           </div>
         </a-tab-pane>
         <a-tab-pane key="token" title="Token / JSON">
@@ -2505,18 +2540,31 @@ onUnmounted(() => {
 
     <a-modal
       v-model:visible="repairVisible"
-      title="Codex 会话不可见"
+      title="找回会话显示"
       :footer="false"
-      width="860px"
+      width="900px"
       modal-class="repair-modal"
     >
       <div class="repair-body">
-        <p class="repair-desc">
-          修复可见性会校正官方 Codex state DB 中影响侧边栏显示的会话记录，适合账号与 API Key 切换后的会话恢复。
-        </p>
+        <div class="repair-hero">
+          <div>
+            <span class="modal-eyebrow">Session Recovery</span>
+            <h3>把切号后消失的会话重新挂回列表</h3>
+            <p>
+              会同步整理 Codex 本地索引与状态库，让侧边栏重新识别已有会话；适合 OAuth 和 API Key 之间切换后使用。
+            </p>
+          </div>
+          <div class="repair-summary-card">
+            <strong>{{ selectedSessionIdList.length || sessions.length }}</strong>
+            <span>{{ selectedSessionIdList.length ? "条已选会话" : "条可处理会话" }}</span>
+          </div>
+        </div>
 
-        <div class="repair-section">
-          <span class="repair-section-title">修复方式</span>
+        <div class="repair-section repair-section-inline">
+          <div class="repair-section-copy">
+            <span class="repair-section-title">处理强度</span>
+            <small>优先使用轻量模式；仍然看不到再切到完整重建。</small>
+          </div>
           <div class="repair-card-grid">
             <button
               class="repair-option-card"
@@ -2524,8 +2572,8 @@ onUnmounted(() => {
               type="button"
               @click="repairMode = 'quick'"
             >
-              <strong>快速修复</strong>
-              <small>校正 state DB，并补写缺失的会话行，适合日常切号恢复。</small>
+              <strong>轻量同步</strong>
+              <small>更新状态库并补齐缺失记录，速度更快。</small>
             </button>
             <button
               class="repair-option-card"
@@ -2533,73 +2581,63 @@ onUnmounted(() => {
               type="button"
               @click="repairMode = 'deep'"
             >
-              <strong>深度修复</strong>
-              <small>在快速修复基础上补齐 session_index，适合仍不可见时使用。</small>
+              <strong>完整重建</strong>
+              <small>额外重写 session_index，适合普通同步无效时。</small>
             </button>
           </div>
         </div>
 
-        <div class="repair-section">
-          <span class="repair-section-title">目标实例</span>
-          <a-select v-model="repairTargetInstanceId" placeholder="默认实例">
-            <a-option
-              v-for="instance in repairInstances"
-              :key="instance.id"
-              :value="instance.id"
-            >
-              {{ instance.name }} · {{ instance.currentProvider }}
-            </a-option>
-          </a-select>
-        </div>
-
-        <div class="repair-section">
-          <span class="repair-section-title">实例范围</span>
-          <div class="repair-card-grid">
-            <button
-              class="repair-option-card"
-              :class="{ selected: repairInstanceScope === 'target' }"
-              type="button"
-              @click="repairInstanceScope = 'target'"
-            >
-              <strong>仅目标实例</strong>
-              <small>只修复上方选中的实例，通常更快。</small>
-            </button>
-            <button
-              class="repair-option-card"
-              :class="{ selected: repairInstanceScope === 'all' }"
-              type="button"
-              @click="repairInstanceScope = 'all'"
-            >
-              <strong>全部实例</strong>
-              <small>当前独立版默认修复本机 Codex 实例。</small>
-            </button>
+        <div class="repair-control-panel">
+          <div class="repair-section">
+            <span class="repair-section-title">Codex 实例</span>
+            <a-select v-model="repairTargetInstanceId" placeholder="默认实例">
+              <a-option
+                v-for="instance in repairInstances"
+                :key="instance.id"
+                :value="instance.id"
+              >
+                {{ instance.name }} · {{ instance.currentProvider }}
+              </a-option>
+            </a-select>
           </div>
-        </div>
-
-        <div class="repair-section">
-          <span class="repair-section-title">会话范围</span>
-          <div class="repair-card-grid">
-            <button
-              class="repair-option-card"
-              :class="{ selected: effectiveRepairSessionScope === 'all' }"
-              type="button"
-              @click="repairSessionScope = 'all'"
-            >
-              <strong>全部会话</strong>
-              <small>修复当前管理列表中的 {{ sessions.length }} 条会话。</small>
-            </button>
-            <button
-              class="repair-option-card"
-              :class="{ selected: effectiveRepairSessionScope === 'selected' }"
-              :disabled="!selectedSessionIdList.length"
-              type="button"
-              @click="repairSessionScope = 'selected'"
-            >
-              <strong>所选会话</strong>
-              <small>
-                {{ selectedSessionIdList.length ? `只修复已勾选的 ${selectedSessionIdList.length} 条会话。` : "先在列表中勾选会话。" }}
-              </small>
-            </button>
+          <div class="repair-section">
+            <span class="repair-section-title">实例覆盖</span>
+            <div class="repair-segmented">
+              <button
+                :class="{ selected: repairInstanceScope === 'target' }"
+                type="button"
+                @click="repairInstanceScope = 'target'"
+              >
+                当前实例
+              </button>
+              <button
+                :class="{ selected: repairInstanceScope === 'all' }"
+                type="button"
+                @click="repairInstanceScope = 'all'"
+              >
+                本机全部
+              </button>
+            </div>
+          </div>
+          <div class="repair-section">
+            <span class="repair-section-title">会话覆盖</span>
+            <div class="repair-segmented">
+              <button
+                :class="{ selected: effectiveRepairSessionScope === 'all' }"
+                type="button"
+                @click="repairSessionScope = 'all'"
+              >
+                全部 {{ sessions.length }}
+              </button>
+              <button
+                :class="{ selected: effectiveRepairSessionScope === 'selected' }"
+                :disabled="!selectedSessionIdList.length"
+                type="button"
+                @click="repairSessionScope = 'selected'"
+              >
+                已选 {{ selectedSessionIdList.length }}
+              </button>
+            </div>
           </div>
         </div>
 
@@ -2621,7 +2659,7 @@ onUnmounted(() => {
           <a-button @click="repairVisible = false">关闭</a-button>
           <a-button type="primary" :loading="sessionRepairing" @click="runRepairSessions">
             <template #icon><icon-refresh /></template>
-            开始修复
+            立即找回
           </a-button>
         </div>
       </div>

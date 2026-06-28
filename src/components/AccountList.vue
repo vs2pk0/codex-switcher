@@ -253,8 +253,11 @@ function badgeTypeKey(account: CodexAccount): string {
 }
 
 function accountLoginLine(account: CodexAccount): string {
-  if (isApiKeyAccount(account)) return `API Key: ${maskSecret(account.openai_api_key || account.openaiApiKey)}`;
-  return `使用 OAuth 登录 | 用户 ID: ${shortAccountId(account)}`;
+  return `API Key: ${maskSecret(account.openai_api_key || account.openaiApiKey)}`;
+}
+
+function isFreePlanAccount(account: CodexAccount): boolean {
+  return !isApiKeyAccount(account) && normalizePlanKey(account.plan_type) === "free";
 }
 
 function displayPhone(value: string): string {
@@ -292,9 +295,9 @@ function resetCreditCount(account: CodexAccount): number {
 
 function quotaWindowLabel(minutes?: number, fallback = "5h"): string {
   if (!minutes) return fallback;
-  if (minutes % (60 * 24) === 0) return `${minutes / 60 / 24} Day`;
-  if (minutes % 60 === 0) return `${minutes / 60}h`;
-  return `${minutes}m`;
+  if (minutes % (60 * 24) === 0) return `${minutes / 60 / 24} 天窗口`;
+  if (minutes % 60 === 0) return `${minutes / 60} 小时窗口`;
+  return `${minutes} 分钟窗口`;
 }
 
 function quotaColor(value?: number): string {
@@ -304,8 +307,8 @@ function quotaColor(value?: number): string {
   return "#ef4444";
 }
 
-function quotaResetLabel(value?: string | number): string {
-  if (!value) return "等待刷新";
+function quotaResetLeftLabel(value?: string | number): string {
+  if (!value) return "--";
   const timestamp = Number(value);
   const date = Number.isFinite(timestamp)
     ? new Date(timestamp > 10_000_000_000 ? timestamp : timestamp * 1000)
@@ -316,8 +319,13 @@ function quotaResetLabel(value?: string | number): string {
   const day = Math.floor(abs / 86_400_000);
   const hour = Math.floor((abs % 86_400_000) / 3_600_000);
   const minute = Math.floor((abs % 3_600_000) / 60_000);
-  const left = day > 0 ? `${day}d ${hour}h ${minute}m` : `${hour}h ${minute}m`;
-  return `${left} (${formatDateTime(value)})`;
+  return day > 0 ? `${day}d ${hour}h ${minute}m` : `${hour}h ${minute}m`;
+}
+
+function quotaResetDateLabel(value?: string | number): string {
+  if (!value) return "等待刷新";
+  const formatted = formatDateTime(value);
+  return formatted ? `更新 ${formatted}` : String(value);
 }
 
 function expiryDaysLabel(value?: string): string {
@@ -326,6 +334,10 @@ function expiryDaysLabel(value?: string): string {
   if (!date) return "";
   const days = Math.max(0, Math.ceil((date.getTime() - Date.now()) / 86_400_000));
   return `${days}天`;
+}
+
+function statusTitle(account: CodexAccount): string {
+  return isApiKeyAccount(account) ? "密钥状态" : "订阅状态";
 }
 
 function tokenExpiryStatus(value?: string): "valid" | "expired" {
@@ -409,8 +421,8 @@ function formatTime(value?: number | null): string {
           </div>
         </div>
 
-        <div class="account-summary">
-          <div v-if="isApiKeyAccount(account)" class="chip-line">
+        <div v-if="isApiKeyAccount(account)" class="account-summary">
+          <div class="chip-line">
             <a-button class="soft-chip" size="mini" @click="emit('open-binding', account)">
               <template #icon><icon-link /></template>
               {{ boundOAuthName(account) === "未绑定" ? "绑定 OAuth" : boundOAuthName(account) }}
@@ -418,11 +430,11 @@ function formatTime(value?: number | null): string {
           </div>
 
           <div class="login-line">{{ accountLoginLine(account) }}</div>
-          <div v-if="isApiKeyAccount(account)" class="login-line full-url" :title="apiBaseUrl(account)">
+          <div class="login-line full-url" :title="apiBaseUrl(account)">
             {{ apiBaseUrlLine(account) }}
           </div>
           <button
-            v-if="isApiKeyAccount(account) && apiOfficialUrl(account)"
+            v-if="apiOfficialUrl(account)"
             class="official-link"
             type="button"
             :title="apiOfficialUrl(account)"
@@ -435,60 +447,92 @@ function formatTime(value?: number | null): string {
 
         <div class="account-health">
           <template v-if="shouldShowQuota(account) && account.quota">
-            <div v-if="account.quota.hourly_window_present !== false" class="quota-block">
-              <div class="quota-head">
-                <span><icon-clock-circle /> {{ quotaWindowLabel(account.quota.hourly_window_minutes, '5h') }}</span>
-                <strong :style="{ color: quotaColor(account.quota.hourly_percentage) }">
-                  {{ account.quota.hourly_percentage }}%
-                </strong>
+            <div class="quota-panel">
+              <div class="quota-panel-head">
+                <span>额度概览</span>
+                <small>自动同步</small>
               </div>
-              <div class="quota-bar">
-                <span
-                  :style="{
-                    width: `${Math.max(0, Math.min(100, account.quota.hourly_percentage))}%`,
-                    background: quotaColor(account.quota.hourly_percentage),
-                  }"
-                />
-              </div>
-              <div class="quota-time">{{ quotaResetLabel(account.quota.hourly_reset_time) }}</div>
-            </div>
+              <div class="quota-metrics" :class="{ single: isFreePlanAccount(account) }">
+                <div v-if="account.quota.hourly_window_present !== false" class="quota-metric">
+                  <div class="quota-metric-top">
+                    <span>
+                      <icon-calendar v-if="isFreePlanAccount(account)" />
+                      <icon-clock-circle v-else />
+                      {{ isFreePlanAccount(account) ? "长周期" : "短周期" }}
+                    </span>
+                    <strong :style="{ color: quotaColor(account.quota.hourly_percentage) }">
+                      {{ account.quota.hourly_percentage }}%
+                    </strong>
+                  </div>
+                  <div class="quota-bar">
+                    <span
+                      :style="{
+                        width: `${Math.max(0, Math.min(100, account.quota.hourly_percentage))}%`,
+                        background: quotaColor(account.quota.hourly_percentage),
+                      }"
+                    />
+                  </div>
+                  <div class="quota-meta">
+                    <span>
+                      <b>{{ quotaWindowLabel(account.quota.hourly_window_minutes, '5 小时窗口') }}</b>
+                      <small>{{ quotaResetLeftLabel(account.quota.hourly_reset_time) }}</small>
+                    </span>
+                    <em>{{ quotaResetDateLabel(account.quota.hourly_reset_time) }}</em>
+                  </div>
+                </div>
 
-            <div v-if="account.quota.weekly_window_present !== false" class="quota-block">
-              <div class="quota-head">
-                <span><icon-calendar /> {{ quotaWindowLabel(account.quota.weekly_window_minutes, 'Weekly') }}</span>
-                <strong :style="{ color: quotaColor(account.quota.weekly_percentage) }">
-                  {{ account.quota.weekly_percentage }}%
-                </strong>
+                <div
+                  v-if="!isFreePlanAccount(account) && account.quota.weekly_window_present !== false"
+                  class="quota-metric"
+                >
+                  <div class="quota-metric-top">
+                    <span>
+                      <icon-calendar />
+                      长周期
+                    </span>
+                    <strong :style="{ color: quotaColor(account.quota.weekly_percentage) }">
+                      {{ account.quota.weekly_percentage }}%
+                    </strong>
+                  </div>
+                  <div class="quota-bar">
+                    <span
+                      :style="{
+                        width: `${Math.max(0, Math.min(100, account.quota.weekly_percentage))}%`,
+                        background: quotaColor(account.quota.weekly_percentage),
+                      }"
+                    />
+                  </div>
+                  <div class="quota-meta">
+                    <span>
+                      <b>{{ quotaWindowLabel(account.quota.weekly_window_minutes, '7 天窗口') }}</b>
+                      <small>{{ quotaResetLeftLabel(account.quota.weekly_reset_time) }}</small>
+                    </span>
+                    <em>{{ quotaResetDateLabel(account.quota.weekly_reset_time) }}</em>
+                  </div>
+                </div>
               </div>
-              <div class="quota-bar">
-                <span
-                  :style="{
-                    width: `${Math.max(0, Math.min(100, account.quota.weekly_percentage))}%`,
-                    background: quotaColor(account.quota.weekly_percentage),
-                  }"
-                />
-              </div>
-              <div class="quota-time">{{ quotaResetLabel(account.quota.weekly_reset_time) }}</div>
             </div>
           </template>
           <div v-else-if="shouldShowQuotaError(account) && account.quota_error" class="quota-error">
             {{ account.quota_error.message }}
           </div>
 
-          <div v-if="accountSubscriptionUntil(account)" class="status-card status-valid">
-            <span>
-              <icon-calendar />
-              有效期 {{ expiryDaysLabel(accountSubscriptionUntil(account)) }}
-            </span>
-            <strong>{{ formatDateTime(accountSubscriptionUntil(account)) }}</strong>
-          </div>
+          <div
+            v-if="accountSubscriptionUntil(account) || accountTokenExpiresAt(account)"
+            class="status-grid"
+            :class="{ single: !(accountSubscriptionUntil(account) && accountTokenExpiresAt(account)) }"
+          >
+            <div v-if="accountSubscriptionUntil(account)" class="status-card status-valid">
+              <span>{{ statusTitle(account) }}</span>
+              <strong>{{ expiryDaysLabel(accountSubscriptionUntil(account)) || "已记录" }}</strong>
+              <small>{{ formatDateTime(accountSubscriptionUntil(account)) }}</small>
+            </div>
 
-          <div v-if="accountTokenExpiresAt(account)" class="status-card status-token-expired">
-            <span>
-              <icon-clock-circle />
-              Token {{ tokenExpiryStatus(accountTokenExpiresAt(account)) === "expired" ? "失效" : "有效" }}
-            </span>
-            <strong>{{ formatDateTime(accountTokenExpiresAt(account)) }}</strong>
+            <div v-if="accountTokenExpiresAt(account)" class="status-card status-token-expired">
+              <span>凭证状态</span>
+              <strong>{{ tokenExpiryStatus(accountTokenExpiresAt(account)) === "expired" ? "需更新" : "可用" }}</strong>
+              <small>{{ formatDateTime(accountTokenExpiresAt(account)) }}</small>
+            </div>
           </div>
         </div>
 
