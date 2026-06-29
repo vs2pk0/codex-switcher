@@ -473,7 +473,10 @@ function formatTime(value?: number | null): string {
             @click="emit('open-official-url', apiOfficialUrl(account))"
           >
             <icon-link />
-            官网地址：{{ apiOfficialUrl(account) }}
+            <span>
+              <b>官网地址</b>
+              <em>{{ apiOfficialUrl(account) }}</em>
+            </span>
           </button>
         </div>
 

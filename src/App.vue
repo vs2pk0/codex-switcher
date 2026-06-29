@@ -4,6 +4,7 @@ import { Message, Modal } from "@arco-design/web-vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import AccountList from "./components/AccountList.vue";
+import ApiServicePanel from "./components/ApiServicePanel.vue";
 import BadgeStyleModal from "./components/BadgeStyleModal.vue";
 import PlanBadge from "./components/PlanBadge.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
@@ -48,6 +49,7 @@ import {
   type CodexSwitcherPaths,
   type CodexSwitcherSettings,
 } from "./services/codex";
+import { bindApiServiceAccounts } from "./services/apiService";
 import { getCodexUsageDashboard } from "./services/usage";
 import {
   listSessionVisibilityRepairInstances,
@@ -68,7 +70,7 @@ import {
 } from "./services/session";
 import type { CodexAccount } from "./types/codex";
 
-type ActiveView = "accounts" | "sessions" | "usage" | "settings";
+type ActiveView = "accounts" | "sessions" | "usage" | "apiService" | "settings";
 
 const activeView = ref<ActiveView>("accounts");
 const usagePanelMounted = ref(false);
@@ -523,7 +525,12 @@ function planLabel(account: CodexAccount): string {
 }
 
 function planClass(account: CodexAccount): string {
-  const style = `badge-${settings.badgeStyle || "classic"}`;
+  const badgeKey = badgeTypeKey(account);
+  const styleName =
+    settings.badgeStyles?.[badgeKey] ||
+    settings.badgeStyle ||
+    "classic";
+  const style = `badge-${styleName}`;
   if (isApiKeyAccount(account)) return `api ${style}`;
   const key = normalizePlanKey(account.plan_type);
   if (key === "pro") {
@@ -533,6 +540,19 @@ function planClass(account: CodexAccount): string {
     return `${proClass} ${style}`;
   }
   return `${key} ${style}`;
+}
+
+function badgeTypeKey(account: CodexAccount): string {
+  if (isApiKeyAccount(account)) return "api";
+  const key = normalizePlanKey(account.plan_type);
+  if (key === "pro") {
+    return normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type) === "prolite"
+      ? "proLite"
+      : "proMax";
+  }
+  if (key === "plus") return "plus";
+  if (["team", "business", "enterprise", "edu", "go"].includes(key)) return "team";
+  return "free";
 }
 
 function planDisplayName(planType?: string): string {
@@ -757,6 +777,10 @@ function resetCreditCount(account: CodexAccount): number {
 
 function canUseResetCredit(account: CodexAccount): boolean {
   return shouldShowQuota(account) && resetCreditCount(account) > 0;
+}
+
+function isFreePlanAccount(account: CodexAccount): boolean {
+  return !isApiKeyAccount(account) && normalizePlanKey(account.plan_type) === "free";
 }
 
 function errorText(error: unknown): string {
@@ -1047,6 +1071,36 @@ async function openBatchExport(): Promise<void> {
   } catch (error) {
     Message.error(`批量导出失败：${errorText(error)}`);
   }
+}
+
+function confirmBindSelectedToApiService(): void {
+  const selected = selectedAccountIdList.value
+    .map((id) => accounts.value.find((account) => account.id === id))
+    .filter((account): account is CodexAccount => Boolean(account))
+    .filter((account) => !isApiKeyAccount(account));
+  if (!selectedAccountIdList.value.length) {
+    Message.warning("请先勾选要绑定到 API 服务的 OAuth 账号");
+    return;
+  }
+  if (!selected.length) {
+    Message.warning("API Key 账号不需要绑定到 API 服务，请选择 OAuth 账号");
+    return;
+  }
+  Modal.warning({
+    title: "绑定到 API 服务",
+    content: `将 ${selected.length} 个 OAuth 账号转换为 CPA 格式，并写入 API 服务认证目录。是否继续？`,
+    okText: "确认绑定",
+    cancelText: "取消",
+    hideCancel: false,
+    async onOk() {
+      try {
+        const summary = await bindApiServiceAccounts(selected.map((account) => account.id));
+        Message.success(`已绑定 ${summary.count} 个账号到 API 服务`);
+      } catch (error) {
+        Message.error(`绑定失败：${errorText(error)}`);
+      }
+    },
+  });
 }
 
 async function refreshBatchExportText(): Promise<void> {
@@ -2089,6 +2143,10 @@ onUnmounted(() => {
           <template #icon><icon-bar-chart /></template>
           使用统计
         </a-button>
+        <a-button :type="activeView === 'apiService' ? 'primary' : 'secondary'" @click="switchView('apiService')">
+          <template #icon><icon-code /></template>
+          API 服务
+        </a-button>
         <a-button :type="activeView === 'settings' ? 'primary' : 'secondary'" @click="switchView('settings')">
           <template #icon><icon-settings /></template>
           设置
@@ -2125,7 +2183,8 @@ onUnmounted(() => {
           v-model="settings.accountTypeFilter"
           class="filter-select"
           popup-container="body"
-          popup-class-name="account-filter-dropdown"
+          :scrollbar="false"
+          :trigger-props="{ contentClass: 'account-filter-dropdown' }"
           @change="() => { currentPage = 1; saveSettings(); }"
         >
           <a-option
@@ -2172,6 +2231,10 @@ onUnmounted(() => {
         <a-button @click="openBatchExport">
           <template #icon><icon-download /></template>
           批量导出
+        </a-button>
+        <a-button @click="confirmBindSelectedToApiService">
+          <template #icon><icon-link /></template>
+          绑定到 API 服务
         </a-button>
         <a-button @click="openAddModal('token')">
           <template #icon><icon-import /></template>
@@ -2473,7 +2536,18 @@ onUnmounted(() => {
       </a-spin>
     </section>
 
-    <UsagePanel v-if="usagePanelMounted" v-show="activeView === 'usage'" />
+    <UsagePanel
+      v-if="usagePanelMounted"
+      v-show="activeView === 'usage'"
+      :active="activeView === 'usage'"
+    />
+
+    <ApiServicePanel
+      v-if="activeView === 'apiService'"
+      :accounts="accounts"
+      :settings="settings"
+      @account-added="loadAccounts"
+    />
 
     <SettingsPanel
       v-if="activeView === 'settings'"
@@ -2950,8 +3024,44 @@ onUnmounted(() => {
                 v-for="oauth in oauthAccounts"
                 :key="oauth.id"
                 :value="oauth.id"
+                :label="displayNameForUi(oauth)"
               >
-                {{ displayNameForUi(oauth) }}
+                <div class="oauth-bind-option">
+                  <div class="oauth-bind-option-head">
+                    <div class="oauth-bind-option-title">
+                      <strong>{{ displayNameForUi(oauth) }}</strong>
+                      <span>OAuth · {{ oauth.email || oauth.id }}</span>
+                    </div>
+                    <PlanBadge :label="planLabel(oauth)" :badge-class="planClass(oauth)" />
+                  </div>
+                  <div v-if="oauth.quota" class="oauth-bind-quota">
+                    <div v-if="oauth.quota.hourly_window_present !== false">
+                      <span>
+                        <icon-calendar v-if="isFreePlanAccount(oauth)" />
+                        <icon-clock-circle v-else />
+                        {{ isFreePlanAccount(oauth) ? "长周期" : "短周期" }}
+                      </span>
+                      <strong :style="{ color: quotaColor(oauth.quota.hourly_percentage) }">
+                        {{ oauth.quota.hourly_percentage }}%
+                      </strong>
+                      <small>{{ quotaWindowLabel(oauth.quota.hourly_window_minutes, '5 小时窗口') }}</small>
+                      <em>{{ quotaResetLabel(oauth.quota.hourly_reset_time) }}</em>
+                    </div>
+                    <div
+                      v-if="!isFreePlanAccount(oauth) && oauth.quota.weekly_window_present !== false"
+                    >
+                      <span><icon-calendar /> 长周期</span>
+                      <strong :style="{ color: quotaColor(oauth.quota.weekly_percentage) }">
+                        {{ oauth.quota.weekly_percentage }}%
+                      </strong>
+                      <small>{{ quotaWindowLabel(oauth.quota.weekly_window_minutes, '7 天窗口') }}</small>
+                      <em>{{ quotaResetLabel(oauth.quota.weekly_reset_time) }}</em>
+                    </div>
+                  </div>
+                  <div v-else-if="oauth.quota_error" class="oauth-bind-quota-error">
+                    {{ oauth.quota_error.message }}
+                  </div>
+                </div>
               </a-option>
             </a-select>
           </a-form-item>

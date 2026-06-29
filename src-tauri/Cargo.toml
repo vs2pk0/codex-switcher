@@ -18,11 +18,13 @@ tauri-build = { version = "2", features = [] }
 base64 = "0.22"
 chrono = "0.4"
 dirs = "5"
+flate2 = "1"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tar = "0.4"
 tauri = { version = "2", features = [] }
 toml_edit = "0.20"
 url = "2"
