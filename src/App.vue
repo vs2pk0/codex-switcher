@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import AccountList from "./components/AccountList.vue";
 import BadgeStyleModal from "./components/BadgeStyleModal.vue";
+import PlanBadge from "./components/PlanBadge.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
+import UsagePanel from "./components/UsagePanel.vue";
 import { defaultBadgeStyles } from "./constants/badgeStyles";
 import {
   addCodexAccountWithApiKey,
@@ -21,13 +23,16 @@ import {
   importCodexFromJson,
   importCodexFromLocal,
   listCodexSwitcherBackups,
+  listCodexSwitcherSessionBackups,
   listCodexAccounts,
   openExternalUrl,
   refreshCodexQuota,
   resetCodexConfigToml,
   restoreCodexSwitcherBackup,
+  restoreCodexSwitcherSessionBackup,
   restartCodexApp,
   startCodexSwitcherBackup,
+  startCodexSwitcherSessionBackup,
   startCodexOAuthLogin,
   switchCodexAccount,
   submitCodexOAuthCallbackUrl,
@@ -43,8 +48,8 @@ import {
   type CodexSwitcherPaths,
   type CodexSwitcherSettings,
 } from "./services/codex";
+import { getCodexUsageDashboard } from "./services/usage";
 import {
-  getSessionTokenStatsAcrossInstances,
   listSessionVisibilityRepairInstances,
   listSessionVisibilityRepairProviders,
   listSessionsAcrossInstances,
@@ -63,7 +68,10 @@ import {
 } from "./services/session";
 import type { CodexAccount } from "./types/codex";
 
-const activeView = ref<"accounts" | "sessions" | "settings">("accounts");
+type ActiveView = "accounts" | "sessions" | "usage" | "settings";
+
+const activeView = ref<ActiveView>("accounts");
+const usagePanelMounted = ref(false);
 const accounts = ref<CodexAccount[]>([]);
 const currentAccount = ref<CodexAccount | null>(null);
 const loading = ref(false);
@@ -72,6 +80,10 @@ const deletingId = ref("");
 const quotaRefreshingId = ref("");
 const selectedAccountIds = ref<Set<string>>(new Set());
 const draggingAccountId = ref("");
+const sortEditorVisible = ref(false);
+const sortDraftIds = ref<string[]>([]);
+const sortDraftDraggingId = ref("");
+const sortDraftOverId = ref("");
 const currentPage = ref(1);
 let quotaTimer: number | undefined;
 let quotaCountdownTimer: number | undefined;
@@ -90,6 +102,8 @@ const savingSettings = ref(false);
 const appPaths = ref<CodexSwitcherPaths | null>(null);
 const backupFiles = ref<CodexSwitcherBackupFile[]>([]);
 const backupLoading = ref(false);
+const sessionBackupFiles = ref<CodexSwitcherBackupFile[]>([]);
+const sessionBackupLoading = ref(false);
 const backupWorking = ref(false);
 const backupProgressVisible = ref(false);
 const backupProgress = ref(0);
@@ -99,8 +113,11 @@ const backupProgressStatus = ref<"running" | "completed" | "failed">("running");
 const backupButtonText = computed(() =>
   backupWorking.value ? `备份 ${Math.round(backupProgress.value)}%` : "备份",
 );
+const sessionRestoreVisible = ref(false);
 const expandedLayout = ref(false);
 let windowResizeTimer: number | undefined;
+let viewLoadTimer: number | undefined;
+let initialPrewarmTimer: number | undefined;
 const settings = reactive<CodexSwitcherSettings>({
   monitorQuota: false,
   quotaRefreshMinutes: 10,
@@ -310,6 +327,12 @@ const apiKeyCount = computed(
   () => accounts.value.filter((account) => isApiKeyAccount(account)).length,
 );
 const oauthAccounts = computed(() => accounts.value.filter((account) => !isApiKeyAccount(account)));
+const sortDraftAccounts = computed(() => {
+  const accountMap = new Map(accounts.value.map((account) => [account.id, account]));
+  return sortDraftIds.value
+    .map((id) => accountMap.get(id))
+    .filter((account): account is CodexAccount => Boolean(account));
+});
 const selectedSessionIdList = computed(() => [...selectedSessionIds.value]);
 const activeSessionIds = computed(() =>
   sessionTrashMode.value ? trashedSessions.value.map((session) => session.id) : sessions.value.map((session) => session.id),
@@ -787,14 +810,25 @@ async function loadSettings(): Promise<void> {
   }
 }
 
-async function loadBackups(): Promise<void> {
+async function loadBackups(options: { silent?: boolean } = {}): Promise<void> {
   backupLoading.value = true;
   try {
     backupFiles.value = await listCodexSwitcherBackups();
   } catch (error) {
-    Message.error(`加载备份列表失败：${errorText(error)}`);
+    if (!options.silent) Message.error(`加载备份列表失败：${errorText(error)}`);
   } finally {
     backupLoading.value = false;
+  }
+}
+
+async function loadSessionBackups(options: { silent?: boolean } = {}): Promise<void> {
+  sessionBackupLoading.value = true;
+  try {
+    sessionBackupFiles.value = await listCodexSwitcherSessionBackups();
+  } catch (error) {
+    if (!options.silent) Message.error(`加载会话备份列表失败：${errorText(error)}`);
+  } finally {
+    sessionBackupLoading.value = false;
   }
 }
 
@@ -1049,19 +1083,117 @@ function handleDragStart(account: CodexAccount): void {
   draggingAccountId.value = account.id;
 }
 
+function handleDragEnd(): void {
+  draggingAccountId.value = "";
+}
+
+function normalizedCustomOrder(): string[] {
+  const allIds = accounts.value.map((account) => account.id);
+  const validIds = new Set(allIds);
+  const orderedIds = new Set<string>();
+  const next: string[] = [];
+  for (const id of settings.customOrder || []) {
+    if (!validIds.has(id) || orderedIds.has(id)) continue;
+    orderedIds.add(id);
+    next.push(id);
+  }
+  for (const account of sortedAccounts.value) {
+    if (orderedIds.has(account.id)) continue;
+    orderedIds.add(account.id);
+    next.push(account.id);
+  }
+  for (const id of allIds) {
+    if (orderedIds.has(id)) continue;
+    orderedIds.add(id);
+    next.push(id);
+  }
+  return next;
+}
+
 async function handleDropAccount(target: CodexAccount): Promise<void> {
   if (settings.sortMode !== "custom" || !draggingAccountId.value || draggingAccountId.value === target.id) {
+    draggingAccountId.value = "";
     return;
   }
-  const currentOrder = settings.customOrder.length
-    ? [...settings.customOrder]
-    : sortedAccounts.value.map((account) => account.id);
+  const currentOrder = normalizedCustomOrder();
   const sourceId = draggingAccountId.value;
   const withoutSource = currentOrder.filter((id) => id !== sourceId);
   const targetIndex = withoutSource.indexOf(target.id);
   withoutSource.splice(targetIndex < 0 ? withoutSource.length : targetIndex, 0, sourceId);
   settings.customOrder = withoutSource;
   draggingAccountId.value = "";
+  await saveSettings();
+}
+
+function openSortEditor(): void {
+  if (settings.sortMode !== "custom") {
+    Message.info("先选择自定义顺序再编辑排序");
+    return;
+  }
+  sortDraftIds.value = normalizedCustomOrder();
+  sortDraftDraggingId.value = "";
+  sortDraftOverId.value = "";
+  sortEditorVisible.value = true;
+}
+
+function closeSortEditor(): void {
+  sortEditorVisible.value = false;
+  sortDraftDraggingId.value = "";
+  sortDraftOverId.value = "";
+  window.removeEventListener("pointerup", handleSortDraftPointerEnd);
+  window.removeEventListener("pointercancel", handleSortDraftPointerEnd);
+}
+
+function moveSortDraft(sourceId: string, targetId: string): void {
+  if (!sourceId || !targetId || sourceId === targetId) return;
+  const current = [...sortDraftIds.value];
+  const sourceIndex = current.indexOf(sourceId);
+  const targetIndex = current.indexOf(targetId);
+  if (sourceIndex < 0 || targetIndex < 0) return;
+  current.splice(sourceIndex, 1);
+  current.splice(targetIndex, 0, sourceId);
+  sortDraftIds.value = current;
+}
+
+function handleSortDraftPointerStart(event: PointerEvent, account: CodexAccount): void {
+  if (event.button !== 0) return;
+  sortDraftDraggingId.value = account.id;
+  sortDraftOverId.value = account.id;
+  window.addEventListener("pointerup", handleSortDraftPointerEnd, { once: true });
+  window.addEventListener("pointercancel", handleSortDraftPointerEnd, { once: true });
+}
+
+function handleSortDraftPointerEnter(account: CodexAccount): void {
+  const sourceId = sortDraftDraggingId.value;
+  if (!sourceId || sourceId === account.id) return;
+  sortDraftOverId.value = account.id;
+  moveSortDraft(sourceId, account.id);
+}
+
+function handleSortDraftPointerEnd(): void {
+  sortDraftDraggingId.value = "";
+  sortDraftOverId.value = "";
+  window.removeEventListener("pointerup", handleSortDraftPointerEnd);
+  window.removeEventListener("pointercancel", handleSortDraftPointerEnd);
+}
+
+function moveSortDraftByStep(account: CodexAccount, offset: number): void {
+  const current = [...sortDraftIds.value];
+  const index = current.indexOf(account.id);
+  const nextIndex = index + offset;
+  if (index < 0 || nextIndex < 0 || nextIndex >= current.length) return;
+  current.splice(index, 1);
+  current.splice(nextIndex, 0, account.id);
+  sortDraftIds.value = current;
+}
+
+async function saveSortEditor(): Promise<void> {
+  const draft = sortDraftIds.value.filter((id, index, ids) => ids.indexOf(id) === index);
+  const draftSet = new Set(draft);
+  const remaining = accounts.value.map((account) => account.id).filter((id) => !draftSet.has(id));
+  settings.customOrder = [...draft, ...remaining];
+  currentPage.value = 1;
+  closeSortEditor();
   await saveSettings();
 }
 
@@ -1401,7 +1533,7 @@ async function handleBindingSave(): Promise<void> {
   }
 }
 
-async function loadSessions(): Promise<void> {
+async function loadSessions(options: { silent?: boolean } = {}): Promise<void> {
   sessionLoading.value = true;
   try {
     if (sessionTrashMode.value) {
@@ -1414,14 +1546,17 @@ async function loadSessions(): Promise<void> {
         contentQuery: sessionSearch.contentQuery,
       });
       trashedSessions.value = [];
-      const ids = sessions.value.map((session) => session.id);
-      sessionStats.value = ids.length ? await getSessionTokenStatsAcrossInstances(ids) : [];
+      sessionStats.value = sessions.value.map((session) => ({
+        sessionId: session.id,
+        approximateTokens: Math.ceil((session.charCount || 0) / 4),
+        charCount: session.charCount || 0,
+      }));
       const firstGroup = sessions.value[0] ? sessionGroupKey(sessions.value[0]) : "";
       expandedSessionGroups.value = firstGroup ? new Set([firstGroup]) : new Set();
     }
     selectedSessionIds.value = new Set();
   } catch (error) {
-    Message.error(`加载会话失败：${errorText(error)}`);
+    if (!options.silent) Message.error(`加载会话失败：${errorText(error)}`);
   } finally {
     sessionLoading.value = false;
   }
@@ -1591,6 +1726,8 @@ function createBackupTaskId(): string {
 async function handleExportBackup(
   successPrefix = "已生成 ZIP 备份",
   title = "正在备份数据",
+  startBackup: (taskId: string) => Promise<string> = startCodexSwitcherBackup,
+  reloadBackups: () => Promise<void> = loadBackups,
 ): Promise<void> {
   if (backupWorking.value) {
     Message.info("已有备份任务正在运行");
@@ -1634,9 +1771,9 @@ async function handleExportBackup(
         }
       },
     );
-    await startCodexSwitcherBackup(taskId);
+    await startBackup(taskId);
     const backup = await backupPromise;
-    await loadBackups();
+    await reloadBackups();
     backupCompleted = true;
     Message.success(`${successPrefix}：${backup.name}`);
   } catch (error) {
@@ -1657,20 +1794,110 @@ async function handleExportBackup(
 }
 
 async function handleExportSessionBackup(): Promise<void> {
-  await handleExportBackup("已备份所有会话", "正在备份所有会话");
+  await handleExportBackup(
+    "已备份会话数据",
+    "正在备份会话数据",
+    startCodexSwitcherSessionBackup,
+    loadSessionBackups,
+  );
 }
 
-async function handleRestoreBackup(backup: CodexSwitcherBackupFile): Promise<void> {
+async function runRestoreTask(
+  title: string,
+  startMessage: string,
+  restore: () => Promise<string>,
+  reload: () => Promise<void>,
+): Promise<void> {
+  if (backupWorking.value) {
+    Message.info("已有备份或恢复任务正在运行");
+    return;
+  }
   backupWorking.value = true;
+  backupProgressVisible.value = true;
+  backupProgressTitle.value = title;
+  backupProgressStatus.value = "running";
+  backupProgress.value = 8;
+  backupProgressMessage.value = startMessage;
   try {
-    const imported = await restoreCodexSwitcherBackup(backup.path);
-    await Promise.all([loadAccounts(), loadSettings()]);
-    Message.success(`已恢复备份，导入 ${imported.length} 个账号`);
+    window.setTimeout(() => {
+      if (backupWorking.value && backupProgressStatus.value === "running") {
+        backupProgress.value = 42;
+        backupProgressMessage.value = "正在写入本机数据...";
+      }
+    }, 200);
+    const message = await restore();
+    backupProgress.value = 82;
+    backupProgressMessage.value = "正在刷新界面数据...";
+    await reload();
+    backupProgress.value = 100;
+    backupProgressStatus.value = "completed";
+    backupProgressMessage.value = message;
+    Message.success(message);
+    window.setTimeout(() => {
+      if (!backupWorking.value) backupProgressVisible.value = false;
+    }, 1200);
   } catch (error) {
-    Message.error(`恢复备份失败：${errorText(error)}`);
+    backupProgressStatus.value = "failed";
+    backupProgress.value = 100;
+    backupProgressMessage.value = errorText(error);
+    Message.error(`恢复失败：${errorText(error)}`);
   } finally {
     backupWorking.value = false;
   }
+}
+
+function handleRestoreBackup(backup: CodexSwitcherBackupFile): void {
+  Modal.warning({
+    title: "恢复完整备份",
+    content: `确认使用 ${backup.name} 恢复账号、设置与所有 Codex 会话记录？`,
+    okText: "开始恢复",
+    cancelText: "取消",
+    hideCancel: false,
+    async onOk() {
+      await runRestoreTask(
+        "正在恢复完整备份",
+        "正在准备恢复账号、设置与会话数据...",
+        async () => {
+          const imported = await restoreCodexSwitcherBackup(backup.path);
+          return `已恢复备份，导入 ${imported.length} 个账号`;
+        },
+        async () => {
+          await Promise.all([loadAccounts(), loadSettings(), loadSessions()]);
+        },
+      );
+    },
+  });
+}
+
+function handleRestoreSessionBackup(backup: CodexSwitcherBackupFile): void {
+  Modal.warning({
+    title: "只恢复会话数据",
+    content: `确认从 ${backup.name} 只恢复 Codex 会话、会话回收站与会话索引？账号和设置不会变更。`,
+    okText: "开始恢复",
+    cancelText: "取消",
+    hideCancel: false,
+    async onOk() {
+      sessionRestoreVisible.value = false;
+      await runRestoreTask(
+        "正在恢复会话数据",
+        "正在准备恢复 Codex 会话数据...",
+        async () => {
+          await restoreCodexSwitcherSessionBackup(backup.path);
+          return "已恢复会话数据";
+        },
+        async () => {
+          await Promise.all([loadSessions(), loadSessionBackups()]);
+        },
+      );
+    },
+  });
+}
+
+async function openSessionRestoreModal(): Promise<void> {
+  if (!sessionBackupFiles.value.length) {
+    await loadSessionBackups();
+  }
+  sessionRestoreVisible.value = true;
 }
 
 async function handleDeleteBackup(backup: CodexSwitcherBackupFile): Promise<void> {
@@ -1700,14 +1927,66 @@ function handleAddTabChange(key: string | number): void {
   }
 }
 
-function switchView(view: "accounts" | "sessions" | "settings"): void {
+function switchView(view: ActiveView): void {
   activeView.value = view;
-  if (view === "sessions" && !sessions.value.length && !trashedSessions.value.length) {
-    void loadSessions();
+  if (view === "usage") {
+    usagePanelMounted.value = true;
   }
-  if (view === "settings" && !appPaths.value) {
-    void loadSettings();
+  if (viewLoadTimer) {
+    window.clearTimeout(viewLoadTimer);
+    viewLoadTimer = undefined;
   }
+  void nextTick(() => {
+    viewLoadTimer = window.setTimeout(() => {
+      if (view !== activeView.value) return;
+      if (view === "sessions" && !sessions.value.length && !trashedSessions.value.length) {
+        void loadSessions();
+      }
+      if (view === "settings" && !appPaths.value) {
+        void loadSettings();
+      }
+    }, 0);
+  });
+}
+
+function todayUsageRange(): { startDate: number; endDate: number } {
+  const now = new Date();
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(now);
+  end.setHours(now.getHours() + 1, 0, 0, 0);
+  return {
+    startDate: Math.floor(start.getTime() / 1000),
+    endDate: Math.floor(end.getTime() / 1000),
+  };
+}
+
+async function prewarmUsageDashboard(): Promise<void> {
+  try {
+    const range = todayUsageRange();
+    await getCodexUsageDashboard({
+      ...range,
+      page: 1,
+      pageSize: 1,
+      refresh: false,
+    });
+  } catch {
+    // 预热失败不打扰首屏，用户进入统计页时仍会正常加载并提示。
+  }
+}
+
+function scheduleInitialPrewarm(): void {
+  if (initialPrewarmTimer) window.clearTimeout(initialPrewarmTimer);
+  initialPrewarmTimer = window.setTimeout(() => {
+    if (!sessions.value.length && !trashedSessions.value.length) {
+      void loadSessions({ silent: true });
+    }
+    if (!sessionBackupFiles.value.length) {
+      void loadSessionBackups({ silent: true });
+    }
+    void prewarmUsageDashboard();
+    usagePanelMounted.value = true;
+  }, 900);
 }
 
 async function syncExpandedLayout(): Promise<void> {
@@ -1750,6 +2029,7 @@ onMounted(() => {
   window.addEventListener("resize", handleWindowResize);
   void loadAccounts();
   void loadSettings();
+  scheduleInitialPrewarm();
   void listen<OAuthCallbackEvent>("codex-oauth-callback-received", async (event) => {
     const payload = event.payload;
     if (!payload?.loginId || payload.loginId !== oauthLoginId.value) return;
@@ -1770,6 +2050,10 @@ onUnmounted(() => {
   oauthUnlisten?.();
   window.removeEventListener("resize", handleWindowResize);
   if (windowResizeTimer) window.clearTimeout(windowResizeTimer);
+  if (viewLoadTimer) window.clearTimeout(viewLoadTimer);
+  if (initialPrewarmTimer) window.clearTimeout(initialPrewarmTimer);
+  window.removeEventListener("pointerup", handleSortDraftPointerEnd);
+  window.removeEventListener("pointercancel", handleSortDraftPointerEnd);
   clearSwitchRepairCloseTimer();
   if (quotaTimer) window.clearInterval(quotaTimer);
   if (quotaCountdownTimer) window.clearInterval(quotaCountdownTimer);
@@ -1800,6 +2084,10 @@ onUnmounted(() => {
         <a-button :type="activeView === 'sessions' ? 'primary' : 'secondary'" @click="switchView('sessions')">
           <template #icon><icon-folder /></template>
           会话管理
+        </a-button>
+        <a-button :type="activeView === 'usage' ? 'primary' : 'secondary'" @click="switchView('usage')">
+          <template #icon><icon-bar-chart /></template>
+          使用统计
         </a-button>
         <a-button :type="activeView === 'settings' ? 'primary' : 'secondary'" @click="switchView('settings')">
           <template #icon><icon-settings /></template>
@@ -1836,6 +2124,8 @@ onUnmounted(() => {
         <a-select
           v-model="settings.accountTypeFilter"
           class="filter-select"
+          popup-container="body"
+          popup-class-name="account-filter-dropdown"
           @change="() => { currentPage = 1; saveSettings(); }"
         >
           <a-option
@@ -1855,6 +2145,10 @@ onUnmounted(() => {
           <a-option value="subscription">按订阅有效期</a-option>
           <a-option value="custom">自定义顺序</a-option>
         </a-select>
+        <a-button v-if="settings.sortMode === 'custom'" @click="openSortEditor">
+          <template #icon><icon-list /></template>
+          编辑排序
+        </a-button>
         <a-radio-group
           v-if="showSortDirection"
           v-model="settings.sortDirection"
@@ -1905,6 +2199,7 @@ onUnmounted(() => {
       @toggle-account="toggleAccount"
       @toggle-pin="toggleAccountPin"
       @drag-start="handleDragStart"
+      @drag-end="handleDragEnd"
       @drop-account="handleDropAccount"
       @open-phone="openPhone"
       @reset-credit="confirmResetCredit"
@@ -1928,6 +2223,61 @@ onUnmounted(() => {
       />
     </div>
 
+    <a-modal
+      v-model:visible="sortEditorVisible"
+      title="编辑账号顺序"
+      width="760px"
+      :footer="false"
+      @cancel="closeSortEditor"
+    >
+      <div class="sort-editor">
+        <div class="sort-editor-hint">
+          <span>拖动列表项调整顺序，保存后会写入自定义顺序。</span>
+          <b>{{ sortDraftAccounts.length }} 个账号</b>
+        </div>
+        <div class="sort-editor-list">
+          <article
+            v-for="(account, index) in sortDraftAccounts"
+            :key="account.id"
+            class="sort-editor-row"
+            :class="{
+              dragging: sortDraftDraggingId === account.id,
+              over: sortDraftOverId === account.id,
+            }"
+            @pointerenter="handleSortDraftPointerEnter(account)"
+          >
+            <button
+              class="sort-editor-grip"
+              type="button"
+              title="按住拖动排序"
+              @pointerdown.prevent="handleSortDraftPointerStart($event, account)"
+            >
+              <icon-list />
+            </button>
+            <span class="sort-editor-index">{{ index + 1 }}</span>
+            <div class="sort-editor-main">
+              <strong>{{ displayNameForUi(account) }}</strong>
+              <span>{{ isApiKeyAccount(account) ? "API Key" : "OAuth" }} · {{ account.email || account.id }}</span>
+            </div>
+            <PlanBadge :label="planLabel(account)" :badge-class="planClass(account)" />
+            <a-tag v-if="account.id === currentId" color="arcoblue">当前</a-tag>
+            <div class="sort-editor-actions">
+              <a-button size="mini" :disabled="index === 0" @click="moveSortDraftByStep(account, -1)">
+                <template #icon><icon-up /></template>
+              </a-button>
+              <a-button size="mini" :disabled="index === sortDraftAccounts.length - 1" @click="moveSortDraftByStep(account, 1)">
+                <template #icon><icon-down /></template>
+              </a-button>
+            </div>
+          </article>
+        </div>
+        <div class="sort-editor-footer">
+          <a-button @click="closeSortEditor">取消</a-button>
+          <a-button type="primary" :loading="savingSettings" @click="saveSortEditor">保存排序</a-button>
+        </div>
+      </div>
+    </a-modal>
+
     <BadgeStyleModal
       v-model:visible="badgeStyleVisible"
       :settings="settings"
@@ -1942,13 +2292,13 @@ onUnmounted(() => {
             v-model="sessionSearch.titleQuery"
             allow-clear
             placeholder="搜索会话标题"
-            @press-enter="loadSessions"
+            @press-enter="() => loadSessions()"
           />
           <a-input
             v-model="sessionSearch.contentQuery"
             allow-clear
             placeholder="搜索会话内容"
-            @press-enter="loadSessions"
+            @press-enter="() => loadSessions()"
           />
         </div>
         <div class="session-actions">
@@ -1970,13 +2320,17 @@ onUnmounted(() => {
           >
             回收站
           </a-button>
-          <a-button :loading="sessionLoading" @click="loadSessions">
+          <a-button :loading="sessionLoading" @click="() => loadSessions()">
             <template #icon><icon-refresh /></template>
             刷新
           </a-button>
           <a-button :loading="backupWorking" @click="handleExportSessionBackup">
             <template #icon><icon-download /></template>
             {{ backupButtonText }}
+          </a-button>
+          <a-button :loading="sessionBackupLoading" :disabled="backupWorking" @click="openSessionRestoreModal">
+            <template #icon><icon-import /></template>
+            恢复会话
           </a-button>
           <a-button :loading="sessionRepairing" type="primary" @click="handleRepairSessions">
             <template #icon><icon-tool /></template>
@@ -2057,7 +2411,34 @@ onUnmounted(() => {
               </article>
             </div>
           </section>
-          <a-empty v-if="!sessions.length" description="暂无会话" />
+          <div v-if="!sessions.length" class="session-empty-state">
+            <div class="session-empty-icon">
+              <icon-message />
+            </div>
+            <div class="session-empty-copy">
+              <strong>{{ sessionSearch.titleQuery || sessionSearch.contentQuery ? "没有匹配的会话" : "还没有可显示的会话" }}</strong>
+              <span>
+                {{ sessionSearch.titleQuery || sessionSearch.contentQuery
+                  ? "换个关键词试试，或清空搜索后重新刷新。"
+                  : "可以先刷新本机会话；如果是切号后看不到旧会话，使用修复可见性重新挂回列表。"
+                }}
+              </span>
+            </div>
+            <div class="session-empty-actions">
+              <a-button type="primary" :loading="sessionLoading" @click="() => loadSessions()">
+                <template #icon><icon-refresh /></template>
+                刷新会话
+              </a-button>
+              <a-button :loading="sessionBackupLoading" :disabled="backupWorking" @click="openSessionRestoreModal">
+                <template #icon><icon-import /></template>
+                从备份恢复
+              </a-button>
+              <a-button :loading="sessionRepairing" @click="handleRepairSessions">
+                <template #icon><icon-tool /></template>
+                修复可见性
+              </a-button>
+            </div>
+          </div>
         </div>
 
         <div v-else class="session-list">
@@ -2079,10 +2460,20 @@ onUnmounted(() => {
               </a-button>
             </div>
           </article>
-          <a-empty v-if="!trashedSessions.length" description="回收站为空" />
+          <div v-if="!trashedSessions.length" class="session-empty-state compact">
+            <div class="session-empty-icon">
+              <icon-delete />
+            </div>
+            <div class="session-empty-copy">
+              <strong>回收站为空</strong>
+              <span>被移入回收站的会话会显示在这里，恢复后会回到原来的会话路径。</span>
+            </div>
+          </div>
         </div>
       </a-spin>
     </section>
+
+    <UsagePanel v-if="usagePanelMounted" v-show="activeView === 'usage'" />
 
     <SettingsPanel
       v-if="activeView === 'settings'"
@@ -2102,6 +2493,43 @@ onUnmounted(() => {
       @restore-backup="handleRestoreBackup"
       @delete-backup="handleDeleteBackup"
     />
+
+    <a-modal
+      v-model:visible="sessionRestoreVisible"
+      title="恢复会话数据"
+      :footer="false"
+      width="720px"
+    >
+      <a-spin :loading="sessionBackupLoading" dot>
+        <div v-if="sessionBackupFiles.length" class="session-restore-list">
+          <article v-for="backup in sessionBackupFiles" :key="backup.path" class="session-restore-item">
+            <div class="session-restore-main">
+              <strong>{{ backup.name }}</strong>
+              <span>{{ backup.createdAt }}</span>
+            </div>
+            <a-button type="primary" :disabled="backupWorking" @click="handleRestoreSessionBackup(backup)">
+              <template #icon><icon-import /></template>
+              只恢复会话
+            </a-button>
+          </article>
+        </div>
+        <div v-else class="session-empty-state compact">
+          <div class="session-empty-icon">
+            <icon-archive />
+          </div>
+          <div class="session-empty-copy">
+            <strong>还没有备份文件</strong>
+            <span>先备份一次会话数据，之后就可以从这里只恢复会话。</span>
+          </div>
+          <div class="session-empty-actions">
+            <a-button type="primary" :loading="backupWorking" @click="handleExportSessionBackup">
+              <template #icon><icon-download /></template>
+              立即备份
+            </a-button>
+          </div>
+        </div>
+      </a-spin>
+    </a-modal>
 
     <a-modal
       v-model:visible="backupProgressVisible"

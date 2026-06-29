@@ -84,6 +84,13 @@ function backupButtonText(): string {
             </a-button>
           </div>
           <div class="path-row">
+            <span>统计目录</span>
+            <a-input :model-value="appPaths?.statisticsDir || ''" readonly />
+            <a-button @click="openPath(appPaths?.statisticsDir)">
+              <template #icon><icon-folder /></template>
+            </a-button>
+          </div>
+          <div class="path-row">
             <span>配置目录</span>
             <a-input :model-value="appPaths?.dataDir || ''" readonly />
             <a-button @click="openPath(appPaths?.dataDir)">
@@ -202,15 +209,10 @@ function backupButtonText(): string {
                   </div>
                 </div>
                 <div class="backup-item-actions">
-                  <a-popconfirm
-                    content="确认使用这个 ZIP 备份恢复账号、设置与所有 Codex 会话记录？"
-                    @ok="emit('restore-backup', backup)"
-                  >
-                    <a-button :disabled="backupWorking">
-                      <template #icon><icon-import /></template>
-                      恢复
-                    </a-button>
-                  </a-popconfirm>
+                  <a-button :disabled="backupWorking" @click="emit('restore-backup', backup)">
+                    <template #icon><icon-import /></template>
+                    恢复
+                  </a-button>
                   <a-popconfirm
                     content="确认删除这个备份文件？"
                     @ok="emit('delete-backup', backup)"
@@ -228,7 +230,7 @@ function backupButtonText(): string {
               </div>
               <div class="backup-empty-copy">
                 <strong>还没有备份</strong>
-                <span>点击“手动备份”会把账号、设置、徽章、排序与所有 Codex 会话记录打包成 ZIP。</span>
+                <span>点击“手动备份”会把账号、设置、统计缓存、费用规则与所有 Codex 会话记录打包成 ZIP。</span>
                 <code>{{ appPaths?.backupDir || "~/.codex_switcher/backup" }}</code>
               </div>
             </div>

@@ -31,6 +31,7 @@ export interface CodexSwitcherPaths {
   backupDir: string;
   accountDir: string;
   sessionDir: string;
+  statisticsDir: string;
   dataDir: string;
   codexHome: string;
 }
@@ -215,12 +216,24 @@ export function startCodexSwitcherBackup(taskId: string): Promise<string> {
   return invoke("start_codex_switcher_backup", { taskId });
 }
 
+export function startCodexSwitcherSessionBackup(taskId: string): Promise<string> {
+  return invoke("start_codex_switcher_session_backup", { taskId });
+}
+
 export function listCodexSwitcherBackups(): Promise<CodexSwitcherBackupFile[]> {
   return invoke("list_codex_switcher_backups");
 }
 
+export function listCodexSwitcherSessionBackups(): Promise<CodexSwitcherBackupFile[]> {
+  return invoke("list_codex_switcher_session_backups");
+}
+
 export function restoreCodexSwitcherBackup(backupPath: string): Promise<CodexAccount[]> {
   return invoke("restore_codex_switcher_backup", { backupPath });
+}
+
+export function restoreCodexSwitcherSessionBackup(backupPath: string): Promise<void> {
+  return invoke("restore_codex_switcher_session_backup", { backupPath });
 }
 
 export function deleteCodexSwitcherBackup(backupPath: string): Promise<void> {
