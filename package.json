@@ -12,6 +12,7 @@
   "dependencies": {
     "@arco-design/web-vue": "^2.57.0",
     "@tauri-apps/api": "^2",
+    "echarts": "^6.1.0",
     "vue": "^3.5.0"
   },
   "devDependencies": {

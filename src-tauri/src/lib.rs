@@ -1,6 +1,7 @@
 mod account;
 mod oauth;
 mod session;
+mod usage;
 
 use account::{AccountStore, ApiKeyAccountBindingInput, CodexAccount, CodexQuota};
 use oauth::CodexOAuthLoginStartResponse;
@@ -20,6 +21,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
+use usage::{CodexUsageDashboard, CodexUsagePricing, CodexUsagePricingConfig};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -119,6 +121,7 @@ struct CodexSwitcherPaths {
     backup_dir: String,
     account_dir: String,
     session_dir: String,
+    statistics_dir: String,
     data_dir: String,
     codex_home: String,
 }
@@ -656,11 +659,55 @@ fn reset_codex_config_toml() -> Result<bool, String> {
 }
 
 #[tauri::command]
+fn codex_get_usage_dashboard(
+    start_date: Option<i64>,
+    end_date: Option<i64>,
+    page: Option<usize>,
+    page_size: Option<usize>,
+    refresh: Option<bool>,
+) -> Result<CodexUsageDashboard, String> {
+    usage::get_codex_usage_dashboard(start_date, end_date, page, page_size, refresh)
+}
+
+#[tauri::command]
+fn codex_list_model_pricing() -> Result<Vec<CodexUsagePricing>, String> {
+    usage::list_model_pricing()
+}
+
+#[tauri::command]
+fn codex_update_model_pricing(pricing: CodexUsagePricing) -> Result<(), String> {
+    usage::update_model_pricing(pricing)
+}
+
+#[tauri::command]
+fn codex_delete_model_pricing(model_id: String) -> Result<(), String> {
+    usage::delete_model_pricing(&model_id)
+}
+
+#[tauri::command]
+fn codex_reset_model_pricing() -> Result<Vec<CodexUsagePricing>, String> {
+    usage::reset_model_pricing()
+}
+
+#[tauri::command]
+fn codex_get_pricing_config() -> Result<Vec<CodexUsagePricingConfig>, String> {
+    usage::get_pricing_config()
+}
+
+#[tauri::command]
+fn codex_update_pricing_config(
+    configs: Vec<CodexUsagePricingConfig>,
+) -> Result<Vec<CodexUsagePricingConfig>, String> {
+    usage::update_pricing_config(configs)
+}
+
+#[tauri::command]
 fn get_codex_switcher_paths() -> Result<CodexSwitcherPaths, String> {
     ensure_switcher_data_dirs()?;
     let app_dir = switcher_data_dir();
     let account_dir = switcher_account_dir();
     let session_dir = switcher_session_dir();
+    let statistics_dir = switcher_statistics_dir();
     let data_dir = switcher_config_data_dir();
     let backup_dir = switcher_backup_dir();
     Ok(CodexSwitcherPaths {
@@ -673,6 +720,7 @@ fn get_codex_switcher_paths() -> Result<CodexSwitcherPaths, String> {
         backup_dir: backup_dir.to_string_lossy().to_string(),
         account_dir: account_dir.to_string_lossy().to_string(),
         session_dir: session_dir.to_string_lossy().to_string(),
+        statistics_dir: statistics_dir.to_string_lossy().to_string(),
         data_dir: data_dir.to_string_lossy().to_string(),
         codex_home: default_codex_home().to_string_lossy().to_string(),
     })
@@ -726,6 +774,52 @@ fn start_codex_switcher_backup(app_handle: AppHandle, task_id: String) -> Result
     Ok(task_id)
 }
 
+#[tauri::command]
+fn start_codex_switcher_session_backup(
+    app_handle: AppHandle,
+    task_id: String,
+) -> Result<String, String> {
+    let task_id = task_id.trim().to_string();
+    if task_id.is_empty() {
+        return Err("备份任务 ID 不能为空".to_string());
+    }
+    let emit_task_id = task_id.clone();
+    thread::spawn(move || {
+        emit_backup_progress(
+            &app_handle,
+            &emit_task_id,
+            "running",
+            1,
+            "正在准备会话备份任务...",
+            None,
+        );
+        let result = export_codex_switcher_session_backup_with_progress(|progress, message| {
+            emit_backup_progress(
+                &app_handle,
+                &emit_task_id,
+                "running",
+                progress,
+                message,
+                None,
+            );
+        });
+        match result {
+            Ok(backup_file) => emit_backup_progress(
+                &app_handle,
+                &emit_task_id,
+                "completed",
+                100,
+                "会话备份完成",
+                Some(backup_file),
+            ),
+            Err(error) => {
+                emit_backup_progress(&app_handle, &emit_task_id, "failed", 100, &error, None)
+            }
+        }
+    });
+    Ok(task_id)
+}
+
 fn emit_backup_progress(
     app_handle: &AppHandle,
     task_id: &str,
@@ -754,6 +848,7 @@ where
 {
     progress(5, "正在读取账号、设置与会话信息...");
     let codex_session_summary = codex_session_backup_summary(&default_codex_home());
+    let statistics_summary = switcher_statistics_backup_summary();
     let backup = serde_json::json!({
         "app": "Codex Switcher",
         "version": 2,
@@ -762,6 +857,7 @@ where
         "currentAccount": get_current_codex_account()?,
         "settings": read_switcher_settings()?,
         "codexSessions": codex_session_summary,
+        "statistics": statistics_summary,
     });
     progress(15, "正在生成备份清单...");
     let content = serde_json::to_string_pretty(&backup)
@@ -778,13 +874,56 @@ where
     backup_file_info(&backup_path)
 }
 
+fn export_codex_switcher_session_backup_with_progress<F>(
+    mut progress: F,
+) -> Result<CodexSwitcherBackupFile, String>
+where
+    F: FnMut(u8, &str),
+{
+    progress(5, "正在读取 Codex 会话信息...");
+    let codex_home = default_codex_home();
+    let backup = serde_json::json!({
+        "app": "Codex Switcher",
+        "kind": "codexSessions",
+        "version": 1,
+        "exportedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "codexSessions": codex_session_backup_summary(&codex_home),
+    });
+    progress(15, "正在生成会话备份清单...");
+    let content = serde_json::to_string_pretty(&backup)
+        .map_err(|error| format!("序列化会话备份失败: {}", error))?;
+    let backup_dir = switcher_session_dir();
+    std::fs::create_dir_all(&backup_dir)
+        .map_err(|error| format!("创建会话备份目录失败: {}", error))?;
+    let filename = format!(
+        "codex-session-backup-{}.zip",
+        chrono::Local::now().format("%Y%m%d-%H%M%S-%3f")
+    );
+    let backup_path = backup_dir.join(filename);
+    write_session_backup_zip(&backup_path, &content, &mut progress)?;
+    progress(98, "正在刷新会话备份文件信息...");
+    backup_file_info(&backup_path)
+}
+
 #[tauri::command]
 fn list_codex_switcher_backups() -> Result<Vec<CodexSwitcherBackupFile>, String> {
-    let backup_dir = switcher_backup_dir();
-    std::fs::create_dir_all(&backup_dir).map_err(|error| format!("创建备份目录失败: {}", error))?;
+    list_backup_files_in_dir(&switcher_backup_dir(), "备份")
+}
+
+#[tauri::command]
+fn list_codex_switcher_session_backups() -> Result<Vec<CodexSwitcherBackupFile>, String> {
+    list_backup_files_in_dir(&switcher_session_dir(), "会话备份")
+}
+
+fn list_backup_files_in_dir(
+    backup_dir: &Path,
+    label: &str,
+) -> Result<Vec<CodexSwitcherBackupFile>, String> {
+    std::fs::create_dir_all(backup_dir)
+        .map_err(|error| format!("创建{}目录失败: {}", label, error))?;
     let mut backups = Vec::new();
     for entry in
-        std::fs::read_dir(&backup_dir).map_err(|error| format!("读取备份目录失败: {}", error))?
+        std::fs::read_dir(backup_dir).map_err(|error| format!("读取{}目录失败: {}", label, error))?
     {
         let path = entry
             .map_err(|error| format!("读取备份文件失败: {}", error))?
@@ -812,6 +951,16 @@ fn restore_codex_switcher_backup(backup_path: String) -> Result<Vec<CodexAccount
         .read_to_string(&mut backup_json)
         .map_err(|error| format!("读取备份 JSON 失败: {}", error))?;
     import_codex_switcher_backup(backup_json)
+}
+
+#[tauri::command]
+fn restore_codex_switcher_session_backup(backup_path: String) -> Result<(), String> {
+    let path = validate_session_backup_zip_path(&backup_path)
+        .or_else(|_| validate_backup_zip_path(&backup_path))?;
+    let file = std::fs::File::open(&path).map_err(|error| format!("打开备份失败: {}", error))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|error| format!("读取 ZIP 备份失败: {}", error))?;
+    restore_backup_archive_session_files(&mut archive)
 }
 
 #[tauri::command]
@@ -987,6 +1136,10 @@ fn switcher_session_dir() -> PathBuf {
     switcher_data_dir().join("session")
 }
 
+fn switcher_statistics_dir() -> PathBuf {
+    switcher_data_dir().join("statistics")
+}
+
 fn switcher_config_data_dir() -> PathBuf {
     switcher_data_dir().join("data")
 }
@@ -1000,6 +1153,7 @@ fn ensure_switcher_data_dirs() -> Result<(), String> {
         switcher_data_dir(),
         switcher_account_dir(),
         switcher_session_dir(),
+        switcher_statistics_dir(),
         switcher_config_data_dir(),
         switcher_backup_dir(),
     ] {
@@ -1035,12 +1189,13 @@ where
         .map_err(|error| format!("写入备份 JSON 失败: {}", error))?;
     progress(30, "正在写入 Codex Switcher 数据...");
     let root = switcher_data_dir();
+    let excluded_dirs = vec![switcher_backup_dir(), switcher_session_dir()];
     add_directory_to_backup_zip(
         &mut zip,
         &root,
         &root,
         "data",
-        Some(&switcher_backup_dir()),
+        &excluded_dirs,
         options,
     )?;
     progress(50, "正在写入 Codex 会话记录...");
@@ -1051,15 +1206,42 @@ where
     Ok(())
 }
 
+fn write_session_backup_zip<F>(
+    backup_path: &Path,
+    backup_json: &str,
+    progress: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(u8, &str),
+{
+    progress(20, "正在创建会话 ZIP 文件...");
+    let file = std::fs::File::create(backup_path)
+        .map_err(|error| format!("创建会话 ZIP 备份失败: {}", error))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+    zip.start_file("backup.json", options)
+        .map_err(|error| format!("写入会话备份 JSON 失败: {}", error))?;
+    zip.write_all(backup_json.as_bytes())
+        .map_err(|error| format!("写入会话备份 JSON 失败: {}", error))?;
+    progress(35, "正在写入 Codex 会话数据...");
+    add_codex_sessions_to_backup_zip(&mut zip, options, progress)?;
+    progress(92, "正在压缩并完成会话 ZIP...");
+    zip.finish()
+        .map_err(|error| format!("完成会话 ZIP 备份失败: {}", error))?;
+    Ok(())
+}
+
 fn add_directory_to_backup_zip(
     zip: &mut zip::ZipWriter<std::fs::File>,
     root: &Path,
     current: &Path,
     archive_prefix: &str,
-    excluded_dir: Option<&Path>,
+    excluded_dirs: &[PathBuf],
     options: zip::write::FileOptions,
 ) -> Result<(), String> {
-    if !current.exists() || excluded_dir.is_some_and(|dir| current.starts_with(dir)) {
+    if !current.exists() || excluded_dirs.iter().any(|dir| current.starts_with(dir)) {
         return Ok(());
     }
     for entry in std::fs::read_dir(current)
@@ -1068,11 +1250,11 @@ fn add_directory_to_backup_zip(
         let path = entry
             .map_err(|error| format!("读取备份数据文件失败: {}", error))?
             .path();
-        if excluded_dir.is_some_and(|dir| path.starts_with(dir)) {
+        if excluded_dirs.iter().any(|dir| path.starts_with(dir)) {
             continue;
         }
         if path.is_dir() {
-            add_directory_to_backup_zip(zip, root, &path, archive_prefix, excluded_dir, options)?;
+            add_directory_to_backup_zip(zip, root, &path, archive_prefix, excluded_dirs, options)?;
             continue;
         }
         let relative = path
@@ -1117,7 +1299,7 @@ fn add_codex_sessions_to_backup_zip(
         &codex_home.join("sessions"),
         &codex_home.join("sessions"),
         "codex/sessions",
-        None,
+        &[],
         options,
     )?;
     progress(82, "正在备份会话回收站...");
@@ -1126,7 +1308,7 @@ fn add_codex_sessions_to_backup_zip(
         &codex_home.join(".codex-switcher").join("session-trash"),
         &codex_home.join(".codex-switcher").join("session-trash"),
         "codex/session-trash",
-        None,
+        &[],
         options,
     )?;
     progress(88, "正在备份会话索引...");
@@ -1147,6 +1329,17 @@ fn codex_session_backup_summary(codex_home: &Path) -> Value {
         "sessionFiles": count_files_under(&codex_home.join("sessions")),
         "trashedSessionFiles": count_files_under(&codex_home.join(".codex-switcher").join("session-trash")),
         "includesSessionIndex": codex_home.join("session_index.jsonl").is_file(),
+    })
+}
+
+fn switcher_statistics_backup_summary() -> Value {
+    let statistics_dir = switcher_statistics_dir();
+    serde_json::json!({
+        "statisticsDir": statistics_dir.to_string_lossy().to_string(),
+        "files": count_files_under(&statistics_dir),
+        "includesUsageCache": statistics_dir.join("usage_logs.json").is_file(),
+        "includesPricing": statistics_dir.join("pricing.json").is_file(),
+        "includesPricingConfig": statistics_dir.join("pricing_config.json").is_file(),
     })
 }
 
@@ -1175,6 +1368,19 @@ fn count_files_under(path: &Path) -> usize {
 fn restore_backup_archive_files(
     archive: &mut zip::ZipArchive<std::fs::File>,
 ) -> Result<(), String> {
+    restore_backup_archive_files_with(archive, backup_entry_restore_target)
+}
+
+fn restore_backup_archive_session_files(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+) -> Result<(), String> {
+    restore_backup_archive_files_with(archive, backup_session_entry_restore_target)
+}
+
+fn restore_backup_archive_files_with(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    restore_target: fn(&str) -> Option<PathBuf>,
+) -> Result<(), String> {
     for index in 0..archive.len() {
         let mut file = archive
             .by_index(index)
@@ -1182,7 +1388,7 @@ fn restore_backup_archive_files(
         if file.is_dir() {
             continue;
         }
-        let Some(target) = backup_entry_restore_target(file.name()) else {
+        let Some(target) = restore_target(file.name()) else {
             continue;
         };
         if let Some(parent) = target.parent() {
@@ -1198,6 +1404,10 @@ fn restore_backup_archive_files(
 }
 
 fn backup_entry_restore_target(name: &str) -> Option<PathBuf> {
+    backup_session_entry_restore_target(name).or_else(|| backup_data_entry_restore_target(name))
+}
+
+fn backup_session_entry_restore_target(name: &str) -> Option<PathBuf> {
     let normalized = name.replace('\\', "/");
     let path = Path::new(&normalized);
     if path.is_absolute()
@@ -1228,11 +1438,21 @@ fn backup_entry_restore_target(name: &str) -> Option<PathBuf> {
                     (normalized == format!("codex/{}", filename)).then(|| codex_home.join(filename))
                 })
         })
-        .or_else(|| {
-            normalized
-                .strip_prefix("data/")
-                .map(|relative| switcher_data_dir().join(relative))
-        })
+}
+
+fn backup_data_entry_restore_target(name: &str) -> Option<PathBuf> {
+    let normalized = name.replace('\\', "/");
+    let path = Path::new(&normalized);
+    if path.is_absolute()
+        || normalized
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return None;
+    }
+    normalized
+        .strip_prefix("data/")
+        .map(|relative| switcher_data_dir().join(relative))
 }
 
 fn backup_file_info(path: &Path) -> Result<CodexSwitcherBackupFile, String> {
@@ -1261,16 +1481,28 @@ fn backup_file_info(path: &Path) -> Result<CodexSwitcherBackupFile, String> {
 }
 
 fn validate_backup_zip_path(path: &str) -> Result<PathBuf, String> {
-    let backup_dir = switcher_backup_dir()
+    validate_backup_zip_path_in_dir(path, &switcher_backup_dir(), "备份")
+}
+
+fn validate_session_backup_zip_path(path: &str) -> Result<PathBuf, String> {
+    validate_backup_zip_path_in_dir(path, &switcher_session_dir(), "会话备份")
+}
+
+fn validate_backup_zip_path_in_dir(
+    path: &str,
+    base_dir: &Path,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let backup_dir = base_dir
         .canonicalize()
-        .map_err(|error| format!("读取备份目录失败: {}", error))?;
+        .map_err(|error| format!("读取{}目录失败: {}", label, error))?;
     let backup_path = PathBuf::from(path)
         .canonicalize()
         .map_err(|error| format!("读取备份文件失败: {}", error))?;
     if !backup_path.starts_with(&backup_dir)
         || backup_path.extension().and_then(|value| value.to_str()) != Some("zip")
     {
-        return Err("只能操作备份目录内的 ZIP 文件".to_string());
+        return Err(format!("只能操作{}目录内的 ZIP 文件", label));
     }
     Ok(backup_path)
 }
@@ -1455,6 +1687,10 @@ mod tests {
             backup_entry_restore_target("data/accounts.json"),
             Some(switcher_data_dir().join("accounts.json"))
         );
+        assert_eq!(
+            backup_entry_restore_target("data/statistics/usage_logs.json"),
+            Some(switcher_data_dir().join("statistics/usage_logs.json"))
+        );
     }
 
     #[test]
@@ -1500,13 +1736,23 @@ pub fn run() {
             get_codex_switcher_paths,
             export_codex_switcher_backup,
             start_codex_switcher_backup,
+            start_codex_switcher_session_backup,
             list_codex_switcher_backups,
+            list_codex_switcher_session_backups,
             restore_codex_switcher_backup,
+            restore_codex_switcher_session_backup,
             delete_codex_switcher_backup,
             import_codex_switcher_backup,
             refresh_codex_quota,
             refresh_all_codex_quotas,
             consume_codex_reset_credit,
+            codex_get_usage_dashboard,
+            codex_list_model_pricing,
+            codex_update_model_pricing,
+            codex_delete_model_pricing,
+            codex_reset_model_pricing,
+            codex_get_pricing_config,
+            codex_update_pricing_config,
             codex_list_sessions_across_instances,
             codex_get_session_token_stats_across_instances,
             codex_move_sessions_to_trash_across_instances,

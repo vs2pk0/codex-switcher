@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import type { CodexSwitcherSettings } from "../services/codex";
 import type { CodexAccount } from "../types/codex";
 import PlanBadge from "./PlanBadge.vue";
@@ -22,6 +22,7 @@ const emit = defineEmits<{
   (event: "toggle-account", id: string): void;
   (event: "toggle-pin", account: CodexAccount): void;
   (event: "drag-start", account: CodexAccount): void;
+  (event: "drag-end"): void;
   (event: "drop-account", account: CodexAccount): void;
   (event: "open-phone", account: CodexAccount): void;
   (event: "reset-credit", account: CodexAccount): void;
@@ -34,6 +35,8 @@ const emit = defineEmits<{
   (event: "confirm-delete", account: CodexAccount): void;
   (event: "open-add", tab: string): void;
 }>();
+
+const dragOverAccountId = ref("");
 
 const gridClass = computed(() => {
   const columns = [3, 4, 5].includes(props.settings.maxColumns) ? props.settings.maxColumns : 3;
@@ -48,9 +51,30 @@ function isPinned(account: CodexAccount): boolean {
 }
 
 function handleDragStart(event: DragEvent, account: CodexAccount): void {
+  if (props.settings.sortMode !== "custom") return;
   event.dataTransfer?.setData("text/plain", account.id);
   if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
   emit("drag-start", account);
+}
+
+function handleDragOver(event: DragEvent, account: CodexAccount): void {
+  if (props.settings.sortMode !== "custom") return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+  dragOverAccountId.value = account.id;
+}
+
+function handleDrop(event: DragEvent, account: CodexAccount): void {
+  if (props.settings.sortMode !== "custom") return;
+  event.preventDefault();
+  event.stopPropagation();
+  dragOverAccountId.value = "";
+  emit("drop-account", account);
+}
+
+function handleDragEnd(): void {
+  dragOverAccountId.value = "";
+  emit("drag-end");
 }
 
 function isApiKeyAccount(account: CodexAccount): boolean {
@@ -377,12 +401,20 @@ function formatTime(value?: number | null): string {
         v-for="account in accounts"
         :key="account.id"
         class="account-card"
-        :class="{ active: account.id === currentId, pinned: isPinned(account), draggable: settings.sortMode === 'custom' }"
+        :class="{
+          active: account.id === currentId,
+          pinned: isPinned(account),
+          draggable: settings.sortMode === 'custom',
+          'drag-over': dragOverAccountId === account.id,
+        }"
         :bordered="false"
         :draggable="settings.sortMode === 'custom'"
         @dragstart="handleDragStart($event, account)"
-        @dragover.prevent
-        @drop="emit('drop-account', account)"
+        @dragenter="handleDragOver($event, account)"
+        @dragover="handleDragOver($event, account)"
+        @dragleave="dragOverAccountId = ''"
+        @dragend="handleDragEnd"
+        @drop="handleDrop($event, account)"
       >
         <div class="account-head">
           <div class="account-title">
