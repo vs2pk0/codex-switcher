@@ -1,4 +1,5 @@
 mod account;
+mod api_service;
 mod oauth;
 mod session;
 mod usage;
@@ -20,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use usage::{CodexUsageDashboard, CodexUsagePricing, CodexUsagePricingConfig};
 
 #[derive(Debug, Clone, Serialize)]
@@ -922,8 +923,8 @@ fn list_backup_files_in_dir(
     std::fs::create_dir_all(backup_dir)
         .map_err(|error| format!("创建{}目录失败: {}", label, error))?;
     let mut backups = Vec::new();
-    for entry in
-        std::fs::read_dir(backup_dir).map_err(|error| format!("读取{}目录失败: {}", label, error))?
+    for entry in std::fs::read_dir(backup_dir)
+        .map_err(|error| format!("读取{}目录失败: {}", label, error))?
     {
         let path = entry
             .map_err(|error| format!("读取备份文件失败: {}", error))?
@@ -1190,14 +1191,7 @@ where
     progress(30, "正在写入 Codex Switcher 数据...");
     let root = switcher_data_dir();
     let excluded_dirs = vec![switcher_backup_dir(), switcher_session_dir()];
-    add_directory_to_backup_zip(
-        &mut zip,
-        &root,
-        &root,
-        "data",
-        &excluded_dirs,
-        options,
-    )?;
+    add_directory_to_backup_zip(&mut zip, &root, &root, "data", &excluded_dirs, options)?;
     progress(50, "正在写入 Codex 会话记录...");
     add_codex_sessions_to_backup_zip(&mut zip, options, progress)?;
     progress(92, "正在压缩并完成 ZIP...");
@@ -1709,7 +1703,20 @@ mod tests {
 
 pub fn run() {
     tauri::Builder::default()
+        .manage(api_service::ApiServiceProcessState::default())
+        .manage(api_service::ApiServiceDownloadState::default())
         .invoke_handler(tauri::generate_handler![
+            api_service::api_service_state,
+            api_service::api_service_update_settings,
+            api_service::api_service_start,
+            api_service::api_service_stop,
+            api_service::api_service_reset,
+            api_service::api_service_check_update,
+            api_service::api_service_download_update,
+            api_service::api_service_cancel_download,
+            api_service::api_service_bind_accounts,
+            api_service::api_service_list_bound_accounts,
+            api_service::api_service_delete_bound_accounts,
             list_codex_accounts,
             get_current_codex_account,
             import_codex_from_json,
@@ -1762,6 +1769,12 @@ pub fn run() {
             codex_list_session_visibility_repair_instances,
             codex_list_session_visibility_repair_providers,
         ])
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                let process = window.state::<api_service::ApiServiceProcessState>();
+                api_service::shutdown_api_service(process);
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

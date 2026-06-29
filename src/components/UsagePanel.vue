@@ -23,6 +23,12 @@ type UsageTooltipParam = {
 };
 type EChartsCoreApi = typeof import("echarts/core");
 
+const props = withDefaults(defineProps<{
+  active?: boolean;
+}>(), {
+  active: true,
+});
+
 const pageSize = 20;
 const loading = ref(false);
 const pricingLoading = ref(false);
@@ -42,6 +48,7 @@ const pricingList = ref<CodexUsagePricing[]>([]);
 const editingModelId = ref<string | null>(null);
 const pricingConfigs = ref<CodexUsagePricingConfig[]>([]);
 const originalPricingConfigs = ref<CodexUsagePricingConfig[]>([]);
+const lastLoadedAt = ref(0);
 const pricingForm = reactive<CodexUsagePricing>({
   modelId: "",
   displayName: "",
@@ -87,6 +94,8 @@ const isHourlyTrend = computed(() =>
 let chartResizeObserver: ResizeObserver | null = null;
 let echartsApi: EChartsCoreApi | null = null;
 let echartsLoading: Promise<EChartsCoreApi> | null = null;
+let autoRefreshTimer: number | undefined;
+let loadSerial = 0;
 
 function errorText(error: unknown): string {
   return String(error instanceof Error ? error.message : error).replace(/^Error:\s*/, "");
@@ -186,8 +195,14 @@ function resolveRange(): { startDate: number; endDate: number } {
   return { startDate: seconds(start), endDate: seconds(end) };
 }
 
-async function loadUsage(refresh = false): Promise<void> {
-  loading.value = true;
+async function loadUsage(
+  refresh = false,
+  options: { silent?: boolean; notify?: boolean } = {},
+): Promise<void> {
+  const silent = Boolean(options.silent);
+  const notify = options.notify ?? refresh;
+  const serial = ++loadSerial;
+  if (!silent) loading.value = true;
   try {
     const nextDashboard = await getCodexUsageDashboard({
       ...resolveRange(),
@@ -195,16 +210,18 @@ async function loadUsage(refresh = false): Promise<void> {
       pageSize,
       refresh,
     });
+    if (serial !== loadSerial) return;
     dashboard.value = nextDashboard;
+    lastLoadedAt.value = Date.now();
     if (!pricingLoaded.value && nextDashboard.pricingConfigs?.length) {
       pricingConfigs.value = nextDashboard.pricingConfigs;
       originalPricingConfigs.value = nextDashboard.pricingConfigs.map((item) => ({ ...item }));
     }
-    if (refresh) Message.success("消耗数据已刷新");
+    if (refresh && notify && !silent) Message.success("消耗数据已刷新");
   } catch (error) {
-    Message.error(`加载消耗数据失败：${errorText(error)}`);
+    if (!silent) Message.error(`加载消耗数据失败：${errorText(error)}`);
   } finally {
-    loading.value = false;
+    if (serial === loadSerial && !silent) loading.value = false;
   }
 }
 
@@ -254,7 +271,7 @@ function changeRange(next: string | number | boolean): void {
   range.value = next as UsageRange;
   page.value = 1;
   syncPickerToPreset(range.value);
-  void loadUsage(false);
+  void loadUsage(true, { notify: false });
 }
 
 function changeCustomRange(value: unknown): void {
@@ -263,13 +280,13 @@ function changeCustomRange(value: unknown): void {
     range.value = "today";
     page.value = 1;
     syncPickerToPreset("today");
-    void loadUsage(false);
+    void loadUsage(true, { notify: false });
     return;
   }
   range.value = "custom";
   dateRange.value = normalized;
   page.value = 1;
-  void loadUsage(false);
+  void loadUsage(true, { notify: false });
 }
 
 function refreshUsage(): void {
@@ -280,6 +297,40 @@ function refreshUsage(): void {
 function changePage(next: number): void {
   page.value = Math.min(Math.max(1, next), totalPages.value);
   void loadUsage(false);
+}
+
+function shouldAutoRefresh(): boolean {
+  return props.active && range.value === "today" && !loading.value && !pricingModalVisible.value;
+}
+
+function refreshPresetRangeForNow(): void {
+  if (range.value === "today") syncPickerToPreset("today");
+}
+
+function scheduleAutoRefresh(): void {
+  if (autoRefreshTimer) window.clearInterval(autoRefreshTimer);
+  autoRefreshTimer = window.setInterval(() => {
+    if (!shouldAutoRefresh()) return;
+    refreshPresetRangeForNow();
+    void loadUsage(false, { silent: true });
+  }, 20_000);
+}
+
+function refreshWhenVisible(force = false): void {
+  if (loading.value) return;
+  if (!props.active || document.visibilityState === "hidden") return;
+  const stale = Date.now() - lastLoadedAt.value > 5_000;
+  if (!force && !stale) return;
+  refreshPresetRangeForNow();
+  void loadUsage(false, { silent: true });
+}
+
+function handleWindowFocus(): void {
+  refreshWhenVisible();
+}
+
+function handleVisibilityChange(): void {
+  refreshWhenVisible();
 }
 
 function resetPricingForm(): void {
@@ -642,11 +693,24 @@ onMounted(() => {
     void loadUsage(false);
     renderUsageChart();
   }, 0);
+  scheduleAutoRefresh();
+  window.addEventListener("focus", handleWindowFocus);
+  document.addEventListener("visibilitychange", handleVisibilityChange);
 });
 
 watch([trends, isHourlyTrend], renderUsageChart, { deep: true });
 
+watch(
+  () => props.active,
+  (active) => {
+    if (active) refreshWhenVisible(true);
+  },
+);
+
 onBeforeUnmount(() => {
+  if (autoRefreshTimer) window.clearInterval(autoRefreshTimer);
+  window.removeEventListener("focus", handleWindowFocus);
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
   chartResizeObserver?.disconnect();
   chartResizeObserver = null;
   usageChart.value?.dispose();
