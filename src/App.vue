@@ -2228,13 +2228,13 @@ onUnmounted(() => {
           <a-option :value="100">每页 100</a-option>
           <a-option :value="200">每页 200</a-option>
         </a-select>
-        <a-button @click="openBatchExport">
-          <template #icon><icon-download /></template>
-          批量导出
-        </a-button>
         <a-button @click="confirmBindSelectedToApiService">
           <template #icon><icon-link /></template>
           绑定到 API 服务
+        </a-button>
+        <a-button @click="openBatchExport">
+          <template #icon><icon-download /></template>
+          批量导出
         </a-button>
         <a-button @click="openAddModal('token')">
           <template #icon><icon-import /></template>
@@ -3007,65 +3007,78 @@ onUnmounted(() => {
       v-model:visible="bindingVisible"
       title="绑定 OAuth 账号"
       :footer="false"
-      width="620px"
+      width="840px"
     >
       <div class="modal-form">
         <a-typography-paragraph>
           API Key 账号绑定 OAuth 后，切换时会同时写入 OAuth Token 与 API Key 配置，便于修复会话身份。
         </a-typography-paragraph>
-        <a-form :model="bindingForm" layout="vertical">
-          <a-form-item label="OAuth 账号">
-            <a-select
-              v-model="bindingForm.boundOauthAccountId"
-              allow-clear
-              placeholder="选择一个已有 OAuth 账号，清空则解绑"
-            >
-              <a-option
-                v-for="oauth in oauthAccounts"
-                :key="oauth.id"
-                :value="oauth.id"
-                :label="displayNameForUi(oauth)"
-              >
-                <div class="oauth-bind-option">
-                  <div class="oauth-bind-option-head">
-                    <div class="oauth-bind-option-title">
-                      <strong>{{ displayNameForUi(oauth) }}</strong>
-                      <span>OAuth · {{ oauth.email || oauth.id }}</span>
-                    </div>
-                    <PlanBadge :label="planLabel(oauth)" :badge-class="planClass(oauth)" />
-                  </div>
-                  <div v-if="oauth.quota" class="oauth-bind-quota">
-                    <div v-if="oauth.quota.hourly_window_present !== false">
-                      <span>
-                        <icon-calendar v-if="isFreePlanAccount(oauth)" />
-                        <icon-clock-circle v-else />
-                        {{ isFreePlanAccount(oauth) ? "长周期" : "短周期" }}
-                      </span>
-                      <strong :style="{ color: quotaColor(oauth.quota.hourly_percentage) }">
-                        {{ oauth.quota.hourly_percentage }}%
-                      </strong>
-                      <small>{{ quotaWindowLabel(oauth.quota.hourly_window_minutes, '5 小时窗口') }}</small>
-                      <em>{{ quotaResetLabel(oauth.quota.hourly_reset_time) }}</em>
-                    </div>
-                    <div
-                      v-if="!isFreePlanAccount(oauth) && oauth.quota.weekly_window_present !== false"
-                    >
-                      <span><icon-calendar /> 长周期</span>
-                      <strong :style="{ color: quotaColor(oauth.quota.weekly_percentage) }">
-                        {{ oauth.quota.weekly_percentage }}%
-                      </strong>
-                      <small>{{ quotaWindowLabel(oauth.quota.weekly_window_minutes, '7 天窗口') }}</small>
-                      <em>{{ quotaResetLabel(oauth.quota.weekly_reset_time) }}</em>
-                    </div>
-                  </div>
-                  <div v-else-if="oauth.quota_error" class="oauth-bind-quota-error">
-                    {{ oauth.quota_error.message }}
-                  </div>
+        <div class="oauth-bind-list">
+          <button
+            type="button"
+            class="oauth-bind-card unlink"
+            :class="{ selected: !bindingForm.boundOauthAccountId }"
+            @click="bindingForm.boundOauthAccountId = ''"
+          >
+            <span class="oauth-bind-check">
+              <icon-check v-if="!bindingForm.boundOauthAccountId" />
+            </span>
+            <div class="oauth-bind-option-title">
+              <strong>不绑定 OAuth</strong>
+              <span>切换时仅写入 API Key 配置</span>
+            </div>
+          </button>
+
+          <button
+            v-for="oauth in oauthAccounts"
+            :key="oauth.id"
+            type="button"
+            class="oauth-bind-card"
+            :class="{ selected: bindingForm.boundOauthAccountId === oauth.id }"
+            @click="bindingForm.boundOauthAccountId = oauth.id"
+          >
+            <span class="oauth-bind-check">
+              <icon-check v-if="bindingForm.boundOauthAccountId === oauth.id" />
+            </span>
+            <div class="oauth-bind-option">
+              <div class="oauth-bind-option-head">
+                <div class="oauth-bind-option-title">
+                  <strong>{{ displayNameForUi(oauth) }}</strong>
+                  <span>OAuth · {{ oauth.email || oauth.id }}</span>
                 </div>
-              </a-option>
-            </a-select>
-          </a-form-item>
-        </a-form>
+                <PlanBadge :label="planLabel(oauth)" :badge-class="planClass(oauth)" />
+              </div>
+              <div v-if="oauth.quota" class="oauth-bind-quota">
+                <div v-if="oauth.quota.hourly_window_present !== false">
+                  <span>
+                    <icon-calendar v-if="isFreePlanAccount(oauth)" />
+                    <icon-clock-circle v-else />
+                    {{ isFreePlanAccount(oauth) ? "长周期" : "短周期" }}
+                  </span>
+                  <strong :style="{ color: quotaColor(oauth.quota.hourly_percentage) }">
+                    {{ oauth.quota.hourly_percentage }}%
+                  </strong>
+                  <small>{{ quotaWindowLabel(oauth.quota.hourly_window_minutes, '5 小时窗口') }}</small>
+                  <em>{{ quotaResetLabel(oauth.quota.hourly_reset_time) }}</em>
+                </div>
+                <div
+                  v-if="!isFreePlanAccount(oauth) && oauth.quota.weekly_window_present !== false"
+                >
+                  <span><icon-calendar /> 长周期</span>
+                  <strong :style="{ color: quotaColor(oauth.quota.weekly_percentage) }">
+                    {{ oauth.quota.weekly_percentage }}%
+                  </strong>
+                  <small>{{ quotaWindowLabel(oauth.quota.weekly_window_minutes, '7 天窗口') }}</small>
+                  <em>{{ quotaResetLabel(oauth.quota.weekly_reset_time) }}</em>
+                </div>
+              </div>
+              <div v-else-if="oauth.quota_error" class="oauth-bind-quota-error">
+                {{ oauth.quota_error.message }}
+              </div>
+            </div>
+          </button>
+          <a-empty v-if="!oauthAccounts.length" description="暂无可绑定的 OAuth 账号" />
+        </div>
         <div class="form-actions">
           <a-button @click="bindingVisible = false">取消</a-button>
           <a-button type="primary" :loading="savingBinding" @click="handleBindingSave">

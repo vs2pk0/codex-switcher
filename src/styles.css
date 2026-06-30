@@ -627,6 +627,67 @@ textarea {
   gap: 10px;
 }
 
+.oauth-bind-list {
+  display: grid;
+  gap: 10px;
+  max-height: min(56vh, 620px);
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.oauth-bind-card {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  width: 100%;
+  padding: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 8px;
+  color: inherit;
+  background: rgba(248, 250, 252, 0.78);
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.03);
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color 0.16s ease,
+    background 0.16s ease,
+    box-shadow 0.16s ease;
+}
+
+.oauth-bind-card:hover {
+  border-color: rgba(37, 99, 235, 0.38);
+  background: #fff;
+  box-shadow: 0 12px 28px rgba(37, 99, 235, 0.08);
+}
+
+.oauth-bind-card.selected {
+  border-color: rgba(37, 99, 235, 0.72);
+  background: rgba(239, 246, 255, 0.72);
+}
+
+.oauth-bind-card.unlink {
+  align-items: center;
+}
+
+.oauth-bind-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-top: 2px;
+  border: 1px solid rgba(148, 163, 184, 0.36);
+  border-radius: 6px;
+  color: #fff;
+  background: #fff;
+}
+
+.oauth-bind-card.selected .oauth-bind-check {
+  border-color: #2563eb;
+  background: #2563eb;
+}
+
 .oauth-bind-option {
   display: grid;
   gap: 8px;
