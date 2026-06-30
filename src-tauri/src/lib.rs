@@ -660,14 +660,18 @@ fn reset_codex_config_toml() -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn codex_get_usage_dashboard(
+async fn codex_get_usage_dashboard(
     start_date: Option<i64>,
     end_date: Option<i64>,
     page: Option<usize>,
     page_size: Option<usize>,
     refresh: Option<bool>,
 ) -> Result<CodexUsageDashboard, String> {
-    usage::get_codex_usage_dashboard(start_date, end_date, page, page_size, refresh)
+    tauri::async_runtime::spawn_blocking(move || {
+        usage::get_codex_usage_dashboard(start_date, end_date, page, page_size, refresh)
+    })
+    .await
+    .map_err(|error| format!("统计任务执行失败: {}", error))?
 }
 
 #[tauri::command]

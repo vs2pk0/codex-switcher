@@ -53,6 +53,7 @@ const boundAccounts = ref<ApiServiceBoundAccount[]>([]);
 const progress = ref<ApiServiceDownloadProgress | null>(null);
 let unlistenProgress: UnlistenFn | null = null;
 let autoUpdateTimer: number | undefined;
+let progressClearTimer: number | undefined;
 
 const form = reactive({
   port: 17877,
@@ -72,10 +73,35 @@ const canDownloadUpdate = computed(() =>
   Boolean(updateInfo.value?.downloadUrl && (updateInfo.value.hasUpdate || !updateInfo.value.latestInstalled)),
 );
 const progressPercent = computed(() => {
+  const status = progress.value?.status;
+  if (status === "done") return 1;
+  if (status === "installing") return 0.96;
+  if (status === "starting") return 0.06;
   const total = progress.value?.totalBytes || 0;
   const downloaded = progress.value?.downloadedBytes || 0;
-  if (!total) return downloading.value ? 0.08 : 0;
-  return Math.max(0.02, Math.min(1, downloaded / total));
+  if (!total) {
+    if (!downloading.value) return 0;
+    if (downloaded <= 0) return 0.12;
+    const downloadedMb = downloaded / 1024 / 1024;
+    return Math.min(0.88, 0.12 + Math.log2(downloadedMb + 1) * 0.12);
+  }
+  return Math.max(0.08, Math.min(0.94, downloaded / total));
+});
+const progressStatus = computed(() => {
+  if (progress.value?.status === "failed") return "danger";
+  if (progress.value?.status === "done") return "success";
+  return "normal";
+});
+const progressDetail = computed(() => {
+  if (!progress.value) return "";
+  const total = progress.value.totalBytes || 0;
+  const downloaded = progress.value.downloadedBytes || 0;
+  if (progress.value.status === "installing") return "安装中";
+  if (progress.value.status === "done") return "100%";
+  if (progress.value.status === "failed") return "失败";
+  if (progress.value.status === "cancelled") return "已取消";
+  if (!total) return downloaded > 0 ? `${formatBytes(downloaded)} · 正在下载` : "准备中";
+  return `${formatBytes(downloaded)} / ${formatBytes(total)}`;
 });
 const serviceStatusText = computed(() => {
   if (running.value) return `运行中 · PID ${state.value?.service.pid || "--"}`;
@@ -530,6 +556,10 @@ async function checkUpdate(): Promise<void> {
 }
 
 async function downloadUpdate(): Promise<void> {
+  if (progressClearTimer) {
+    window.clearTimeout(progressClearTimer);
+    progressClearTimer = undefined;
+  }
   downloading.value = true;
   progress.value = {
     status: "starting",
@@ -543,8 +573,24 @@ async function downloadUpdate(): Promise<void> {
     syncForm(next);
     scheduleAutoUpdate();
     updateInfo.value = await checkApiServiceUpdate().catch(() => updateInfo.value);
+    if (progress.value?.status !== "done") {
+      progress.value = {
+        status: "done",
+        assetName: progress.value?.assetName || updateInfo.value?.assetName || "",
+        downloadedBytes: 1,
+        totalBytes: 1,
+        message: next.service.running ? "API 服务已更新并重新启动" : "API 服务更新已安装",
+      };
+    }
     Message.success("API 服务更新已安装");
   } catch (error) {
+    progress.value = {
+      status: errorText(error).includes("下载已取消") ? "cancelled" : "failed",
+      assetName: progress.value?.assetName || updateInfo.value?.assetName || "",
+      downloadedBytes: progress.value?.downloadedBytes || 0,
+      totalBytes: progress.value?.totalBytes || null,
+      message: errorText(error).includes("下载已取消") ? "下载已取消" : errorText(error),
+    };
     if (errorText(error).includes("下载已取消")) {
       Message.info("下载已取消");
     } else {
@@ -552,6 +598,9 @@ async function downloadUpdate(): Promise<void> {
     }
   } finally {
     downloading.value = false;
+    if (progress.value?.status === "done" || progress.value?.status === "cancelled") {
+      clearProgressLater();
+    }
   }
 }
 
@@ -561,6 +610,14 @@ async function cancelDownload(): Promise<void> {
   } catch (error) {
     Message.error(`取消失败：${errorText(error)}`);
   }
+}
+
+function clearProgressLater(delay = 1200): void {
+  if (progressClearTimer) window.clearTimeout(progressClearTimer);
+  progressClearTimer = window.setTimeout(() => {
+    progress.value = null;
+    progressClearTimer = undefined;
+  }, delay);
 }
 
 function addApiKey(): void {
@@ -646,8 +703,15 @@ onMounted(async () => {
   unlistenProgress = await listen<ApiServiceDownloadProgress>(
     API_SERVICE_DOWNLOAD_PROGRESS_EVENT,
     (event) => {
+      if (progressClearTimer) {
+        window.clearTimeout(progressClearTimer);
+        progressClearTimer = undefined;
+      }
       progress.value = event.payload;
       downloading.value = ["starting", "downloading", "installing"].includes(event.payload.status);
+      if (["done", "cancelled"].includes(event.payload.status)) {
+        clearProgressLater();
+      }
     },
   );
   await refreshState();
@@ -656,6 +720,7 @@ onMounted(async () => {
 onUnmounted(() => {
   unlistenProgress?.();
   if (autoUpdateTimer) window.clearTimeout(autoUpdateTimer);
+  if (progressClearTimer) window.clearTimeout(progressClearTimer);
 });
 </script>
 
@@ -704,11 +769,10 @@ onUnmounted(() => {
                 <strong>{{ progress.message || (downloading ? "正在处理服务包" : "下载状态") }}</strong>
                 <span>
                   {{ progress.assetName || "CLIProxyAPI" }}
-                  · {{ formatBytes(progress.downloadedBytes) }}
-                  <template v-if="progress.totalBytes"> / {{ formatBytes(progress.totalBytes) }}</template>
+                  · {{ progressDetail }}
                 </span>
               </div>
-              <a-progress :percent="progressPercent" />
+              <a-progress :percent="progressPercent" :status="progressStatus" />
               <a-button v-if="downloading" size="small" @click="cancelDownload">取消下载</a-button>
             </div>
 

@@ -269,12 +269,41 @@ pub fn api_service_download_update(
     download: State<'_, ApiServiceDownloadState>,
 ) -> Result<ApiServiceState, String> {
     let was_running = service_pid_for_state(&process)?.is_some();
-    download_latest_runtime(&app, &process, &download, true)?;
     if was_running {
+        emit_download_progress(
+            &app,
+            "starting",
+            "",
+            0,
+            None,
+            Some("正在停止 API 服务以更新"),
+        )?;
         stop_service_impl(&process)?;
-        return start_service_impl(&app, &process, &download);
     }
-    build_state(&process)
+    if let Err(error) = download_latest_runtime(&app, &process, &download, true) {
+        if was_running {
+            let _ = mark_update_check_attempted();
+            let _ = start_service_impl(&app, &process, &download);
+        }
+        return Err(error);
+    }
+    let next = if was_running {
+        let next = start_service_impl(&app, &process, &download)?;
+        emit_download_progress(
+            &app,
+            "done",
+            "",
+            1,
+            Some(1),
+            Some("API 服务已更新并重新启动"),
+        )?;
+        next
+    } else {
+        let next = build_state(&process)?;
+        emit_download_progress(&app, "done", "", 1, Some(1), Some("API 服务更新已安装"))?;
+        next
+    };
+    Ok(next)
 }
 
 #[tauri::command]
@@ -486,6 +515,13 @@ fn should_auto_update(
     Ok(now.saturating_sub(last) >= interval && !list_runtimes(dirs)?.is_empty())
 }
 
+fn mark_update_check_attempted() -> Result<(), String> {
+    let dirs = ApiServiceDirs::new()?;
+    let mut settings = read_settings(&dirs)?;
+    settings.last_update_check_at = Some(unix_timestamp()?);
+    write_settings(&dirs, &settings)
+}
+
 fn download_latest_runtime(
     app: &AppHandle,
     process: &State<'_, ApiServiceProcessState>,
@@ -516,8 +552,8 @@ fn download_latest_runtime(
             app,
             "installing",
             &asset_name,
-            0,
-            None,
+            1,
+            Some(1),
             Some("正在安装 API 服务"),
         )?;
         let install_result = install_runtime_package(&dirs, &package_path, activate);
@@ -1374,7 +1410,23 @@ fn listener_pid_on_port(port: u16) -> Result<Option<u32>, String> {
     Ok(None)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn listener_pid_on_port(port: u16) -> Result<Option<u32>, String> {
+    let script = format!(
+        "$c = Get-NetTCPConnection -LocalPort {} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -ne $c) {{ [Console]::Out.Write($c.OwningProcess) }}",
+        port
+    );
+    if let Ok(output) = windows_powershell_output(&script, "检查端口监听失败") {
+        if output.status.success() {
+            if let Ok(pid) = String::from_utf8_lossy(&output.stdout).trim().parse::<u32>() {
+                return Ok(Some(pid));
+            }
+        }
+    }
+    listener_pid_on_port_with_netstat(port)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn listener_pid_on_port(_port: u16) -> Result<Option<u32>, String> {
     Ok(None)
 }
@@ -1394,7 +1446,21 @@ fn pid_command(pid: u32) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn pid_command(pid: u32) -> Option<String> {
+    let script = format!(
+        "$p = Get-CimInstance Win32_Process -Filter \"ProcessId = {}\" -ErrorAction SilentlyContinue; if ($null -ne $p) {{ [Console]::Out.Write($p.CommandLine) }}",
+        pid
+    );
+    let output = windows_powershell_output(&script, "读取进程命令失败").ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!command.is_empty()).then_some(command)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn pid_command(_pid: u32) -> Option<String> {
     None
 }
@@ -1417,7 +1483,20 @@ fn pid_is_running(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn pid_is_running(pid: u32) -> bool {
+    let script = format!(
+        "if (Get-Process -Id {} -ErrorAction SilentlyContinue) {{ [Console]::Out.Write('1') }}",
+        pid
+    );
+    windows_powershell_output(&script, "检查进程状态失败")
+        .ok()
+        .is_some_and(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1"
+        })
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn pid_is_running(_pid: u32) -> bool {
     false
 }
@@ -1449,9 +1528,77 @@ fn terminate_pid(pid: u32) -> Result<(), String> {
         .ok_or_else(|| format!("强制停止 API 服务失败: kill -KILL {}", pid))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn terminate_pid(pid: u32) -> Result<(), String> {
+    let pid_text = pid.to_string();
+    let mut command = Command::new("taskkill");
+    command.args(["/PID", &pid_text, "/T", "/F"]);
+    hide_command_window(&mut command);
+    let status = command
+        .status()
+        .map_err(|error| format!("停止 API 服务失败: {}", error))?;
+    if !status.success() && pid_is_running(pid) {
+        return Err(format!("停止 API 服务失败: taskkill /PID {}", pid));
+    }
+    for _ in 0..20 {
+        if !pid_is_running(pid) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!("停止 API 服务超时: PID {}", pid))
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn terminate_pid(_pid: u32) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_powershell_output(
+    script: &str,
+    error_context: &str,
+) -> Result<std::process::Output, String> {
+    let mut command = Command::new("powershell");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"])
+        .arg(script);
+    hide_command_window(&mut command);
+    command
+        .output()
+        .map_err(|error| format!("{}: {}", error_context, error))
+}
+
+#[cfg(windows)]
+fn listener_pid_on_port_with_netstat(port: u16) -> Result<Option<u32>, String> {
+    let mut command = Command::new("netstat");
+    command.args(["-ano", "-p", "TCP"]);
+    hide_command_window(&mut command);
+    let output = command
+        .output()
+        .map_err(|error| format!("检查端口监听失败: {}", error))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let parts = line.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 5 || !parts[0].eq_ignore_ascii_case("TCP") {
+            continue;
+        }
+        if !parts[3].eq_ignore_ascii_case("LISTENING") || !address_matches_port(parts[1], port) {
+            continue;
+        }
+        if let Ok(pid) = parts[4].parse::<u32>() {
+            return Ok(Some(pid));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn address_matches_port(address: &str, port: u16) -> bool {
+    let expected = format!(":{}", port);
+    address.ends_with(&expected) || address.ends_with(&format!("]:{}", port))
 }
 
 #[cfg(windows)]

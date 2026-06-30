@@ -95,6 +95,7 @@ let chartResizeObserver: ResizeObserver | null = null;
 let echartsApi: EChartsCoreApi | null = null;
 let echartsLoading: Promise<EChartsCoreApi> | null = null;
 let autoRefreshTimer: number | undefined;
+let activationRefreshTimer: number | undefined;
 let loadSerial = 0;
 
 function errorText(error: unknown): string {
@@ -314,6 +315,14 @@ function scheduleAutoRefresh(): void {
     refreshPresetRangeForNow();
     void loadUsage(false, { silent: true });
   }, 20_000);
+}
+
+function scheduleActivationRefresh(delay = 280): void {
+  if (activationRefreshTimer) window.clearTimeout(activationRefreshTimer);
+  activationRefreshTimer = window.setTimeout(() => {
+    activationRefreshTimer = undefined;
+    window.requestAnimationFrame(() => refreshWhenVisible(true));
+  }, delay);
 }
 
 function refreshWhenVisible(force = false): void {
@@ -692,7 +701,7 @@ onMounted(() => {
   window.setTimeout(() => {
     void loadUsage(false);
     renderUsageChart();
-  }, 0);
+  }, props.active ? 120 : 0);
   scheduleAutoRefresh();
   window.addEventListener("focus", handleWindowFocus);
   document.addEventListener("visibilitychange", handleVisibilityChange);
@@ -703,12 +712,18 @@ watch([trends, isHourlyTrend], renderUsageChart, { deep: true });
 watch(
   () => props.active,
   (active) => {
-    if (active) refreshWhenVisible(true);
+    if (active) {
+      scheduleActivationRefresh();
+    } else if (activationRefreshTimer) {
+      window.clearTimeout(activationRefreshTimer);
+      activationRefreshTimer = undefined;
+    }
   },
 );
 
 onBeforeUnmount(() => {
   if (autoRefreshTimer) window.clearInterval(autoRefreshTimer);
+  if (activationRefreshTimer) window.clearTimeout(activationRefreshTimer);
   window.removeEventListener("focus", handleWindowFocus);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   chartResizeObserver?.disconnect();
