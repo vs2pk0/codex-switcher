@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import AccountList from "./components/AccountList.vue";
@@ -70,9 +71,10 @@ import {
 } from "./services/session";
 import type { CodexAccount } from "./types/codex";
 
-type ActiveView = "accounts" | "sessions" | "usage" | "apiService" | "settings";
+type ActiveView = "accounts" | "sessions" | "usage" | "apiService" | "settings" | "about";
 
 const activeView = ref<ActiveView>("accounts");
+const appVersion = ref("0.1.0");
 const usagePanelMounted = ref(false);
 const accounts = ref<CodexAccount[]>([]);
 const currentAccount = ref<CodexAccount | null>(null);
@@ -88,8 +90,11 @@ const sortDraftDraggingId = ref("");
 const sortDraftOverId = ref("");
 const currentPage = ref(1);
 let quotaTimer: number | undefined;
+let currentAccountQuotaTimer: number | undefined;
 let quotaCountdownTimer: number | undefined;
+let countdownSettingsPersistTimer: number | undefined;
 const nextQuotaRefreshAt = ref(0);
+const nextCurrentAccountRefreshAt = ref(0);
 const nowMs = ref(Date.now());
 const addModalVisible = ref(false);
 const badgeStyleVisible = ref(false);
@@ -124,6 +129,8 @@ const settings = reactive<CodexSwitcherSettings>({
   monitorQuota: false,
   quotaRefreshMinutes: 10,
   currentAccountRefreshMinutes: 10,
+  quotaNextRefreshAt: 0,
+  currentAccountNextRefreshAt: 0,
   sortMode: "created_at",
   sortDirection: "desc",
   customOrder: [],
@@ -380,13 +387,92 @@ const editTitle = computed(() => {
 });
 const quotaRefreshCountdown = computed(() => {
   if (!settings.monitorQuota || !settings.showQuotaCountdowns || !nextQuotaRefreshAt.value) return "";
-  const remaining = Math.max(0, nextQuotaRefreshAt.value - nowMs.value);
-  const totalSeconds = Math.ceil(remaining / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+  return formatCountdown(nextQuotaRefreshAt.value - nowMs.value);
+});
+const currentAccountRefreshCountdown = computed(() => {
+  if (
+    !settings.monitorQuota ||
+    !settings.showQuotaCountdowns ||
+    !currentAccount.value ||
+    !canShowQuota(currentAccount.value) ||
+    !nextCurrentAccountRefreshAt.value
+  ) {
+    return "";
+  }
+  return formatCountdown(nextCurrentAccountRefreshAt.value - nowMs.value);
 });
 const showSortDirection = computed(() => quotaSortModes.has(settings.sortMode));
+
+function clampRefreshMinutes(value: unknown, fallback = 10): number {
+  const minutes = Number(value);
+  if (!Number.isFinite(minutes)) return fallback;
+  return Math.max(1, Math.min(1440, Math.round(minutes)));
+}
+
+function normalizedNextRefreshAt(value: unknown, minutes: number): number {
+  const intervalMs = clampRefreshMinutes(minutes) * 60_000;
+  const parsed = Number(value || 0);
+  const now = Date.now();
+  if (Number.isFinite(parsed) && parsed > now && parsed - now <= intervalMs) {
+    return Math.floor(parsed);
+  }
+  return now + intervalMs;
+}
+
+function scheduleCountdownSettingsPersist(): void {
+  if (countdownSettingsPersistTimer) {
+    window.clearTimeout(countdownSettingsPersistTimer);
+  }
+  countdownSettingsPersistTimer = window.setTimeout(() => {
+    countdownSettingsPersistTimer = undefined;
+    void updateCodexSwitcherSettings({
+      ...settings,
+      badgeStyles: {
+        ...defaultBadgeStyles(),
+        ...settings.badgeStyles,
+      },
+      sortDirection: settings.sortDirection === "asc" ? "asc" : "desc",
+      pinnedAccountIds: settings.pinnedAccountIds || [],
+      accountTypeFilter: settings.accountTypeFilter || "all",
+      pageSize: Math.max(1, Number(settings.pageSize || 50)),
+      quotaRefreshMinutes: clampRefreshMinutes(settings.quotaRefreshMinutes),
+      currentAccountRefreshMinutes: clampRefreshMinutes(settings.currentAccountRefreshMinutes),
+      quotaNextRefreshAt: settings.monitorQuota ? Math.floor(settings.quotaNextRefreshAt || 0) : 0,
+      currentAccountNextRefreshAt: settings.monitorQuota
+        ? Math.floor(settings.currentAccountNextRefreshAt || 0)
+        : 0,
+      showQuotaCountdowns: settings.showQuotaCountdowns ?? true,
+      maxColumns: [3, 4, 5].includes(settings.maxColumns) ? settings.maxColumns : 3,
+    }).catch(() => {
+      // 倒计时缓存失败不影响主流程，下一次正常保存设置会带上最新时间。
+    });
+  }, 300);
+}
+
+function setQuotaNextRefreshAt(value: number, persist = true): void {
+  const next = Math.max(0, Math.floor(value || 0));
+  nextQuotaRefreshAt.value = next;
+  settings.quotaNextRefreshAt = next;
+  if (persist) scheduleCountdownSettingsPersist();
+}
+
+function setCurrentAccountNextRefreshAt(value: number, persist = true): void {
+  const next = Math.max(0, Math.floor(value || 0));
+  nextCurrentAccountRefreshAt.value = next;
+  settings.currentAccountNextRefreshAt = next;
+  if (persist) scheduleCountdownSettingsPersist();
+}
+
+function formatCountdown(remainingMs: number): string {
+  const totalSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  }
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
 
 function isApiKeyAccount(account: CodexAccount): boolean {
   return account.auth_mode === "apikey" || Boolean(account.openai_api_key || account.openaiApiKey);
@@ -414,6 +500,12 @@ function displayNameForUi(account: CodexAccount): string {
   return privacyMasked.value ? maskDisplayText(name) : name;
 }
 
+function quotaErrorLabel(account: CodexAccount): string {
+  if (account.quota_error?.code === "token_expired") return "Token 失效";
+  if (account.quota_error) return "额度异常";
+  return "";
+}
+
 function boundOAuthName(account: CodexAccount): string {
   const bound = boundOAuthAccount(account);
   return bound ? displayName(bound) : "未绑定";
@@ -425,14 +517,17 @@ function boundOAuthAccount(account: CodexAccount): CodexAccount | undefined {
   return accounts.value.find((item) => item.id === boundId);
 }
 
+function isBoundApiKeyAccount(account: CodexAccount): boolean {
+  return isApiKeyAccount(account) && Boolean(account.bound_oauth_account_id);
+}
+
 function sessionGroupKey(session: CodexSessionRecord): string {
   return session.projectName || "未归属项目";
 }
 
 function canShowQuota(account: CodexAccount): boolean {
   if (!settings.monitorQuota) return false;
-  if (!isApiKeyAccount(account)) return true;
-  return Boolean(boundOAuthAccount(account));
+  return !isApiKeyAccount(account);
 }
 
 function shouldShowQuota(account: CodexAccount): boolean {
@@ -484,6 +579,7 @@ function jwtAuthClaim(token: string | undefined, claim: string): string | undefi
 }
 
 function accountStatusSource(account: CodexAccount): CodexAccount {
+  if (isBoundApiKeyAccount(account)) return account;
   return account.subscription_active_until ||
     account.access_token_expires_at ||
     jwtAuthClaim(account.tokens.id_token, "chatgpt_subscription_active_until") ||
@@ -652,11 +748,7 @@ function collapsedJsonPreview(value: unknown, depth = 0): string {
     if (!entries.length) return "{}";
     const visibleEntries = entries.slice(0, 8);
     const previewEntries = visibleEntries.map(([key, item], index) => {
-      const suffix = Array.isArray(item)
-        ? `[${item.length} items]`
-        : item && typeof item === "object"
-          ? "{...}"
-          : JSON.stringify(item) ?? "null";
+      const suffix = collapsedJsonEntryPreview(key, item, depth + 1);
       const comma = index < visibleEntries.length - 1 || entries.length > 8 ? "," : "";
       return `${nextIndent}"${key}": ${suffix}${comma}`;
     });
@@ -664,6 +756,22 @@ function collapsedJsonPreview(value: unknown, depth = 0): string {
     return ["{", ...previewEntries, ...rest, `${indent}}`].join("\n");
   }
   return JSON.stringify(value);
+}
+
+function collapsedJsonEntryPreview(key: string, value: unknown, depth: number): string {
+  if (Array.isArray(value)) {
+    if (key === "accounts") return collapsedJsonPreview(value, depth);
+    return `[${value.length} items]`;
+  }
+  if (value && typeof value === "object") {
+    const objectValue = value as Record<string, unknown>;
+    const previewKeys = ["email", "account_name", "name", "auth_mode", "api_provider_name"];
+    const previewEntries = previewKeys
+      .filter((previewKey) => objectValue[previewKey] !== undefined)
+      .map((previewKey) => `"${previewKey}": ${JSON.stringify(objectValue[previewKey])}`);
+    return previewEntries.length ? `{ ${previewEntries.join(", ")} }` : "{...}";
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 function maskSensitiveJson(value: unknown): unknown {
@@ -821,6 +929,10 @@ async function loadSettings(): Promise<void> {
       pinnedAccountIds: nextSettings.pinnedAccountIds || [],
       accountTypeFilter: nextSettings.accountTypeFilter || "all",
       pageSize: Math.max(1, Number(nextSettings.pageSize || 50)),
+      quotaRefreshMinutes: clampRefreshMinutes(nextSettings.quotaRefreshMinutes),
+      currentAccountRefreshMinutes: clampRefreshMinutes(nextSettings.currentAccountRefreshMinutes),
+      quotaNextRefreshAt: Number(nextSettings.quotaNextRefreshAt || 0),
+      currentAccountNextRefreshAt: Number(nextSettings.currentAccountNextRefreshAt || 0),
       showQuotaCountdowns: nextSettings.showQuotaCountdowns ?? true,
       maxColumns: [3, 4, 5].includes(nextSettings.maxColumns) ? nextSettings.maxColumns : 3,
     });
@@ -869,6 +981,12 @@ async function saveSettings(): Promise<void> {
       pinnedAccountIds: settings.pinnedAccountIds || [],
       accountTypeFilter: settings.accountTypeFilter || "all",
       pageSize: Math.max(1, Number(settings.pageSize || 50)),
+      quotaRefreshMinutes: clampRefreshMinutes(settings.quotaRefreshMinutes),
+      currentAccountRefreshMinutes: clampRefreshMinutes(settings.currentAccountRefreshMinutes),
+      quotaNextRefreshAt: settings.monitorQuota ? Math.floor(settings.quotaNextRefreshAt || 0) : 0,
+      currentAccountNextRefreshAt: settings.monitorQuota
+        ? Math.floor(settings.currentAccountNextRefreshAt || 0)
+        : 0,
       showQuotaCountdowns: settings.showQuotaCountdowns ?? true,
       maxColumns: [3, 4, 5].includes(settings.maxColumns) ? settings.maxColumns : 3,
     });
@@ -882,20 +1000,74 @@ async function saveSettings(): Promise<void> {
   }
 }
 
-function resetQuotaTimer(): void {
+function resetCurrentAccountQuotaTimer(forceNew = false): void {
+  if (currentAccountQuotaTimer) {
+    window.clearTimeout(currentAccountQuotaTimer);
+    currentAccountQuotaTimer = undefined;
+  }
+  const storedNextAt = settings.currentAccountNextRefreshAt;
+  setCurrentAccountNextRefreshAt(0, false);
+  if (!settings.monitorQuota || !currentAccount.value || !canShowQuota(currentAccount.value)) return;
+  const minutes = clampRefreshMinutes(settings.currentAccountRefreshMinutes);
+  const nextAt = forceNew
+    ? Date.now() + minutes * 60_000
+    : normalizedNextRefreshAt(storedNextAt, minutes);
+  setCurrentAccountNextRefreshAt(nextAt);
+  currentAccountQuotaTimer = window.setTimeout(() => {
+    void handleRefreshCurrentQuota(false).finally(() => {
+      if (settings.monitorQuota && currentAccount.value) {
+        resetCurrentAccountQuotaTimer(true);
+      }
+    });
+  }, Math.max(1_000, nextAt - Date.now()));
+}
+
+function resetQuotaTimer(forceNew = false): void {
   if (quotaTimer) {
-    window.clearInterval(quotaTimer);
+    window.clearTimeout(quotaTimer);
     quotaTimer = undefined;
   }
-  nextQuotaRefreshAt.value = 0;
-  if (!settings.monitorQuota) return;
-  const minutes = Math.max(1, settings.quotaRefreshMinutes || 10);
-  nextQuotaRefreshAt.value = Date.now() + minutes * 60_000;
-  quotaTimer = window.setInterval(() => {
+  const storedNextAt = settings.quotaNextRefreshAt;
+  setQuotaNextRefreshAt(0, false);
+  if (!settings.monitorQuota) {
+    resetCurrentAccountQuotaTimer();
+    return;
+  }
+  const minutes = clampRefreshMinutes(settings.quotaRefreshMinutes);
+  const nextAt = forceNew
+    ? Date.now() + minutes * 60_000
+    : normalizedNextRefreshAt(storedNextAt, minutes);
+  setQuotaNextRefreshAt(nextAt);
+  quotaTimer = window.setTimeout(() => {
     void handleRefreshAllQuotas(false).finally(() => {
-      nextQuotaRefreshAt.value = Date.now() + minutes * 60_000;
+      if (settings.monitorQuota) {
+        resetQuotaTimer(true);
+      }
     });
-  }, minutes * 60_000);
+  }, Math.max(1_000, nextAt - Date.now()));
+  resetCurrentAccountQuotaTimer();
+}
+
+async function handleRefreshCurrentQuota(showMessage = true): Promise<void> {
+  if (!settings.monitorQuota || !currentAccount.value || !canShowQuota(currentAccount.value)) {
+    return;
+  }
+  const accountId = currentAccount.value.id;
+  quotaRefreshingId.value = accountId;
+  try {
+    const updated = await refreshCodexQuota(accountId);
+    currentAccount.value = updated;
+    await loadAccounts();
+    setCurrentAccountNextRefreshAt(
+      Date.now() + clampRefreshMinutes(settings.currentAccountRefreshMinutes) * 60_000,
+    );
+    if (showMessage) Message.success("当前账号额度已刷新");
+  } catch (error) {
+    await loadAccounts();
+    if (showMessage) Message.warning(`当前账号额度刷新失败：${errorText(error)}`);
+  } finally {
+    quotaRefreshingId.value = "";
+  }
 }
 
 async function handleRefreshQuota(account: CodexAccount): Promise<void> {
@@ -951,8 +1123,7 @@ async function handleRefreshAllQuotas(showMessage = true): Promise<void> {
     }
     await loadAccounts();
     if (settings.monitorQuota) {
-      nextQuotaRefreshAt.value =
-        Date.now() + Math.max(1, settings.quotaRefreshMinutes || 10) * 60_000;
+      setQuotaNextRefreshAt(Date.now() + clampRefreshMinutes(settings.quotaRefreshMinutes) * 60_000);
     }
     if (showMessage) Message.success(`已刷新当前页 ${candidates.length} 个账号额度`);
   } catch (error) {
@@ -1385,10 +1556,25 @@ function openOAuthUrl(): void {
   });
 }
 
+async function startOrOpenOAuthUrl(): Promise<void> {
+  if (!oauthUrl.value) {
+    await prepareOAuthLogin();
+  }
+  if (oauthUrl.value) {
+    openOAuthUrl();
+  }
+}
+
 function openOfficialUrl(url: string): void {
   if (!url.trim()) return;
   void openExternalUrl(url.trim()).catch((error) => {
     Message.error(`打开官网失败：${errorText(error)}`);
+  });
+}
+
+function openGithubProfile(): void {
+  void openExternalUrl("https://github.com/vs2pk0").catch((error) => {
+    Message.error(`打开 GitHub 失败：${errorText(error)}`);
   });
 }
 
@@ -1434,7 +1620,7 @@ async function handleOAuthCallbackSubmit(): Promise<void> {
   }
 }
 
-function openEdit(account: CodexAccount): void {
+async function openEdit(account: CodexAccount): Promise<void> {
   editingAccount.value = account;
   editTab.value = "form";
   editJsonText.value = JSON.stringify(account, null, 2);
@@ -1444,6 +1630,20 @@ function openEdit(account: CodexAccount): void {
   editForm.apiProviderName = account.api_provider_name ?? account.apiProviderName ?? "OpenAI Official";
   editForm.apiOfficialUrl = account.api_official_url ?? account.apiOfficialUrl ?? "";
   editVisible.value = true;
+  try {
+    editJsonText.value = await exportCodexAccounts([account.id], "cockpit_tools");
+  } catch (error) {
+    Message.warning(`读取完整 JSON 失败，已使用当前缓存：${errorText(error)}`);
+  }
+}
+
+function hasPreviewJsonPlaceholders(value: string): boolean {
+  return (
+    /\/\*\s*\.\.\./.test(value) ||
+    /\{\s*\.\.\.\s*\}/.test(value) ||
+    /\[\d+\s+items\]/.test(value) ||
+    /"\s*[^"]*\*{3,}[^"]*"\s*/.test(value)
+  );
 }
 
 async function handleEditSave(): Promise<void> {
@@ -1454,6 +1654,10 @@ async function handleEditSave(): Promise<void> {
   }
   if (editTab.value === "json" && !editJsonText.value.trim()) {
     Message.error("JSON 不能为空");
+    return;
+  }
+  if (editTab.value === "json" && hasPreviewJsonPlaceholders(editJsonText.value)) {
+    Message.error("当前内容像是预览 JSON，包含省略或隐藏字段，请粘贴完整 JSON 后保存");
     return;
   }
   editing.value = true;
@@ -2075,10 +2279,22 @@ watch(switchRepairVisible, (visible) => {
   if (!visible) clearSwitchRepairCloseTimer();
 });
 
+watch(
+  () => currentAccount.value?.id,
+  () => {
+    resetCurrentAccountQuotaTimer();
+  },
+);
+
 onMounted(() => {
   quotaCountdownTimer = window.setInterval(() => {
     nowMs.value = Date.now();
   }, 1000);
+  void getVersion()
+    .then((version) => {
+      if (version) appVersion.value = version;
+    })
+    .catch(() => undefined);
   void syncExpandedLayout();
   window.addEventListener("resize", handleWindowResize);
   void loadAccounts();
@@ -2109,8 +2325,10 @@ onUnmounted(() => {
   window.removeEventListener("pointerup", handleSortDraftPointerEnd);
   window.removeEventListener("pointercancel", handleSortDraftPointerEnd);
   clearSwitchRepairCloseTimer();
-  if (quotaTimer) window.clearInterval(quotaTimer);
+  if (quotaTimer) window.clearTimeout(quotaTimer);
+  if (currentAccountQuotaTimer) window.clearTimeout(currentAccountQuotaTimer);
   if (quotaCountdownTimer) window.clearInterval(quotaCountdownTimer);
+  if (countdownSettingsPersistTimer) window.clearTimeout(countdownSettingsPersistTimer);
 });
 </script>
 
@@ -2128,6 +2346,9 @@ onUnmounted(() => {
       <a-tag color="green">OAuth {{ oauthCount }}</a-tag>
       <a-tag color="orange">API Key {{ apiKeyCount }}</a-tag>
       <span v-if="currentAccount">当前：{{ displayNameForUi(currentAccount) }}</span>
+      <a-tag v-if="currentAccount && quotaErrorLabel(currentAccount)" color="red">
+        {{ quotaErrorLabel(currentAccount) }}
+      </a-tag>
     </section>
 
     <section class="command-bar">
@@ -2150,6 +2371,10 @@ onUnmounted(() => {
         <a-button :type="activeView === 'settings' ? 'primary' : 'secondary'" @click="switchView('settings')">
           <template #icon><icon-settings /></template>
           设置
+        </a-button>
+        <a-button :type="activeView === 'about' ? 'primary' : 'secondary'" @click="switchView('about')">
+          <template #icon><icon-info-circle /></template>
+          关于
         </a-button>
       </div>
       <div v-if="activeView === 'accounts'" class="command-actions">
@@ -2241,9 +2466,17 @@ onUnmounted(() => {
           批量导入
         </a-button>
       </div>
-      <span v-if="quotaRefreshCountdown" class="quota-countdown">
-        下次刷新 {{ quotaRefreshCountdown }}
-      </span>
+      <div
+        v-if="currentAccountRefreshCountdown || quotaRefreshCountdown"
+        class="quota-countdown-group"
+      >
+        <span v-if="currentAccountRefreshCountdown" class="quota-countdown primary">
+          当前账号 {{ currentAccountRefreshCountdown }}
+        </span>
+        <span v-if="quotaRefreshCountdown" class="quota-countdown">
+          当前页 {{ quotaRefreshCountdown }}
+        </span>
+      </div>
     </section>
 
     <AccountList
@@ -2289,7 +2522,7 @@ onUnmounted(() => {
     <a-modal
       v-model:visible="sortEditorVisible"
       title="编辑账号顺序"
-      width="760px"
+      width="820px"
       :footer="false"
       @cancel="closeSortEditor"
     >
@@ -2568,6 +2801,32 @@ onUnmounted(() => {
       @delete-backup="handleDeleteBackup"
     />
 
+    <section v-if="activeView === 'about'" class="about-panel">
+      <a-card class="about-card" :bordered="false">
+        <div class="about-hero">
+          <span class="about-eyebrow">About</span>
+          <h2>Codex Switcher</h2>
+          <p>本地管理 Codex OAuth 与 API Key 登录态，支持账号切换、会话维护、使用统计和本地 API 服务。</p>
+        </div>
+        <div class="about-grid">
+          <div class="about-metric">
+            <span>当前版本</span>
+            <strong>v{{ appVersion }}</strong>
+          </div>
+          <div class="about-metric">
+            <span>项目主页</span>
+            <strong>GitHub</strong>
+          </div>
+        </div>
+        <div class="about-actions">
+          <a-button type="primary" @click="openGithubProfile">
+            <template #icon><icon-link /></template>
+            打开 GitHub 主页
+          </a-button>
+        </div>
+      </a-card>
+    </section>
+
     <a-modal
       v-model:visible="sessionRestoreVisible"
       title="恢复会话数据"
@@ -2705,10 +2964,10 @@ onUnmounted(() => {
                   long
                   size="large"
                   :loading="oauthPreparing"
-                  @click="oauthUrl ? openOAuthUrl() : prepareOAuthLogin()"
+                  @click="startOrOpenOAuthUrl"
                 >
                   <template #icon><icon-globe /></template>
-                  {{ oauthUrl ? "继续打开授权页" : "生成并打开授权" }}
+                  {{ oauthUrl ? "继续打开授权页" : "生成并打开授权页" }}
                 </a-button>
                 <a-button v-if="oauthUrl" @click="copyOAuthUrl">
                   <template #icon><icon-copy /></template>
@@ -2924,7 +3183,7 @@ onUnmounted(() => {
           class="token-textarea export-json-viewer"
           :class="{ collapsed: !exportPreviewVisible }"
           readonly
-          :auto-size="exportPreviewVisible ? { minRows: 10, maxRows: 18 } : { minRows: 6, maxRows: 6 }"
+          :auto-size="exportPreviewVisible ? { minRows: 14, maxRows: 24 } : { minRows: 12, maxRows: 12 }"
         />
       </div>
     </a-modal>
@@ -2933,7 +3192,7 @@ onUnmounted(() => {
       v-model:visible="batchExportVisible"
       title="批量导出 JSON"
       :footer="false"
-      width="760px"
+      width="820px"
     >
       <div class="modal-form">
         <div class="export-toolbar">
@@ -2973,7 +3232,7 @@ onUnmounted(() => {
           class="token-textarea export-json-viewer"
           :class="{ collapsed: !batchExportPreviewVisible }"
           readonly
-          :auto-size="batchExportPreviewVisible ? { minRows: 10, maxRows: 18 } : { minRows: 6, maxRows: 6 }"
+          :auto-size="batchExportPreviewVisible ? { minRows: 14, maxRows: 24 } : { minRows: 12, maxRows: 12 }"
         />
       </div>
     </a-modal>

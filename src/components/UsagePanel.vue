@@ -4,12 +4,16 @@ import { Message } from "@arco-design/web-vue";
 import type { ECharts, EChartsCoreOption } from "echarts/core";
 import {
   deleteModelPricing,
+  getCodexUsageActivity,
   getPricingConfig,
   getCodexUsageDashboard,
   listModelPricing,
   resetModelPricing,
   updatePricingConfig,
   updateModelPricing,
+  type CodexUsageActivity,
+  type CodexUsageActivityDay,
+  type CodexUsageActivityHour,
   type CodexUsageDashboard,
   type CodexUsagePricing,
   type CodexUsagePricingConfig,
@@ -22,6 +26,21 @@ type UsageTooltipParam = {
   value?: number | Array<string | number>;
 };
 type EChartsCoreApi = typeof import("echarts/core");
+type ActivityMode = "daily" | "weekly" | "cumulative";
+type ActivityCell = {
+  key: string;
+  label: string;
+  timestamp: number;
+  tokens: number;
+  requests: number;
+  value: number;
+  level: number;
+};
+type ActivityBlock = ActivityCell & {
+  subtitle: string;
+  detail: string;
+  percent: number;
+};
 
 const props = withDefaults(defineProps<{
   active?: boolean;
@@ -44,6 +63,8 @@ const chartContainer = ref<HTMLDivElement | null>(null);
 const usageChart = shallowRef<ECharts | null>(null);
 const dateRange = ref<[string, string] | undefined>();
 const dashboard = ref<CodexUsageDashboard | null>(null);
+const activity = ref<CodexUsageActivity | null>(null);
+const activityMode = ref<ActivityMode>("daily");
 const pricingList = ref<CodexUsagePricing[]>([]);
 const editingModelId = ref<string | null>(null);
 const pricingConfigs = ref<CodexUsagePricingConfig[]>([]);
@@ -69,6 +90,19 @@ const rangeOptions: Array<{ value: UsageRange; label: string }> = [
 const summary = computed(() => dashboard.value?.summary);
 const logs = computed(() => dashboard.value?.logs ?? []);
 const trends = computed(() => dashboard.value?.trends ?? []);
+const activitySummary = computed(() => activity.value?.summary);
+const activityDays = computed(() => activity.value?.days ?? []);
+const activityHours = computed(() =>
+  activity.value?.hours?.length
+    ? activity.value.hours
+    : Array.from({ length: 24 }, (_, hour) => ({
+        hour,
+        label: `${String(hour).padStart(2, "0")}:00`,
+        timestamp: 0,
+        tokens: 0,
+        requests: 0,
+      })),
+);
 const providerStats = computed(() => dashboard.value?.providerStats ?? []);
 const modelStats = computed(() => dashboard.value?.modelStats ?? []);
 const totalLogs = computed(() => dashboard.value?.totalLogs ?? 0);
@@ -91,6 +125,128 @@ const isHourlyTrend = computed(() =>
     ? trends.value[1].timestamp - trends.value[0].timestamp <= 60 * 60
     : range.value === "today",
 );
+const recentActivityDays = computed(() => activityDays.value.slice(-7));
+const activityWeeklyTotals = computed(() => {
+  return recentActivityDays.value.map((day) => day.tokens);
+});
+const activityCells = computed<ActivityCell[]>(() => {
+  let cumulative = 0;
+  const source =
+    activityMode.value === "daily"
+      ? activityHours.value.map(activityHourToCellSource)
+      : activityMode.value === "weekly"
+        ? recentActivityDays.value.map(activityDayToCellSource)
+        : activityDays.value.map(activityDayToCellSource);
+  const values = source.map((cell, index) => {
+    if (activityMode.value === "cumulative") {
+      cumulative += cell.tokens;
+      return cumulative;
+    }
+    if (activityMode.value === "weekly") return activityWeeklyTotals.value[index] ?? 0;
+    return cell.tokens;
+  });
+  const max = Math.max(...values, 0);
+  return source.map((cell, index) => ({
+    ...cell,
+    value: values[index] ?? 0,
+    level: activityLevel(values[index] ?? 0, max),
+  }));
+});
+const activityColumnCount = computed(() => {
+  if (activityMode.value === "daily") return 24;
+  if (activityMode.value === "weekly") return 7;
+  return Math.max(1, Math.ceil(activityDays.value.length / 7));
+});
+const activityRowCount = computed(() => (activityMode.value === "cumulative" ? 7 : 1));
+const activityLabels = computed(() => {
+  if (activityMode.value === "daily") {
+    return [0, 6, 12, 18, 23].map((hour) => ({
+      key: `hour-${hour}`,
+      label: `${String(hour).padStart(2, "0")}:00`,
+      column: hour + 1,
+    }));
+  }
+  if (activityMode.value === "weekly") {
+    return recentActivityDays.value.map((day, index) => ({
+      key: day.date,
+      label: activityWeekdayLabel(day),
+      column: index + 1,
+    }));
+  }
+  const labels: Array<{ key: string; label: string; column: number }> = [];
+  let previousMonth = "";
+  activityDays.value.forEach((day, index) => {
+    const currentMonth = day.date.slice(5, 7);
+    if (currentMonth !== previousMonth) {
+      const nextLabel = {
+        key: day.date,
+        label: `${Number(currentMonth)}月`,
+        column: Math.floor(index / 7) + 1,
+      };
+      const previous = labels[labels.length - 1];
+      if (previous && nextLabel.column - previous.column < 4) {
+        labels[labels.length - 1] = nextLabel;
+      } else {
+        labels.push(nextLabel);
+      }
+      previousMonth = currentMonth;
+    }
+  });
+  return labels;
+});
+const dailyActivityBlocks = computed<ActivityBlock[]>(() => {
+  const segments = [
+    { start: 0, end: 3, label: "凌晨", subtitle: "00:00-03:59" },
+    { start: 4, end: 7, label: "清晨", subtitle: "04:00-07:59" },
+    { start: 8, end: 11, label: "上午", subtitle: "08:00-11:59" },
+    { start: 12, end: 15, label: "午后", subtitle: "12:00-15:59" },
+    { start: 16, end: 19, label: "傍晚", subtitle: "16:00-19:59" },
+    { start: 20, end: 23, label: "夜间", subtitle: "20:00-23:59" },
+  ];
+  const rows = segments.map((segment) => {
+    const hours = activityHours.value.slice(segment.start, segment.end + 1);
+    const tokens = hours.reduce((sum, item) => sum + item.tokens, 0);
+    const requests = hours.reduce((sum, item) => sum + item.requests, 0);
+    return {
+      key: `daily-${segment.start}`,
+      label: segment.label,
+      subtitle: segment.subtitle,
+      detail: `${formatFullNumber(tokens)} Tokens · ${requests} 次`,
+      timestamp: hours[0]?.timestamp ?? 0,
+      tokens,
+      requests,
+      value: tokens,
+      level: 0,
+      percent: 0,
+    };
+  });
+  const max = Math.max(...rows.map((item) => item.value), 0);
+  return rows.map((item) => ({
+    ...item,
+    level: activityLevel(item.value, max),
+    percent: max > 0 ? Math.max(6, Math.round((item.value / max) * 100)) : 0,
+  }));
+});
+const weeklyActivityBlocks = computed<ActivityBlock[]>(() => {
+  const max = Math.max(...recentActivityDays.value.map((day) => day.tokens), 0);
+  return recentActivityDays.value.map((day) => {
+    const value = day.tokens;
+    return {
+      ...activityDayToCellSource(day),
+      label: activityWeekdayLabel(day),
+      subtitle: day.date,
+      detail: `${formatFullNumber(value)} Tokens · ${day.requests} 次`,
+      value,
+      level: activityLevel(value, max),
+      percent: max > 0 ? Math.max(8, Math.round((value / max) * 100)) : 0,
+    };
+  });
+});
+const activityModeOptions: Array<{ value: ActivityMode; label: string }> = [
+  { value: "daily", label: "每日" },
+  { value: "weekly", label: "每周" },
+  { value: "cumulative", label: "累计" },
+];
 let chartResizeObserver: ResizeObserver | null = null;
 let echartsApi: EChartsCoreApi | null = null;
 let echartsLoading: Promise<EChartsCoreApi> | null = null;
@@ -211,8 +367,13 @@ async function loadUsage(
       pageSize,
       refresh,
     });
+    const nextActivity = await getCodexUsageActivity({ refresh: false }).catch((error) => {
+      if (!silent) Message.warning(`加载年度活动失败：${errorText(error)}`);
+      return null;
+    });
     if (serial !== loadSerial) return;
     dashboard.value = nextDashboard;
+    if (nextActivity) activity.value = nextActivity;
     lastLoadedAt.value = Date.now();
     if (!pricingLoaded.value && nextDashboard.pricingConfigs?.length) {
       pricingConfigs.value = nextDashboard.pricingConfigs;
@@ -442,6 +603,51 @@ function formatUsd(value?: string): string {
 
 function formatPercent(value?: number): string {
   return `${((value || 0) * 100).toFixed(1)}%`;
+}
+
+function activityHourToCellSource(hour: CodexUsageActivityHour): ActivityCell {
+  return {
+    key: `hour-${hour.hour}`,
+    label: hour.label,
+    timestamp: hour.timestamp,
+    tokens: hour.tokens,
+    requests: hour.requests,
+    value: 0,
+    level: 0,
+  };
+}
+
+function activityDayToCellSource(day: CodexUsageActivityDay): ActivityCell {
+  return {
+    key: day.date,
+    label: day.date,
+    timestamp: day.timestamp,
+    tokens: day.tokens,
+    requests: day.requests,
+    value: 0,
+    level: 0,
+  };
+}
+
+function activityWeekdayLabel(day: CodexUsageActivityDay): string {
+  const date = new Date(day.timestamp * 1000);
+  const weekday = ["日", "一", "二", "三", "四", "五", "六"][date.getDay()];
+  return `${date.getMonth() + 1}/${date.getDate()} 周${weekday}`;
+}
+
+function activityLevel(value: number, max: number): number {
+  if (value <= 0 || max <= 0) return 0;
+  const ratio = value / max;
+  if (ratio >= 0.75) return 4;
+  if (ratio >= 0.45) return 3;
+  if (ratio >= 0.18) return 2;
+  return 1;
+}
+
+function activityCellTitle(cell: ActivityCell): string {
+  const prefix =
+    activityMode.value === "weekly" ? "当日" : activityMode.value === "cumulative" ? "累计" : "时段";
+  return `${cell.label}：${prefix} ${formatFullNumber(cell.value)} Tokens，${cell.requests} 次调用`;
 }
 
 function formatTime(timestamp: number): string {
@@ -818,6 +1024,111 @@ onBeforeUnmount(() => {
               <div ref="chartContainer" class="usage-echart" />
             </div>
             <a-empty v-else description="暂无趋势数据" />
+          </div>
+
+          <div class="usage-activity-card">
+            <div class="usage-activity-summary">
+              <article>
+                <strong>{{ formatTokens(activitySummary?.totalTokens) }}</strong>
+                <span>累计 Token 数</span>
+              </article>
+              <article>
+                <strong>{{ formatTokens(activitySummary?.peakDayTokens) }}</strong>
+                <span>峰值 Token 数</span>
+              </article>
+              <article>
+                <strong>{{ activitySummary?.currentStreakDays ?? 0 }} 天</strong>
+                <span>当前连续天数</span>
+              </article>
+              <article>
+                <strong>{{ activitySummary?.longestStreakDays ?? 0 }} 天</strong>
+                <span>最长连续天数</span>
+              </article>
+            </div>
+
+            <div class="usage-card-title usage-activity-title">
+              <strong>Token 活动</strong>
+              <div class="usage-activity-mode">
+                <button
+                  v-for="item in activityModeOptions"
+                  :key="item.value"
+                  :class="{ active: activityMode === item.value }"
+                  type="button"
+                  @click="activityMode = item.value"
+                >
+                  {{ item.label }}
+                </button>
+              </div>
+            </div>
+            <div v-if="activityMode === 'daily'" class="usage-activity-bars daily">
+              <article
+                v-for="block in dailyActivityBlocks"
+                :key="block.key"
+                class="usage-activity-block"
+                :class="`level-${block.level}`"
+                :title="activityCellTitle(block)"
+              >
+                <div class="usage-activity-block-head">
+                  <strong>{{ block.label }}</strong>
+                  <span>{{ block.subtitle }}</span>
+                </div>
+                <div class="usage-activity-track">
+                  <i :style="{ width: `${block.percent}%` }" />
+                </div>
+                <div class="usage-activity-block-foot">
+                  <span>{{ formatTokens(block.value) }}</span>
+                  <em>{{ block.requests }} 次</em>
+                </div>
+              </article>
+            </div>
+            <div v-else-if="activityMode === 'weekly'" class="usage-activity-bars weekly">
+              <article
+                v-for="block in weeklyActivityBlocks"
+                :key="block.key"
+                class="usage-activity-block"
+                :class="`level-${block.level}`"
+                :title="activityCellTitle(block)"
+              >
+                <div class="usage-activity-block-head">
+                  <strong>{{ block.label }}</strong>
+                  <span>{{ block.subtitle }}</span>
+                </div>
+                <div class="usage-activity-track">
+                  <i :style="{ width: `${block.percent}%` }" />
+                </div>
+                <div class="usage-activity-block-foot">
+                  <span>{{ formatTokens(block.value) }}</span>
+                  <em>{{ block.requests }} 次</em>
+                </div>
+              </article>
+            </div>
+            <div v-else-if="activityCells.length" class="usage-activity-map">
+              <div
+                class="usage-activity-grid"
+                :style="{ '--activity-columns': activityColumnCount, '--activity-rows': activityRowCount }"
+              >
+                <i
+                  v-for="cell in activityCells"
+                  :key="cell.key"
+                  class="usage-activity-cell"
+                  :class="`level-${cell.level}`"
+                  :title="activityCellTitle(cell)"
+                />
+              </div>
+              <div
+                class="usage-activity-months"
+                :style="{ '--activity-columns': activityColumnCount }"
+              >
+                <span
+                  v-for="item in activityLabels"
+                  :key="item.key"
+                  :style="{ gridColumn: item.column }"
+                >
+                  {{ item.label }}
+                </span>
+              </div>
+            </div>
+            <a-empty v-else description="暂无活动数据" />
           </div>
 
           <div class="usage-table-card">

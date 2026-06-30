@@ -24,6 +24,35 @@ export interface CodexUsageSummary {
   cacheHitRate: number;
 }
 
+export interface CodexUsageActivity {
+  summary: CodexUsageActivitySummary;
+  days: CodexUsageActivityDay[];
+  hours: CodexUsageActivityHour[];
+}
+
+export interface CodexUsageActivitySummary {
+  totalTokens: number;
+  peakDayTokens: number;
+  longestTaskSeconds: number;
+  currentStreakDays: number;
+  longestStreakDays: number;
+}
+
+export interface CodexUsageActivityDay {
+  date: string;
+  timestamp: number;
+  tokens: number;
+  requests: number;
+}
+
+export interface CodexUsageActivityHour {
+  hour: number;
+  label: string;
+  timestamp: number;
+  tokens: number;
+  requests: number;
+}
+
 export interface CodexUsageTrendPoint {
   timestamp: number;
   label: string;
@@ -97,6 +126,14 @@ export function getCodexUsageDashboard(
     endDate: query.endDate ?? null,
     page: query.page ?? 1,
     pageSize: query.pageSize ?? 20,
+    refresh: query.refresh ?? false,
+  });
+}
+
+export function getCodexUsageActivity(
+  query: Pick<CodexUsageQuery, "refresh"> = {},
+): Promise<CodexUsageActivity> {
+  return invoke("codex_get_usage_activity", {
     refresh: query.refresh ?? false,
   });
 }
