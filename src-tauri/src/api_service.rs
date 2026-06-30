@@ -1418,7 +1418,10 @@ fn listener_pid_on_port(port: u16) -> Result<Option<u32>, String> {
     );
     if let Ok(output) = windows_powershell_output(&script, "检查端口监听失败") {
         if output.status.success() {
-            if let Ok(pid) = String::from_utf8_lossy(&output.stdout).trim().parse::<u32>() {
+            if let Ok(pid) = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u32>()
+            {
                 return Ok(Some(pid));
             }
         }
@@ -1561,7 +1564,13 @@ fn windows_powershell_output(
 ) -> Result<std::process::Output, String> {
     let mut command = Command::new("powershell");
     command
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+        ])
         .arg(script);
     hide_command_window(&mut command);
     command

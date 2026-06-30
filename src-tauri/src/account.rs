@@ -8,6 +8,9 @@ use std::thread;
 use std::time::Duration;
 use toml_edit::{value, Document};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CodexTokens {
     pub id_token: String,
@@ -116,6 +119,33 @@ fn clear_account_quota(account: &mut CodexAccount) {
     account.quota = None;
     account.quota_error = None;
     account.usage_updated_at = None;
+}
+
+fn select_account_value_for_update<'a>(
+    value: &'a Value,
+    old_account: &CodexAccount,
+) -> Result<&'a Value, String> {
+    let Some(accounts) = value.get("accounts").and_then(Value::as_array) else {
+        return Ok(value);
+    };
+    if accounts.is_empty() {
+        return Err("导出 JSON 中没有账号数据".to_string());
+    }
+    if let Some(account) = accounts.iter().find(|candidate| {
+        read_string(candidate, &["id"]).as_deref() == Some(old_account.id.as_str())
+    }) {
+        return Ok(account);
+    }
+    if let Some(account) = accounts.iter().find(|candidate| {
+        read_string(candidate, &["email"])
+            .is_some_and(|email| email.eq_ignore_ascii_case(&old_account.email))
+    }) {
+        return Ok(account);
+    }
+    if accounts.len() == 1 {
+        return Ok(&accounts[0]);
+    }
+    Err("导出 JSON 中包含多个账号，未找到当前编辑账号".to_string())
 }
 
 impl Default for AccountStore {
@@ -242,9 +272,50 @@ impl AccountStore {
                 "refresh_token": refresh_token.unwrap_or_default()
             }
         });
-        let account = self.account_from_import_value(&payload)?;
+        let mut account = self.account_from_import_value(&payload)?;
         let mut database = self.read_database()?;
+        let current_id = database.current_account_id.clone();
+        let existing = database
+            .accounts
+            .iter()
+            .find(|candidate| {
+                candidate.auth_mode.as_deref() != Some("apikey")
+                    && candidate.email.eq_ignore_ascii_case(&account.email)
+            })
+            .cloned();
+        let was_current = existing
+            .as_ref()
+            .is_some_and(|existing| current_id.as_deref() == Some(existing.id.as_str()))
+            || current_id.as_deref() == Some(account.id.as_str());
+        let current_api_key_depends_on_refreshed_oauth =
+            existing.as_ref().is_some_and(|existing| {
+                database.accounts.iter().any(|candidate| {
+                    current_id.as_deref() == Some(candidate.id.as_str())
+                        && candidate.auth_mode.as_deref() == Some("apikey")
+                        && candidate.bound_oauth_account_id.as_deref() == Some(existing.id.as_str())
+                })
+            });
+        if let Some(existing) = existing {
+            account.id = existing.id;
+            account.account_name = existing.account_name;
+            account.bound_phone = existing.bound_phone;
+            account.created_at = existing.created_at;
+            account.last_used = existing.last_used;
+        }
         upsert_account(&mut database.accounts, account.clone());
+        if was_current {
+            database.current_account_id = Some(account.id.clone());
+            write_codex_auth_projection(&self.codex_home, &account, &database.accounts)?;
+        } else if current_api_key_depends_on_refreshed_oauth {
+            if let Some(current) = database
+                .accounts
+                .iter()
+                .find(|candidate| current_id.as_deref() == Some(candidate.id.as_str()))
+                .cloned()
+            {
+                write_codex_auth_projection(&self.codex_home, &current, &database.accounts)?;
+            }
+        }
         self.write_database(&database)?;
         Ok(account)
     }
@@ -455,9 +526,10 @@ impl AccountStore {
             .cloned()
             .ok_or_else(|| "账号不存在".to_string())?;
 
-        let mut updated = match serde_json::from_value::<CodexAccount>(value.clone()) {
+        let import_value = select_account_value_for_update(&value, &old_account)?;
+        let mut updated = match serde_json::from_value::<CodexAccount>(import_value.clone()) {
             Ok(account) => account,
-            Err(_) => self.account_from_import_value(&value)?,
+            Err(_) => self.account_from_import_value(import_value)?,
         };
         if updated.id.trim().is_empty() {
             updated.id = old_account.id.clone();
@@ -468,7 +540,7 @@ impl AccountStore {
         if updated.last_used <= 0 {
             updated.last_used = old_account.last_used;
         }
-        apply_import_metadata(&mut updated, &value);
+        apply_import_metadata(&mut updated, import_value);
 
         let was_current = database.current_account_id.as_deref() == Some(account_id);
         database
@@ -513,8 +585,12 @@ impl AccountStore {
             .iter_mut()
             .find(|account| account.id == account_id)
             .ok_or_else(|| "账号不存在".to_string())?;
+        let code = quota_error_code(&message);
+        if code.as_deref() == Some("token_expired") {
+            account.quota = None;
+        }
         account.quota_error = Some(CodexQuotaErrorInfo {
-            code: None,
+            code,
             message,
             timestamp: now_timestamp(),
         });
@@ -731,8 +807,15 @@ pub fn codex_restart_commands() -> (
         (
             "taskkill",
             vec!["/IM", "Codex.exe", "/F"],
-            "cmd",
-            vec!["/C", "start", "", "Codex"],
+            "powershell",
+            vec![
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                WINDOWS_CODEX_START_SCRIPT,
+            ],
         )
     }
 
@@ -741,6 +824,51 @@ pub fn codex_restart_commands() -> (
         ("pkill", vec!["-x", "codex"], "codex", vec![])
     }
 }
+
+#[cfg(target_os = "windows")]
+const WINDOWS_CODEX_START_SCRIPT: &str = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$candidates = @()
+if ($env:LOCALAPPDATA) {
+  $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\Codex\Codex.exe')
+  $candidates += (Join-Path $env:LOCALAPPDATA 'Codex\Codex.exe')
+}
+if ($env:ProgramFiles) {
+  $candidates += (Join-Path $env:ProgramFiles 'Codex\Codex.exe')
+}
+${pf86} = ${env:ProgramFiles(x86)}
+if (${pf86}) {
+  $candidates += (Join-Path ${pf86} 'Codex\Codex.exe')
+}
+foreach ($path in $candidates) {
+  if ($path -and (Test-Path -LiteralPath $path)) {
+    Start-Process -FilePath $path
+    exit 0
+  }
+}
+$shortcutRoots = @()
+if ($env:APPDATA) {
+  $shortcutRoots += (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs')
+}
+if ($env:ProgramData) {
+  $shortcutRoots += (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs')
+}
+foreach ($root in $shortcutRoots) {
+  if (-not (Test-Path -LiteralPath $root)) { continue }
+  $shortcut = Get-ChildItem -LiteralPath $root -Filter 'Codex*.lnk' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($shortcut) {
+    Start-Process -FilePath $shortcut.FullName
+    exit 0
+  }
+}
+$command = Get-Command 'Codex.exe' -ErrorAction SilentlyContinue
+if (-not $command) { $command = Get-Command 'codex.exe' -ErrorAction SilentlyContinue }
+if ($command) {
+  Start-Process -FilePath $command.Source
+  exit 0
+}
+exit 1
+"#;
 
 pub fn codex_restart_delay_ms() -> u64 {
     #[cfg(target_os = "macos")]
@@ -756,14 +884,33 @@ pub fn codex_restart_delay_ms() -> u64 {
 
 fn restart_codex_app() -> Result<String, String> {
     let (stop_program, stop_args, start_program, start_args) = codex_restart_commands();
-    let _ = Command::new(stop_program).args(stop_args).status();
+    let mut stop_command = Command::new(stop_program);
+    stop_command.args(stop_args);
+    hide_command_window(&mut stop_command);
+    let _ = stop_command.status();
     thread::sleep(Duration::from_millis(codex_restart_delay_ms()));
-    Command::new(start_program)
-        .args(start_args)
+    let mut start_command = Command::new(start_program);
+    start_command.args(start_args);
+    hide_command_window(&mut start_command);
+    let status = start_command
         .status()
         .map_err(|error| format!("启动 Codex 失败: {}", error))?;
+    if !status.success() {
+        return Err(
+            "启动 Codex 失败：未找到 Codex 桌面应用，请确认已安装并可从开始菜单打开".to_string(),
+        );
+    }
     Ok("已尝试重启 Codex".to_string())
 }
+
+#[cfg(windows)]
+fn hide_command_window(command: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_command_window(_command: &mut Command) {}
 
 fn upsert_account(accounts: &mut Vec<CodexAccount>, account: CodexAccount) {
     if let Some(existing) = accounts.iter_mut().find(|item| item.id == account.id) {
@@ -777,6 +924,18 @@ fn upsert_account(accounts: &mut Vec<CodexAccount>, account: CodexAccount) {
 
 fn now_timestamp() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+fn quota_error_code(message: &str) -> Option<String> {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("token_expired")
+        || lower.contains("unauthorized")
+        || lower.contains("401")
+        || lower.contains("authentication token is expired")
+    {
+        return Some("token_expired".to_string());
+    }
+    None
 }
 
 fn normalize_optional(value: Option<&str>) -> Option<String> {

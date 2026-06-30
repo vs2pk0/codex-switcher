@@ -125,10 +125,13 @@ function boundOAuthName(account: CodexAccount): string {
   return bound ? displayAccountName(bound) : "未绑定";
 }
 
+function isBoundApiKeyAccount(account: CodexAccount): boolean {
+  return isApiKeyAccount(account) && Boolean(account.bound_oauth_account_id);
+}
+
 function canShowQuota(account: CodexAccount): boolean {
   if (!props.settings.monitorQuota) return false;
-  if (!isApiKeyAccount(account)) return true;
-  return Boolean(boundOAuthAccount(account));
+  return !isApiKeyAccount(account);
 }
 
 function shouldShowQuota(account: CodexAccount): boolean {
@@ -168,6 +171,7 @@ function jwtAuthClaim(token: string | undefined, claim: string): string | undefi
 }
 
 function accountStatusSource(account: CodexAccount): CodexAccount {
+  if (isBoundApiKeyAccount(account)) return account;
   return account.subscription_active_until ||
     account.access_token_expires_at ||
     jwtAuthClaim(account.tokens.id_token, "chatgpt_subscription_active_until") ||
@@ -364,6 +368,13 @@ function statusTitle(account: CodexAccount): string {
   return isApiKeyAccount(account) ? "密钥状态" : "订阅状态";
 }
 
+function quotaErrorMessage(account: CodexAccount): string {
+  if (account.quota_error?.code === "token_expired") {
+    return "Token 失效，请重新登录或更换绑定账号";
+  }
+  return account.quota_error?.message || "额度刷新失败";
+}
+
 function tokenExpiryStatus(value?: string): "valid" | "expired" {
   const date = normalizeDate(value);
   if (!date) return "valid";
@@ -549,11 +560,11 @@ function formatTime(value?: number | null): string {
             </div>
           </template>
           <div v-else-if="shouldShowQuotaError(account) && account.quota_error" class="quota-error">
-            {{ account.quota_error.message }}
+            {{ quotaErrorMessage(account) }}
           </div>
 
           <div
-            v-if="accountSubscriptionUntil(account) || accountTokenExpiresAt(account)"
+            v-if="!isBoundApiKeyAccount(account) && (accountSubscriptionUntil(account) || accountTokenExpiresAt(account))"
             class="status-grid"
             :class="{ single: !(accountSubscriptionUntil(account) && accountTokenExpiresAt(account)) }"
           >

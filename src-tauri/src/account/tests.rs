@@ -203,6 +203,54 @@ fn updates_account_from_editable_json() {
 }
 
 #[test]
+fn updates_account_from_exported_accounts_json() {
+    let (_storage, _codex, store) = test_store();
+    let account = store
+        .import_from_json(
+            &json!({
+                "email": "owner@example.com",
+                "tokens": {
+                    "id_token": "id-token",
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import account")
+        .remove(0);
+
+    let updated = store
+        .update_account_from_json(
+            &account.id,
+            &json!({
+                "app": "Codex Switcher",
+                "format": "codex-switcher.accounts",
+                "version": 1,
+                "accounts": [
+                    {
+                        "id": account.id,
+                        "email": "owner@example.com",
+                        "account_name": "导出包里的账号",
+                        "tokens": {
+                            "id_token": "id-token-3",
+                            "access_token": "access-token-3",
+                            "refresh_token": "refresh-token-3"
+                        },
+                        "created_at": account.created_at,
+                        "last_used": account.last_used
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("update account from exported json");
+
+    assert_eq!(updated.account_name.as_deref(), Some("导出包里的账号"));
+    assert_eq!(updated.tokens.access_token, "access-token-3");
+}
+
+#[test]
 fn updates_phone_and_exports_cockpit_tools_json() {
     let (_storage, _codex, store) = test_store();
     let account = store
@@ -286,6 +334,45 @@ fn saves_oauth_tokens_as_account() {
         Some("refresh-token")
     );
     assert_eq!(store.list_accounts().expect("list").len(), 1);
+}
+
+#[test]
+fn save_oauth_tokens_refreshes_current_account_projection_by_email() {
+    let (_storage, codex, store) = test_store();
+    let old_account = store
+        .import_from_json(
+            &json!({
+                "email": "owner@example.com",
+                "tokens": {
+                    "id_token": "old-id-token",
+                    "access_token": "old-access-token",
+                    "refresh_token": "old-refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import account")
+        .remove(0);
+    store
+        .switch_account(&old_account.id)
+        .expect("switch old account");
+
+    let updated = store
+        .save_oauth_tokens(
+            "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6Im93bmVyQGV4YW1wbGUuY29tIn0.signature".to_string(),
+            "new-access-token".to_string(),
+            Some("new-refresh-token".to_string()),
+        )
+        .expect("refresh oauth tokens");
+
+    assert_eq!(updated.id, old_account.id);
+    assert_eq!(store.list_accounts().expect("list").len(), 1);
+    let current = store.current_account().expect("current").expect("selected");
+    assert_eq!(current.id, old_account.id);
+    let auth_json = fs::read_to_string(codex.path().join("auth.json")).expect("auth json");
+    let auth: serde_json::Value = serde_json::from_str(&auth_json).expect("valid auth json");
+    assert_eq!(auth["tokens"]["access_token"], "new-access-token");
+    assert_eq!(auth["tokens"]["refresh_token"], "new-refresh-token");
 }
 
 #[test]
@@ -586,8 +673,8 @@ fn restart_command_targets_codex_app_on_current_platform() {
 
     #[cfg(target_os = "windows")]
     {
-        assert_eq!(start_program, "cmd");
-        assert!(start_args.contains(&"Codex"));
+        assert_eq!(start_program, "powershell");
+        assert!(start_args.iter().any(|arg| arg.contains("Codex.exe")));
     }
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]

@@ -1,4 +1,6 @@
-use chrono::{DateTime, Local, TimeZone};
+use chrono::{
+    DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Timelike,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -33,6 +35,43 @@ pub struct CodexUsageSummary {
     pub total_cache_creation_tokens: u64,
     pub real_total_tokens: u64,
     pub cache_hit_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexUsageActivity {
+    pub summary: CodexUsageActivitySummary,
+    pub days: Vec<CodexUsageActivityDay>,
+    pub hours: Vec<CodexUsageActivityHour>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexUsageActivitySummary {
+    pub total_tokens: u64,
+    pub peak_day_tokens: u64,
+    pub longest_task_seconds: i64,
+    pub current_streak_days: usize,
+    pub longest_streak_days: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexUsageActivityDay {
+    pub date: String,
+    pub timestamp: i64,
+    pub tokens: u64,
+    pub requests: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexUsageActivityHour {
+    pub hour: u32,
+    pub label: String,
+    pub timestamp: i64,
+    pub tokens: u64,
+    pub requests: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -213,6 +252,11 @@ pub fn get_codex_usage_dashboard(
         cache_path: usage_cache_path().to_string_lossy().to_string(),
         pricing_configs,
     })
+}
+
+pub fn get_codex_usage_activity(refresh: Option<bool>) -> Result<CodexUsageActivity, String> {
+    let cache = load_or_rebuild_usage_cache(refresh.unwrap_or(false))?;
+    Ok(build_usage_activity(&cache.logs))
 }
 
 pub fn list_model_pricing() -> Result<Vec<CodexUsagePricing>, String> {
@@ -562,6 +606,145 @@ fn summarize_logs(
     };
     summary.total_cost = format_cost(total_cost);
     summary
+}
+
+fn build_usage_activity(logs: &[ParsedUsageLog]) -> CodexUsageActivity {
+    let today = Local::now().date_naive();
+    let current_week_start =
+        today - ChronoDuration::days(today.weekday().num_days_from_monday() as i64);
+    let start_date = current_week_start - ChronoDuration::weeks(52);
+    let day_count = 53 * 7;
+    let mut day_tokens: HashMap<NaiveDate, (u64, usize)> = HashMap::new();
+    let mut hour_tokens: HashMap<u32, (u64, usize)> = HashMap::new();
+    let mut session_ranges: HashMap<String, (i64, i64)> = HashMap::new();
+
+    for log in logs {
+        let local_time = Local
+            .timestamp_opt(log.created_at, 0)
+            .single()
+            .unwrap_or_else(Local::now);
+        let date = local_time.date_naive();
+        let entry = day_tokens.entry(date).or_default();
+        entry.0 += log_total_tokens(log);
+        entry.1 += 1;
+
+        if date == today {
+            let hour_entry = hour_tokens.entry(local_time.hour()).or_default();
+            hour_entry.0 += log_total_tokens(log);
+            hour_entry.1 += 1;
+        }
+
+        if let Some(session_id) = usage_log_session_id(&log.request_id) {
+            let range = session_ranges
+                .entry(session_id.to_string())
+                .or_insert((log.created_at, log.created_at));
+            range.0 = range.0.min(log.created_at);
+            range.1 = range.1.max(log.created_at);
+        }
+    }
+
+    let mut hours = Vec::with_capacity(24);
+    for hour in 0..24 {
+        let (tokens, requests) = hour_tokens.get(&hour).copied().unwrap_or_default();
+        let timestamp = Local
+            .with_ymd_and_hms(today.year(), today.month(), today.day(), hour, 0, 0)
+            .earliest()
+            .map(|date_time| date_time.timestamp())
+            .unwrap_or_else(|| Local::now().timestamp());
+        hours.push(CodexUsageActivityHour {
+            hour,
+            label: format!("{:02}:00", hour),
+            timestamp,
+            tokens,
+            requests,
+        });
+    }
+
+    let mut days = Vec::with_capacity(day_count);
+    for index in 0..day_count {
+        let date = start_date + ChronoDuration::days(index as i64);
+        let (tokens, requests) = day_tokens.get(&date).copied().unwrap_or_default();
+        days.push(CodexUsageActivityDay {
+            date: date.format("%Y-%m-%d").to_string(),
+            timestamp: local_day_start_timestamp(date),
+            tokens,
+            requests,
+        });
+    }
+
+    let total_tokens = days.iter().map(|day| day.tokens).sum::<u64>();
+    let peak_day_tokens = days.iter().map(|day| day.tokens).max().unwrap_or_default();
+    let longest_task_seconds = session_ranges
+        .values()
+        .map(|(start, end)| end.saturating_sub(*start))
+        .max()
+        .unwrap_or_default();
+    let active_days = days
+        .iter()
+        .map(|day| (day.date.clone(), day.tokens > 0))
+        .collect::<HashMap<_, _>>();
+
+    CodexUsageActivity {
+        summary: CodexUsageActivitySummary {
+            total_tokens,
+            peak_day_tokens,
+            longest_task_seconds,
+            current_streak_days: current_usage_streak(today, &active_days),
+            longest_streak_days: longest_usage_streak(&days),
+        },
+        days,
+        hours,
+    }
+}
+
+fn local_day_start_timestamp(date: NaiveDate) -> i64 {
+    let Some(naive) = date.and_hms_opt(0, 0, 0) else {
+        return Local::now().timestamp();
+    };
+    Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .map(|date_time| date_time.timestamp())
+        .unwrap_or_else(|| Local::now().timestamp())
+}
+
+fn usage_log_session_id(request_id: &str) -> Option<&str> {
+    request_id
+        .strip_prefix("codex_session:")
+        .and_then(|rest| rest.rsplit_once(':').map(|(session_id, _)| session_id))
+        .filter(|session_id| !session_id.is_empty())
+}
+
+fn log_total_tokens(log: &ParsedUsageLog) -> u64 {
+    fresh_input_tokens(log) + log.output_tokens + log.cache_read_tokens
+}
+
+fn current_usage_streak(today: NaiveDate, active_days: &HashMap<String, bool>) -> usize {
+    let mut streak = 0;
+    let mut cursor = today;
+    loop {
+        let key = cursor.format("%Y-%m-%d").to_string();
+        if !active_days.get(&key).copied().unwrap_or(false) {
+            break;
+        }
+        streak += 1;
+        cursor -= ChronoDuration::days(1);
+    }
+    streak
+}
+
+fn longest_usage_streak(days: &[CodexUsageActivityDay]) -> usize {
+    let mut current = 0;
+    let mut longest = 0;
+    for day in days {
+        if day.tokens > 0 {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
 }
 
 fn build_trends(

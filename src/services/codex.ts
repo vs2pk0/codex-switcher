@@ -12,6 +12,8 @@ export interface CodexSwitcherSettings {
   monitorQuota: boolean;
   quotaRefreshMinutes: number;
   currentAccountRefreshMinutes: number;
+  quotaNextRefreshAt?: number;
+  currentAccountNextRefreshAt?: number;
   sortMode: string;
   sortDirection: "asc" | "desc";
   customOrder: string[];

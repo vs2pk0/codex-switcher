@@ -22,7 +22,10 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
-use usage::{CodexUsageDashboard, CodexUsagePricing, CodexUsagePricingConfig};
+use usage::{CodexUsageActivity, CodexUsageDashboard, CodexUsagePricing, CodexUsagePricingConfig};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +41,10 @@ struct CodexSwitcherSettings {
     monitor_quota: bool,
     quota_refresh_minutes: u64,
     current_account_refresh_minutes: u64,
+    #[serde(default)]
+    quota_next_refresh_at: u64,
+    #[serde(default)]
+    current_account_next_refresh_at: u64,
     sort_mode: String,
     #[serde(default = "default_sort_direction")]
     sort_direction: String,
@@ -58,12 +65,16 @@ struct CodexSwitcherSettings {
     max_columns: u64,
 }
 
+const MAX_REFRESH_MINUTES: u64 = 1440;
+
 impl Default for CodexSwitcherSettings {
     fn default() -> Self {
         Self {
             monitor_quota: false,
             quota_refresh_minutes: 10,
             current_account_refresh_minutes: 10,
+            quota_next_refresh_at: 0,
+            current_account_next_refresh_at: 0,
             sort_mode: "created_at".to_string(),
             sort_direction: default_sort_direction(),
             custom_order: Vec::new(),
@@ -75,6 +86,41 @@ impl Default for CodexSwitcherSettings {
             badge_styles: default_badge_styles(),
             max_columns: default_max_columns(),
         }
+    }
+}
+
+impl CodexSwitcherSettings {
+    fn normalized(mut self) -> Self {
+        self.quota_refresh_minutes = clamp_refresh_minutes(self.quota_refresh_minutes);
+        self.current_account_refresh_minutes =
+            clamp_refresh_minutes(self.current_account_refresh_minutes);
+        self.quota_next_refresh_at =
+            normalize_next_refresh_at(self.quota_next_refresh_at, self.quota_refresh_minutes);
+        self.current_account_next_refresh_at = normalize_next_refresh_at(
+            self.current_account_next_refresh_at,
+            self.current_account_refresh_minutes,
+        );
+        self
+    }
+}
+
+fn clamp_refresh_minutes(value: u64) -> u64 {
+    value.clamp(1, MAX_REFRESH_MINUTES)
+}
+
+fn normalize_next_refresh_at(value: u64, interval_minutes: u64) -> u64 {
+    if value == 0 {
+        return 0;
+    }
+    let Ok(now_ms) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return 0;
+    };
+    let now = now_ms.as_millis() as u64;
+    let interval_ms = clamp_refresh_minutes(interval_minutes) * 60_000;
+    if value > now && value - now <= interval_ms {
+        value
+    } else {
+        0
     }
 }
 
@@ -395,7 +441,7 @@ fn oauth_callback_html(success: bool, title: &str, description: &str) -> String 
     let status_class = if success { "success" } else { "error" };
     let icon = if success { "✓" } else { "!" };
     let countdown_html = if success {
-        r#"<div class="countdown">正在尝试关闭页面，<span id="countdown">3</span> 秒后自动清空标签页。</div>"#
+        r#"<div class="countdown">正在尝试关闭页面，<span id="countdown">3</span> 秒后如未关闭，可直接关闭此标签页。</div>"#
     } else {
         ""
     };
@@ -406,16 +452,20 @@ fn oauth_callback_html(success: bool, title: &str, description: &str) -> String 
             var seconds = 3;
             var countdown = document.getElementById('countdown');
             var closeButton = document.getElementById('closeButton');
-            function tryClose() {
-              try { window.open('', '_self'); } catch (_) {}
-              try { window.close(); } catch (_) {}
+            var closeHint = document.getElementById('closeHint');
+            var closeStatus = document.getElementById('closeStatus');
+            function markBlocked() {
+              if (document.hidden) return;
+              if (closeButton) closeButton.textContent = '关闭标签页';
+              if (closeStatus) closeStatus.textContent = '浏览器限制脚本关闭当前标签页，请使用标签页关闭按钮或快捷键关闭。';
+              if (closeHint) closeHint.className = 'hint blocked';
             }
-            function blankFallback() {
-              try { window.location.replace('about:blank'); } catch (_) {}
+            function tryClose() {
+              try { window.close(); } catch (_) {}
             }
             closeButton && closeButton.addEventListener('click', function () {
               tryClose();
-              window.setTimeout(blankFallback, 300);
+              window.setTimeout(markBlocked, 280);
             });
             var timer = window.setInterval(function () {
               seconds -= 1;
@@ -423,7 +473,7 @@ fn oauth_callback_html(success: bool, title: &str, description: &str) -> String 
               tryClose();
               if (seconds <= 0) {
                 window.clearInterval(timer);
-                blankFallback();
+                markBlocked();
               }
             }, 1000);
             window.setTimeout(tryClose, 250);
@@ -516,6 +566,13 @@ fn oauth_callback_html(success: bool, title: &str, description: &str) -> String 
         color: #8a97a8;
         font-size: 13px;
       }}
+      .hint.blocked {{
+        padding: 10px 12px;
+        border: 1px solid #fed7aa;
+        border-radius: 10px;
+        color: #9a3412;
+        background: #fff7ed;
+      }}
       .countdown {{
         margin-top: 14px;
         color: #64748b;
@@ -530,9 +587,9 @@ fn oauth_callback_html(success: bool, title: &str, description: &str) -> String 
       <p>{description}</p>
       {countdown_html}
       <div class="actions">
-        <button id="closeButton" onclick="window.close()">关闭页面</button>
+        <button id="closeButton" type="button">关闭页面</button>
       </div>
-      <div class="hint">如果浏览器拦截自动关闭，可以直接关闭此标签页。</div>
+      <div id="closeHint" class="hint"><span id="closeStatus">如果浏览器拦截自动关闭，可以直接关闭此标签页。</span></div>
     </main>
     {auto_close_script}
   </body>
@@ -601,8 +658,19 @@ fn open_url_with_system(url: &str) -> Result<std::process::ExitStatus, String> {
     }
     #[cfg(target_os = "windows")]
     {
-        Command::new("cmd")
-            .args(["/C", "start", "", url])
+        let mut command = Command::new("powershell");
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "Start-Process -FilePath $args[0]",
+            ])
+            .arg(url);
+        hide_command_window(&mut command);
+        command
             .status()
             .map_err(|error| format!("打开浏览器失败: {}", error))
     }
@@ -613,6 +681,12 @@ fn open_url_with_system(url: &str) -> Result<std::process::ExitStatus, String> {
             .status()
             .map_err(|error| format!("打开浏览器失败: {}", error))
     }
+}
+
+#[cfg(windows)]
+fn hide_command_window(command: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[tauri::command]
@@ -639,6 +713,7 @@ fn get_codex_switcher_settings() -> Result<CodexSwitcherSettings, String> {
 fn update_codex_switcher_settings(
     settings: CodexSwitcherSettings,
 ) -> Result<CodexSwitcherSettings, String> {
+    let settings = settings.normalized();
     write_switcher_settings(&settings)?;
     Ok(settings)
 }
@@ -672,6 +747,13 @@ async fn codex_get_usage_dashboard(
     })
     .await
     .map_err(|error| format!("统计任务执行失败: {}", error))?
+}
+
+#[tauri::command]
+async fn codex_get_usage_activity(refresh: Option<bool>) -> Result<CodexUsageActivity, String> {
+    tauri::async_runtime::spawn_blocking(move || usage::get_codex_usage_activity(refresh))
+        .await
+        .map_err(|error| format!("活动统计任务执行失败: {}", error))?
 }
 
 #[tauri::command]
@@ -1009,16 +1091,18 @@ async fn refresh_all_codex_quotas() -> Result<i32, String> {
     let accounts = AccountStore::default().list_accounts()?;
     let mut count = 0;
     for account in accounts {
-        if fetch_codex_quota_for_account(&account.id)
-            .await
-            .and_then(|quota| {
-                AccountStore::default()
+        match fetch_codex_quota_for_account(&account.id).await {
+            Ok(quota) => {
+                if AccountStore::default()
                     .update_account_quota(&account.id, quota)
-                    .map(|_| ())
-            })
-            .is_ok()
-        {
-            count += 1;
+                    .is_ok()
+                {
+                    count += 1;
+                }
+            }
+            Err(error) => {
+                let _ = AccountStore::default().update_account_quota_error(&account.id, error);
+            }
         }
     }
     Ok(count)
@@ -1545,13 +1629,16 @@ fn read_switcher_settings() -> Result<CodexSwitcherSettings, String> {
     }
     let content =
         std::fs::read_to_string(&path).map_err(|error| format!("读取设置失败: {}", error))?;
-    serde_json::from_str(&content).map_err(|error| format!("解析设置失败: {}", error))
+    serde_json::from_str::<CodexSwitcherSettings>(&content)
+        .map(CodexSwitcherSettings::normalized)
+        .map_err(|error| format!("解析设置失败: {}", error))
 }
 
 fn write_switcher_settings(settings: &CodexSwitcherSettings) -> Result<(), String> {
+    let settings = settings.clone().normalized();
     std::fs::create_dir_all(switcher_config_data_dir())
         .map_err(|error| format!("创建设置目录失败: {}", error))?;
-    let content = serde_json::to_string_pretty(settings)
+    let content = serde_json::to_string_pretty(&settings)
         .map_err(|error| format!("序列化设置失败: {}", error))?;
     std::fs::write(switcher_settings_path(), content)
         .map_err(|error| format!("写入设置失败: {}", error))
@@ -1758,6 +1845,7 @@ pub fn run() {
             refresh_all_codex_quotas,
             consume_codex_reset_credit,
             codex_get_usage_dashboard,
+            codex_get_usage_activity,
             codex_list_model_pricing,
             codex_update_model_pricing,
             codex_delete_model_pricing,

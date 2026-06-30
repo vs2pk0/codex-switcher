@@ -129,7 +129,7 @@ function backupButtonText(): string {
               <a-input-number
                 v-model="settings.quotaRefreshMinutes"
                 :min="1"
-                :max="120"
+                :max="1440"
                 mode="button"
               >
                 <template #suffix>分钟</template>
@@ -139,7 +139,7 @@ function backupButtonText(): string {
               <a-input-number
                 v-model="settings.currentAccountRefreshMinutes"
                 :min="1"
-                :max="120"
+                :max="1440"
                 mode="button"
               >
                 <template #suffix>分钟</template>
