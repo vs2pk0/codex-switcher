@@ -828,6 +828,66 @@ pub fn codex_restart_commands() -> (
 #[cfg(target_os = "windows")]
 const WINDOWS_CODEX_START_SCRIPT: &str = r#"
 $ErrorActionPreference = 'SilentlyContinue'
+function Start-CodexStoreTarget([string]$target) {
+  if ([string]::IsNullOrWhiteSpace($target)) { return $false }
+  try {
+    Start-Process -FilePath $target -ErrorAction Stop
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Start-CodexExe([string]$path) {
+  if ([string]::IsNullOrWhiteSpace($path)) { return $false }
+  if ($path -match '(?i)codex[-_\s]*switcher') { return $false }
+  if ((Split-Path -Leaf $path) -ine 'Codex.exe') { return $false }
+  if (Test-Path -LiteralPath $path) {
+    try {
+      Start-Process -FilePath $path -ErrorAction Stop
+      return $true
+    } catch {
+      return $false
+    }
+  }
+  return $false
+}
+
+$startApp = Get-StartApps | Where-Object { $_.AppID -like 'OpenAI.Codex_*' } | Select-Object -First 1
+if ($startApp -and -not [string]::IsNullOrWhiteSpace($startApp.AppID)) {
+  $target = 'shell:AppsFolder\' + [string]$startApp.AppID
+  if (Start-CodexStoreTarget $target) { exit 0 }
+}
+
+$pkg = Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction SilentlyContinue |
+  Sort-Object -Property Version -Descending |
+  Select-Object -First 1
+if ($pkg -and -not [string]::IsNullOrWhiteSpace($pkg.PackageFamilyName)) {
+  $target = 'shell:AppsFolder\' + [string]($pkg.PackageFamilyName.Trim() + '!App')
+  if (Start-CodexStoreTarget $target) { exit 0 }
+}
+if ($pkg -and -not [string]::IsNullOrWhiteSpace($pkg.InstallLocation)) {
+  $appxExe = Join-Path ([string]$pkg.InstallLocation.Trim()) 'app\Codex.exe'
+  if (Start-CodexExe $appxExe) { exit 0 }
+}
+
+$windowsAppsRoots = @()
+$windowsAppsRoots += 'C:\Program Files\WindowsApps'
+Get-PSDrive -PSProvider FileSystem | ForEach-Object {
+  $root = $_.Root
+  if ([string]::IsNullOrWhiteSpace($root)) { return }
+  $windowsAppsRoots += (Join-Path $root 'WindowsApps')
+}
+foreach ($root in ($windowsAppsRoots | Select-Object -Unique)) {
+  if (-not (Test-Path -LiteralPath $root)) { continue }
+  $entries = Get-ChildItem -LiteralPath $root -Directory -Filter 'OpenAI.Codex_*' -ErrorAction SilentlyContinue |
+    Sort-Object -Property Name -Descending
+  foreach ($entry in $entries) {
+    $exe = Join-Path $entry.FullName 'app\Codex.exe'
+    if (Start-CodexExe $exe) { exit 0 }
+  }
+}
+
 $candidates = @()
 if ($env:LOCALAPPDATA) {
   $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\Codex\Codex.exe')
@@ -841,11 +901,9 @@ if (${pf86}) {
   $candidates += (Join-Path ${pf86} 'Codex\Codex.exe')
 }
 foreach ($path in $candidates) {
-  if ($path -and (Test-Path -LiteralPath $path)) {
-    Start-Process -FilePath $path
-    exit 0
-  }
+  if (Start-CodexExe $path) { exit 0 }
 }
+
 $shortcutRoots = @()
 if ($env:APPDATA) {
   $shortcutRoots += (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs')
@@ -855,17 +913,18 @@ if ($env:ProgramData) {
 }
 foreach ($root in $shortcutRoots) {
   if (-not (Test-Path -LiteralPath $root)) { continue }
-  $shortcut = Get-ChildItem -LiteralPath $root -Filter 'Codex*.lnk' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+  $shortcut = Get-ChildItem -LiteralPath $root -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { $_.BaseName -match '^(Codex|OpenAI Codex)$' -and $_.FullName -notmatch '(?i)codex[-_\s]*switcher' } |
+    Select-Object -First 1
   if ($shortcut) {
     Start-Process -FilePath $shortcut.FullName
     exit 0
   }
 }
-$command = Get-Command 'Codex.exe' -ErrorAction SilentlyContinue
-if (-not $command) { $command = Get-Command 'codex.exe' -ErrorAction SilentlyContinue }
-if ($command) {
-  Start-Process -FilePath $command.Source
-  exit 0
+
+foreach ($commandName in @('Codex.exe', 'codex.exe')) {
+  $command = Get-Command $commandName -CommandType Application -ErrorAction SilentlyContinue
+  if ($command -and (Start-CodexExe $command.Source)) { exit 0 }
 }
 exit 1
 "#;

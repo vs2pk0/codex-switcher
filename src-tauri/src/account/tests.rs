@@ -675,6 +675,10 @@ fn restart_command_targets_codex_app_on_current_platform() {
     {
         assert_eq!(start_program, "powershell");
         assert!(start_args.iter().any(|arg| arg.contains("Codex.exe")));
+        assert!(start_args.iter().any(|arg| arg.contains("OpenAI.Codex_*")));
+        assert!(start_args
+            .iter()
+            .all(|arg| !arg.contains("-Filter 'Codex*.lnk'")));
     }
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
