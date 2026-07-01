@@ -1,4 +1,4 @@
-name: Build Windows
+name: Build Desktop Releases
 
 on:
   workflow_dispatch:
@@ -30,37 +30,115 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build frontend
-        run: npm run build
-
       - name: Build Windows app
         run: npm run tauri build
 
-      - name: List bundle output
+      - name: Collect Windows installers
         shell: pwsh
-        run: |
-          Get-ChildItem -Path "src-tauri/target/release/bundle" -Recurse |
-            Select-Object FullName, Length, LastWriteTime
-
-      - name: Publish Windows release assets
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
-          $tag = "windows-latest"
-          $title = "Windows Latest"
-          $notes = "Automated Windows build for $env:GITHUB_SHA"
-          $assets = Get-ChildItem -Path "src-tauri/target/release/bundle" -Recurse -Include "*.exe", "*.msi" |
-            Select-Object -ExpandProperty FullName
+          New-Item -ItemType Directory -Force -Path "release-assets/windows" | Out-Null
+          $assets = Get-ChildItem -Path "src-tauri/target/release/bundle" -Recurse -Include "*.exe", "*.msi"
           if (-not $assets) {
             throw "No Windows installer assets found."
           }
-
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --title $title --notes $notes --target $env:GITHUB_SHA --latest=false
-          } else {
-            gh release edit $tag --title $title --notes $notes --target $env:GITHUB_SHA --latest=false
+          $assets | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination "release-assets/windows/$($_.Name)" -Force
           }
-          gh release upload $tag @assets --clobber
+          Get-ChildItem -Path "release-assets/windows" | Select-Object FullName, Length, LastWriteTime
+
+      - name: Upload Windows installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          path: release-assets/windows/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build macOS app
+        run: npm run tauri build
+
+      - name: Collect macOS installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "release-assets/macos"
+          find "src-tauri/target/release/bundle" -type f \( -name "*.dmg" -o -name "*.tar.gz" \) -print0 |
+            while IFS= read -r -d '' asset; do
+              cp "$asset" "release-assets/macos/$(basename "$asset")"
+            done
+          if ! find "release-assets/macos" -type f | grep -q .; then
+            echo "No macOS installer assets found." >&2
+            exit 1
+          fi
+          ls -lh "release-assets/macos"
+
+      - name: Upload macOS installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-installers
+          path: release-assets/macos/*
+          if-no-files-found: error
+
+  release:
+    name: Publish version release
+    runs-on: ubuntu-latest
+    needs:
+      - windows
+      - macos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          tag="v${version}"
+          title="Codex Switcher ${tag}"
+          notes="Automated Windows and macOS build for ${GITHUB_SHA}"
+          mapfile -t assets < <(find "release-assets" -type f | sort)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets found." >&2
+            exit 1
+          fi
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release edit "${tag}" --title "${title}" --notes "${notes}" --target "${GITHUB_SHA}" --latest
+          else
+            gh release create "${tag}" --title "${title}" --notes "${notes}" --target "${GITHUB_SHA}" --latest
+          fi
+          gh release upload "${tag}" "${assets[@]}" --clobber

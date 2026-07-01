@@ -4,6 +4,7 @@ import type {
   CodexSwitcherPaths,
   CodexSwitcherSettings,
 } from "../services/codex";
+import { languageOptions, setLanguage } from "../i18n";
 
 const props = defineProps<{
   settings: CodexSwitcherSettings;
@@ -46,6 +47,13 @@ function backupButtonText(): string {
   if (!props.backupWorking) return "手动备份";
   const progress = Math.max(0, Math.min(100, Math.round(props.backupProgress || 0)));
   return `手动备份 ${progress}%`;
+}
+
+function changeLanguage(value: unknown): void {
+  if (typeof value !== "string") return;
+  props.settings.language = value;
+  setLanguage(value);
+  emit("save");
 }
 
 </script>
@@ -154,6 +162,19 @@ function backupButtonText(): string {
 
         <a-card title="外观" :bordered="false" class="settings-card settings-appearance">
           <a-form :model="settings" layout="vertical">
+            <a-form-item label="语言">
+              <a-select
+                :model-value="settings.language || 'zh-CN'"
+                popup-container="body"
+                :scrollbar="false"
+                :trigger-props="{ contentClass: 'account-filter-dropdown language-dropdown' }"
+                @change="changeLanguage"
+              >
+                <a-option v-for="item in languageOptions" :key="item.value" :value="item.value">
+                  {{ item.label }}
+                </a-option>
+              </a-select>
+            </a-form-item>
             <a-form-item label="每行固定账号数">
               <a-radio-group v-model="settings.maxColumns" type="button" @change="emit('save')">
                 <a-radio :value="3">3 个</a-radio>

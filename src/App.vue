@@ -12,6 +12,7 @@ import SettingsPanel from "./components/SettingsPanel.vue";
 import UsagePanel from "./components/UsagePanel.vue";
 import appIcon from "./assets/app-icon.png";
 import { defaultBadgeStyles } from "./constants/badgeStyles";
+import { setLanguage } from "./i18n";
 import {
   addCodexAccountWithApiKey,
   cancelCodexOAuthLogin,
@@ -97,6 +98,8 @@ let quotaTimer: number | undefined;
 let currentAccountQuotaTimer: number | undefined;
 let quotaCountdownTimer: number | undefined;
 let countdownSettingsPersistTimer: number | undefined;
+let scheduledQuotaRefreshRunning = false;
+let scheduledCurrentAccountRefreshRunning = false;
 const nextQuotaRefreshAt = ref(0);
 const nextCurrentAccountRefreshAt = ref(0);
 const nowMs = ref(Date.now());
@@ -146,6 +149,7 @@ const settings = reactive<CodexSwitcherSettings>({
   badgeStyle: "classic",
   badgeStyles: defaultBadgeStyles(),
   maxColumns: 3,
+  language: "zh-CN",
 });
 
 const oauthLoginId = ref("");
@@ -455,6 +459,7 @@ function scheduleCountdownSettingsPersist(): void {
         : 0,
       showQuotaCountdowns: settings.showQuotaCountdowns ?? true,
       maxColumns: [3, 4, 5].includes(settings.maxColumns) ? settings.maxColumns : 3,
+      language: settings.language || "zh-CN",
     }).catch(() => {
       // 倒计时缓存失败不影响主流程，下一次正常保存设置会带上最新时间。
     });
@@ -1077,7 +1082,9 @@ async function loadSettings(): Promise<void> {
       currentAccountNextRefreshAt: Number(nextSettings.currentAccountNextRefreshAt || 0),
       showQuotaCountdowns: nextSettings.showQuotaCountdowns ?? true,
       maxColumns: [3, 4, 5].includes(nextSettings.maxColumns) ? nextSettings.maxColumns : 3,
+      language: nextSettings.language || "zh-CN",
     });
+    setLanguage(settings.language);
     appPaths.value = nextPaths;
     backupFiles.value = nextBackups;
     resetQuotaTimer();
@@ -1131,8 +1138,10 @@ async function saveSettings(): Promise<void> {
         : 0,
       showQuotaCountdowns: settings.showQuotaCountdowns ?? true,
       maxColumns: [3, 4, 5].includes(settings.maxColumns) ? settings.maxColumns : 3,
+      language: settings.language || "zh-CN",
     });
     Object.assign(settings, saved);
+    setLanguage(settings.language);
     resetQuotaTimer();
     Message.success("设置已保存");
   } catch (error) {
@@ -1154,14 +1163,7 @@ function resetCurrentAccountQuotaTimer(forceNew = false): void {
   const nextAt = forceNew
     ? Date.now() + minutes * 60_000
     : normalizedNextRefreshAt(storedNextAt, minutes);
-  setCurrentAccountNextRefreshAt(nextAt);
-  currentAccountQuotaTimer = window.setTimeout(() => {
-    void handleRefreshCurrentQuota(false).finally(() => {
-      if (settings.monitorQuota && currentAccount.value) {
-        resetCurrentAccountQuotaTimer(true);
-      }
-    });
-  }, Math.max(1_000, nextAt - Date.now()));
+  scheduleCurrentAccountQuotaTimer(nextAt);
 }
 
 function resetQuotaTimer(forceNew = false): void {
@@ -1179,18 +1181,95 @@ function resetQuotaTimer(forceNew = false): void {
   const nextAt = forceNew
     ? Date.now() + minutes * 60_000
     : normalizedNextRefreshAt(storedNextAt, minutes);
-  setQuotaNextRefreshAt(nextAt);
-  quotaTimer = window.setTimeout(() => {
-    void handleRefreshAllQuotas(false).finally(() => {
-      if (settings.monitorQuota) {
-        resetQuotaTimer(true);
-      }
-    });
-  }, Math.max(1_000, nextAt - Date.now()));
+  scheduleQuotaTimer(nextAt);
   resetCurrentAccountQuotaTimer();
 }
 
-async function handleRefreshCurrentQuota(showMessage = true): Promise<void> {
+function scheduleCurrentAccountQuotaTimer(nextAt: number): void {
+  if (currentAccountQuotaTimer) {
+    window.clearTimeout(currentAccountQuotaTimer);
+    currentAccountQuotaTimer = undefined;
+  }
+  setCurrentAccountNextRefreshAt(nextAt);
+  currentAccountQuotaTimer = window.setTimeout(() => {
+    void runScheduledCurrentAccountQuotaRefresh();
+  }, Math.max(1_000, nextAt - Date.now()));
+}
+
+function scheduleQuotaTimer(nextAt: number): void {
+  if (quotaTimer) {
+    window.clearTimeout(quotaTimer);
+    quotaTimer = undefined;
+  }
+  setQuotaNextRefreshAt(nextAt);
+  quotaTimer = window.setTimeout(() => {
+    void runScheduledQuotaRefresh();
+  }, Math.max(1_000, nextAt - Date.now()));
+}
+
+function scheduleNextCurrentAccountQuotaCycle(): void {
+  if (!settings.monitorQuota || !currentAccount.value) {
+    resetCurrentAccountQuotaTimer();
+    return;
+  }
+  scheduleCurrentAccountQuotaTimer(
+    Date.now() + clampRefreshMinutes(settings.currentAccountRefreshMinutes) * 60_000,
+  );
+}
+
+function scheduleNextQuotaCycle(): void {
+  if (!settings.monitorQuota) {
+    resetQuotaTimer();
+    return;
+  }
+  scheduleQuotaTimer(Date.now() + clampRefreshMinutes(settings.quotaRefreshMinutes) * 60_000);
+}
+
+async function runScheduledCurrentAccountQuotaRefresh(): Promise<void> {
+  if (scheduledCurrentAccountRefreshRunning) return;
+  scheduledCurrentAccountRefreshRunning = true;
+  scheduleNextCurrentAccountQuotaCycle();
+  try {
+    await handleRefreshCurrentQuota(false, false);
+  } finally {
+    scheduledCurrentAccountRefreshRunning = false;
+  }
+}
+
+async function runScheduledQuotaRefresh(): Promise<void> {
+  if (scheduledQuotaRefreshRunning) return;
+  scheduledQuotaRefreshRunning = true;
+  scheduleNextQuotaCycle();
+  try {
+    await handleRefreshAllQuotas(false, false);
+  } finally {
+    scheduledQuotaRefreshRunning = false;
+  }
+}
+
+function refreshOverdueQuotaCountdowns(): void {
+  if (!settings.monitorQuota) return;
+  const now = Date.now();
+  if (
+    nextCurrentAccountRefreshAt.value > 0 &&
+    now >= nextCurrentAccountRefreshAt.value &&
+    !scheduledCurrentAccountRefreshRunning
+  ) {
+    void runScheduledCurrentAccountQuotaRefresh();
+  }
+  if (
+    nextQuotaRefreshAt.value > 0 &&
+    now >= nextQuotaRefreshAt.value &&
+    !scheduledQuotaRefreshRunning
+  ) {
+    void runScheduledQuotaRefresh();
+  }
+}
+
+async function handleRefreshCurrentQuota(
+  showMessage = true,
+  updateNextRefresh = true,
+): Promise<void> {
   if (!settings.monitorQuota || !currentAccount.value || !canShowQuota(currentAccount.value)) {
     return;
   }
@@ -1200,9 +1279,9 @@ async function handleRefreshCurrentQuota(showMessage = true): Promise<void> {
     const updated = await refreshCodexQuota(accountId);
     currentAccount.value = updated;
     await loadAccounts();
-    setCurrentAccountNextRefreshAt(
-      Date.now() + clampRefreshMinutes(settings.currentAccountRefreshMinutes) * 60_000,
-    );
+    if (updateNextRefresh) {
+      resetCurrentAccountQuotaTimer(true);
+    }
     if (showMessage) Message.success("当前账号额度已刷新");
   } catch (error) {
     await loadAccounts();
@@ -1289,7 +1368,10 @@ async function handleConsumeSelectedResetCredit(): Promise<void> {
   }
 }
 
-async function handleRefreshAllQuotas(showMessage = true): Promise<void> {
+async function handleRefreshAllQuotas(
+  showMessage = true,
+  updateNextRefresh = true,
+): Promise<void> {
   if (!settings.monitorQuota) return;
   quotaRefreshingId.value = "__all__";
   try {
@@ -1299,8 +1381,8 @@ async function handleRefreshAllQuotas(showMessage = true): Promise<void> {
       await refreshCodexQuota(account.id);
     }
     await loadAccounts();
-    if (settings.monitorQuota) {
-      setQuotaNextRefreshAt(Date.now() + clampRefreshMinutes(settings.quotaRefreshMinutes) * 60_000);
+    if (settings.monitorQuota && updateNextRefresh) {
+      resetQuotaTimer(true);
     }
     if (showMessage) Message.success(`已刷新当前页 ${candidates.length} 个账号额度`);
   } catch (error) {
@@ -1468,16 +1550,27 @@ async function copyBatchExportText(): Promise<void> {
   }
 }
 
+function downloadJsonText(content: string, filename: string): void {
+  let url = "";
+  try {
+    const blob = new Blob([content], { type: "application/json;charset=utf-8" });
+    url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.click();
+    Message.success(`已开始下载 ${filename}`);
+  } catch (error) {
+    Message.error(`下载失败：${errorText(error)}`);
+  } finally {
+    if (url) URL.revokeObjectURL(url);
+  }
+}
+
 function downloadBatchExportText(): void {
-  const blob = new Blob([batchExportText.value], { type: "application/json;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
   const suffix = exportFormat.value === "cockpit_tools" ? "" : `_${exportFormat.value}`;
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  link.download = `codex-switcher-batch${suffix}_${timestamp}.json`;
-  link.click();
-  URL.revokeObjectURL(url);
+  downloadJsonText(batchExportText.value, `codex-switcher-batch${suffix}_${timestamp}.json`);
 }
 
 function handleDragStart(account: CodexAccount): void {
@@ -1749,10 +1842,31 @@ function openOfficialUrl(url: string): void {
   });
 }
 
-function openGithubProfile(): void {
-  void openExternalUrl("https://github.com/vs2pk0").catch((error) => {
-    Message.error(`打开 GitHub 失败：${errorText(error)}`);
+const authorProfileUrl = "https://github.com/vs2pk0";
+const repositoryUrl = "https://github.com/vs2pk0/codex-switcher";
+const sponsorUrl = "https://github.com/vs2pk0/codex-switcher/blob/main/doc/sponsor.md";
+const feedbackUrl = "https://github.com/vs2pk0/codex-switcher/issues";
+
+function openAboutUrl(url: string, label: string): void {
+  void openExternalUrl(url).catch((error) => {
+    Message.error(`打开${label}失败：${errorText(error)}`);
   });
+}
+
+function openGithubProfile(): void {
+  openAboutUrl(authorProfileUrl, "作者主页");
+}
+
+function openRepository(): void {
+  openAboutUrl(repositoryUrl, "开源仓库");
+}
+
+function openSponsorPage(): void {
+  openAboutUrl(sponsorUrl, "赞助页面");
+}
+
+function openFeedbackPage(): void {
+  openAboutUrl(feedbackUrl, "问题反馈");
 }
 
 async function completeOAuthLoginFlow(loginId: string): Promise<void> {
@@ -1907,14 +2021,8 @@ async function copyExportText(): Promise<void> {
 
 function downloadExportText(): void {
   const name = exportAccount.value ? displayName(exportAccount.value).replace(/[^\w.-]+/g, "_") : "codex-account";
-  const blob = new Blob([exportText.value], { type: "application/json;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
   const suffix = exportFormat.value === "cockpit_tools" ? "" : `_${exportFormat.value}`;
-  link.download = `${name}${suffix}.json`;
-  link.click();
-  URL.revokeObjectURL(url);
+  downloadJsonText(exportText.value, `${name}${suffix}.json`);
 }
 
 function openPhone(account: CodexAccount): void {
@@ -2498,6 +2606,7 @@ watch(
 onMounted(() => {
   quotaCountdownTimer = window.setInterval(() => {
     nowMs.value = Date.now();
+    refreshOverdueQuotaCountdowns();
   }, 1000);
   void getVersion()
     .then((version) => {
@@ -2643,7 +2752,14 @@ onUnmounted(() => {
         >
           <template #prefix><icon-search /></template>
         </a-input>
-        <a-select v-model="settings.sortMode" class="sort-select" @change="saveSettings">
+        <a-select
+          v-model="settings.sortMode"
+          class="sort-select"
+          popup-container="body"
+          :scrollbar="false"
+          :trigger-props="{ contentClass: 'account-filter-dropdown account-sort-dropdown' }"
+          @change="saveSettings"
+        >
           <a-option value="created_at">按创建时间</a-option>
           <a-option value="weekly_quota">按周配额</a-option>
           <a-option value="hourly_quota">按5小时配额</a-option>
@@ -3028,47 +3144,58 @@ onUnmounted(() => {
 
     <section v-if="activeView === 'about'" class="about-panel">
       <div class="about-hero">
-        <img :src="appIcon" alt="Codex Switcher" class="about-app-icon" />
+        <div class="about-icon-wrap">
+          <img :src="appIcon" alt="Codex Switcher" class="about-app-icon" />
+        </div>
+        <span class="about-kicker">本地 Codex 管理工具</span>
         <h2>Codex Switcher</h2>
         <div class="about-badges">
           <span class="about-version">v{{ appVersion }}</span>
-          <a-button class="about-github-button" size="small" @click="openGithubProfile">
+          <a-button class="about-github-button" size="small" @click="openRepository">
             <template #icon><icon-link /></template>
             GitHub
           </a-button>
         </div>
-        <p>专注 Codex 账号切换、会话维护、使用统计和本地 API 服务的桌面管理工具。</p>
+        <p>把账号切换、会话维护、使用统计和本地 API 服务收在一个干净的桌面工作台里。</p>
       </div>
 
       <div class="about-grid">
         <button type="button" class="about-tile" @click="openGithubProfile">
-          <span class="about-tile-icon">
+          <span class="about-tile-icon about-tile-icon-profile">
             <icon-user />
           </span>
-          <strong>作者主页</strong>
-          <span>vs2pk0</span>
+          <span class="about-tile-copy">
+            <strong>作者主页</strong>
+            <span>访问 vs2pk0 的 GitHub 主页</span>
+          </span>
         </button>
-        <button type="button" class="about-tile" @click="openGithubProfile">
-          <span class="about-tile-icon">
+        <button type="button" class="about-tile" @click="openRepository">
+          <span class="about-tile-icon about-tile-icon-repo">
             <icon-code />
           </span>
-          <strong>开源仓库</strong>
-          <span>codex-switcher</span>
+          <span class="about-tile-copy">
+            <strong>开源仓库</strong>
+            <span>查看源码、版本和发布记录</span>
+          </span>
         </button>
-        <div class="about-tile">
-          <span class="about-tile-icon danger">
+        <button type="button" class="about-tile" @click="openSponsorPage">
+          <span class="about-tile-icon about-tile-icon-sponsor">
             <icon-heart />
           </span>
-          <strong>赞助支持</strong>
-          <span>支持项目持续开发</span>
-        </div>
-        <div class="about-tile">
-          <span class="about-tile-icon accent">
+          <span class="about-tile-copy">
+            <strong>赞助支持</strong>
+            <span>查看支付宝、微信和 Binance 收款码</span>
+          </span>
+        </button>
+        <button type="button" class="about-tile" @click="openFeedbackPage">
+          <span class="about-tile-icon about-tile-icon-feedback">
             <icon-message />
           </span>
-          <strong>意见反馈</strong>
-          <span>报告问题或提交建议</span>
-        </div>
+          <span class="about-tile-copy">
+            <strong>问题反馈</strong>
+            <span>提交 Issue 或改进建议</span>
+          </span>
+        </button>
       </div>
     </section>
 
