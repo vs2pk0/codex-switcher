@@ -41,6 +41,10 @@ type ActivityBlock = ActivityCell & {
   detail: string;
   percent: number;
 };
+type AutoRefreshOption = {
+  value: number;
+  label: string;
+};
 
 const props = withDefaults(defineProps<{
   active?: boolean;
@@ -86,6 +90,15 @@ const rangeOptions: Array<{ value: UsageRange; label: string }> = [
   { value: "thisMonth", label: "当月" },
   { value: "lastMonth", label: "上月" },
 ];
+const autoRefreshStorageKey = "codex-switcher:usage-auto-refresh-ms";
+const autoRefreshOptions: AutoRefreshOption[] = [
+  { value: 0, label: "关闭" },
+  { value: 5_000, label: "5s" },
+  { value: 10_000, label: "10s" },
+  { value: 30_000, label: "30s" },
+  { value: 60_000, label: "60s" },
+];
+const autoRefreshIntervalMs = ref(readAutoRefreshInterval());
 
 const summary = computed(() => dashboard.value?.summary);
 const logs = computed(() => dashboard.value?.logs ?? []);
@@ -253,6 +266,17 @@ let echartsLoading: Promise<EChartsCoreApi> | null = null;
 let autoRefreshTimer: number | undefined;
 let activationRefreshTimer: number | undefined;
 let loadSerial = 0;
+
+function readAutoRefreshInterval(): number {
+  const fallback = 30_000;
+  try {
+    const stored = window.localStorage.getItem(autoRefreshStorageKey);
+    const parsed = Number(stored);
+    return autoRefreshOptions.some((item) => item.value === parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 function errorText(error: unknown): string {
   return String(error instanceof Error ? error.message : error).replace(/^Error:\s*/, "");
@@ -456,6 +480,18 @@ function refreshUsage(): void {
   void loadUsage(true);
 }
 
+function changeAutoRefreshInterval(value: unknown): void {
+  const next = Number(value);
+  if (!autoRefreshOptions.some((item) => item.value === next)) return;
+  autoRefreshIntervalMs.value = next;
+  try {
+    window.localStorage.setItem(autoRefreshStorageKey, String(next));
+  } catch {
+    // localStorage 不可用时只在当前页面生命周期内生效。
+  }
+  scheduleAutoRefresh();
+}
+
 function changePage(next: number): void {
   page.value = Math.min(Math.max(1, next), totalPages.value);
   void loadUsage(false);
@@ -471,11 +507,13 @@ function refreshPresetRangeForNow(): void {
 
 function scheduleAutoRefresh(): void {
   if (autoRefreshTimer) window.clearInterval(autoRefreshTimer);
+  autoRefreshTimer = undefined;
+  if (autoRefreshIntervalMs.value <= 0) return;
   autoRefreshTimer = window.setInterval(() => {
     if (!shouldAutoRefresh()) return;
     refreshPresetRangeForNow();
     void loadUsage(false, { silent: true });
-  }, 20_000);
+  }, autoRefreshIntervalMs.value);
 }
 
 function scheduleActivationRefresh(delay = 280): void {
@@ -959,6 +997,16 @@ onBeforeUnmount(() => {
           class="usage-range-picker"
           @change="changeCustomRange"
         />
+        <a-select
+          :model-value="autoRefreshIntervalMs"
+          class="usage-auto-refresh-select"
+          @change="changeAutoRefreshInterval"
+        >
+          <template #prefix><icon-refresh /></template>
+          <a-option v-for="item in autoRefreshOptions" :key="item.value" :value="item.value">
+            {{ item.label }}
+          </a-option>
+        </a-select>
         <a-button :loading="loading" @click="refreshUsage">
           <template #icon><icon-refresh /></template>
           刷新

@@ -65,6 +65,8 @@ struct CodexSwitcherSettings {
     badge_styles: HashMap<String, String>,
     #[serde(default = "default_max_columns")]
     max_columns: u64,
+    #[serde(default = "default_language")]
+    language: String,
 }
 
 const MAX_REFRESH_MINUTES: u64 = 1440;
@@ -87,6 +89,7 @@ impl Default for CodexSwitcherSettings {
             badge_style: default_badge_style(),
             badge_styles: default_badge_styles(),
             max_columns: default_max_columns(),
+            language: default_language(),
         }
     }
 }
@@ -102,6 +105,7 @@ impl CodexSwitcherSettings {
             self.current_account_next_refresh_at,
             self.current_account_refresh_minutes,
         );
+        self.language = normalize_language(&self.language);
         self
     }
 }
@@ -159,6 +163,17 @@ fn default_badge_styles() -> HashMap<String, String> {
 
 fn default_max_columns() -> u64 {
     3
+}
+
+fn default_language() -> String {
+    "zh-CN".to_string()
+}
+
+fn normalize_language(value: &str) -> String {
+    match value {
+        "zh-TW" | "en" | "ru" => value.to_string(),
+        _ => default_language(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1423,10 +1438,14 @@ fn codex_session_backup_summary(codex_home: &Path) -> Value {
 
 fn switcher_statistics_backup_summary() -> Value {
     let statistics_dir = switcher_statistics_dir();
+    let includes_usage_json_cache = statistics_dir.join("usage_logs.json").is_file();
+    let includes_usage_database = statistics_dir.join("usage.sqlite").is_file();
     serde_json::json!({
         "statisticsDir": statistics_dir.to_string_lossy().to_string(),
         "files": count_files_under(&statistics_dir),
-        "includesUsageCache": statistics_dir.join("usage_logs.json").is_file(),
+        "includesUsageCache": includes_usage_json_cache || includes_usage_database,
+        "includesUsageJsonCache": includes_usage_json_cache,
+        "includesUsageDatabase": includes_usage_database,
         "includesPricing": statistics_dir.join("pricing.json").is_file(),
         "includesPricingConfig": statistics_dir.join("pricing_config.json").is_file(),
     })
@@ -2137,6 +2156,10 @@ mod tests {
         assert_eq!(
             backup_entry_restore_target("data/statistics/usage_logs.json"),
             Some(switcher_data_dir().join("statistics/usage_logs.json"))
+        );
+        assert_eq!(
+            backup_entry_restore_target("data/statistics/usage.sqlite"),
+            Some(switcher_data_dir().join("statistics/usage.sqlite"))
         );
     }
 

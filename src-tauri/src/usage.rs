@@ -1,6 +1,7 @@
 use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Timelike,
 };
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -217,16 +218,15 @@ pub fn get_codex_usage_dashboard(
     page_size: Option<usize>,
     refresh: Option<bool>,
 ) -> Result<CodexUsageDashboard, String> {
-    let cache = load_or_rebuild_usage_cache(refresh.unwrap_or(false))?;
+    let (conn, cache) = ensure_usage_cache_db(refresh.unwrap_or(false))?;
     let pricing = load_pricing()?;
     let pricing_configs = load_pricing_configs()?;
     let cost_multiplier = pricing_config_multiplier(&pricing_configs);
-    let mut logs = cache.logs;
     let errors = cache.errors;
 
     let start = start_date.unwrap_or(i64::MIN);
     let end = end_date.unwrap_or(i64::MAX);
-    logs.retain(|log| log.created_at >= start && log.created_at <= end);
+    let mut logs = read_usage_logs_db_range(&conn, start, end)?;
     logs.sort_by_key(|log| std::cmp::Reverse(log.created_at));
 
     let total_logs = logs.len();
@@ -249,14 +249,16 @@ pub fn get_codex_usage_dashboard(
         total_logs,
         files_scanned: cache.files.len(),
         errors,
-        cache_path: usage_cache_path().to_string_lossy().to_string(),
+        cache_path: usage_db_path().to_string_lossy().to_string(),
         pricing_configs,
     })
 }
 
 pub fn get_codex_usage_activity(refresh: Option<bool>) -> Result<CodexUsageActivity, String> {
-    let cache = load_or_rebuild_usage_cache(refresh.unwrap_or(false))?;
-    Ok(build_usage_activity(&cache.logs))
+    let (conn, _) = ensure_usage_cache_db(refresh.unwrap_or(false))?;
+    let start = local_day_start_timestamp(usage_activity_start_date(Local::now().date_naive()));
+    let logs = read_usage_logs_db_range(&conn, start, i64::MAX)?;
+    Ok(build_usage_activity(&logs))
 }
 
 pub fn list_model_pricing() -> Result<Vec<CodexUsagePricing>, String> {
@@ -486,17 +488,20 @@ fn compute_delta(prev: &Option<CumulativeTokens>, current: &CumulativeTokens) ->
     }
 }
 
-fn load_or_rebuild_usage_cache(force_refresh: bool) -> Result<UsageCache, String> {
-    let path = usage_cache_path();
-    let previous_cache = read_usage_cache(&path).ok();
+fn ensure_usage_cache_db(force_refresh: bool) -> Result<(Connection, UsageCache), String> {
+    let mut conn = open_usage_db()?;
+    migrate_usage_json_cache_if_needed(&mut conn)?;
+    let previous_cache = read_usage_cache_meta_db(&conn)?;
     if !force_refresh {
         if let Some(cache) = previous_cache.as_ref() {
             if cache.version == USAGE_CACHE_VERSION && cache.files == current_usage_cache_files() {
-                return Ok(cache.clone());
+                return Ok((conn, cache.clone()));
             }
         }
     }
-    rebuild_usage_cache(previous_cache)
+    let previous_cache = read_usage_cache_db(&conn)?;
+    let cache = rebuild_usage_cache_db(&mut conn, previous_cache)?;
+    Ok((conn, cache))
 }
 
 fn current_usage_cache_files() -> Vec<UsageCacheFile> {
@@ -506,13 +511,16 @@ fn current_usage_cache_files() -> Vec<UsageCacheFile> {
         .collect()
 }
 
-fn read_usage_cache(path: &Path) -> Result<UsageCache, String> {
+fn read_usage_json_cache(path: &Path) -> Result<UsageCache, String> {
     let content =
         fs::read_to_string(path).map_err(|error| format!("读取统计缓存失败: {}", error))?;
     serde_json::from_str(&content).map_err(|error| format!("解析统计缓存失败: {}", error))
 }
 
-fn rebuild_usage_cache(previous_cache: Option<UsageCache>) -> Result<UsageCache, String> {
+fn rebuild_usage_cache_db(
+    conn: &mut Connection,
+    previous_cache: Option<UsageCache>,
+) -> Result<UsageCache, String> {
     fs::create_dir_all(statistics_dir()).map_err(|error| format!("创建统计目录失败: {}", error))?;
     let codex_home = default_codex_home();
     let files = collect_codex_session_files(&codex_home);
@@ -536,11 +544,352 @@ fn rebuild_usage_cache(previous_cache: Option<UsageCache>) -> Result<UsageCache,
         logs,
         errors,
     };
-    let content = serde_json::to_string_pretty(&cache)
-        .map_err(|error| format!("序列化统计缓存失败: {}", error))?;
-    fs::write(usage_cache_path(), content)
-        .map_err(|error| format!("写入统计缓存失败: {}", error))?;
+    write_usage_cache_db(conn, &cache)?;
     Ok(cache)
+}
+
+fn open_usage_db() -> Result<Connection, String> {
+    fs::create_dir_all(statistics_dir()).map_err(|error| format!("创建统计目录失败: {}", error))?;
+    let conn = Connection::open(usage_db_path())
+        .map_err(|error| format!("打开统计数据库失败: {}", error))?;
+    init_usage_db(&conn)?;
+    Ok(conn)
+}
+
+fn init_usage_db(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        r#"
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        CREATE TABLE IF NOT EXISTS usage_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS usage_files (
+            path TEXT PRIMARY KEY,
+            modified_ms TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS usage_errors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS usage_logs (
+            request_id TEXT PRIMARY KEY,
+            model TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            cache_read_tokens INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at ON usage_logs(created_at);
+        CREATE INDEX IF NOT EXISTS idx_usage_logs_model ON usage_logs(model);
+        "#,
+    )
+    .map_err(|error| format!("初始化统计数据库失败: {}", error))?;
+    Ok(())
+}
+
+fn read_usage_cache_db(conn: &Connection) -> Result<Option<UsageCache>, String> {
+    let Some(mut cache) = read_usage_cache_meta_db(conn)? else {
+        return Ok(None);
+    };
+    cache.logs = read_usage_logs_db(conn)?;
+    Ok(Some(cache))
+}
+
+fn read_usage_cache_meta_db(conn: &Connection) -> Result<Option<UsageCache>, String> {
+    let Some(version_value) = read_usage_meta(conn, "version")? else {
+        return Ok(None);
+    };
+    let version = version_value.parse::<u32>().unwrap_or_default();
+    let updated_at = read_usage_meta(conn, "updatedAt")?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or_default();
+    let files = read_usage_files_db(conn)?;
+    let errors = read_usage_errors_db(conn)?;
+    Ok(Some(UsageCache {
+        version,
+        updated_at,
+        files,
+        logs: Vec::new(),
+        errors,
+    }))
+}
+
+fn read_usage_meta(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT value FROM usage_meta WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|error| format!("读取统计元数据失败: {}", error))
+}
+
+fn read_usage_files_db(conn: &Connection) -> Result<Vec<UsageCacheFile>, String> {
+    let mut stmt = conn
+        .prepare("SELECT path, modified_ms, size_bytes FROM usage_files ORDER BY path ASC")
+        .map_err(|error| format!("读取统计文件指纹失败: {}", error))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let modified_ms = row.get::<_, String>(1)?.parse::<u128>().unwrap_or_default();
+            Ok(UsageCacheFile {
+                path: row.get(0)?,
+                modified_ms,
+                size_bytes: row.get::<_, i64>(2)?.max(0) as u64,
+            })
+        })
+        .map_err(|error| format!("读取统计文件指纹失败: {}", error))?;
+    collect_sqlite_rows(rows, "读取统计文件指纹失败")
+}
+
+fn read_usage_logs_db(conn: &Connection) -> Result<Vec<ParsedUsageLog>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT request_id, model, input_tokens, output_tokens, cache_read_tokens, created_at \
+             FROM usage_logs ORDER BY created_at ASC, request_id ASC",
+        )
+        .map_err(|error| format!("读取统计日志失败: {}", error))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(ParsedUsageLog {
+                request_id: row.get(0)?,
+                model: row.get(1)?,
+                input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                output_tokens: row.get::<_, i64>(3)?.max(0) as u64,
+                cache_read_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                created_at: row.get(5)?,
+            })
+        })
+        .map_err(|error| format!("读取统计日志失败: {}", error))?;
+    collect_sqlite_rows(rows, "读取统计日志失败")
+}
+
+fn read_usage_logs_db_range(
+    conn: &Connection,
+    start: i64,
+    end: i64,
+) -> Result<Vec<ParsedUsageLog>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT request_id, model, input_tokens, output_tokens, cache_read_tokens, created_at \
+             FROM usage_logs WHERE created_at >= ?1 AND created_at <= ?2 \
+             ORDER BY created_at ASC, request_id ASC",
+        )
+        .map_err(|error| format!("读取统计日志失败: {}", error))?;
+    let rows = stmt
+        .query_map(params![start, end], |row| {
+            Ok(ParsedUsageLog {
+                request_id: row.get(0)?,
+                model: row.get(1)?,
+                input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                output_tokens: row.get::<_, i64>(3)?.max(0) as u64,
+                cache_read_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                created_at: row.get(5)?,
+            })
+        })
+        .map_err(|error| format!("读取统计日志失败: {}", error))?;
+    collect_sqlite_rows(rows, "读取统计日志失败")
+}
+
+fn read_usage_errors_db(conn: &Connection) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT message FROM usage_errors ORDER BY id ASC")
+        .map_err(|error| format!("读取统计错误失败: {}", error))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("读取统计错误失败: {}", error))?;
+    collect_sqlite_rows(rows, "读取统计错误失败")
+}
+
+fn collect_sqlite_rows<T>(
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
+    message: &str,
+) -> Result<Vec<T>, String> {
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|error| format!("{}: {}", message, error))?);
+    }
+    Ok(items)
+}
+
+fn write_usage_cache_db(conn: &mut Connection, cache: &UsageCache) -> Result<(), String> {
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("写入统计数据库失败: {}", error))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO usage_meta (key, value) VALUES ('version', ?1)",
+        params![cache.version.to_string()],
+    )
+    .map_err(|error| format!("写入统计版本失败: {}", error))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO usage_meta (key, value) VALUES ('updatedAt', ?1)",
+        params![cache.updated_at.to_string()],
+    )
+    .map_err(|error| format!("写入统计更新时间失败: {}", error))?;
+    tx.execute("DELETE FROM usage_files", [])
+        .map_err(|error| format!("清理统计文件指纹失败: {}", error))?;
+    tx.execute("DELETE FROM usage_errors", [])
+        .map_err(|error| format!("清理统计错误失败: {}", error))?;
+    tx.execute("DELETE FROM usage_logs", [])
+        .map_err(|error| format!("清理统计日志失败: {}", error))?;
+
+    {
+        let mut stmt = tx
+            .prepare("INSERT INTO usage_files (path, modified_ms, size_bytes) VALUES (?1, ?2, ?3)")
+            .map_err(|error| format!("写入统计文件指纹失败: {}", error))?;
+        for file in &cache.files {
+            stmt.execute(params![
+                file.path,
+                file.modified_ms.to_string(),
+                file.size_bytes as i64,
+            ])
+            .map_err(|error| format!("写入统计文件指纹失败: {}", error))?;
+        }
+    }
+    {
+        let mut stmt = tx
+            .prepare("INSERT INTO usage_errors (message) VALUES (?1)")
+            .map_err(|error| format!("写入统计错误失败: {}", error))?;
+        for error in &cache.errors {
+            stmt.execute(params![error])
+                .map_err(|error| format!("写入统计错误失败: {}", error))?;
+        }
+    }
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT OR REPLACE INTO usage_logs \
+                 (request_id, model, input_tokens, output_tokens, cache_read_tokens, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .map_err(|error| format!("写入统计日志失败: {}", error))?;
+        for log in &cache.logs {
+            stmt.execute(params![
+                log.request_id,
+                log.model,
+                log.input_tokens as i64,
+                log.output_tokens as i64,
+                log.cache_read_tokens as i64,
+                log.created_at,
+            ])
+            .map_err(|error| format!("写入统计日志失败: {}", error))?;
+        }
+    }
+
+    tx.commit()
+        .map_err(|error| format!("提交统计数据库失败: {}", error))?;
+    Ok(())
+}
+
+fn migrate_usage_json_cache_if_needed(conn: &mut Connection) -> Result<(), String> {
+    let path = usage_cache_path();
+    let Some(marker) = usage_json_cache_marker(&path) else {
+        return Ok(());
+    };
+    if read_usage_meta(conn, "jsonMigrated")?.as_deref() == Some(marker.as_str()) {
+        return Ok(());
+    }
+    let has_existing_cache = read_usage_meta(conn, "version")?.is_some();
+    let cache = match read_usage_json_cache(&path) {
+        Ok(cache) => cache,
+        Err(_) if has_existing_cache => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    import_usage_cache_into_db(conn, &cache)?;
+    write_usage_meta(conn, "jsonMigrated", &marker)?;
+    Ok(())
+}
+
+fn usage_json_cache_marker(path: &Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    Some(format!("{}:{}", metadata.len(), modified_ms))
+}
+
+fn write_usage_meta(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO usage_meta (key, value) VALUES (?1, ?2)",
+        params![key, value],
+    )
+    .map_err(|error| format!("写入统计元数据失败: {}", error))?;
+    Ok(())
+}
+
+fn import_usage_cache_into_db(conn: &mut Connection, cache: &UsageCache) -> Result<(), String> {
+    let has_version = read_usage_meta(conn, "version")?.is_some();
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("迁移统计缓存失败: {}", error))?;
+    if !has_version {
+        tx.execute(
+            "INSERT OR REPLACE INTO usage_meta (key, value) VALUES ('version', ?1)",
+            params![cache.version.to_string()],
+        )
+        .map_err(|error| format!("迁移统计版本失败: {}", error))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO usage_meta (key, value) VALUES ('updatedAt', ?1)",
+            params![cache.updated_at.to_string()],
+        )
+        .map_err(|error| format!("迁移统计更新时间失败: {}", error))?;
+        tx.execute("DELETE FROM usage_files", [])
+            .map_err(|error| format!("迁移统计文件指纹失败: {}", error))?;
+        tx.execute("DELETE FROM usage_errors", [])
+            .map_err(|error| format!("迁移统计错误失败: {}", error))?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO usage_files (path, modified_ms, size_bytes) VALUES (?1, ?2, ?3)",
+                )
+                .map_err(|error| format!("迁移统计文件指纹失败: {}", error))?;
+            for file in &cache.files {
+                stmt.execute(params![
+                    file.path,
+                    file.modified_ms.to_string(),
+                    file.size_bytes as i64,
+                ])
+                .map_err(|error| format!("迁移统计文件指纹失败: {}", error))?;
+            }
+        }
+        {
+            let mut stmt = tx
+                .prepare("INSERT INTO usage_errors (message) VALUES (?1)")
+                .map_err(|error| format!("迁移统计错误失败: {}", error))?;
+            for error in &cache.errors {
+                stmt.execute(params![error])
+                    .map_err(|error| format!("迁移统计错误失败: {}", error))?;
+            }
+        }
+    }
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT OR IGNORE INTO usage_logs \
+                 (request_id, model, input_tokens, output_tokens, cache_read_tokens, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .map_err(|error| format!("迁移统计日志失败: {}", error))?;
+        for log in &cache.logs {
+            stmt.execute(params![
+                log.request_id,
+                log.model,
+                log.input_tokens as i64,
+                log.output_tokens as i64,
+                log.cache_read_tokens as i64,
+                log.created_at,
+            ])
+            .map_err(|error| format!("迁移统计日志失败: {}", error))?;
+        }
+    }
+    tx.commit()
+        .map_err(|error| format!("提交统计迁移失败: {}", error))?;
+    Ok(())
 }
 
 fn merge_usage_logs(
@@ -610,9 +959,7 @@ fn summarize_logs(
 
 fn build_usage_activity(logs: &[ParsedUsageLog]) -> CodexUsageActivity {
     let today = Local::now().date_naive();
-    let current_week_start =
-        today - ChronoDuration::days(today.weekday().num_days_from_monday() as i64);
-    let start_date = current_week_start - ChronoDuration::weeks(52);
+    let start_date = usage_activity_start_date(today);
     let day_count = 53 * 7;
     let mut day_tokens: HashMap<NaiveDate, (u64, usize)> = HashMap::new();
     let mut hour_tokens: HashMap<u32, (u64, usize)> = HashMap::new();
@@ -695,6 +1042,12 @@ fn build_usage_activity(logs: &[ParsedUsageLog]) -> CodexUsageActivity {
         days,
         hours,
     }
+}
+
+fn usage_activity_start_date(today: NaiveDate) -> NaiveDate {
+    let current_week_start =
+        today - ChronoDuration::days(today.weekday().num_days_from_monday() as i64);
+    current_week_start - ChronoDuration::weeks(52)
 }
 
 fn local_day_start_timestamp(date: NaiveDate) -> i64 {
@@ -2106,6 +2459,10 @@ fn usage_cache_path() -> PathBuf {
     statistics_dir().join("usage_logs.json")
 }
 
+fn usage_db_path() -> PathBuf {
+    statistics_dir().join("usage.sqlite")
+}
+
 fn pricing_path() -> PathBuf {
     statistics_dir().join("pricing.json")
 }
@@ -2213,6 +2570,41 @@ mod tests {
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].input_tokens, 200);
         assert_eq!(logs[0].cache_read_tokens, 40);
+    }
+
+    #[test]
+    fn sqlite_usage_cache_round_trips_imported_logs() {
+        let mut conn = Connection::open_in_memory().expect("open sqlite");
+        init_usage_db(&conn).expect("init sqlite");
+        let cache = UsageCache {
+            version: USAGE_CACHE_VERSION,
+            updated_at: 1_782_880_000,
+            files: vec![UsageCacheFile {
+                path: "/tmp/session.jsonl".to_string(),
+                modified_ms: 123,
+                size_bytes: 456,
+            }],
+            logs: vec![ParsedUsageLog {
+                request_id: "codex_session:imported:1".to_string(),
+                model: "gpt-5.5".to_string(),
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_read_tokens: 4,
+                created_at: 1_782_880_001,
+            }],
+            errors: vec!["sample error".to_string()],
+        };
+
+        import_usage_cache_into_db(&mut conn, &cache).expect("import cache");
+        let restored = read_usage_cache_db(&conn)
+            .expect("read cache")
+            .expect("cache exists");
+
+        assert_eq!(restored.version, USAGE_CACHE_VERSION);
+        assert_eq!(restored.files, cache.files);
+        assert_eq!(restored.logs.len(), 1);
+        assert_eq!(restored.logs[0].request_id, "codex_session:imported:1");
+        assert_eq!(restored.errors, cache.errors);
     }
 
     #[test]

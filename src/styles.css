@@ -1184,6 +1184,10 @@ textarea {
   width: 390px;
 }
 
+.usage-auto-refresh-select {
+  width: 112px;
+}
+
 .usage-dashboard-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(300px, 340px);
@@ -3192,42 +3196,59 @@ textarea {
 
 .about-panel {
   display: grid;
-  gap: 22px;
-  width: min(1180px, calc(100vw - clamp(36px, 4.4vw, 64px)));
+  gap: 24px;
+  width: min(1120px, calc(100vw - clamp(36px, 4.4vw, 64px)));
   margin: 0 auto;
-  padding: 36px 0 8px;
+  padding: 28px 0 8px;
 }
 
 .about-hero {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 14px;
-  min-height: 250px;
-  padding: 24px 24px 32px;
+  gap: 12px;
+  padding: 18px 24px 24px;
   text-align: center;
 }
 
+.about-icon-wrap {
+  display: inline-flex;
+  padding: 9px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 28px;
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.92), rgba(239, 246, 255, 0.72)),
+    rgba(255, 255, 255, 0.72);
+  box-shadow: 0 22px 54px rgba(37, 99, 235, 0.16);
+}
+
 .about-app-icon {
-  width: 92px;
-  height: 92px;
-  border-radius: 24px;
-  box-shadow: 0 18px 42px rgba(37, 99, 235, 0.18);
+  width: 82px;
+  height: 82px;
+  border-radius: 22px;
+}
+
+.about-kicker {
+  margin-top: 2px;
+  color: #2563eb;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0;
 }
 
 .about-hero h2 {
   margin: 0;
   color: var(--text);
-  font-size: 36px;
+  font-size: 34px;
   line-height: 1.15;
 }
 
 .about-hero p {
-  margin: 0;
-  max-width: 680px;
+  margin: 4px 0 0;
+  max-width: 620px;
   color: var(--text-soft);
-  font-size: 16px;
-  line-height: 1.7;
+  font-size: 15px;
+  line-height: 1.65;
 }
 
 .about-badges {
@@ -3275,23 +3296,29 @@ textarea {
 .about-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(180px, 1fr));
-  gap: 18px;
+  gap: 14px;
 }
 
 .about-tile {
   display: flex;
-  min-height: 136px;
-  flex-direction: column;
+  min-height: 112px;
+  flex-direction: row;
   align-items: center;
-  justify-content: center;
-  gap: 10px;
-  padding: 24px;
+  justify-content: flex-start;
+  gap: 16px;
+  padding: 20px 22px;
   border: 1px solid rgba(85, 113, 156, 0.18);
   border-radius: 8px;
   color: var(--text);
-  background: rgba(255, 255, 255, 0.86);
-  box-shadow: 0 18px 46px rgba(20, 35, 55, 0.07);
-  text-align: center;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.94), rgba(248, 250, 252, 0.82)),
+    rgba(255, 255, 255, 0.86);
+  box-shadow: 0 16px 38px rgba(20, 35, 55, 0.06);
+  text-align: left;
+  transition:
+    border-color 0.18s ease,
+    box-shadow 0.18s ease,
+    transform 0.18s ease;
 }
 
 .about-tile:is(button) {
@@ -3302,32 +3329,56 @@ textarea {
 .about-tile:is(button):hover {
   border-color: rgba(37, 99, 235, 0.24);
   box-shadow: 0 20px 52px rgba(37, 99, 235, 0.1);
+  transform: translateY(-2px);
 }
 
 .about-tile-icon {
+  flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-muted);
-  font-size: 30px;
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
+  font-size: 25px;
 }
 
-.about-tile-icon.danger {
-  color: #ef4444;
+.about-tile-icon-profile {
+  color: #1d4ed8;
+  background: rgba(219, 234, 254, 0.82);
 }
 
-.about-tile-icon.accent {
-  color: #2563eb;
+.about-tile-icon-repo {
+  color: #334155;
+  background: rgba(226, 232, 240, 0.78);
+}
+
+.about-tile-icon-sponsor {
+  color: #dc2626;
+  background: rgba(254, 226, 226, 0.76);
+}
+
+.about-tile-icon-feedback {
+  color: #0f766e;
+  background: rgba(204, 251, 241, 0.72);
+}
+
+.about-tile-copy {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
 }
 
 .about-tile strong {
   color: var(--text);
   font-size: 17px;
+  line-height: 1.25;
 }
 
-.about-tile span:last-child {
+.about-tile-copy span {
   color: var(--text-soft);
   font-size: 14px;
+  line-height: 1.5;
 }
 
 @media (max-width: 760px) {

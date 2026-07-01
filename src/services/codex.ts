@@ -24,6 +24,7 @@ export interface CodexSwitcherSettings {
   badgeStyle: string;
   badgeStyles: Record<string, string>;
   maxColumns: 3 | 4 | 5;
+  language: string;
 }
 
 export interface CodexSwitcherPaths {
