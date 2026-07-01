@@ -12,7 +12,7 @@ import SettingsPanel from "./components/SettingsPanel.vue";
 import UsagePanel from "./components/UsagePanel.vue";
 import appIcon from "./assets/app-icon.png";
 import { defaultBadgeStyles } from "./constants/badgeStyles";
-import { setLanguage } from "./i18n";
+import { currentLanguage, formatLocalizedCount, formatLocalizedDuration, setLanguage, t } from "./i18n";
 import {
   addCodexAccountWithApiKey,
   cancelCodexOAuthLogin,
@@ -329,9 +329,10 @@ const isCurrentPageSelected = computed(
   () => pagedAccounts.value.length > 0 && pagedAccounts.value.every((account) => selectedAccountIds.value.has(account.id)),
 );
 const accountTypeOptions = computed(() => {
+  currentLanguage.value;
   const count = (predicate: (account: CodexAccount) => boolean) => accounts.value.filter(predicate).length;
   return [
-    { label: `全部 (${accounts.value.length})`, value: "all" },
+    { label: `${t("全部")} (${accounts.value.length})`, value: "all" },
     { label: `OAuth (${oauthCount.value})`, value: "oauth" },
     { label: `API Key (${apiKeyCount.value})`, value: "apikey" },
     { label: `FREE (${count((account) => !isApiKeyAccount(account) && normalizePlanKey(account.plan_type) === "free")})`, value: "free" },
@@ -343,8 +344,8 @@ const accountTypeOptions = computed(() => {
       )})`,
       value: "team",
     },
-    { label: `异常 (${count(isAccountAbnormal)})`, value: "error" },
-    { label: `有效账号 (${count((account) => !isAccountAbnormal(account))})`, value: "valid" },
+    { label: `${t("异常")} (${count(isAccountAbnormal)})`, value: "error" },
+    { label: `${t("有效账号")} (${count((account) => !isAccountAbnormal(account))})`, value: "valid" },
   ];
 });
 const oauthCount = computed(
@@ -373,7 +374,7 @@ const sessionGroups = computed<SessionGroup[]>(() => {
     const key = sessionGroupKey(session);
     const group = groups.get(key) ?? {
       key,
-      projectName: session.projectName || "未归属项目",
+      projectName: session.projectName || t("未归属项目"),
       sessions: [],
       latestUpdatedAt: 0,
       approximateTokens: 0,
@@ -518,14 +519,14 @@ function displayNameForUi(account: CodexAccount): string {
 }
 
 function quotaErrorLabel(account: CodexAccount): string {
-  if (account.quota_error?.code === "token_expired") return "Token 失效";
-  if (account.quota_error) return "额度异常";
+  if (account.quota_error?.code === "token_expired") return t("Token 失效");
+  if (account.quota_error) return t("额度异常");
   return "";
 }
 
 function boundOAuthName(account: CodexAccount): string {
   const bound = boundOAuthAccount(account);
-  return bound ? displayName(bound) : "未绑定";
+  return bound ? displayName(bound) : t("未绑定");
 }
 
 function boundOAuthAccount(account: CodexAccount): CodexAccount | undefined {
@@ -539,7 +540,7 @@ function isBoundApiKeyAccount(account: CodexAccount): boolean {
 }
 
 function sessionGroupKey(session: CodexSessionRecord): string {
-  return session.projectName || "未归属项目";
+  return session.projectName || t("未归属项目");
 }
 
 function canShowQuota(account: CodexAccount): boolean {
@@ -851,15 +852,14 @@ function formatDateTime(value?: string): string {
 
 function expiryDaysLabel(value?: string): string {
   const date = parseFlexibleDate(value);
-  if (!date) return "未知";
+  if (!date) return t("未知");
   const diff = date.getTime() - Date.now();
-  if (diff <= 0) return "已过期";
+  if (diff <= 0) return t("已过期");
   const totalMinutes = Math.floor(diff / 60_000);
   const days = Math.floor(totalMinutes / 1440);
   const hours = Math.floor((totalMinutes % 1440) / 60);
   const minutes = totalMinutes % 60;
-  if (days > 0) return `${days}天${hours}小时`;
-  return `${hours}小时${minutes}分钟`;
+  return formatLocalizedDuration(days, hours, minutes);
 }
 
 function tokenExpiryStatus(value?: string): "normal" | "expired" {
@@ -874,17 +874,17 @@ function dateSortValue(value?: string): number {
 }
 
 function quotaWindowLabel(minutes?: number, fallback = "5h"): string {
-  if (!minutes || !Number.isFinite(minutes)) return fallback;
-  if (minutes % (60 * 24 * 7) === 0) return `${minutes / (60 * 24 * 7)} Week`;
-  if (minutes % (60 * 24) === 0) return `${minutes / (60 * 24)} Day`;
-  if (minutes % 60 === 0) return `${minutes / 60}h`;
-  return `${minutes}m`;
+  if (!minutes || !Number.isFinite(minutes)) return t(fallback);
+  if (minutes % (60 * 24 * 7) === 0) return t(`${minutes / (60 * 24 * 7) * 7} 天窗口`);
+  if (minutes % (60 * 24) === 0) return t(`${minutes / (60 * 24)} 天窗口`);
+  if (minutes % 60 === 0) return t(`${minutes / 60} 小时窗口`);
+  return t(`${minutes} 分钟窗口`);
 }
 
 function quotaResetLabel(timestamp?: number): string {
   if (!timestamp) return "";
   const diff = timestamp - Math.floor(Date.now() / 1000);
-  if (diff <= 0) return "已重置";
+  if (diff <= 0) return t("已重置");
   const minutes = Math.floor(diff / 60);
   const days = Math.floor(minutes / 1440);
   const hours = Math.floor((minutes % 1440) / 60);
@@ -1004,14 +1004,14 @@ function isAvailableResetCredit(credit: CodexResetCredit): boolean {
 
 function resetCreditStatusLabel(credit: CodexResetCredit): string {
   const key = resetCreditStatusKey(credit);
-  if (key === "available") return "可用";
-  if (key === "used") return "已使用";
-  if (key === "expired") return "已过期";
-  return credit.raw_status || credit.status || "未知";
+  if (key === "available") return t("可用");
+  if (key === "used") return t("已使用");
+  if (key === "expired") return t("已过期");
+  return credit.raw_status || credit.status || t("未知");
 }
 
 function formatResetCreditDate(value?: number): string {
-  return Number.isFinite(value) ? formatTime(Number(value)) : "时间未知";
+  return Number.isFinite(value) ? formatTime(Number(value)) : t("时间未知");
 }
 
 function isFreePlanAccount(account: CodexAccount): boolean {
@@ -1846,6 +1846,9 @@ const authorProfileUrl = "https://github.com/vs2pk0";
 const repositoryUrl = "https://github.com/vs2pk0/codex-switcher";
 const sponsorUrl = "https://github.com/vs2pk0/codex-switcher/blob/main/doc/sponsor.md";
 const feedbackUrl = "https://github.com/vs2pk0/codex-switcher/issues";
+const releasesUrl = "https://github.com/vs2pk0/codex-switcher/releases";
+const latestReleaseApiUrl = "https://api.github.com/repos/vs2pk0/codex-switcher/releases/latest";
+const checkingAppUpdate = ref(false);
 
 function openAboutUrl(url: string, label: string): void {
   void openExternalUrl(url).catch((error) => {
@@ -1867,6 +1870,98 @@ function openSponsorPage(): void {
 
 function openFeedbackPage(): void {
   openAboutUrl(feedbackUrl, "问题反馈");
+}
+
+function openReleasesPage(): void {
+  openAboutUrl(releasesUrl, "下载页面");
+}
+
+function normalizeVersionTag(value: string): string {
+  return value.trim().replace(/^v/i, "");
+}
+
+function compareVersion(left: string, right: string): number {
+  const leftParts = normalizeVersionTag(left).split(/[.-]/).map((item) => Number.parseInt(item, 10) || 0);
+  const rightParts = normalizeVersionTag(right).split(/[.-]/).map((item) => Number.parseInt(item, 10) || 0);
+  const length = Math.max(leftParts.length, rightParts.length);
+  for (let index = 0; index < length; index += 1) {
+    const diff = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
+    if (diff !== 0) return diff > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
+async function fetchLatestAppRelease(): Promise<{ tagName: string; htmlUrl: string; name?: string }> {
+  const response = await fetch(latestReleaseApiUrl, {
+    headers: {
+      Accept: "application/vnd.github+json",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const data = await response.json() as {
+    tag_name?: string;
+    html_url?: string;
+    name?: string;
+  };
+  if (!data.tag_name) throw new Error("未找到最新版本号");
+  return {
+    tagName: data.tag_name,
+    htmlUrl: data.html_url || releasesUrl,
+    name: data.name,
+  };
+}
+
+function showUpdateDialog(input: {
+  latestVersion: string;
+  currentVersion: string;
+  url: string;
+  hasUpdate: boolean;
+}): void {
+  const title = input.hasUpdate ? `发现新版本 ${input.latestVersion}` : "当前已是最新版本";
+  const content = input.hasUpdate
+    ? `当前版本 v${input.currentVersion}，最新版本 ${input.latestVersion}。请前往 GitHub Releases 下载最新安装包。`
+    : `当前版本 v${input.currentVersion}，最新发布版本 ${input.latestVersion}。如需重新下载安装包，可以打开 GitHub Releases。`;
+  Modal.confirm({
+    title,
+    content,
+    okText: "前往下载",
+    cancelText: input.hasUpdate ? "稍后再说" : "关闭",
+    onOk: () => {
+      openAboutUrl(input.url, "下载页面");
+    },
+  });
+}
+
+async function checkAppUpdate(options: { silent?: boolean } = {}): Promise<void> {
+  if (checkingAppUpdate.value) return;
+  checkingAppUpdate.value = true;
+  try {
+    const release = await fetchLatestAppRelease();
+    const currentVersion = normalizeVersionTag(appVersion.value || "0.0.0");
+    const hasUpdate = compareVersion(release.tagName, currentVersion) > 0;
+    if (hasUpdate || !options.silent) {
+      showUpdateDialog({
+        latestVersion: release.tagName,
+        currentVersion,
+        url: release.htmlUrl,
+        hasUpdate,
+      });
+    }
+  } catch (error) {
+    if (!options.silent) {
+      Modal.confirm({
+        title: "检查更新失败",
+        content: `暂时无法获取最新版本信息：${errorText(error)}。可以前往 GitHub Releases 手动查看。`,
+        okText: "打开 Releases",
+        cancelText: "关闭",
+        onOk: openReleasesPage,
+      });
+    }
+  } finally {
+    checkingAppUpdate.value = false;
+  }
 }
 
 async function completeOAuthLoginFlow(loginId: string): Promise<void> {
@@ -2611,8 +2706,11 @@ onMounted(() => {
   void getVersion()
     .then((version) => {
       if (version) appVersion.value = version;
+      void checkAppUpdate({ silent: true });
     })
-    .catch(() => undefined);
+    .catch(() => {
+      void checkAppUpdate({ silent: true });
+    });
   void syncExpandedLayout();
   window.addEventListener("resize", handleWindowResize);
   void loadAccounts();
@@ -2655,15 +2753,15 @@ onUnmounted(() => {
     <header class="topbar">
       <div class="brand">
         <h1>Codex Switcher</h1>
-        <p>管理 OAuth 与 API Key 登录态，并写回本机 Codex 配置。</p>
+        <p>{{ t("管理 OAuth 与 API Key 登录态，并写回本机 Codex 配置。") }}</p>
       </div>
     </header>
 
     <section v-if="activeView === 'accounts'" class="status-line">
-      <a-tag color="arcoblue">全部 {{ accounts.length }}</a-tag>
+      <a-tag color="arcoblue">{{ t("全部") }} {{ accounts.length }}</a-tag>
       <a-tag color="green">OAuth {{ oauthCount }}</a-tag>
       <a-tag color="orange">API Key {{ apiKeyCount }}</a-tag>
-      <span v-if="currentAccount">当前：{{ displayNameForUi(currentAccount) }}</span>
+      <span v-if="currentAccount">{{ t("当前：") }} {{ displayNameForUi(currentAccount) }}</span>
       <a-tag v-if="currentAccount && quotaErrorLabel(currentAccount)" color="red">
         {{ quotaErrorLabel(currentAccount) }}
       </a-tag>
@@ -2672,48 +2770,48 @@ onUnmounted(() => {
     <section class="command-bar">
       <div class="view-tabs">
         <a-button :type="activeView === 'accounts' ? 'primary' : 'secondary'" @click="switchView('accounts')">
-          账号总览
+          {{ t("账号总览") }}
         </a-button>
         <a-button :type="activeView === 'sessions' ? 'primary' : 'secondary'" @click="switchView('sessions')">
           <template #icon><icon-folder /></template>
-          会话管理
+          {{ t("会话管理") }}
         </a-button>
         <a-button :type="activeView === 'usage' ? 'primary' : 'secondary'" @click="switchView('usage')">
           <template #icon><icon-bar-chart /></template>
-          使用统计
+          {{ t("使用统计") }}
         </a-button>
         <a-button :type="activeView === 'apiService' ? 'primary' : 'secondary'" @click="switchView('apiService')">
           <template #icon><icon-code /></template>
-          API 服务
+          {{ t("API 服务") }}
         </a-button>
         <a-button :type="activeView === 'settings' ? 'primary' : 'secondary'" @click="switchView('settings')">
           <template #icon><icon-settings /></template>
-          设置
+          {{ t("设置") }}
         </a-button>
         <a-button :type="activeView === 'about' ? 'primary' : 'secondary'" @click="switchView('about')">
           <template #icon><icon-info-circle /></template>
-          关于
+          {{ t("关于") }}
         </a-button>
       </div>
       <div v-if="activeView === 'accounts'" class="command-actions">
         <a-button :loading="detectingCurrentAccount" @click="handleDetectCurrentAccount">
           <template #icon><icon-refresh /></template>
-          读取当前账号
+          {{ t("读取当前账号") }}
         </a-button>
         <a-button @click="privacyMasked = !privacyMasked">
           <template #icon>
             <icon-eye-invisible v-if="privacyMasked" />
             <icon-eye v-else />
           </template>
-          {{ privacyMasked ? "已隐藏" : "隐私" }}
+          {{ privacyMasked ? t("已隐藏") : t("隐私") }}
         </a-button>
         <a-button @click="badgeStyleVisible = true">
           <template #icon><icon-palette /></template>
-          徽章样式
+          {{ t("徽章样式") }}
         </a-button>
         <a-button type="primary" @click="openAddModal('oauth')">
           <template #icon><icon-plus /></template>
-          添加账号
+          {{ t("添加账号") }}
         </a-button>
       </div>
     </section>
@@ -2724,7 +2822,7 @@ onUnmounted(() => {
           :model-value="isCurrentPageSelected"
           @change="(checked) => toggleAllAccounts(Boolean(checked))"
         >
-          全选
+          {{ t("全选") }}
         </a-checkbox>
         <a-select
           v-model="settings.accountTypeFilter"
@@ -2746,7 +2844,7 @@ onUnmounted(() => {
           v-model="accountSearchKeyword"
           class="account-search-input"
           allow-clear
-          placeholder="筛选邮箱 / 昵称"
+          :placeholder="t('筛选邮箱 / 昵称')"
           @input="currentPage = 1"
           @clear="currentPage = 1"
         >
@@ -2760,17 +2858,17 @@ onUnmounted(() => {
           :trigger-props="{ contentClass: 'account-filter-dropdown account-sort-dropdown' }"
           @change="saveSettings"
         >
-          <a-option value="created_at">按创建时间</a-option>
-          <a-option value="weekly_quota">按周配额</a-option>
-          <a-option value="hourly_quota">按5小时配额</a-option>
-          <a-option value="weekly_reset">按周配额重置时间</a-option>
-          <a-option value="hourly_reset">按5小时配额重置时间</a-option>
-          <a-option value="subscription">按订阅有效期</a-option>
-          <a-option value="custom">自定义顺序</a-option>
+          <a-option value="created_at">{{ t("按创建时间") }}</a-option>
+          <a-option value="weekly_quota">{{ t("按周配额") }}</a-option>
+          <a-option value="hourly_quota">{{ t("按5小时配额") }}</a-option>
+          <a-option value="weekly_reset">{{ t("按周配额重置时间") }}</a-option>
+          <a-option value="hourly_reset">{{ t("按5小时配额重置时间") }}</a-option>
+          <a-option value="subscription">{{ t("按订阅有效期") }}</a-option>
+          <a-option value="custom">{{ t("自定义顺序") }}</a-option>
         </a-select>
         <a-button v-if="settings.sortMode === 'custom'" @click="openSortEditor">
           <template #icon><icon-list /></template>
-          编辑排序
+          {{ t("编辑排序") }}
         </a-button>
         <a-radio-group
           v-if="showSortDirection"
@@ -2779,30 +2877,30 @@ onUnmounted(() => {
           size="small"
           @change="saveSettings"
         >
-          <a-radio value="desc">倒序</a-radio>
-          <a-radio value="asc">正序</a-radio>
+          <a-radio value="desc">{{ t("倒序") }}</a-radio>
+          <a-radio value="asc">{{ t("正序") }}</a-radio>
         </a-radio-group>
         <a-select
           v-model="settings.pageSize"
           class="page-size-select"
           @change="() => { currentPage = 1; saveSettings(); }"
         >
-          <a-option :value="20">每页 20</a-option>
-          <a-option :value="50">每页 50</a-option>
-          <a-option :value="100">每页 100</a-option>
-          <a-option :value="200">每页 200</a-option>
+          <a-option :value="20">{{ t("每页") }} 20</a-option>
+          <a-option :value="50">{{ t("每页") }} 50</a-option>
+          <a-option :value="100">{{ t("每页") }} 100</a-option>
+          <a-option :value="200">{{ t("每页") }} 200</a-option>
         </a-select>
         <a-button @click="confirmBindSelectedToApiService">
           <template #icon><icon-link /></template>
-          绑定到 API 服务
+          {{ t("绑定到 API 服务") }}
         </a-button>
         <a-button @click="openBatchExport">
           <template #icon><icon-download /></template>
-          批量导出
+          {{ t("批量导出") }}
         </a-button>
         <a-button @click="openAddModal('token')">
           <template #icon><icon-import /></template>
-          批量导入
+          {{ t("批量导入") }}
         </a-button>
       </div>
       <div
@@ -2810,10 +2908,10 @@ onUnmounted(() => {
         class="quota-countdown-group"
       >
         <span v-if="currentAccountRefreshCountdown" class="quota-countdown primary">
-          当前账号 {{ currentAccountRefreshCountdown }}
+          {{ t("当前账号") }} {{ currentAccountRefreshCountdown }}
         </span>
         <span v-if="quotaRefreshCountdown" class="quota-countdown">
-          当前页 {{ quotaRefreshCountdown }}
+          {{ t("当前页") }} {{ quotaRefreshCountdown }}
         </span>
       </div>
     </section>
@@ -2928,13 +3026,13 @@ onUnmounted(() => {
           <a-input
             v-model="sessionSearch.titleQuery"
             allow-clear
-            placeholder="搜索会话标题"
+            :placeholder="t('搜索会话标题')"
             @press-enter="() => loadSessions()"
           />
           <a-input
             v-model="sessionSearch.contentQuery"
             allow-clear
-            placeholder="搜索会话内容"
+            :placeholder="t('搜索会话内容')"
             @press-enter="() => loadSessions()"
           />
         </div>
@@ -2943,23 +3041,23 @@ onUnmounted(() => {
             :disabled="!activeSessionIds.length"
             @click="toggleAllSessions"
           >
-            {{ allSessionsSelected ? "取消全选" : (sessionTrashMode ? "全选回收站" : "全选") }}
+            {{ allSessionsSelected ? t("取消全选") : (sessionTrashMode ? t("全选回收站") : t("全选")) }}
           </a-button>
           <a-button
             :type="sessionTrashMode ? 'secondary' : 'primary'"
             @click="sessionTrashMode = false; loadSessions()"
           >
-            会话列表
+            {{ t("会话列表") }}
           </a-button>
           <a-button
             :type="sessionTrashMode ? 'primary' : 'secondary'"
             @click="sessionTrashMode = true; loadSessions()"
           >
-            回收站
+            {{ t("回收站") }}
           </a-button>
           <a-button :loading="sessionLoading" @click="() => loadSessions()">
             <template #icon><icon-refresh /></template>
-            刷新
+            {{ t("刷新") }}
           </a-button>
           <a-button :loading="backupWorking" @click="handleExportSessionBackup">
             <template #icon><icon-download /></template>
@@ -2967,11 +3065,11 @@ onUnmounted(() => {
           </a-button>
           <a-button :loading="sessionBackupLoading" :disabled="backupWorking" @click="openSessionRestoreModal">
             <template #icon><icon-import /></template>
-            恢复会话
+            {{ t("恢复会话") }}
           </a-button>
           <a-button :loading="sessionRepairing" type="primary" @click="handleRepairSessions">
             <template #icon><icon-tool /></template>
-            修复可见性
+            {{ t("修复可见性") }}
           </a-button>
           <a-button
             v-if="!sessionTrashMode"
@@ -2980,7 +3078,7 @@ onUnmounted(() => {
             @click="handleTrashSessions"
           >
             <template #icon><icon-delete /></template>
-            移入回收站
+            {{ t("移入回收站") }}
           </a-button>
           <a-button
             v-else
@@ -2989,7 +3087,7 @@ onUnmounted(() => {
             @click="handleRestoreSessions"
           >
             <template #icon><icon-undo /></template>
-            恢复
+            {{ t("恢复") }}
           </a-button>
         </div>
       </div>
@@ -3022,7 +3120,7 @@ onUnmounted(() => {
               >
                 {{ group.projectName }}
               </button>
-              <span class="session-group-meta">{{ group.sessions.length }} 条会话</span>
+              <span class="session-group-meta">{{ formatLocalizedCount(group.sessions.length, "条会话") }}</span>
               <span class="token-count">{{ new Intl.NumberFormat("en-US").format(group.approximateTokens) }} tokens</span>
               <span class="session-group-time">{{ formatTime(group.latestUpdatedAt) }}</span>
             </div>
@@ -3034,7 +3132,7 @@ onUnmounted(() => {
                 />
                 <div class="session-main session-main-name-only">
                   <strong class="session-name-only" :title="session.title">
-                    {{ session.title || "未命名会话" }}
+                    {{ session.title || t("未命名会话") }}
                   </strong>
                 </div>
                 <div class="session-stat">
@@ -3042,7 +3140,7 @@ onUnmounted(() => {
                   <span>{{ formatTime(session.updatedAt) }}</span>
                   <a-button size="small" @click="openSessionFolder(session.path)">
                     <template #icon><icon-folder /></template>
-                    打开文件夹
+                    {{ t("打开文件夹") }}
                   </a-button>
                 </div>
               </article>
@@ -3053,26 +3151,26 @@ onUnmounted(() => {
               <icon-message />
             </div>
             <div class="session-empty-copy">
-              <strong>{{ sessionSearch.titleQuery || sessionSearch.contentQuery ? "没有匹配的会话" : "还没有可显示的会话" }}</strong>
+              <strong>{{ sessionSearch.titleQuery || sessionSearch.contentQuery ? t("没有匹配的会话") : t("还没有可显示的会话") }}</strong>
               <span>
                 {{ sessionSearch.titleQuery || sessionSearch.contentQuery
-                  ? "换个关键词试试，或清空搜索后重新刷新。"
-                  : "可以先刷新本机会话；如果是切号后看不到旧会话，使用修复可见性重新挂回列表。"
+                  ? t("换个关键词试试，或清空搜索后重新刷新。")
+                  : t("可以先刷新本机会话；如果是切号后看不到旧会话，使用修复可见性重新挂回列表。")
                 }}
               </span>
             </div>
             <div class="session-empty-actions">
               <a-button type="primary" :loading="sessionLoading" @click="() => loadSessions()">
                 <template #icon><icon-refresh /></template>
-                刷新会话
+                {{ t("刷新会话") }}
               </a-button>
               <a-button :loading="sessionBackupLoading" :disabled="backupWorking" @click="openSessionRestoreModal">
                 <template #icon><icon-import /></template>
-                从备份恢复
+                {{ t("从备份恢复") }}
               </a-button>
               <a-button :loading="sessionRepairing" @click="handleRepairSessions">
                 <template #icon><icon-tool /></template>
-                修复可见性
+                {{ t("修复可见性") }}
               </a-button>
             </div>
           </div>
@@ -3089,11 +3187,11 @@ onUnmounted(() => {
               <span :title="session.originalPath">{{ session.originalPath }}</span>
             </div>
             <div class="session-stat">
-              <span>已删除</span>
+              <span>{{ t("已删除") }}</span>
               <span>{{ formatTime(session.deletedAt) }}</span>
               <a-button size="small" @click="openSessionFolder(session.originalPath)">
                 <template #icon><icon-folder /></template>
-                打开文件夹
+                {{ t("打开文件夹") }}
               </a-button>
             </div>
           </article>
@@ -3102,8 +3200,8 @@ onUnmounted(() => {
               <icon-delete />
             </div>
             <div class="session-empty-copy">
-              <strong>回收站为空</strong>
-              <span>被移入回收站的会话会显示在这里，恢复后会回到原来的会话路径。</span>
+              <strong>{{ t("回收站为空") }}</strong>
+              <span>{{ t("被移入回收站的会话会显示在这里，恢复后会回到原来的会话路径。") }}</span>
             </div>
           </div>
         </div>
@@ -3147,7 +3245,7 @@ onUnmounted(() => {
         <div class="about-icon-wrap">
           <img :src="appIcon" alt="Codex Switcher" class="about-app-icon" />
         </div>
-        <span class="about-kicker">本地 Codex 管理工具</span>
+        <span class="about-kicker">{{ t("本地 Codex 管理工具") }}</span>
         <h2>Codex Switcher</h2>
         <div class="about-badges">
           <span class="about-version">v{{ appVersion }}</span>
@@ -3156,7 +3254,7 @@ onUnmounted(() => {
             GitHub
           </a-button>
         </div>
-        <p>把账号切换、会话维护、使用统计和本地 API 服务收在一个干净的桌面工作台里。</p>
+        <p>{{ t("把账号切换、会话维护、使用统计和本地 API 服务收在一个干净的桌面工作台里。") }}</p>
       </div>
 
       <div class="about-grid">
@@ -3165,8 +3263,8 @@ onUnmounted(() => {
             <icon-user />
           </span>
           <span class="about-tile-copy">
-            <strong>作者主页</strong>
-            <span>访问 vs2pk0 的 GitHub 主页</span>
+            <strong>{{ t("作者主页") }}</strong>
+            <span>{{ t("访问 vs2pk0 的 GitHub 主页") }}</span>
           </span>
         </button>
         <button type="button" class="about-tile" @click="openRepository">
@@ -3174,8 +3272,8 @@ onUnmounted(() => {
             <icon-code />
           </span>
           <span class="about-tile-copy">
-            <strong>开源仓库</strong>
-            <span>查看源码、版本和发布记录</span>
+            <strong>{{ t("开源仓库") }}</strong>
+            <span>{{ t("查看源码、版本和发布记录") }}</span>
           </span>
         </button>
         <button type="button" class="about-tile" @click="openSponsorPage">
@@ -3183,8 +3281,8 @@ onUnmounted(() => {
             <icon-heart />
           </span>
           <span class="about-tile-copy">
-            <strong>赞助支持</strong>
-            <span>查看支付宝、微信和 Binance 收款码</span>
+            <strong>{{ t("赞助支持") }}</strong>
+            <span>{{ t("查看支付宝、微信和 Binance 收款码") }}</span>
           </span>
         </button>
         <button type="button" class="about-tile" @click="openFeedbackPage">
@@ -3192,8 +3290,17 @@ onUnmounted(() => {
             <icon-message />
           </span>
           <span class="about-tile-copy">
-            <strong>问题反馈</strong>
-            <span>提交 Issue 或改进建议</span>
+            <strong>{{ t("问题反馈") }}</strong>
+            <span>{{ t("提交 Issue 或改进建议") }}</span>
+          </span>
+        </button>
+        <button type="button" class="about-tile" @click="checkAppUpdate()">
+          <span class="about-tile-icon about-tile-icon-update">
+            <icon-refresh />
+          </span>
+          <span class="about-tile-copy">
+            <strong>{{ t("检查更新") }}</strong>
+            <span>{{ t("查看最新版本并下载安装包") }}</span>
           </span>
         </button>
       </div>
@@ -3636,13 +3743,13 @@ onUnmounted(() => {
 
     <a-modal
       v-model:visible="bindingVisible"
-      title="绑定 OAuth 账号"
+      :title="t('绑定 OAuth 账号')"
       :footer="false"
       width="840px"
     >
       <div class="modal-form">
         <a-typography-paragraph>
-          API Key 账号绑定 OAuth 后，切换时会同时写入 OAuth Token 与 API Key 配置，便于修复会话身份。
+          {{ t("API Key 账号绑定 OAuth 后，切换时会同时写入 OAuth Token 与 API Key 配置，便于修复会话身份。") }}
         </a-typography-paragraph>
         <div class="oauth-bind-list">
           <button
@@ -3655,8 +3762,8 @@ onUnmounted(() => {
               <icon-check v-if="!bindingForm.boundOauthAccountId" />
             </span>
             <div class="oauth-bind-option-title">
-              <strong>不绑定 OAuth</strong>
-              <span>切换时仅写入 API Key 配置</span>
+              <strong>{{ t("不绑定 OAuth") }}</strong>
+              <span>{{ t("切换时仅写入 API Key 配置") }}</span>
             </div>
           </button>
 
@@ -3684,7 +3791,7 @@ onUnmounted(() => {
                   <span>
                     <icon-calendar v-if="isFreePlanAccount(oauth)" />
                     <icon-clock-circle v-else />
-                    {{ isFreePlanAccount(oauth) ? "长周期" : "短周期" }}
+                    {{ isFreePlanAccount(oauth) ? t("长周期") : t("短周期") }}
                   </span>
                   <strong :style="{ color: quotaColor(oauth.quota.hourly_percentage) }">
                     {{ oauth.quota.hourly_percentage }}%
@@ -3695,7 +3802,7 @@ onUnmounted(() => {
                 <div
                   v-if="!isFreePlanAccount(oauth) && oauth.quota.weekly_window_present !== false"
                 >
-                  <span><icon-calendar /> 长周期</span>
+                  <span><icon-calendar /> {{ t("长周期") }}</span>
                   <strong :style="{ color: quotaColor(oauth.quota.weekly_percentage) }">
                     {{ oauth.quota.weekly_percentage }}%
                   </strong>
@@ -3708,13 +3815,13 @@ onUnmounted(() => {
               </div>
             </div>
           </button>
-          <a-empty v-if="!oauthAccounts.length" description="暂无可绑定的 OAuth 账号" />
+          <a-empty v-if="!oauthAccounts.length" :description="t('暂无可绑定的 OAuth 账号')" />
         </div>
         <div class="form-actions">
-          <a-button @click="bindingVisible = false">取消</a-button>
+          <a-button @click="bindingVisible = false">{{ t("取消") }}</a-button>
           <a-button type="primary" :loading="savingBinding" @click="handleBindingSave">
             <template #icon><icon-save /></template>
-            保存
+            {{ t("保存") }}
           </a-button>
         </div>
       </div>
@@ -3722,7 +3829,7 @@ onUnmounted(() => {
 
     <a-modal
       v-model:visible="resetCreditVisible"
-      title="选择重置次数"
+      :title="t('选择重置次数')"
       :footer="false"
       width="680px"
       modal-class="reset-credit-modal"
@@ -3731,15 +3838,15 @@ onUnmounted(() => {
         <div class="reset-credit-modal-head">
           <div>
             <span class="modal-eyebrow">Reset Credit</span>
-            <h3>选择要消耗的重置次数</h3>
+            <h3>{{ t("选择要消耗的重置次数") }}</h3>
             <p>
-              {{ displayNameForUi(resetCreditAccount) }} 当前有
-              {{ resetCreditCount(resetCreditAccount) }} 次可用重置次数。
+              {{ displayNameForUi(resetCreditAccount) }} {{ t("当前有") }}
+              {{ formatLocalizedCount(resetCreditCount(resetCreditAccount), "次") }} {{ t("可用重置次数") }}。
             </p>
           </div>
           <div class="reset-credit-modal-count">
             <strong>{{ resetCreditCount(resetCreditAccount) }}</strong>
-            <span>次可用</span>
+            <span>{{ t("次可用") }}</span>
           </div>
         </div>
 
@@ -3760,18 +3867,18 @@ onUnmounted(() => {
               {{ resetCreditStatusLabel(credit) }}
             </span>
             <span class="reset-credit-choice-main">
-              <strong>第 {{ index + 1 }} 次</strong>
-              <small>发放 {{ formatResetCreditDate(credit.granted_at) }}</small>
+              <strong>{{ t(`第 ${index + 1} 次`) }}</strong>
+              <small>{{ t("发放") }} {{ formatResetCreditDate(credit.granted_at) }}</small>
             </span>
             <span class="reset-credit-choice-time">
-              可用至 {{ formatResetCreditDate(credit.expires_at) }}
+              {{ t("可用至") }} {{ formatResetCreditDate(credit.expires_at) }}
             </span>
           </button>
         </div>
-        <a-empty v-else description="暂无重置次数明细，请先刷新额度" />
+        <a-empty v-else :description="t('暂无重置次数明细，请先刷新额度')" />
 
         <div class="reset-credit-modal-actions">
-          <a-button @click="resetCreditVisible = false">取消</a-button>
+          <a-button @click="resetCreditVisible = false">{{ t("取消") }}</a-button>
           <a-button
             type="primary"
             status="warning"
@@ -3780,7 +3887,7 @@ onUnmounted(() => {
             @click="handleConsumeSelectedResetCredit"
           >
             <template #icon><icon-thunderbolt /></template>
-            重置使用次数
+            {{ t("重置使用次数") }}
           </a-button>
         </div>
       </div>

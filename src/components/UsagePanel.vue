@@ -18,6 +18,14 @@ import {
   type CodexUsagePricing,
   type CodexUsagePricingConfig,
 } from "../services/usage";
+import {
+  currentLanguage,
+  currentLocale,
+  formatCompactTokens,
+  formatLocalizedCount,
+  formatLocalizedNumber,
+  t,
+} from "../i18n";
 
 type UsageRange = "today" | "yesterday" | "beforeYesterday" | "thisMonth" | "lastMonth" | "custom";
 type UsageTooltipParam = {
@@ -193,7 +201,7 @@ const activityLabels = computed(() => {
     if (currentMonth !== previousMonth) {
       const nextLabel = {
         key: day.date,
-        label: `${Number(currentMonth)}月`,
+        label: new Intl.DateTimeFormat(currentLocale(), { month: "short" }).format(new Date(day.timestamp * 1000)),
         column: Math.floor(index / 7) + 1,
       };
       const previous = labels[labels.length - 1];
@@ -624,14 +632,11 @@ async function restoreDefaultPricing(): Promise<void> {
 }
 
 function formatTokens(value?: number): string {
-  const safe = Number(value || 0);
-  if (safe >= 100_000_000) return `${(safe / 100_000_000).toFixed(1)} 亿`;
-  if (safe >= 10_000) return `${(safe / 10_000).toFixed(1)} 万`;
-  return new Intl.NumberFormat("zh-CN").format(safe);
+  return formatCompactTokens(value);
 }
 
 function formatFullNumber(value?: number): string {
-  return new Intl.NumberFormat("en-US").format(Number(value || 0));
+  return formatLocalizedNumber(Number(value || 0));
 }
 
 function formatUsd(value?: string): string {
@@ -669,8 +674,8 @@ function activityDayToCellSource(day: CodexUsageActivityDay): ActivityCell {
 
 function activityWeekdayLabel(day: CodexUsageActivityDay): string {
   const date = new Date(day.timestamp * 1000);
-  const weekday = ["日", "一", "二", "三", "四", "五", "六"][date.getDay()];
-  return `${date.getMonth() + 1}/${date.getDate()} 周${weekday}`;
+  const weekday = new Intl.DateTimeFormat(currentLocale(), { weekday: "short" }).format(date);
+  return `${date.getMonth() + 1}/${date.getDate()} ${weekday}`;
 }
 
 function activityLevel(value: number, max: number): number {
@@ -684,13 +689,13 @@ function activityLevel(value: number, max: number): number {
 
 function activityCellTitle(cell: ActivityCell): string {
   const prefix =
-    activityMode.value === "weekly" ? "当日" : activityMode.value === "cumulative" ? "累计" : "时段";
-  return `${cell.label}：${prefix} ${formatFullNumber(cell.value)} Tokens，${cell.requests} 次调用`;
+    activityMode.value === "weekly" ? t("当日") : activityMode.value === "cumulative" ? t("累计") : t("时段");
+  return `${cell.label}: ${prefix} ${formatFullNumber(cell.value)} Tokens, ${formatLocalizedCount(cell.requests, "次")}`;
 }
 
 function formatTime(timestamp: number): string {
   if (!timestamp) return "--";
-  return new Intl.DateTimeFormat("zh-CN", {
+  return new Intl.DateTimeFormat(currentLocale(), {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
@@ -724,7 +729,7 @@ function formatChartTooltip(params: unknown): string {
     .map((item) => {
       const value = tooltipValue(item);
       const formatted =
-        item.seriesName === "预估费用" ? formatUsd(String(value)) : formatFullNumber(value);
+        item.seriesName === t("预估费用") ? formatUsd(String(value)) : formatFullNumber(value);
       return `<div class="usage-echart-tooltip-row">${item.marker || ""}<span>${item.seriesName}</span><strong>${formatted}</strong></div>`;
     })
     .join("");
@@ -804,7 +809,7 @@ function usageChartOption(core: EChartsCoreApi): EChartsCoreOption {
         fontSize: 12,
         fontWeight: 600,
       },
-      data: ["预估费用", "缓存写入", "缓存复用", "输入", "输出"],
+      data: ["预估费用", "缓存写入", "缓存复用", "输入", "输出"].map(t),
     },
     xAxis: {
       type: "category",
@@ -848,7 +853,7 @@ function usageChartOption(core: EChartsCoreApi): EChartsCoreOption {
     ],
     series: [
       {
-        name: "预估费用",
+        name: t("预估费用"),
         type: "line",
         yAxisIndex: 1,
         smooth: 0.42,
@@ -860,7 +865,7 @@ function usageChartOption(core: EChartsCoreApi): EChartsCoreOption {
         emphasis: { focus: "series" },
       },
       {
-        name: "缓存写入",
+        name: t("缓存写入"),
         type: "line",
         smooth: 0.42,
         showSymbol: false,
@@ -871,7 +876,7 @@ function usageChartOption(core: EChartsCoreApi): EChartsCoreOption {
         emphasis: { focus: "series" },
       },
       {
-        name: "缓存复用",
+        name: t("缓存复用"),
         type: "line",
         smooth: 0.42,
         showSymbol: false,
@@ -888,7 +893,7 @@ function usageChartOption(core: EChartsCoreApi): EChartsCoreOption {
         emphasis: { focus: "series" },
       },
       {
-        name: "输入",
+        name: t("输入"),
         type: "line",
         smooth: 0.42,
         showSymbol: false,
@@ -899,7 +904,7 @@ function usageChartOption(core: EChartsCoreApi): EChartsCoreOption {
         emphasis: { focus: "series" },
       },
       {
-        name: "输出",
+        name: t("输出"),
         type: "line",
         smooth: 0.42,
         showSymbol: false,
@@ -951,7 +956,7 @@ onMounted(() => {
   document.addEventListener("visibilitychange", handleVisibilityChange);
 });
 
-watch([trends, isHourlyTrend], renderUsageChart, { deep: true });
+watch([trends, isHourlyTrend, currentLanguage], renderUsageChart, { deep: true });
 
 watch(
   () => props.active,
@@ -981,13 +986,13 @@ onBeforeUnmount(() => {
   <section class="usage-panel">
     <div class="usage-head">
       <div>
-        <h2>消耗看板</h2>
-        <p>从本机会话记录汇总 Tokens、缓存复用和预估费用</p>
+        <h2>{{ t("消耗看板") }}</h2>
+        <p>{{ t("从本机会话记录汇总 Tokens、缓存复用和预估费用") }}</p>
       </div>
       <div class="usage-controls">
         <a-radio-group :model-value="range" type="button" @change="changeRange">
           <a-radio v-for="item in rangeOptions" :key="item.value" :value="item.value">
-            {{ item.label }}
+            {{ t(item.label) }}
           </a-radio>
         </a-radio-group>
         <a-range-picker
@@ -1004,12 +1009,12 @@ onBeforeUnmount(() => {
         >
           <template #prefix><icon-refresh /></template>
           <a-option v-for="item in autoRefreshOptions" :key="item.value" :value="item.value">
-            {{ item.label }}
+            {{ t(item.label) }}
           </a-option>
         </a-select>
         <a-button :loading="loading" @click="refreshUsage">
           <template #icon><icon-refresh /></template>
-          刷新
+          {{ t("刷新") }}
         </a-button>
       </div>
     </div>
@@ -1021,18 +1026,18 @@ onBeforeUnmount(() => {
             <div class="usage-hero-main">
               <div class="usage-app-mark"><icon-robot /></div>
               <div>
-                <span>本地 Codex 消耗</span>
+                <span>{{ t("本地 Codex 消耗") }}</span>
                 <strong>{{ formatFullNumber(summary?.realTotalTokens) }}</strong>
                 <small>≈ {{ formatTokens(summary?.realTotalTokens) }}</small>
               </div>
             </div>
             <div class="usage-hero-side">
               <div>
-                <span>总请求数</span>
+                <span>{{ t("总请求数") }}</span>
                 <strong>{{ formatFullNumber(summary?.totalRequests) }}</strong>
               </div>
               <div>
-                <span>预估费用</span>
+                <span>{{ t("预估费用") }}</span>
                 <strong>{{ formatUsd(summary?.totalCost) }}</strong>
               </div>
             </div>
@@ -1040,23 +1045,23 @@ onBeforeUnmount(() => {
 
           <div class="usage-metrics">
             <article>
-              <span><icon-arrow-down /> 输入 Tokens</span>
+              <span><icon-arrow-down /> {{ t("输入 Tokens") }}</span>
               <strong>{{ formatTokens(summary?.totalInputTokens) }}</strong>
             </article>
             <article>
-              <span><icon-arrow-up /> 输出 Tokens</span>
+              <span><icon-arrow-up /> {{ t("输出 Tokens") }}</span>
               <strong>{{ formatTokens(summary?.totalOutputTokens) }}</strong>
             </article>
             <article>
-              <span><icon-storage /> 缓存写入</span>
+              <span><icon-storage /> {{ t("缓存写入") }}</span>
               <strong>{{ formatTokens(summary?.totalCacheCreationTokens) }}</strong>
             </article>
             <article>
-              <span><icon-thunderbolt /> 缓存复用</span>
+              <span><icon-thunderbolt /> {{ t("缓存复用") }}</span>
               <strong>{{ formatTokens(summary?.totalCacheReadTokens) }}</strong>
             </article>
             <article>
-              <span>复用占比</span>
+              <span>{{ t("复用占比") }}</span>
               <strong>{{ formatPercent(summary?.cacheHitRate) }}</strong>
               <div class="usage-hit-bar">
                 <i :style="{ width: formatPercent(summary?.cacheHitRate) }" />
@@ -1066,36 +1071,36 @@ onBeforeUnmount(() => {
 
           <div class="usage-chart-card">
             <div class="usage-card-title">
-              <strong>时段消耗曲线</strong>
+              <strong>{{ t("时段消耗曲线") }}</strong>
             </div>
             <div v-if="trends.length" class="usage-chart">
               <div ref="chartContainer" class="usage-echart" />
             </div>
-            <a-empty v-else description="暂无趋势数据" />
+            <a-empty v-else :description="t('暂无趋势数据')" />
           </div>
 
           <div class="usage-activity-card">
             <div class="usage-activity-summary">
               <article>
                 <strong>{{ formatTokens(activitySummary?.totalTokens) }}</strong>
-                <span>累计 Token 数</span>
+                <span>{{ t("累计 Token 数") }}</span>
               </article>
               <article>
                 <strong>{{ formatTokens(activitySummary?.peakDayTokens) }}</strong>
-                <span>峰值 Token 数</span>
+                <span>{{ t("峰值 Token 数") }}</span>
               </article>
               <article>
-                <strong>{{ activitySummary?.currentStreakDays ?? 0 }} 天</strong>
-                <span>当前连续天数</span>
+                <strong>{{ formatLocalizedCount(activitySummary?.currentStreakDays ?? 0, "天") }}</strong>
+                <span>{{ t("当前连续天数") }}</span>
               </article>
               <article>
-                <strong>{{ activitySummary?.longestStreakDays ?? 0 }} 天</strong>
-                <span>最长连续天数</span>
+                <strong>{{ formatLocalizedCount(activitySummary?.longestStreakDays ?? 0, "天") }}</strong>
+                <span>{{ t("最长连续天数") }}</span>
               </article>
             </div>
 
             <div class="usage-card-title usage-activity-title">
-              <strong>Token 活动</strong>
+              <strong>{{ t("Token 活动") }}</strong>
               <div class="usage-activity-mode">
                 <button
                   v-for="item in activityModeOptions"
@@ -1104,7 +1109,7 @@ onBeforeUnmount(() => {
                   type="button"
                   @click="activityMode = item.value"
                 >
-                  {{ item.label }}
+                  {{ t(item.label) }}
                 </button>
               </div>
             </div>
@@ -1125,7 +1130,7 @@ onBeforeUnmount(() => {
                 </div>
                 <div class="usage-activity-block-foot">
                   <span>{{ formatTokens(block.value) }}</span>
-                  <em>{{ block.requests }} 次</em>
+                  <em>{{ formatLocalizedCount(block.requests, "次") }}</em>
                 </div>
               </article>
             </div>
@@ -1146,7 +1151,7 @@ onBeforeUnmount(() => {
                 </div>
                 <div class="usage-activity-block-foot">
                   <span>{{ formatTokens(block.value) }}</span>
-                  <em>{{ block.requests }} 次</em>
+                  <em>{{ formatLocalizedCount(block.requests, "次") }}</em>
                 </div>
               </article>
             </div>
@@ -1176,39 +1181,39 @@ onBeforeUnmount(() => {
                 </span>
               </div>
             </div>
-            <a-empty v-else description="暂无活动数据" />
+            <a-empty v-else :description="t('暂无活动数据')" />
           </div>
 
           <div class="usage-table-card">
             <div class="usage-tabs">
               <button :class="{ active: activeUsageTab === 'logs' }" type="button" @click="activeUsageTab = 'logs'">
-                <icon-list /> 调用流水
+                <icon-list /> {{ t("调用流水") }}
               </button>
               <button :class="{ active: activeUsageTab === 'providers' }" type="button" @click="activeUsageTab = 'providers'">
-                <icon-thunderbolt /> 来源汇总
+                <icon-thunderbolt /> {{ t("来源汇总") }}
               </button>
               <button :class="{ active: activeUsageTab === 'models' }" type="button" @click="activeUsageTab = 'models'">
-                <icon-bar-chart /> 模型用量
+                <icon-bar-chart /> {{ t("模型用量") }}
               </button>
             </div>
 
             <div v-if="activeUsageTab === 'logs'">
               <div class="usage-card-title">
-                <strong>调用记录</strong>
-                <span>共 {{ totalLogs }} 条记录</span>
+                <strong>{{ t("调用记录") }}</strong>
+                <span>{{ formatLocalizedCount(totalLogs, "条记录") }}</span>
               </div>
               <div class="usage-log-table">
                 <table>
                   <thead>
                     <tr>
-                      <th>时间</th>
-                      <th>来源</th>
-                      <th>计费模型</th>
-                      <th>输入</th>
-                      <th>输出</th>
-                      <th>费用</th>
-                      <th>状态</th>
-                      <th>来源</th>
+                      <th>{{ t("时间") }}</th>
+                      <th>{{ t("来源") }}</th>
+                      <th>{{ t("计费模型") }}</th>
+                      <th>{{ t("输入") }}</th>
+                      <th>{{ t("输出") }}</th>
+                      <th>{{ t("费用") }}</th>
+                      <th>{{ t("状态") }}</th>
+                      <th>{{ t("来源") }}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1227,14 +1232,14 @@ onBeforeUnmount(() => {
                     </tr>
                     <tr v-if="!logs.length">
                       <td colspan="8">
-                        <a-empty description="暂无使用记录" />
+                        <a-empty :description="t('暂无使用记录')" />
                       </td>
                     </tr>
                   </tbody>
                 </table>
               </div>
               <div class="usage-pagination">
-                <span>第 {{ page }} / {{ totalPages }} 页</span>
+                <span>{{ t(`第 ${page} / ${totalPages} 页`) }}</span>
                 <a-button size="small" :disabled="page <= 1" @click="changePage(page - 1)">
                   <template #icon><icon-left /></template>
                 </a-button>
@@ -1248,12 +1253,12 @@ onBeforeUnmount(() => {
               <table>
                 <thead>
                   <tr>
-                    <th>来源</th>
-                    <th>请求数</th>
+                    <th>{{ t("来源") }}</th>
+                    <th>{{ t("请求数") }}</th>
                     <th>Tokens</th>
-                    <th>费用</th>
-                    <th>成功率</th>
-                    <th>平均延迟</th>
+                    <th>{{ t("费用") }}</th>
+                    <th>{{ t("成功率") }}</th>
+                    <th>{{ t("平均延迟") }}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1266,7 +1271,7 @@ onBeforeUnmount(() => {
                     <td>{{ item.avgLatencyMs }}ms</td>
                   </tr>
                   <tr v-if="!providerStats.length">
-                    <td colspan="6"><a-empty description="暂无来源数据" /></td>
+                    <td colspan="6"><a-empty :description="t('暂无来源数据')" /></td>
                   </tr>
                 </tbody>
               </table>
@@ -1276,11 +1281,11 @@ onBeforeUnmount(() => {
               <table>
                 <thead>
                   <tr>
-                    <th>模型</th>
-                    <th>请求数</th>
+                    <th>{{ t("模型") }}</th>
+                    <th>{{ t("请求数") }}</th>
                     <th>Tokens</th>
-                    <th>费用</th>
-                    <th>单次均价</th>
+                    <th>{{ t("费用") }}</th>
+                    <th>{{ t("单次均价") }}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1292,7 +1297,7 @@ onBeforeUnmount(() => {
                     <td>{{ formatUsd(item.avgCostPerRequest) }}</td>
                   </tr>
                   <tr v-if="!modelStats.length">
-                    <td colspan="5"><a-empty description="暂无模型用量" /></td>
+                    <td colspan="5"><a-empty :description="t('暂无模型用量')" /></td>
                   </tr>
                 </tbody>
               </table>
@@ -1303,8 +1308,8 @@ onBeforeUnmount(() => {
         <button class="usage-pricing-head" type="button" @click="togglePricing">
           <span>
             <icon-settings />
-            <strong>费用规则</strong>
-            <small>维护 Codex 统计使用的模型单价和倍率</small>
+            <strong>{{ t("费用规则") }}</strong>
+            <small>{{ t("维护 Codex 统计使用的模型单价和倍率") }}</small>
           </span>
           <icon-down :class="{ rotated: !pricingCollapsed }" />
         </button>
@@ -1313,8 +1318,8 @@ onBeforeUnmount(() => {
           <div class="usage-pricing-section">
             <div class="usage-card-title">
               <div>
-                <strong>Codex 计费口径</strong>
-                <span>设置统计倍率与模型识别来源</span>
+                <strong>{{ t("Codex 计费口径") }}</strong>
+                <span>{{ t("设置统计倍率与模型识别来源") }}</span>
               </div>
               <a-button
                 type="primary"
@@ -1322,16 +1327,16 @@ onBeforeUnmount(() => {
                 :loading="savingPricingConfig"
                 @click="savePricingConfig"
               >
-                保存
+                {{ t("保存") }}
               </a-button>
             </div>
             <div class="usage-pricing-defaults">
               <table>
                 <thead>
                   <tr>
-                    <th>应用</th>
-                    <th>默认倍率</th>
-                    <th>计费模式</th>
+                    <th>{{ t("应用") }}</th>
+                    <th>{{ t("默认倍率") }}</th>
+                    <th>{{ t("计费模式") }}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1347,8 +1352,8 @@ onBeforeUnmount(() => {
                     </td>
                     <td>
                       <a-select v-model="item.pricingModelSource" class="usage-config-select">
-                        <a-option value="response">返回模型</a-option>
-                        <a-option value="request">请求模型</a-option>
+                        <a-option value="response">{{ t("返回模型") }}</a-option>
+                        <a-option value="request">{{ t("请求模型") }}</a-option>
                       </a-select>
                     </td>
                   </tr>
@@ -1360,19 +1365,19 @@ onBeforeUnmount(() => {
           <div class="usage-pricing-section">
             <div class="usage-card-title">
               <div>
-                <strong>模型单价（每百万 Tokens）</strong>
-                <span>{{ pricingList.length }} 条规则</span>
+                <strong>{{ t("模型单价（每百万 Tokens）") }}</strong>
+                <span>{{ formatLocalizedCount(pricingList.length, "条规则") }}</span>
               </div>
               <div class="usage-pricing-actions">
-                <a-popconfirm content="恢复内置 GPT/Codex 单价会覆盖当前 pricing.json，确定继续？" @ok="restoreDefaultPricing">
+                <a-popconfirm :content="t('恢复内置 GPT/Codex 单价会覆盖当前 pricing.json，确定继续？')" @ok="restoreDefaultPricing">
                   <a-button :loading="pricingLoading">
                     <template #icon><icon-refresh /></template>
-                    恢复默认
+                    {{ t("恢复默认") }}
                   </a-button>
                 </a-popconfirm>
                 <a-button type="primary" @click="openAddPricing">
                   <template #icon><icon-plus /></template>
-                  添加
+                  {{ t("添加") }}
                 </a-button>
               </div>
             </div>
@@ -1382,13 +1387,13 @@ onBeforeUnmount(() => {
                 <table>
                   <thead>
                     <tr>
-                      <th>模型</th>
-                      <th>显示名称</th>
-                      <th>输入单价</th>
-                      <th>输出单价</th>
-                      <th>缓存复用</th>
-                      <th>缓存写入</th>
-                      <th>操作</th>
+                      <th>{{ t("模型") }}</th>
+                      <th>{{ t("显示名称") }}</th>
+                      <th>{{ t("输入单价") }}</th>
+                      <th>{{ t("输出单价") }}</th>
+                      <th>{{ t("缓存复用") }}</th>
+                      <th>{{ t("缓存写入") }}</th>
+                      <th>{{ t("操作") }}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1404,7 +1409,7 @@ onBeforeUnmount(() => {
                           <a-button size="mini" @click="openEditPricing(item)">
                             <template #icon><icon-edit /></template>
                           </a-button>
-                          <a-popconfirm content="确定删除这条模型单价？" @ok="removePricing(item.modelId)">
+                          <a-popconfirm :content="t('确定删除这条模型单价？')" @ok="removePricing(item.modelId)">
                             <a-button size="mini" status="danger">
                               <template #icon><icon-delete /></template>
                             </a-button>
@@ -1414,7 +1419,7 @@ onBeforeUnmount(() => {
                     </tr>
                     <tr v-if="!pricingList.length">
                       <td colspan="7">
-                        <a-empty description="暂无模型单价" />
+                        <a-empty :description="t('暂无模型单价')" />
                       </td>
                     </tr>
                   </tbody>
@@ -1429,54 +1434,54 @@ onBeforeUnmount(() => {
         <aside class="usage-side-column">
           <section class="usage-side-card">
             <div class="usage-card-title">
-              <strong>本期概览</strong>
+              <strong>{{ t("本期概览") }}</strong>
               <span>Codex</span>
             </div>
             <article class="usage-side-metric">
-              <span>主要来源</span>
+              <span>{{ t("主要来源") }}</span>
               <strong>{{ topProvider?.providerName || "--" }}</strong>
               <small>{{ formatUsd(topProvider?.totalCost) }} · {{ formatTokens(topProvider?.totalTokens) }}</small>
             </article>
             <article class="usage-side-metric">
-              <span>主要模型</span>
+              <span>{{ t("主要模型") }}</span>
               <strong>{{ topModel?.model || "--" }}</strong>
               <small>{{ formatUsd(topModel?.totalCost) }} · {{ formatTokens(topModel?.totalTokens) }}</small>
             </article>
             <article class="usage-side-metric">
-              <span>费用倍率</span>
+              <span>{{ t("费用倍率") }}</span>
               <strong>{{ codexPricingConfig.multiplier }}x</strong>
-              <small>{{ codexPricingConfig.pricingModelSource === "request" ? "请求模型" : "返回模型" }}</small>
+              <small>{{ codexPricingConfig.pricingModelSource === "request" ? t("请求模型") : t("返回模型") }}</small>
             </article>
           </section>
 
           <section class="usage-side-card">
             <div class="usage-card-title">
-              <strong>来源分布</strong>
-              <span>{{ providerStats.length }} 个</span>
+              <strong>{{ t("来源分布") }}</strong>
+              <span>{{ formatLocalizedCount(providerStats.length, "个") }}</span>
             </div>
             <article v-for="item in providerStats.slice(0, 5)" :key="item.providerId" class="usage-rank-row">
               <div>
                 <strong>{{ item.providerName }}</strong>
-                <span>{{ item.requestCount }} 次 · {{ formatUsd(item.totalCost) }}</span>
+                <span>{{ formatLocalizedCount(item.requestCount, "次") }} · {{ formatUsd(item.totalCost) }}</span>
               </div>
               <b>{{ formatTokens(item.totalTokens) }}</b>
             </article>
-            <a-empty v-if="!providerStats.length" description="暂无来源数据" />
+            <a-empty v-if="!providerStats.length" :description="t('暂无来源数据')" />
           </section>
 
           <section class="usage-side-card">
             <div class="usage-card-title">
-              <strong>模型分布</strong>
-              <span>{{ modelStats.length }} 个</span>
+              <strong>{{ t("模型分布") }}</strong>
+              <span>{{ formatLocalizedCount(modelStats.length, "个") }}</span>
             </div>
             <article v-for="item in modelStats.slice(0, 6)" :key="item.model" class="usage-rank-row">
               <div>
                 <strong>{{ item.model }}</strong>
-                <span>{{ item.requestCount }} 次 · 平均 {{ formatUsd(item.avgCostPerRequest) }}</span>
+                <span>{{ formatLocalizedCount(item.requestCount, "次") }} · {{ t("平均") }} {{ formatUsd(item.avgCostPerRequest) }}</span>
               </div>
               <b>{{ formatTokens(item.totalTokens) }}</b>
             </article>
-            <a-empty v-if="!modelStats.length" description="暂无模型用量" />
+            <a-empty v-if="!modelStats.length" :description="t('暂无模型用量')" />
           </section>
         </aside>
       </div>
@@ -1484,41 +1489,41 @@ onBeforeUnmount(() => {
       <a-alert
         v-if="dashboard?.errors.length"
         type="warning"
-        :content="`有 ${dashboard.errors.length} 个会话文件暂时无法读取，已跳过这些文件。`"
+        :content="t(`有 ${dashboard.errors.length} 个会话文件暂时无法读取，已跳过这些文件。`)"
       />
     </a-spin>
 
     <a-modal
       v-model:visible="pricingModalVisible"
-      :title="editingModelId ? '编辑模型单价' : '添加模型单价'"
+      :title="editingModelId ? t('编辑模型单价') : t('添加模型单价')"
       :footer="false"
       width="620px"
     >
       <a-form :model="pricingForm" layout="vertical">
-        <a-form-item label="模型 ID">
-          <a-input v-model="pricingForm.modelId" placeholder="例如 gpt-5-codex" />
+        <a-form-item :label="t('模型 ID')">
+          <a-input v-model="pricingForm.modelId" :placeholder="t('例如 gpt-5-codex')" />
         </a-form-item>
-        <a-form-item label="显示名称">
-          <a-input v-model="pricingForm.displayName" placeholder="例如 GPT-5 Codex" />
+        <a-form-item :label="t('显示名称')">
+          <a-input v-model="pricingForm.displayName" :placeholder="t('例如 GPT-5 Codex')" />
         </a-form-item>
         <div class="usage-pricing-form-grid">
-          <a-form-item label="输入单价 / 1M">
+          <a-form-item :label="t('输入单价 / 1M')">
             <a-input v-model="pricingForm.inputCostPerMillion" />
           </a-form-item>
-          <a-form-item label="输出单价 / 1M">
+          <a-form-item :label="t('输出单价 / 1M')">
             <a-input v-model="pricingForm.outputCostPerMillion" />
           </a-form-item>
-          <a-form-item label="缓存复用 / 1M">
+          <a-form-item :label="t('缓存复用 / 1M')">
             <a-input v-model="pricingForm.cacheReadCostPerMillion" />
           </a-form-item>
-          <a-form-item label="缓存写入 / 1M">
+          <a-form-item :label="t('缓存写入 / 1M')">
             <a-input v-model="pricingForm.cacheCreationCostPerMillion" />
           </a-form-item>
         </div>
       </a-form>
       <div class="usage-modal-actions">
-        <a-button @click="pricingModalVisible = false">取消</a-button>
-        <a-button type="primary" :loading="savingPricing" @click="savePricing">保存</a-button>
+        <a-button @click="pricingModalVisible = false">{{ t("取消") }}</a-button>
+        <a-button type="primary" :loading="savingPricing" @click="savePricing">{{ t("保存") }}</a-button>
       </div>
     </a-modal>
   </section>

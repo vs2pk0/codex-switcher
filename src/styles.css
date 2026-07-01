@@ -3363,6 +3363,11 @@ textarea {
   background: rgba(204, 251, 241, 0.72);
 }
 
+.about-tile-icon-update {
+  color: #7c3aed;
+  background: rgba(237, 233, 254, 0.76);
+}
+
 .about-tile-copy {
   display: grid;
   gap: 5px;
