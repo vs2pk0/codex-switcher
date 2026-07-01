@@ -2,6 +2,7 @@
 import { computed, ref } from "vue";
 import type { CodexSwitcherSettings } from "../services/codex";
 import type { CodexAccount, CodexResetCredit } from "../types/codex";
+import { formatLocalizedDuration, t } from "../i18n";
 import PlanBadge from "./PlanBadge.vue";
 
 const props = defineProps<{
@@ -84,7 +85,7 @@ function isApiKeyAccount(account: CodexAccount): boolean {
 }
 
 function displayName(account: CodexAccount): string {
-  return account.account_name || account.email || account.id || "未命名账号";
+  return account.account_name || account.email || account.id || t("未命名账号");
 }
 
 function maskEmail(value: string): string {
@@ -124,7 +125,7 @@ function boundOAuthAccount(account: CodexAccount): CodexAccount | undefined {
 
 function boundOAuthName(account: CodexAccount): string {
   const bound = boundOAuthAccount(account);
-  return bound ? displayAccountName(bound) : "未绑定";
+  return bound ? displayAccountName(bound) : t("未绑定");
 }
 
 function isBoundApiKeyAccount(account: CodexAccount): boolean {
@@ -300,7 +301,7 @@ function apiBaseUrl(account: CodexAccount): string {
 
 function apiBaseUrlLine(account: CodexAccount): string {
   const value = apiBaseUrl(account);
-  return value ? `Base URL: ${value}` : "Base URL: 未设置";
+  return value ? `Base URL: ${value}` : `Base URL: ${t("未设置")}`;
 }
 
 function apiOfficialUrl(account: CodexAccount): string {
@@ -309,7 +310,7 @@ function apiOfficialUrl(account: CodexAccount): string {
 
 function maskSecret(value?: string): string {
   const trimmed = value?.trim() ?? "";
-  if (!trimmed) return "未保存";
+  if (!trimmed) return t("未保存");
   if (trimmed.length <= 10) return `${trimmed.slice(0, 3)}****`;
   return `${trimmed.slice(0, 6)}****${trimmed.slice(-4)}`;
 }
@@ -410,27 +411,27 @@ function resetCreditStatusKey(credit: CodexResetCredit): "available" | "used" | 
 
 function resetCreditStatusLabel(credit: CodexResetCredit): string {
   const key = resetCreditStatusKey(credit);
-  if (key === "available") return "可用";
-  if (key === "used") return "已使用";
-  if (key === "expired") return "已过期";
-  return credit.raw_status || credit.status || "未知";
+  if (key === "available") return t("可用");
+  if (key === "used") return t("已使用");
+  if (key === "expired") return t("已过期");
+  return credit.raw_status || credit.status || t("未知");
 }
 
 function resetCreditDateLabel(value?: number): string {
-  return formatDateTime(value) || "时间未知";
+  return formatDateTime(value) || t("时间未知");
 }
 
 function resetCreditEndLabel(credit: CodexResetCredit): string {
   const usedAt = resetCreditDateLabel(credit.redeemed_at);
-  if (resetCreditStatusKey(credit) === "used" && usedAt !== "时间未知") return `使用 ${usedAt}`;
-  return `可用至 ${resetCreditDateLabel(credit.expires_at)}`;
+  if (resetCreditStatusKey(credit) === "used" && usedAt !== t("时间未知")) return `${t("使用")} ${usedAt}`;
+  return `${t("可用至")} ${resetCreditDateLabel(credit.expires_at)}`;
 }
 
 function quotaWindowLabel(minutes?: number, fallback = "5h"): string {
-  if (!minutes) return fallback;
-  if (minutes % (60 * 24) === 0) return `${minutes / 60 / 24} 天窗口`;
-  if (minutes % 60 === 0) return `${minutes / 60} 小时窗口`;
-  return `${minutes} 分钟窗口`;
+  if (!minutes) return t(fallback);
+  if (minutes % (60 * 24) === 0) return t(`${minutes / 60 / 24} 天窗口`);
+  if (minutes % 60 === 0) return t(`${minutes / 60} 小时窗口`);
+  return t(`${minutes} 分钟窗口`);
 }
 
 function quotaColor(value?: number): string {
@@ -456,20 +457,19 @@ function quotaResetLeftLabel(value?: string | number): string {
 }
 
 function quotaResetDateLabel(value?: string | number): string {
-  if (!value) return "等待刷新";
+  if (!value) return t("等待刷新");
   const formatted = formatDateTime(value);
-  return formatted ? `更新 ${formatted}` : String(value);
+  return formatted ? t(`更新 ${formatted}`) : String(value);
 }
 
 function formatRemainingTimeLabel(targetTime: number): string {
   const diff = targetTime - Date.now();
-  if (diff <= 0) return "已过期";
+  if (diff <= 0) return t("已过期");
   const totalMinutes = Math.floor(diff / 60_000);
   const days = Math.floor(totalMinutes / 1440);
   const hours = Math.floor((totalMinutes % 1440) / 60);
   const minutes = totalMinutes % 60;
-  if (days > 0) return `${days}天${hours}小时`;
-  return `${hours}小时${minutes}分钟`;
+  return formatLocalizedDuration(days, hours, minutes);
 }
 
 function expiryDaysLabel(value?: string): string {
@@ -480,14 +480,14 @@ function expiryDaysLabel(value?: string): string {
 }
 
 function statusTitle(account: CodexAccount): string {
-  return isApiKeyAccount(account) ? "密钥状态" : "订阅状态";
+  return isApiKeyAccount(account) ? t("密钥状态") : t("订阅状态");
 }
 
 function quotaErrorMessage(account: CodexAccount): string {
   if (account.quota_error?.code === "token_expired") {
-    return "Token 失效，请重新登录或更换绑定账号";
+    return t("Token 失效，请重新登录或更换绑定账号");
   }
-  return account.quota_error?.message || "额度刷新失败";
+  return account.quota_error?.message ? t(account.quota_error.message) : t("额度刷新失败");
 }
 
 function isTokenExpiredError(account: CodexAccount): boolean {
@@ -519,7 +519,7 @@ function formatDateTime(value?: string | number | null): string {
 }
 
 function formatTime(value?: number | null): string {
-  if (!value) return "从未使用";
+  if (!value) return t("从未使用");
   return formatDateTime(value);
 }
 </script>
@@ -555,7 +555,7 @@ function formatTime(value?: number | null): string {
             />
             <span
               class="account-name"
-              :title="`${displayAccountName(account)}，双击复制邮箱`"
+              :title="`${displayAccountName(account)}, ${t('双击复制邮箱')}`"
               @dblclick.stop="emit('copy-email', account)"
             >
               {{ displayAccountName(account) }}
@@ -563,9 +563,9 @@ function formatTime(value?: number | null): string {
           </div>
           <div class="account-head-actions">
             <span v-if="account.id === currentId" class="current-account-pill">
-              当前
+              {{ t("当前") }}
             </span>
-            <a-tooltip v-if="!isApiKeyAccount(account) && canUseResetCredit(account)" content="可用重置次数">
+            <a-tooltip v-if="!isApiKeyAccount(account) && canUseResetCredit(account)" :content="t('可用重置次数')">
               <button
                 class="reset-credit-pill"
                 type="button"
@@ -576,7 +576,7 @@ function formatTime(value?: number | null): string {
                 {{ resetCreditCount(account) }}
               </button>
             </a-tooltip>
-            <a-tooltip :content="isPinned(account) ? '取消置顶' : '置顶账号'">
+            <a-tooltip :content="isPinned(account) ? t('取消置顶') : t('置顶账号')">
               <button
                 class="pin-button"
                 :class="{ active: isPinned(account) }"
@@ -594,7 +594,7 @@ function formatTime(value?: number | null): string {
           <div class="chip-line">
             <a-button class="soft-chip" size="mini" @click="emit('open-binding', account)">
               <template #icon><icon-link /></template>
-              {{ boundOAuthName(account) === "未绑定" ? "绑定 OAuth" : boundOAuthName(account) }}
+              {{ boundOAuthName(account) === t("未绑定") ? t("绑定 OAuth") : boundOAuthName(account) }}
             </a-button>
           </div>
 
@@ -611,7 +611,7 @@ function formatTime(value?: number | null): string {
           >
             <icon-link />
             <span>
-              <b>官网地址</b>
+              <b>{{ t("官网地址") }}</b>
               <em>{{ apiOfficialUrl(account) }}</em>
             </span>
           </button>
@@ -621,8 +621,8 @@ function formatTime(value?: number | null): string {
           <template v-if="shouldShowQuota(account) && account.quota">
             <div class="quota-panel">
               <div class="quota-panel-head">
-                <span>额度概览</span>
-                <small>自动同步</small>
+                <span>{{ t("额度概览") }}</span>
+                <small>{{ t("自动同步") }}</small>
               </div>
               <div class="quota-metrics" :class="{ single: isFreePlanAccount(account) }">
                 <div v-if="account.quota.hourly_window_present !== false" class="quota-metric">
@@ -630,7 +630,7 @@ function formatTime(value?: number | null): string {
                     <span>
                       <icon-calendar v-if="isFreePlanAccount(account)" />
                       <icon-clock-circle v-else />
-                      {{ isFreePlanAccount(account) ? "长周期" : "短周期" }}
+                      {{ isFreePlanAccount(account) ? t("长周期") : t("短周期") }}
                     </span>
                     <strong :style="{ color: quotaColor(account.quota.hourly_percentage) }">
                       {{ account.quota.hourly_percentage }}%
@@ -660,7 +660,7 @@ function formatTime(value?: number | null): string {
                   <div class="quota-metric-top">
                     <span>
                       <icon-calendar />
-                      长周期
+                      {{ t("长周期") }}
                     </span>
                     <strong :style="{ color: quotaColor(account.quota.weekly_percentage) }">
                       {{ account.quota.weekly_percentage }}%
@@ -703,7 +703,7 @@ function formatTime(value?: number | null): string {
               status="danger"
               @click="emit('reauthorize', account)"
             >
-              重新授权
+              {{ t("重新授权") }}
             </a-button>
           </div>
 
@@ -723,7 +723,7 @@ function formatTime(value?: number | null): string {
                 <icon-calendar />
                 {{ statusTitle(account) }}
                 <b class="status-remaining-time">
-                  {{ expiryDaysLabel(accountSubscriptionUntil(account)) || "已记录" }}
+                  {{ expiryDaysLabel(accountSubscriptionUntil(account)) || t("已记录") }}
                 </b>
               </span>
               <strong>{{ formatDateTime(accountSubscriptionUntil(account)) }}</strong>
@@ -732,7 +732,7 @@ function formatTime(value?: number | null): string {
             <div v-if="accountTokenExpiresAt(account)" class="status-card status-token-expired">
               <span>
                 <icon-clock-circle />
-                Token {{ tokenExpiryStatus(accountTokenExpiresAt(account)) === "expired" ? "失效" : "可用" }}
+                {{ tokenExpiryStatus(accountTokenExpiresAt(account)) === "expired" ? t("Token 失效") : t("Token 可用") }}
               </span>
               <strong>{{ formatDateTime(accountTokenExpiresAt(account)) }}</strong>
             </div>
@@ -753,60 +753,60 @@ function formatTime(value?: number | null): string {
             </button>
           </div>
           <div class="card-actions">
-            <a-tooltip v-if="!isApiKeyAccount(account)" content="绑定手机">
-              <a-button size="small" title="绑定手机" @click="emit('open-phone', account)">
+            <a-tooltip v-if="!isApiKeyAccount(account)" :content="t('绑定手机')">
+              <a-button size="small" :title="t('绑定手机')" @click="emit('open-phone', account)">
                 <template #icon><icon-phone /></template>
               </a-button>
             </a-tooltip>
-            <a-tooltip content="编辑">
-              <a-button size="small" title="编辑" @click="emit('open-edit', account)">
+            <a-tooltip :content="t('编辑')">
+              <a-button size="small" :title="t('编辑')" @click="emit('open-edit', account)">
                 <template #icon><icon-edit /></template>
               </a-button>
             </a-tooltip>
-            <a-tooltip content="切换">
+            <a-tooltip :content="t('切换')">
               <a-button
                 size="small"
-                title="切换"
+                :title="t('切换')"
                 :loading="switchingId === account.id"
                 @click="emit('switch-account', account)"
               >
                 <template #icon><icon-play-arrow /></template>
               </a-button>
             </a-tooltip>
-            <a-tooltip v-if="!isApiKeyAccount(account)" content="刷新额度">
+            <a-tooltip v-if="!isApiKeyAccount(account)" :content="t('刷新额度')">
               <a-button
                 size="small"
-                title="刷新额度"
+                :title="t('刷新额度')"
                 :loading="quotaRefreshingId === account.id"
                 @click="emit('refresh-quota', account)"
               >
                 <template #icon><icon-refresh /></template>
               </a-button>
             </a-tooltip>
-            <a-tooltip v-if="canUseResetCredit(account)" content="重置额度">
+            <a-tooltip v-if="canUseResetCredit(account)" :content="t('重置额度')">
               <a-button
                 size="small"
-                title="重置额度"
+                :title="t('重置额度')"
                 :loading="quotaRefreshingId === account.id"
                 @click="emit('reset-credit', account)"
               >
                 <template #icon><icon-thunderbolt /></template>
               </a-button>
             </a-tooltip>
-            <a-tooltip content="导出">
+            <a-tooltip :content="t('导出')">
               <a-button
                 size="small"
-                title="导出"
+                :title="t('导出')"
                 :loading="exportingId === account.id"
                 @click="emit('open-export', account)"
               >
                 <template #icon><icon-download /></template>
               </a-button>
             </a-tooltip>
-            <a-tooltip content="删除">
+            <a-tooltip :content="t('删除')">
               <a-button
                 size="small"
-                title="删除"
+                :title="t('删除')"
                 :loading="deletingId === account.id"
                 @click="emit('confirm-delete', account)"
               >
@@ -821,26 +821,25 @@ function formatTime(value?: number | null): string {
     <section v-else class="empty-wrap">
       <div class="empty-panel">
         <div class="empty-copy">
-          <span class="empty-kicker">本机还没有可切换账号</span>
-          <h2>先放进一个 Codex 登录态</h2>
+          <span class="empty-kicker">{{ t("本机还没有可切换账号") }}</span>
+          <h2>{{ t("先放进一个 Codex 登录态") }}</h2>
           <p>
-            导入 OAuth Token / JSON，或添加 API Key。保存后这里会显示账号卡片，
-            之后就可以一键切换并写回本机 Codex 配置。
+            {{ t("导入 OAuth Token / JSON，或添加 API Key。保存后这里会显示账号卡片，之后就可以一键切换并写回本机 Codex 配置。") }}
           </p>
           <div class="empty-actions">
             <a-button type="primary" size="large" @click="emit('open-add', 'token')">
               <template #icon><icon-import /></template>
-              导入 Token / JSON
+              {{ t("导入 Token / JSON") }}
             </a-button>
             <a-button size="large" @click="emit('open-add', 'apikey')">
               <template #icon><icon-plus /></template>
-              添加 API Key
+              {{ t("添加 API Key") }}
             </a-button>
           </div>
-          <div class="empty-steps" aria-label="账号添加流程">
-            <span>粘贴凭据</span>
-            <span>保存账号</span>
-            <span>切换 Codex</span>
+          <div class="empty-steps" :aria-label="t('账号添加流程')">
+            <span>{{ t("粘贴凭据") }}</span>
+            <span>{{ t("保存账号") }}</span>
+            <span>{{ t("切换 Codex") }}</span>
           </div>
         </div>
 

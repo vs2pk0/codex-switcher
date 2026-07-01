@@ -4,7 +4,7 @@ import type {
   CodexSwitcherPaths,
   CodexSwitcherSettings,
 } from "../services/codex";
-import { languageOptions, setLanguage } from "../i18n";
+import { languageOptions, setLanguage, t } from "../i18n";
 
 const props = defineProps<{
   settings: CodexSwitcherSettings;
@@ -44,9 +44,9 @@ function formatFileSize(bytes: number): string {
 }
 
 function backupButtonText(): string {
-  if (!props.backupWorking) return "手动备份";
+  if (!props.backupWorking) return t("手动备份");
   const progress = Math.max(0, Math.min(100, Math.round(props.backupProgress || 0)));
-  return `手动备份 ${progress}%`;
+  return t(`手动备份 ${progress}%`);
 }
 
 function changeLanguage(value: unknown): void {
@@ -62,65 +62,65 @@ function changeLanguage(value: unknown): void {
   <section class="settings-panel">
     <a-spin :loading="loading" dot>
       <div class="settings-grid">
-        <a-card title="数据" :bordered="false" class="settings-card">
+        <a-card :title="t('数据')" :bordered="false" class="settings-card">
           <div class="path-row">
-            <span>应用目录</span>
+            <span>{{ t("应用目录") }}</span>
             <a-input :model-value="appPaths?.appDir || ''" readonly />
             <a-button @click="openPath(appPaths?.appDir)">
               <template #icon><icon-folder /></template>
             </a-button>
           </div>
           <div class="path-row">
-            <span>账号 JSON</span>
+            <span>{{ t("账号 JSON") }}</span>
             <a-input :model-value="appPaths?.accountsJson || ''" readonly />
             <a-button @click="openPath(appPaths?.accountsJson)">
               <template #icon><icon-folder /></template>
             </a-button>
           </div>
           <div class="path-row">
-            <span>账号目录</span>
+            <span>{{ t("账号目录") }}</span>
             <a-input :model-value="appPaths?.accountDir || ''" readonly />
             <a-button @click="openPath(appPaths?.accountDir)">
               <template #icon><icon-folder /></template>
             </a-button>
           </div>
           <div class="path-row">
-            <span>会话目录</span>
+            <span>{{ t("会话目录") }}</span>
             <a-input :model-value="appPaths?.sessionDir || ''" readonly />
             <a-button @click="openPath(appPaths?.sessionDir)">
               <template #icon><icon-folder /></template>
             </a-button>
           </div>
           <div class="path-row">
-            <span>统计目录</span>
+            <span>{{ t("统计目录") }}</span>
             <a-input :model-value="appPaths?.statisticsDir || ''" readonly />
             <a-button @click="openPath(appPaths?.statisticsDir)">
               <template #icon><icon-folder /></template>
             </a-button>
           </div>
           <div class="path-row">
-            <span>配置目录</span>
+            <span>{{ t("配置目录") }}</span>
             <a-input :model-value="appPaths?.dataDir || ''" readonly />
             <a-button @click="openPath(appPaths?.dataDir)">
               <template #icon><icon-folder /></template>
             </a-button>
           </div>
           <div class="path-row">
-            <span>设置 JSON</span>
+            <span>{{ t("设置 JSON") }}</span>
             <a-input :model-value="appPaths?.settingsJson || ''" readonly />
             <a-button @click="openPath(appPaths?.settingsJson)">
               <template #icon><icon-folder /></template>
             </a-button>
           </div>
           <div class="path-row">
-            <span>Codex 目录</span>
+            <span>{{ t("Codex 目录") }}</span>
             <a-input :model-value="appPaths?.codexHome || ''" readonly />
             <a-button @click="openPath(appPaths?.codexHome)">
               <template #icon><icon-folder /></template>
             </a-button>
           </div>
           <div class="path-row">
-            <span>备份目录</span>
+            <span>{{ t("备份目录") }}</span>
             <a-input :model-value="appPaths?.backupDir || ''" readonly />
             <a-button @click="openPath(appPaths?.backupDir)">
               <template #icon><icon-folder /></template>
@@ -128,41 +128,41 @@ function changeLanguage(value: unknown): void {
           </div>
         </a-card>
 
-        <a-card title="刷新" :bordered="false" class="settings-card">
+        <a-card :title="t('刷新')" :bordered="false" class="settings-card">
           <a-form :model="settings" layout="vertical">
-            <a-form-item label="监控额度">
+            <a-form-item :label="t('监控额度')">
               <a-switch v-model="settings.monitorQuota" @change="emit('save')" />
             </a-form-item>
-            <a-form-item label="额度自动刷新">
+            <a-form-item :label="t('额度自动刷新')">
               <a-input-number
                 v-model="settings.quotaRefreshMinutes"
                 :min="1"
                 :max="1440"
                 mode="button"
               >
-                <template #suffix>分钟</template>
+                <template #suffix>{{ t("分钟") }}</template>
               </a-input-number>
             </a-form-item>
-            <a-form-item label="当前账号刷新">
+            <a-form-item :label="t('当前账号刷新')">
               <a-input-number
                 v-model="settings.currentAccountRefreshMinutes"
                 :min="1"
                 :max="1440"
                 mode="button"
               >
-                <template #suffix>分钟</template>
+                <template #suffix>{{ t("分钟") }}</template>
               </a-input-number>
             </a-form-item>
-            <a-form-item label="等待刷新倒计时">
+            <a-form-item :label="t('等待刷新倒计时')">
               <a-switch v-model="settings.showQuotaCountdowns" @change="emit('save')" />
             </a-form-item>
-            <a-button type="primary" :loading="saving" @click="emit('save')">保存</a-button>
+            <a-button type="primary" :loading="saving" @click="emit('save')">{{ t("保存") }}</a-button>
           </a-form>
         </a-card>
 
-        <a-card title="外观" :bordered="false" class="settings-card settings-appearance">
+        <a-card :title="t('外观')" :bordered="false" class="settings-card settings-appearance">
           <a-form :model="settings" layout="vertical">
-            <a-form-item label="语言">
+            <a-form-item :label="t('语言')">
               <a-select
                 :model-value="settings.language || 'zh-CN'"
                 popup-container="body"
@@ -175,14 +175,14 @@ function changeLanguage(value: unknown): void {
                 </a-option>
               </a-select>
             </a-form-item>
-            <a-form-item label="每行固定账号数">
+            <a-form-item :label="t('每行固定账号数')">
               <a-radio-group v-model="settings.maxColumns" type="button" @change="emit('save')">
-                <a-radio :value="3">3 个</a-radio>
-                <a-radio :value="4">4 个</a-radio>
-                <a-radio :value="5">5 个</a-radio>
+                <a-radio :value="3">{{ t("3 个") }}</a-radio>
+                <a-radio :value="4">{{ t("4 个") }}</a-radio>
+                <a-radio :value="5">{{ t("5 个") }}</a-radio>
               </a-radio-group>
             </a-form-item>
-            <a-form-item label="每页账号数">
+            <a-form-item :label="t('每页账号数')">
               <a-input-number
                 v-model="settings.pageSize"
                 :min="10"
@@ -195,16 +195,16 @@ function changeLanguage(value: unknown): void {
           </a-form>
         </a-card>
 
-        <a-card title="配置" :bordered="false" class="settings-card">
+        <a-card :title="t('配置')" :bordered="false" class="settings-card">
           <p class="settings-hint">
-            重置会删除本机 Codex 目录下的 config.toml，适合切换配置异常时恢复默认配置。
+            {{ t("重置会删除本机 Codex 目录下的 config.toml，适合切换配置异常时恢复默认配置。") }}
           </p>
           <a-button status="danger" @click="emit('reset-config')">
             <template #icon><icon-delete /></template>
-            重置 config.toml
+            {{ t("重置 config.toml") }}
           </a-button>
         </a-card>
-        <a-card title="备份" :bordered="false" class="settings-card settings-backup">
+        <a-card :title="t('备份')" :bordered="false" class="settings-card settings-backup">
           <div class="backup-actions">
             <a-button type="primary" :loading="backupWorking" @click="emit('export-backup')">
               <template #icon><icon-download /></template>
@@ -212,11 +212,11 @@ function changeLanguage(value: unknown): void {
             </a-button>
             <a-button @click="openPath(appPaths?.backupDir)">
               <template #icon><icon-folder /></template>
-              打开备份目录
+              {{ t("打开备份目录") }}
             </a-button>
             <a-button :loading="backupLoading" @click="emit('refresh-backups')">
               <template #icon><icon-refresh /></template>
-              刷新
+              {{ t("刷新") }}
             </a-button>
           </div>
           <a-spin :loading="backupLoading" dot>
@@ -232,10 +232,10 @@ function changeLanguage(value: unknown): void {
                 <div class="backup-item-actions">
                   <a-button :disabled="backupWorking" @click="emit('restore-backup', backup)">
                     <template #icon><icon-import /></template>
-                    恢复
+                    {{ t("恢复") }}
                   </a-button>
                   <a-popconfirm
-                    content="确认删除这个备份文件？"
+                    :content="t('确认删除这个备份文件？')"
                     @ok="emit('delete-backup', backup)"
                   >
                     <a-button status="danger" :disabled="backupWorking">
@@ -250,8 +250,8 @@ function changeLanguage(value: unknown): void {
                 <icon-archive />
               </div>
               <div class="backup-empty-copy">
-                <strong>还没有备份</strong>
-                <span>点击“手动备份”会把账号、设置、统计缓存、费用规则与所有 Codex 会话记录打包成 ZIP。</span>
+                <strong>{{ t("还没有备份") }}</strong>
+                <span>{{ t("点击“手动备份”会把账号、设置、统计缓存、费用规则与所有 Codex 会话记录打包成 ZIP。") }}</span>
                 <code>{{ appPaths?.backupDir || "~/.codex_switcher/backup" }}</code>
               </div>
             </div>

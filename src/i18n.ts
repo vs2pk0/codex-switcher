@@ -1,4 +1,4 @@
-import { nextTick, ref } from "vue";
+import { nextTick, ref, watch } from "vue";
 import type { Message, Modal } from "@arco-design/web-vue";
 
 export type AppLanguage = "zh-CN" | "zh-TW" | "en" | "ru";
@@ -33,6 +33,8 @@ const en: Record<string, string> = {
   "Codex Switcher": "Codex Switcher",
   "管理 OAuth 与 API Key 登录态，并写回本机 Codex 配置。":
     "Manage OAuth and API Key sessions, then write them back to the local Codex config.",
+  "管理 OAuth 与 API Key 登录态，并写回本机 Codex 配置":
+    "Manage OAuth and API Key sessions, then write them back to the local Codex config",
   "账号总览": "Accounts",
   "会话管理": "Sessions",
   "使用统计": "Usage",
@@ -40,6 +42,9 @@ const en: Record<string, string> = {
   "设置": "Settings",
   "关于": "About",
   "全部": "All",
+  "当前：": "Current:",
+  "异常": "Abnormal",
+  "有效账号": "Valid Accounts",
   "当前": "Current",
   "读取当前账号": "Detect Current",
   "已隐藏": "Hidden",
@@ -91,7 +96,21 @@ const en: Record<string, string> = {
   "恢复": "Restore",
   "删除": "Delete",
   "还没有备份": "No backups yet",
+  "点击“手动备份”会把账号、设置、统计缓存、费用规则与所有 Codex 会话记录打包成 ZIP。":
+    "Click \"Manual Backup\" to package accounts, settings, statistics cache, pricing rules, and all Codex sessions into a ZIP.",
+  "确认删除这个备份文件？": "Delete this backup file?",
   "手动备份": "Manual Backup",
+  "分钟": "minutes",
+  "小时": "hours",
+  "天": "days",
+  "万": "ten-thousand",
+  "亿": "hundred-million",
+  "已过期": "Expired",
+  "已记录": "Recorded",
+  "等待刷新": "Waiting",
+  "个": "items",
+  "重置会删除本机 Codex 目录下的 config.toml，适合切换配置异常时恢复默认配置。":
+    "Reset deletes config.toml under the local Codex directory, useful for restoring defaults after switching issues.",
   "取消": "Cancel",
   "确认": "Confirm",
   "关闭": "Close",
@@ -102,6 +121,13 @@ const en: Record<string, string> = {
   "置顶账号": "Pin account",
   "取消置顶": "Unpin account",
   "绑定手机": "Bind Phone",
+  "未命名账号": "Unnamed Account",
+  "未设置": "Not Set",
+  "未保存": "Not Saved",
+  "可用重置次数": "Available reset credits",
+  "刷新额度": "Refresh Quota",
+  "重置额度": "Reset Quota",
+  "导出": "Export",
   "重新授权": "Reauthorize",
   "官网地址": "Official Website",
   "额度概览": "Quota Overview",
@@ -112,6 +138,10 @@ const en: Record<string, string> = {
   "密钥状态": "Key Status",
   "Token 可用": "Token Available",
   "Token 失效": "Token Expired",
+  "Token 失效，请重新登录或更换绑定账号": "Token expired. Please reauthorize or switch the bound account.",
+  "请重新登录或更换绑定账号": "Please reauthorize or switch the bound account",
+  "绑定 OAuth": "Bind OAuth",
+  "未绑定": "Unbound",
   "消耗看板": "Usage Dashboard",
   "从本机会话记录汇总 Tokens、缓存复用和预估费用":
     "Summarize tokens, cache reuse, and estimated cost from local sessions.",
@@ -127,12 +157,86 @@ const en: Record<string, string> = {
   "输出 Tokens": "Output Tokens",
   "缓存写入": "Cache Write",
   "缓存复用": "Cache Reuse",
+  "输入": "Input",
+  "输出": "Output",
+  "平均": "avg",
   "复用占比": "Reuse Rate",
   "趋势": "Trend",
+  "时段消耗曲线": "Usage by Time Range",
+  "暂无趋势数据": "No trend data",
+  "累计 Token 数": "Total Tokens",
+  "峰值 Token 数": "Peak Tokens",
+  "当前连续天数": "Current Streak",
+  "最长连续天数": "Longest Streak",
+  "Token 活动": "Token Activity",
+  "凌晨": "Late Night",
+  "清晨": "Early Morning",
+  "上午": "Morning",
+  "午后": "Afternoon",
+  "傍晚": "Evening",
+  "夜间": "Night",
+  "每日": "Daily",
+  "每周": "Weekly",
+  "累计": "Total",
+  "暂无活动数据": "No activity data",
+  "调用流水": "Call Logs",
+  "来源汇总": "Sources",
+  "模型用量": "Models",
+  "调用记录": "Call Records",
+  "时间": "Time",
+  "来源": "Source",
+  "计费模型": "Billing Model",
+  "费用": "Cost",
+  "状态": "Status",
+  "暂无使用记录": "No usage records",
+  "第": "Page",
+  "页": "Page",
+  "请求数": "Requests",
+  "Tokens": "Tokens",
+  "成功率": "Success Rate",
+  "平均延迟": "Avg Latency",
+  "模型": "Model",
+  "单次均价": "Avg Cost",
+  "本期概览": "Period Overview",
+  "主要来源": "Top Source",
+  "主要模型": "Top Model",
+  "费用倍率": "Cost Multiplier",
+  "请求模型": "Request Model",
+  "返回模型": "Response Model",
+  "来源分布": "Source Distribution",
+  "模型分布": "Model Distribution",
+  "暂无来源数据": "No source data",
+  "暂无模型用量": "No model usage",
   "请求明细": "Request Logs",
   "Provider 统计": "Provider Stats",
   "模型统计": "Model Stats",
   "费用规则": "Pricing",
+  "维护 Codex 统计使用的模型单价和倍率": "Maintain model prices and multipliers for Codex usage statistics",
+  "Codex 计费口径": "Codex Billing Basis",
+  "设置统计倍率与模型识别来源": "Set the statistics multiplier and model source",
+  "应用": "App",
+  "默认倍率": "Default Multiplier",
+  "计费模式": "Billing Mode",
+  "模型单价（每百万 Tokens）": "Model Pricing (per 1M Tokens)",
+  "条规则": "rules",
+  "恢复默认": "Restore Defaults",
+  "显示名称": "Display Name",
+  "输入单价": "Input Price",
+  "输出单价": "Output Price",
+  "操作": "Actions",
+  "暂无模型单价": "No model pricing",
+  "确定删除这条模型单价？": "Delete this model pricing rule?",
+  "编辑模型单价": "Edit Model Pricing",
+  "添加模型单价": "Add Model Pricing",
+  "模型 ID": "Model ID",
+  "输入单价 / 1M": "Input Price / 1M",
+  "输出单价 / 1M": "Output Price / 1M",
+  "缓存复用 / 1M": "Cache Read / 1M",
+  "缓存写入 / 1M": "Cache Write / 1M",
+  "例如 gpt-5-codex": "e.g. gpt-5-codex",
+  "例如 GPT-5 Codex": "e.g. GPT-5 Codex",
+  "恢复内置 GPT/Codex 单价会覆盖当前 pricing.json，确定继续？":
+    "Restoring built-in GPT/Codex pricing will overwrite pricing.json. Continue?",
   "服务状态": "Service Status",
   "当前版本": "Current Version",
   "访问地址": "Endpoint",
@@ -156,6 +260,16 @@ const en: Record<string, string> = {
   "随机重生成": "Regenerate",
   "添加密钥": "Add Key",
   "保存配置": "Save Config",
+  "可用": "Available",
+  "已使用": "Used",
+  "未知": "Unknown",
+  "时间未知": "Unknown time",
+  "使用": "Used",
+  "可用至": "Available until",
+  "从未使用": "Never used",
+  "额度刷新失败": "Quota refresh failed",
+  "额度异常": "Quota Error",
+  "双击复制邮箱": "Double-click to copy email",
   "更新信息": "Update Info",
   "最新版本": "Latest Version",
   "匹配平台": "Platform",
@@ -188,6 +302,11 @@ const en: Record<string, string> = {
   "只恢复会话": "Restore Sessions Only",
   "立即备份": "Backup Now",
   "选择重置次数": "Choose Reset Credit",
+  "选择要消耗的重置次数": "Choose a reset credit to use",
+  "当前有": "currently has",
+  "次可用": "available",
+  "发放": "Granted",
+  "暂无重置次数明细，请先刷新额度": "No reset credit details. Refresh quota first.",
   "重置使用次数": "Use Reset Credit",
   "找回会话显示": "Recover Session Visibility",
   "立即找回": "Recover Now",
@@ -204,8 +323,54 @@ const en: Record<string, string> = {
   "查看支付宝、微信和 Binance 收款码": "View Alipay, WeChat, and Binance QR codes",
   "问题反馈": "Feedback",
   "提交 Issue 或改进建议": "Submit an issue or suggestion",
+  "检查更新": "Check Updates",
+  "查看最新版本并下载安装包": "View the latest version and download installers",
+  "当前已是最新版本": "You are up to date",
+  "检查更新失败": "Update check failed",
+  "前往下载": "Go to Download",
+  "稍后再说": "Later",
+  "打开 Releases": "Open Releases",
   "当前实例": "Current Instance",
+  "未归属项目": "Unassigned Project",
   "本机全部": "All Local",
+  "搜索会话标题": "Search session titles",
+  "搜索会话内容": "Search session content",
+  "取消全选": "Clear Selection",
+  "全选回收站": "Select Trash",
+  "会话列表": "Session List",
+  "回收站": "Trash",
+  "恢复会话": "Restore Sessions",
+  "移入回收站": "Move to Trash",
+  "未命名会话": "Untitled Session",
+  "打开文件夹": "Open Folder",
+  "已删除": "Deleted",
+  "没有匹配的会话": "No matching sessions",
+  "还没有可显示的会话": "No sessions to show",
+  "换个关键词试试，或清空搜索后重新刷新。": "Try another keyword, or clear the search and refresh.",
+  "可以先刷新本机会话；如果是切号后看不到旧会话，使用修复可见性重新挂回列表。":
+    "Refresh local sessions first. If old sessions disappear after switching accounts, use visibility repair to attach them back.",
+  "刷新会话": "Refresh Sessions",
+  "修复可见性": "Repair Visibility",
+  "从备份恢复": "Restore from Backup",
+  "回收站为空": "Trash is Empty",
+  "被移入回收站的会话会显示在这里，恢复后会回到原来的会话路径。":
+    "Sessions moved to trash appear here and return to their original path after restore.",
+  "本机还没有可切换账号": "No switchable accounts yet",
+  "先放进一个 Codex 登录态": "Add a Codex login state first",
+  "导入 OAuth Token / JSON，或添加 API Key。保存后这里会显示账号卡片，之后就可以一键切换并写回本机 Codex 配置。":
+    "Import an OAuth token / JSON, or add an API Key. After saving, account cards appear here and can be switched back into the local Codex config.",
+  "导入 Token / JSON": "Import Token / JSON",
+  "添加 API Key": "Add API Key",
+  "账号添加流程": "Account add flow",
+  "粘贴凭据": "Paste Credentials",
+  "保存账号": "Save Account",
+  "切换 Codex": "Switch Codex",
+  "绑定 OAuth 账号": "Bind OAuth Account",
+  "API Key 账号绑定 OAuth 后，切换时会同时写入 OAuth Token 与 API Key 配置，便于修复会话身份。":
+    "After binding OAuth to an API Key account, switching writes both OAuth Token and API Key config, making session identity repair easier.",
+  "不绑定 OAuth": "Do not bind OAuth",
+  "切换时仅写入 API Key 配置": "Only write API Key config when switching",
+  "暂无可绑定的 OAuth 账号": "No OAuth accounts available",
 };
 
 const ru: Record<string, string> = {
@@ -214,6 +379,10 @@ const ru: Record<string, string> = {
   "English": "Английский",
   "Русский": "Русский",
   "Codex Switcher": "Codex Switcher",
+  "管理 OAuth 与 API Key 登录态，并写回本机 Codex 配置。":
+    "Управляйте сессиями OAuth и API Key и записывайте их в локальную конфигурацию Codex.",
+  "管理 OAuth 与 API Key 登录态，并写回本机 Codex 配置":
+    "Управляйте сессиями OAuth и API Key и записывайте их в локальную конфигурацию Codex",
   "账号总览": "Аккаунты",
   "会话管理": "Сессии",
   "使用统计": "Статистика",
@@ -221,6 +390,9 @@ const ru: Record<string, string> = {
   "设置": "Настройки",
   "关于": "О программе",
   "全部": "Все",
+  "当前：": "Текущий:",
+  "异常": "Проблемные",
+  "有效账号": "Действительные",
   "当前": "Текущий",
   "读取当前账号": "Определить текущий",
   "已隐藏": "Скрыто",
@@ -272,7 +444,21 @@ const ru: Record<string, string> = {
   "恢复": "Восстановить",
   "删除": "Удалить",
   "还没有备份": "Резервных копий пока нет",
+  "点击“手动备份”会把账号、设置、统计缓存、费用规则与所有 Codex 会话记录打包成 ZIP。":
+    "Нажмите «Создать копию», чтобы упаковать аккаунты, настройки, кэш статистики, правила цен и все сессии Codex в ZIP.",
+  "确认删除这个备份文件？": "Удалить этот файл резервной копии?",
   "手动备份": "Создать копию",
+  "分钟": "минут",
+  "小时": "ч",
+  "天": "дн.",
+  "万": "10 тыс.",
+  "亿": "100 млн",
+  "已过期": "Истекло",
+  "已记录": "Записано",
+  "等待刷新": "Ожидание",
+  "个": "шт.",
+  "重置会删除本机 Codex 目录下的 config.toml，适合切换配置异常时恢复默认配置。":
+    "Сброс удалит config.toml в локальной папке Codex и вернет настройки по умолчанию при ошибках переключения.",
   "取消": "Отмена",
   "确认": "Подтвердить",
   "关闭": "Закрыть",
@@ -283,6 +469,13 @@ const ru: Record<string, string> = {
   "置顶账号": "Закрепить",
   "取消置顶": "Открепить",
   "绑定手机": "Привязать телефон",
+  "未命名账号": "Безымянный аккаунт",
+  "未设置": "Не задано",
+  "未保存": "Не сохранено",
+  "可用重置次数": "Доступные сбросы",
+  "刷新额度": "Обновить квоту",
+  "重置额度": "Сбросить квоту",
+  "导出": "Экспорт",
   "重新授权": "Авторизовать заново",
   "官网地址": "Официальный сайт",
   "额度概览": "Обзор квоты",
@@ -293,7 +486,13 @@ const ru: Record<string, string> = {
   "密钥状态": "Статус ключа",
   "Token 可用": "Токен доступен",
   "Token 失效": "Токен недействителен",
+  "Token 失效，请重新登录或更换绑定账号": "Токен недействителен. Авторизуйтесь заново или смените привязанный аккаунт.",
+  "请重新登录或更换绑定账号": "Авторизуйтесь заново или смените привязанный аккаунт",
+  "绑定 OAuth": "Привязать OAuth",
+  "未绑定": "Не привязан",
   "消耗看板": "Панель расхода",
+  "从本机会话记录汇总 Tokens、缓存复用和预估费用":
+    "Сводка токенов, повторного использования кэша и примерной стоимости по локальным сессиям.",
   "当天": "Сегодня",
   "昨天": "Вчера",
   "前天": "Позавчера",
@@ -306,12 +505,84 @@ const ru: Record<string, string> = {
   "输出 Tokens": "Выходные токены",
   "缓存写入": "Запись кэша",
   "缓存复用": "Повтор кэша",
+  "输入": "Ввод",
+  "输出": "Вывод",
+  "平均": "сред.",
   "复用占比": "Доля повтора",
   "趋势": "Тренд",
+  "时段消耗曲线": "Расход по периодам",
+  "暂无趋势数据": "Нет данных тренда",
+  "累计 Token 数": "Всего токенов",
+  "峰值 Token 数": "Пиковые токены",
+  "当前连续天数": "Текущая серия",
+  "最长连续天数": "Лучшая серия",
+  "Token 活动": "Активность токенов",
+  "凌晨": "Ночь",
+  "清晨": "Раннее утро",
+  "上午": "Утро",
+  "午后": "День",
+  "傍晚": "Вечер",
+  "夜间": "Поздний вечер",
+  "每日": "По дням",
+  "每周": "По неделям",
+  "累计": "Всего",
+  "暂无活动数据": "Нет данных активности",
+  "调用流水": "Вызовы",
+  "来源汇总": "Источники",
+  "模型用量": "Модели",
+  "调用记录": "Журнал вызовов",
+  "时间": "Время",
+  "来源": "Источник",
+  "计费模型": "Модель тарификации",
+  "费用": "Стоимость",
+  "状态": "Статус",
+  "暂无使用记录": "Нет записей использования",
+  "请求数": "Запросы",
+  "Tokens": "Токены",
+  "成功率": "Успешность",
+  "平均延迟": "Средняя задержка",
+  "模型": "Модель",
+  "单次均价": "Средняя стоимость",
+  "本期概览": "Обзор периода",
+  "主要来源": "Главный источник",
+  "主要模型": "Главная модель",
+  "费用倍率": "Множитель стоимости",
+  "请求模型": "Модель запроса",
+  "返回模型": "Модель ответа",
+  "来源分布": "Распределение источников",
+  "模型分布": "Распределение моделей",
+  "暂无来源数据": "Нет данных источников",
+  "暂无模型用量": "Нет данных моделей",
   "请求明细": "Журнал запросов",
   "Provider 统计": "Статистика провайдеров",
   "模型统计": "Статистика моделей",
   "费用规则": "Цены",
+  "维护 Codex 统计使用的模型单价和倍率": "Настройка цен моделей и множителей для статистики Codex",
+  "Codex 计费口径": "Правила тарификации Codex",
+  "设置统计倍率与模型识别来源": "Настройте множитель статистики и источник модели",
+  "应用": "Приложение",
+  "默认倍率": "Множитель",
+  "计费模式": "Режим тарификации",
+  "模型单价（每百万 Tokens）": "Цены моделей (за 1M токенов)",
+  "条规则": "правил",
+  "恢复默认": "Вернуть по умолчанию",
+  "显示名称": "Отображаемое имя",
+  "输入单价": "Цена ввода",
+  "输出单价": "Цена вывода",
+  "操作": "Действия",
+  "暂无模型单价": "Нет цен моделей",
+  "确定删除这条模型单价？": "Удалить это правило цены?",
+  "编辑模型单价": "Изменить цену модели",
+  "添加模型单价": "Добавить цену модели",
+  "模型 ID": "ID модели",
+  "输入单价 / 1M": "Цена ввода / 1M",
+  "输出单价 / 1M": "Цена вывода / 1M",
+  "缓存复用 / 1M": "Повтор кэша / 1M",
+  "缓存写入 / 1M": "Запись кэша / 1M",
+  "例如 gpt-5-codex": "например gpt-5-codex",
+  "例如 GPT-5 Codex": "например GPT-5 Codex",
+  "恢复内置 GPT/Codex 单价会覆盖当前 pricing.json，确定继续？":
+    "Встроенные цены GPT/Codex перезапишут pricing.json. Продолжить?",
   "服务状态": "Статус сервиса",
   "当前版本": "Текущая версия",
   "访问地址": "Адрес",
@@ -335,6 +606,16 @@ const ru: Record<string, string> = {
   "随机重生成": "Сгенерировать",
   "添加密钥": "Добавить ключ",
   "保存配置": "Сохранить",
+  "可用": "Доступно",
+  "已使用": "Использовано",
+  "未知": "Неизвестно",
+  "时间未知": "Время неизвестно",
+  "使用": "Использовано",
+  "可用至": "Доступно до",
+  "从未使用": "Не использовалось",
+  "额度刷新失败": "Не удалось обновить квоту",
+  "额度异常": "Ошибка квоты",
+  "双击复制邮箱": "Двойной клик копирует email",
   "更新信息": "Обновления",
   "最新版本": "Последняя версия",
   "匹配平台": "Платформа",
@@ -354,6 +635,13 @@ const ru: Record<string, string> = {
   "隐藏预览": "Скрыть предпросмотр",
   "复制": "Копировать",
   "下载": "Скачать",
+  "选择重置次数": "Выбрать сброс",
+  "选择要消耗的重置次数": "Выберите сброс для использования",
+  "当前有": "сейчас доступно",
+  "次可用": "доступно",
+  "发放": "Выдано",
+  "暂无重置次数明细，请先刷新额度": "Нет сведений о сбросах. Сначала обновите квоту.",
+  "重置使用次数": "Использовать сброс",
   "本地 Codex 管理工具": "Локальный инструмент управления Codex",
   "把账号切换、会话维护、使用统计和本地 API 服务收在一个干净的桌面工作台里。":
     "Удобное рабочее место для переключения аккаунтов, обслуживания сессий, статистики и локального API-сервиса.",
@@ -365,15 +653,64 @@ const ru: Record<string, string> = {
   "查看支付宝、微信和 Binance 收款码": "Открыть QR-коды Alipay, WeChat и Binance",
   "问题反馈": "Обратная связь",
   "提交 Issue 或改进建议": "Создать issue или предложить улучшение",
+  "检查更新": "Проверить обновления",
+  "查看最新版本并下载安装包": "Посмотреть последнюю версию и скачать установщик",
+  "当前已是最新版本": "У вас последняя версия",
+  "检查更新失败": "Не удалось проверить обновления",
+  "前往下载": "Перейти к загрузке",
+  "稍后再说": "Позже",
+  "打开 Releases": "Открыть Releases",
+  "搜索会话标题": "Поиск по названию сессии",
+  "未归属项目": "Проект не назначен",
+  "搜索会话内容": "Поиск по содержимому сессии",
+  "取消全选": "Снять выделение",
+  "全选回收站": "Выбрать корзину",
+  "会话列表": "Список сессий",
+  "回收站": "Корзина",
+  "恢复会话": "Восстановить сессии",
+  "移入回收站": "Переместить в корзину",
+  "未命名会话": "Безымянная сессия",
+  "打开文件夹": "Открыть папку",
+  "已删除": "Удалено",
+  "没有匹配的会话": "Сессии не найдены",
+  "还没有可显示的会话": "Нет сессий для отображения",
+  "换个关键词试试，或清空搜索后重新刷新。": "Попробуйте другой запрос или очистите поиск и обновите.",
+  "可以先刷新本机会话；如果是切号后看不到旧会话，使用修复可见性重新挂回列表。":
+    "Сначала обновите локальные сессии. Если старые сессии не видны после переключения, восстановите видимость.",
+  "刷新会话": "Обновить сессии",
+  "修复可见性": "Восстановить видимость",
+  "从备份恢复": "Восстановить из копии",
+  "回收站为空": "Корзина пуста",
+  "被移入回收站的会话会显示在这里，恢复后会回到原来的会话路径。":
+    "Сессии из корзины отображаются здесь и возвращаются в исходный путь после восстановления.",
+  "本机还没有可切换账号": "Пока нет аккаунтов для переключения",
+  "先放进一个 Codex 登录态": "Сначала добавьте состояние входа Codex",
+  "导入 OAuth Token / JSON，或添加 API Key。保存后这里会显示账号卡片，之后就可以一键切换并写回本机 Codex 配置。":
+    "Импортируйте OAuth Token / JSON или добавьте API Key. После сохранения карточки появятся здесь, и их можно будет переключать в локальную конфигурацию Codex.",
+  "导入 Token / JSON": "Импорт Token / JSON",
+  "添加 API Key": "Добавить API Key",
+  "账号添加流程": "Процесс добавления аккаунта",
+  "粘贴凭据": "Вставить данные",
+  "保存账号": "Сохранить аккаунт",
+  "切换 Codex": "Переключить Codex",
+  "绑定 OAuth 账号": "Привязать OAuth аккаунт",
+  "API Key 账号绑定 OAuth 后，切换时会同时写入 OAuth Token 与 API Key 配置，便于修复会话身份。":
+    "После привязки OAuth к аккаунту API Key при переключении будут записываться OAuth Token и API Key, что помогает восстановить идентичность сессии.",
+  "不绑定 OAuth": "Не привязывать OAuth",
+  "切换时仅写入 API Key 配置": "При переключении записывать только API Key",
+  "暂无可绑定的 OAuth 账号": "Нет OAuth аккаунтов для привязки",
 };
 
 const dictionary: Record<Exclude<AppLanguage, "zh-CN" | "zh-TW">, Record<string, string>> = {
   en,
   ru,
 };
+let reverseDictionary: Map<string, string> | null = null;
 
 const simplifiedToTraditional: Record<string, string> = {
   与: "與",
+  万: "萬",
+  亿: "億",
   账号: "帳號",
   账号数: "帳號數",
   会话: "會話",
@@ -470,16 +807,80 @@ export function setLanguage(value: unknown): void {
   queueTranslateDocument();
 }
 
+export function currentLocale(): string {
+  if (currentLanguage.value === "zh-TW") return "zh-TW";
+  if (currentLanguage.value === "en") return "en-US";
+  if (currentLanguage.value === "ru") return "ru-RU";
+  return "zh-CN";
+}
+
+export function formatLocalizedNumber(value?: number, options?: Intl.NumberFormatOptions): string {
+  return new Intl.NumberFormat(currentLocale(), options).format(Number(value || 0));
+}
+
+export function formatCompactTokens(value?: number): string {
+  const safe = Number(value || 0);
+  if (currentLanguage.value === "zh-CN" || currentLanguage.value === "zh-TW") {
+    if (safe >= 100_000_000) return `${(safe / 100_000_000).toFixed(1)} ${t("亿")}`;
+    if (safe >= 10_000) return `${(safe / 10_000).toFixed(1)} ${t("万")}`;
+    return formatLocalizedNumber(safe);
+  }
+  return formatLocalizedNumber(safe, {
+    notation: "compact",
+    maximumFractionDigits: safe >= 1_000 ? 1 : 0,
+  });
+}
+
+export function formatLocalizedCount(count: number, unit: string): string {
+  const number = formatLocalizedNumber(count);
+  if (currentLanguage.value === "en") {
+    const units: Record<string, string> = {
+      天: "days",
+      次: "times",
+      个: "items",
+      条记录: "records",
+      条规则: "rules",
+      条会话: "sessions",
+      个账号: "accounts",
+    };
+    return `${number} ${units[unit] || t(unit)}`;
+  }
+  if (currentLanguage.value === "ru") {
+    const units: Record<string, string> = {
+      天: "дн.",
+      次: "раз",
+      个: "шт.",
+      条记录: "записей",
+      条规则: "правил",
+      条会话: "сессий",
+      个账号: "аккаунтов",
+    };
+    return `${number} ${units[unit] || t(unit)}`;
+  }
+  return `${number} ${t(unit)}`;
+}
+
+export function formatLocalizedDuration(days: number, hours: number, minutes = 0): string {
+  if (currentLanguage.value === "en") {
+    return days > 0 ? `${days}d${hours}h` : `${hours}h${minutes}m`;
+  }
+  if (currentLanguage.value === "ru") {
+    return days > 0 ? `${days}д${hours}ч` : `${hours}ч${minutes}м`;
+  }
+  return days > 0 ? `${days}${t("天")}${hours}${t("小时")}` : `${hours}${t("小时")}${minutes}${t("分钟")}`;
+}
+
 export function t(value: unknown): string {
   if (typeof value !== "string" || !value.trim()) return String(value ?? "");
   const lang = currentLanguage.value;
-  if (lang === "zh-CN") return value;
   const leading = value.match(/^\s*/)?.[0] ?? "";
   const trailing = value.match(/\s*$/)?.[0] ?? "";
   const body = value.trim();
   if (!body) return value;
-  if (lang === "zh-TW") return `${leading}${toTraditional(body)}${trailing}`;
-  const translated = translateWithDictionary(body, dictionary[lang]);
+  const sourceBody = restoreSourceText(body);
+  if (lang === "zh-CN") return `${leading}${sourceBody}${trailing}`;
+  if (lang === "zh-TW") return `${leading}${toTraditional(sourceBody)}${trailing}`;
+  const translated = translateWithDictionary(sourceBody, dictionary[lang]);
   return `${leading}${translated}${trailing}`;
 }
 
@@ -494,6 +895,7 @@ export function installDomI18n(root: HTMLElement = document.body): void {
     attributes: true,
     attributeFilter: ["placeholder", "title", "aria-label"],
   });
+  watch(currentLanguage, () => queueTranslateDocument());
 }
 
 export function installArcoI18n(message: ArcoMessage, modal: ArcoModal): void {
@@ -595,21 +997,178 @@ function shouldSkipElement(element: HTMLElement): boolean {
 
 function translateWithDictionary(text: string, dict: Record<string, string>): string {
   if (dict[text]) return dict[text];
-  let next = text;
-  for (const key of Object.keys(dict).sort((left, right) => right.length - left.length)) {
-    if (!next.includes(key)) continue;
-    next = next.split(key).join(dict[key]);
+  return translateDynamicText(text, dict) ?? text;
+}
+
+function restoreSourceText(text: string): string {
+  const reverse = getReverseDictionary();
+  return reverse.get(text) || restoreDynamicSourceText(text) || text;
+}
+
+function getReverseDictionary(): Map<string, string> {
+  if (reverseDictionary) return reverseDictionary;
+  const next = new Map<string, string>();
+  for (const source of Object.keys(en)) {
+    next.set(en[source], source);
   }
+  for (const source of Object.keys(ru)) {
+    next.set(ru[source], source);
+  }
+  reverseDictionary = next;
   return next;
 }
 
+function restoreDynamicSourceText(text: string): string | null {
+  const pageText = text.match(/^(?:Page|Страница)\s+(\d+)\s*\/\s*(\d+)$/);
+  if (pageText) return `第 ${pageText[1]} / ${pageText[2]} 页`;
+
+  const ordinal = text.match(/^(?:#|№)\s*(\d+)$/);
+  if (ordinal) return `第 ${ordinal[1]} 次`;
+
+  const updated = text.match(/^(?:Updated|Обновлено)\s+(.+)$/);
+  if (updated) return `更新 ${updated[1]}`;
+
+  const records = text.match(/^(\d+)\s+(?:records|записей)$/);
+  if (records) return `共 ${records[1]} 条记录`;
+
+  return null;
+}
+
 function isRenderedTranslation(source: string, current: string): boolean {
+  const restored = restoreSourceText(current);
   return (
     current === source ||
+    restored === source ||
     current === toTraditional(source) ||
     current === translateWithDictionary(source, en) ||
     current === translateWithDictionary(source, ru)
   );
+}
+
+function translateDynamicText(text: string, dict: Record<string, string>): string | null {
+  const isRussian = dict === ru;
+  const isEnglish = dict === en;
+  if (!isRussian && !isEnglish) return null;
+
+  const countUnit = text.match(/^(\d+)\s*(天|次|个|条记录|条规则|条会话)$/);
+  if (countUnit) {
+    const [, count, unit] = countUnit;
+    const units: Record<string, [string, string]> = {
+      天: ["days", "дн."],
+      次: ["times", "раз"],
+      个: ["items", "шт."],
+      条记录: ["records", "записей"],
+      条规则: ["rules", "правил"],
+      条会话: ["sessions", "сессий"],
+    };
+    const translatedUnit = units[unit]?.[isEnglish ? 0 : 1];
+    return translatedUnit ? `${count} ${translatedUnit}` : null;
+  }
+
+  const totalRecords = text.match(/^共\s*(\d+)\s*条记录$/);
+  if (totalRecords) {
+    return isEnglish ? `${totalRecords[1]} records` : `${totalRecords[1]} записей`;
+  }
+
+  const pageText = text.match(/^第\s*(\d+)\s*\/\s*(\d+)\s*页$/);
+  if (pageText) {
+    return isEnglish
+      ? `Page ${pageText[1]} / ${pageText[2]}`
+      : `Страница ${pageText[1]} / ${pageText[2]}`;
+  }
+
+  const ordinalUse = text.match(/^第\s*(\d+)\s*次$/);
+  if (ordinalUse) {
+    return isEnglish ? `#${ordinalUse[1]}` : `№ ${ordinalUse[1]}`;
+  }
+
+  const manualBackupProgress = text.match(/^手动备份\s*(\d+)%$/);
+  if (manualBackupProgress) {
+    return isEnglish
+      ? `Manual Backup ${manualBackupProgress[1]}%`
+      : `Создание копии ${manualBackupProgress[1]}%`;
+  }
+
+  const minutesWindow = text.match(/^(\d+)\s*分钟窗口$/);
+  if (minutesWindow) {
+    return isEnglish
+      ? `${minutesWindow[1]} min window`
+      : `Окно ${minutesWindow[1]} мин`;
+  }
+
+  const hoursWindow = text.match(/^(\d+)\s*小时窗口$/);
+  if (hoursWindow) {
+    return isEnglish
+      ? `${hoursWindow[1]}h window`
+      : `Окно ${hoursWindow[1]} ч`;
+  }
+
+  const daysWindow = text.match(/^(\d+)\s*天窗口$/);
+  if (daysWindow) {
+    return isEnglish
+      ? `${daysWindow[1]} day window`
+      : `Окно ${daysWindow[1]} дн.`;
+  }
+
+  const updatedAt = text.match(/^更新\s+(.+)$/);
+  if (updatedAt) {
+    return isEnglish ? `Updated ${updatedAt[1]}` : `Обновлено ${updatedAt[1]}`;
+  }
+
+  const averageCost = text.match(/^(.+)\s*次\s*·\s*平均\s*(.+)$/);
+  if (averageCost) {
+    return isEnglish
+      ? `${averageCost[1]} times · avg ${averageCost[2]}`
+      : `${averageCost[1]} раз · сред. ${averageCost[2]}`;
+  }
+
+  const costText = text.match(/^(.+)\s*次\s*·\s*(.+)$/);
+  if (costText) {
+    return isEnglish
+      ? `${costText[1]} times · ${costText[2]}`
+      : `${costText[1]} раз · ${costText[2]}`;
+  }
+
+  const unreadableSessions = text.match(/^有\s*(\d+)\s*个会话文件暂时无法读取，已跳过这些文件。$/);
+  if (unreadableSessions) {
+    return isEnglish
+      ? `${unreadableSessions[1]} session files could not be read and were skipped.`
+      : `${unreadableSessions[1]} файлов сессий не удалось прочитать, они пропущены.`;
+  }
+
+  const updateTitle = text.match(/^发现新版本\s+(.+)$/);
+  if (updateTitle) {
+    return isEnglish
+      ? `New version available ${updateTitle[1]}`
+      : `Доступна новая версия ${updateTitle[1]}`;
+  }
+
+  const updateAvailable = text.match(
+    /^当前版本\s+(.+)，最新版本\s+(.+)。请前往 GitHub Releases 下载最新安装包。$/,
+  );
+  if (updateAvailable) {
+    return isEnglish
+      ? `Current version ${updateAvailable[1]}, latest version ${updateAvailable[2]}. Open GitHub Releases to download the latest installer.`
+      : `Текущая версия ${updateAvailable[1]}, последняя версия ${updateAvailable[2]}. Откройте GitHub Releases, чтобы скачать новый установщик.`;
+  }
+
+  const updateCurrent = text.match(
+    /^当前版本\s+(.+)，最新发布版本\s+(.+)。如需重新下载安装包，可以打开 GitHub Releases。$/,
+  );
+  if (updateCurrent) {
+    return isEnglish
+      ? `Current version ${updateCurrent[1]}, latest release ${updateCurrent[2]}. You can open GitHub Releases to download the installer again.`
+      : `Текущая версия ${updateCurrent[1]}, последний релиз ${updateCurrent[2]}. Можно открыть GitHub Releases, чтобы скачать установщик заново.`;
+  }
+
+  const updateFailed = text.match(/^暂时无法获取最新版本信息：(.+)。可以前往 GitHub Releases 手动查看。$/);
+  if (updateFailed) {
+    return isEnglish
+      ? `Could not fetch the latest version right now: ${updateFailed[1]}. You can open GitHub Releases manually.`
+      : `Не удалось получить последнюю версию: ${updateFailed[1]}. Можно открыть GitHub Releases вручную.`;
+  }
+
+  return null;
 }
 
 function toTraditional(text: string): string {
