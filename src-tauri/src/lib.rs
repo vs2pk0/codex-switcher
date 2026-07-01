@@ -4,7 +4,9 @@ mod oauth;
 mod session;
 mod usage;
 
-use account::{AccountStore, ApiKeyAccountBindingInput, CodexAccount, CodexQuota};
+use account::{
+    AccountStore, ApiKeyAccountBindingInput, CodexAccount, CodexQuota, CodexResetCredit,
+};
 use oauth::CodexOAuthLoginStartResponse;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -200,6 +202,11 @@ fn list_codex_accounts() -> Result<Vec<CodexAccount>, String> {
 #[tauri::command]
 fn get_current_codex_account() -> Result<Option<CodexAccount>, String> {
     AccountStore::default().current_account()
+}
+
+#[tauri::command]
+fn detect_current_codex_account() -> Result<Option<CodexAccount>, String> {
+    AccountStore::default().detect_current_account_from_codex_config()
 }
 
 #[tauri::command]
@@ -1645,7 +1652,13 @@ fn write_switcher_settings(settings: &CodexSwitcherSettings) -> Result<(), Strin
 }
 
 async fn fetch_codex_quota_for_account(account_id: &str) -> Result<CodexQuota, String> {
-    let source = quota_source_account(account_id)?;
+    let accounts = AccountStore::default().list_accounts()?;
+    let target = accounts
+        .iter()
+        .find(|item| item.id == account_id)
+        .cloned()
+        .ok_or_else(|| "账号不存在".to_string())?;
+    let source = quota_source_account_from_accounts(&accounts, &target)?;
     let access_token = source.tokens.access_token.trim();
     if access_token.is_empty() {
         return Err("OAuth access_token 为空，无法查询额度".to_string());
@@ -1672,7 +1685,15 @@ async fn fetch_codex_quota_for_account(account_id: &str) -> Result<CodexQuota, S
     }
     let raw: Value =
         serde_json::from_str(&body).map_err(|error| format!("解析额度 JSON 失败: {}", error))?;
-    Ok(parse_codex_quota(raw))
+    let mut quota = parse_codex_quota(raw);
+    hydrate_reset_credits_once(
+        &source,
+        target.quota.as_ref(),
+        source.quota.as_ref(),
+        &mut quota,
+    )
+    .await;
+    Ok(quota)
 }
 
 fn quota_source_account(account_id: &str) -> Result<CodexAccount, String> {
@@ -1682,6 +1703,13 @@ fn quota_source_account(account_id: &str) -> Result<CodexAccount, String> {
         .find(|item| item.id == account_id)
         .cloned()
         .ok_or_else(|| "账号不存在".to_string())?;
+    quota_source_account_from_accounts(&accounts, &account)
+}
+
+fn quota_source_account_from_accounts(
+    accounts: &[CodexAccount],
+    account: &CodexAccount,
+) -> Result<CodexAccount, String> {
     let source = if account.auth_mode.as_deref() == Some("apikey") {
         let bound_id = account
             .bound_oauth_account_id
@@ -1695,15 +1723,173 @@ fn quota_source_account(account_id: &str) -> Result<CodexAccount, String> {
             .cloned()
             .ok_or_else(|| "绑定的 OAuth 账号不存在".to_string())?
     } else {
-        account
+        account.clone()
     };
     Ok(source)
+}
+
+async fn hydrate_reset_credits_once(
+    source: &CodexAccount,
+    target_cached_quota: Option<&CodexQuota>,
+    source_cached_quota: Option<&CodexQuota>,
+    quota: &mut CodexQuota,
+) {
+    if !quota.reset_credits.is_empty() {
+        quota.reset_credits_next_expires_at = next_reset_credit_expires_at(&quota.reset_credits);
+        return;
+    }
+    if quota.reset_credits_available == Some(0) {
+        return;
+    }
+
+    let cached = reset_credits_from_cached_quota(target_cached_quota)
+        .or_else(|| reset_credits_from_cached_quota(source_cached_quota));
+    if let Some(credits) = cached {
+        if !reset_credits_match_available_count(&credits, quota.reset_credits_available) {
+            if let Ok((available_count, fetched_credits)) = fetch_codex_reset_credits(source).await
+            {
+                if !fetched_credits.is_empty() {
+                    quota.reset_credits = fetched_credits;
+                    quota.reset_credits_next_expires_at =
+                        next_reset_credit_expires_at(&quota.reset_credits);
+                    if quota.reset_credits_available.is_none() {
+                        quota.reset_credits_available = available_count.or_else(|| {
+                            Some(
+                                quota
+                                    .reset_credits
+                                    .iter()
+                                    .filter(|credit| is_available_reset_credit(credit))
+                                    .count() as i64,
+                            )
+                        });
+                    }
+                }
+            }
+            return;
+        }
+        quota.reset_credits = credits;
+        quota.reset_credits_next_expires_at = next_reset_credit_expires_at(&quota.reset_credits);
+        if quota.reset_credits_available.is_none() {
+            quota.reset_credits_available = Some(
+                quota
+                    .reset_credits
+                    .iter()
+                    .filter(|credit| is_available_reset_credit(credit))
+                    .count() as i64,
+            );
+        }
+        return;
+    }
+    if quota.reset_credits_available.is_none()
+        && reset_credits_available_from_cached_quota(target_cached_quota)
+            .or_else(|| reset_credits_available_from_cached_quota(source_cached_quota))
+            == Some(0)
+    {
+        quota.reset_credits_available = Some(0);
+        return;
+    }
+
+    if let Ok((available_count, credits)) = fetch_codex_reset_credits(source).await {
+        if credits.is_empty() {
+            if quota.reset_credits_available.is_none() {
+                quota.reset_credits_available = available_count;
+            }
+            return;
+        }
+        quota.reset_credits = credits;
+        quota.reset_credits_next_expires_at = next_reset_credit_expires_at(&quota.reset_credits);
+        if quota.reset_credits_available.is_none() {
+            quota.reset_credits_available = available_count.or_else(|| {
+                Some(
+                    quota
+                        .reset_credits
+                        .iter()
+                        .filter(|credit| is_available_reset_credit(credit))
+                        .count() as i64,
+                )
+            });
+        }
+    }
+}
+
+fn reset_credits_from_cached_quota(quota: Option<&CodexQuota>) -> Option<Vec<CodexResetCredit>> {
+    let quota = quota?;
+    if !quota.reset_credits.is_empty() {
+        return Some(quota.reset_credits.clone());
+    }
+    let raw_data = quota.raw_data.as_ref()?;
+    let container = raw_data.get("rate_limit_reset_credits").or_else(|| {
+        raw_data
+            .get("data")
+            .and_then(|data| data.get("rate_limit_reset_credits"))
+    });
+    let credits = parse_reset_credit_records(container);
+    (!credits.is_empty()).then_some(credits)
+}
+
+fn reset_credits_match_available_count(
+    credits: &[CodexResetCredit],
+    available_count: Option<i64>,
+) -> bool {
+    let Some(available_count) = available_count else {
+        return true;
+    };
+    let cached_available = credits
+        .iter()
+        .filter(|credit| is_available_reset_credit(credit))
+        .count() as i64;
+    cached_available == available_count
+}
+
+fn reset_credits_available_from_cached_quota(quota: Option<&CodexQuota>) -> Option<i64> {
+    quota.and_then(|value| value.reset_credits_available)
+}
+
+async fn fetch_codex_reset_credits(
+    source: &CodexAccount,
+) -> Result<(Option<i64>, Vec<CodexResetCredit>), String> {
+    let access_token = source.tokens.access_token.trim();
+    if access_token.is_empty() {
+        return Err("OAuth access_token 为空，无法查询重置次数".to_string());
+    }
+    let response = reqwest::Client::new()
+        .get("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")
+        .bearer_auth(access_token)
+        .header("OpenAI-Beta", "codex-1")
+        .header("Referer", "https://chatgpt.com/")
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .await
+        .map_err(|error| format!("请求重置次数明细失败: {}", error))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("读取重置次数明细响应失败: {}", error))?;
+    if !status.is_success() {
+        return Err(format!(
+            "重置次数明细接口返回 {}: {}",
+            status,
+            compact_http_body(&body)
+        ));
+    }
+    let raw: Value = serde_json::from_str(&body)
+        .map_err(|error| format!("解析重置次数明细 JSON 失败: {}", error))?;
+    let credits = parse_reset_credit_records(Some(&raw));
+    let available_count = parse_reset_credits_available_count(Some(&raw), &credits);
+    Ok((available_count, credits))
 }
 
 fn parse_codex_quota(raw: Value) -> CodexQuota {
     let rate_limit = raw.get("rate_limit");
     let primary = rate_limit.and_then(|value| value.get("primary_window"));
     let secondary = rate_limit.and_then(|value| value.get("secondary_window"));
+    let reset_credit_container = raw.get("rate_limit_reset_credits").or_else(|| {
+        raw.get("data")
+            .and_then(|data| data.get("rate_limit_reset_credits"))
+    });
+    let reset_credits = parse_reset_credit_records(reset_credit_container);
+    let reset_credits_next_expires_at = next_reset_credit_expires_at(&reset_credits);
     let now = chrono::Utc::now().timestamp();
     CodexQuota {
         hourly_percentage: quota_remaining_percentage(primary),
@@ -1714,12 +1900,185 @@ fn parse_codex_quota(raw: Value) -> CodexQuota {
         weekly_reset_time: quota_reset_time(secondary, now),
         weekly_window_minutes: quota_window_minutes(secondary),
         weekly_window_present: Some(secondary.is_some()),
-        reset_credits_available: raw
-            .get("rate_limit_reset_credits")
-            .and_then(|value| value.get("available_count"))
-            .and_then(Value::as_i64),
+        reset_credits_available: parse_reset_credits_available_count(
+            reset_credit_container,
+            &reset_credits,
+        ),
+        reset_credits,
+        reset_credits_next_expires_at,
         raw_data: Some(raw),
     }
+}
+
+fn parse_reset_credits_available_count(
+    container: Option<&Value>,
+    credits: &[CodexResetCredit],
+) -> Option<i64> {
+    container
+        .and_then(|value| {
+            value
+                .get("available_count")
+                .or_else(|| value.get("availableCount"))
+                .or_else(|| {
+                    value.get("data").and_then(|data| {
+                        data.get("available_count")
+                            .or_else(|| data.get("availableCount"))
+                    })
+                })
+        })
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|raw| i64::try_from(raw).ok()))
+        })
+        .or_else(|| {
+            (!credits.is_empty()).then(|| {
+                credits
+                    .iter()
+                    .filter(|credit| is_available_reset_credit(credit))
+                    .count() as i64
+            })
+        })
+}
+
+fn next_reset_credit_expires_at(credits: &[CodexResetCredit]) -> Option<i64> {
+    credits
+        .iter()
+        .filter(|credit| is_available_reset_credit(credit))
+        .filter_map(|credit| credit.expires_at)
+        .min()
+}
+
+fn parse_reset_credit_records(container: Option<&Value>) -> Vec<CodexResetCredit> {
+    container
+        .and_then(|value| {
+            value
+                .get("credits")
+                .or_else(|| value.get("data").and_then(|data| data.get("credits")))
+        })
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(parse_reset_credit_record)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_reset_credit_record(value: &Value) -> Option<CodexResetCredit> {
+    let record = value.as_object()?;
+    let raw_status = extract_reset_credit_string(record, &["status", "state"]);
+    let expires_at =
+        extract_reset_credit_timestamp(record, &["expires_at", "expire_at", "expiresAt"]);
+    let status = normalize_reset_credit_status(raw_status.as_deref(), expires_at);
+
+    Some(CodexResetCredit {
+        id: extract_reset_credit_string(record, &["id", "credit_id", "creditId"]),
+        status,
+        reset_type: extract_reset_credit_string(record, &["type", "reset_type", "resetType"]),
+        granted_at: extract_reset_credit_timestamp(
+            record,
+            &["granted_at", "created_at", "grantedAt"],
+        ),
+        expires_at,
+        redeemed_at: extract_reset_credit_timestamp(
+            record,
+            &["redeemed_at", "used_at", "consumed_at", "redeemedAt"],
+        ),
+        raw_status,
+    })
+}
+
+fn extract_reset_credit_string(
+    record: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let value = record.get(*key)?;
+        match value {
+            Value::String(text) => {
+                let trimmed = text.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            }
+            Value::Number(number) => Some(number.to_string()),
+            Value::Bool(flag) => Some(flag.to_string()),
+            _ => None,
+        }
+    })
+}
+
+fn extract_reset_credit_timestamp(
+    record: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<i64> {
+    keys.iter()
+        .find_map(|key| parse_reset_credit_timestamp(record.get(*key)))
+}
+
+fn parse_reset_credit_timestamp(value: Option<&Value>) -> Option<i64> {
+    match value? {
+        Value::Number(number) => {
+            let mut timestamp = number
+                .as_i64()
+                .or_else(|| number.as_u64().and_then(|raw| i64::try_from(raw).ok()))?;
+            if timestamp > 1_000_000_000_000 {
+                timestamp /= 1000;
+            }
+            Some(timestamp)
+        }
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if let Ok(mut timestamp) = trimmed.parse::<i64>() {
+                if timestamp > 1_000_000_000_000 {
+                    timestamp /= 1000;
+                }
+                return Some(timestamp);
+            }
+            chrono::DateTime::parse_from_rfc3339(trimmed)
+                .ok()
+                .map(|date| date.timestamp())
+        }
+        _ => None,
+    }
+}
+
+fn normalize_reset_credit_status(status: Option<&str>, expires_at: Option<i64>) -> Option<String> {
+    let normalized = status
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+    if normalized.is_some() {
+        return normalized;
+    }
+
+    expires_at
+        .filter(|timestamp| *timestamp <= chrono::Utc::now().timestamp())
+        .map(|_| "expired".to_string())
+}
+
+fn is_available_reset_credit(credit: &CodexResetCredit) -> bool {
+    let status = credit
+        .status
+        .as_deref()
+        .or(credit.raw_status.as_deref())
+        .unwrap_or("available")
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(
+        status.as_str(),
+        "redeemed" | "used" | "consumed" | "expired"
+    ) {
+        return false;
+    }
+
+    credit
+        .expires_at
+        .map(|timestamp| timestamp > chrono::Utc::now().timestamp())
+        .unwrap_or(true)
 }
 
 fn quota_remaining_percentage(window: Option<&Value>) -> i64 {
@@ -1756,7 +2115,10 @@ fn compact_http_body(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{backup_entry_restore_target, default_codex_home, switcher_data_dir};
+    use super::{
+        backup_entry_restore_target, default_codex_home, parse_codex_quota, switcher_data_dir,
+    };
+    use serde_json::json;
 
     #[test]
     fn backup_restore_target_accepts_known_backup_roots() {
@@ -1790,6 +2152,52 @@ mod tests {
             assert_eq!(backup_entry_restore_target(name), None);
         }
     }
+
+    #[test]
+    fn parse_quota_keeps_reset_credit_details() {
+        let quota = parse_codex_quota(json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 12,
+                    "limit_window_seconds": 18_000,
+                    "reset_at": 1_785_000_000
+                },
+                "secondary_window": {
+                    "used_percent": 33,
+                    "limit_window_seconds": 604_800,
+                    "reset_at": 1_786_000_000
+                }
+            },
+            "rate_limit_reset_credits": {
+                "available_count": 2,
+                "credits": [
+                    {
+                        "id": "credit-1",
+                        "status": "available",
+                        "granted_at": 1_785_100_000,
+                        "expires_at": 4_102_444_800_i64
+                    },
+                    {
+                        "creditId": "credit-2",
+                        "state": "redeemed",
+                        "grantedAt": "2026-07-01T00:00:00Z",
+                        "expiresAt": 4_102_531_200_000_i64,
+                        "redeemedAt": 1_785_200_000
+                    }
+                ]
+            }
+        }));
+
+        assert_eq!(quota.reset_credits_available, Some(2));
+        assert_eq!(quota.reset_credits.len(), 2);
+        assert_eq!(quota.reset_credits[0].id.as_deref(), Some("credit-1"));
+        assert_eq!(quota.reset_credits[0].status.as_deref(), Some("available"));
+        assert_eq!(quota.reset_credits[1].id.as_deref(), Some("credit-2"));
+        assert_eq!(quota.reset_credits[1].status.as_deref(), Some("redeemed"));
+        assert_eq!(quota.reset_credits[1].granted_at, Some(1_782_864_000));
+        assert_eq!(quota.reset_credits[1].expires_at, Some(4_102_531_200));
+        assert_eq!(quota.reset_credits_next_expires_at, Some(4_102_444_800));
+    }
 }
 
 pub fn run() {
@@ -1810,6 +2218,7 @@ pub fn run() {
             api_service::api_service_delete_bound_accounts,
             list_codex_accounts,
             get_current_codex_account,
+            detect_current_codex_account,
             import_codex_from_json,
             import_codex_from_local,
             add_codex_account_with_api_key,

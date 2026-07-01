@@ -443,6 +443,195 @@ fn binds_api_key_to_oauth_account_and_writes_combined_projection() {
 }
 
 #[test]
+fn detects_bound_api_key_current_account_from_codex_config() {
+    let (_storage, codex, store) = test_store();
+    let oauth = store
+        .import_from_json(
+            &json!({
+                "email": "owner@example.com",
+                "tokens": {
+                    "id_token": "id-token",
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import oauth")
+        .remove(0);
+    let api = store
+        .add_api_key_account(
+            "sk-bound-123456".to_string(),
+            Some("https://relay.example/v1".to_string()),
+            Some("Relay".to_string()),
+            None,
+            Some("Relay Key".to_string()),
+        )
+        .expect("add api key account");
+    let api = store
+        .update_api_key_bound_oauth_account(&api.id, Some(oauth.id.clone()), false)
+        .expect("bind oauth");
+    store.switch_account(&oauth.id).expect("switch oauth first");
+
+    fs::write(
+        codex.path().join("auth.json"),
+        json!({
+            "OPENAI_API_KEY": null,
+            "email": "owner@example.com",
+            "tokens": {
+                "id_token": "id-token",
+                "access_token": "access-token",
+                "refresh_token": "refresh-token"
+            }
+        })
+        .to_string(),
+    )
+    .expect("write auth json");
+    fs::write(
+        codex.path().join("config.toml"),
+        r#"
+model_provider = "relay"
+
+[model_providers.relay]
+base_url = "https://relay.example/v1"
+experimental_bearer_token = "sk-bound-123456"
+"#,
+    )
+    .expect("write config");
+
+    let detected = store
+        .detect_current_account_from_codex_config()
+        .expect("detect current")
+        .expect("matched account");
+
+    assert_eq!(detected.id, api.id);
+    assert_eq!(
+        store
+            .current_account()
+            .expect("current")
+            .map(|account| account.id),
+        Some(api.id)
+    );
+}
+
+#[test]
+fn detects_oauth_current_account_from_auth_json() {
+    let (_storage, codex, store) = test_store();
+    store
+        .import_from_json(
+            &json!({
+                "email": "first@example.com",
+                "tokens": {
+                    "id_token": "first-id-token",
+                    "access_token": "first-access-token",
+                    "refresh_token": "first-refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import first");
+    let second = store
+        .import_from_json(
+            &json!({
+                "email": "second@example.com",
+                "tokens": {
+                    "id_token": "second-id-token",
+                    "access_token": "second-access-token",
+                    "refresh_token": "second-refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import second")
+        .remove(0);
+    fs::write(
+        codex.path().join("auth.json"),
+        json!({
+            "OPENAI_API_KEY": null,
+            "email": "second@example.com",
+            "tokens": {
+                "id_token": "second-id-token",
+                "access_token": "second-access-token",
+                "refresh_token": "second-refresh-token"
+            }
+        })
+        .to_string(),
+    )
+    .expect("write auth json");
+    fs::write(
+        codex.path().join("config.toml"),
+        "model_provider = \"openai\"\n",
+    )
+    .expect("write config");
+
+    let detected = store
+        .detect_current_account_from_codex_config()
+        .expect("detect current")
+        .expect("matched account");
+
+    assert_eq!(detected.id, second.id);
+}
+
+#[test]
+fn detects_oauth_current_account_when_official_provider_has_base_url() {
+    let (_storage, codex, store) = test_store();
+    store
+        .add_api_key_account(
+            "sk-official-like-123456".to_string(),
+            Some("https://api.openai.com/v1".to_string()),
+            Some("Official Relay".to_string()),
+            None,
+            Some("Official-like API Key".to_string()),
+        )
+        .expect("add api key account");
+    let oauth = store
+        .import_from_json(
+            &json!({
+                "email": "owner@example.com",
+                "tokens": {
+                    "id_token": "id-token",
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import oauth")
+        .remove(0);
+    fs::write(
+        codex.path().join("auth.json"),
+        json!({
+            "OPENAI_API_KEY": null,
+            "email": "owner@example.com",
+            "tokens": {
+                "id_token": "id-token",
+                "access_token": "access-token",
+                "refresh_token": "refresh-token"
+            }
+        })
+        .to_string(),
+    )
+    .expect("write auth json");
+    fs::write(
+        codex.path().join("config.toml"),
+        r#"
+model_provider = "openai"
+
+[model_providers.openai]
+base_url = "https://api.openai.com/v1"
+"#,
+    )
+    .expect("write config");
+
+    let detected = store
+        .detect_current_account_from_codex_config()
+        .expect("detect current")
+        .expect("matched account");
+
+    assert_eq!(detected.id, oauth.id);
+}
+
+#[test]
 fn adds_api_key_account_with_existing_oauth_binding() {
     let (_storage, _codex, store) = test_store();
     let oauth = store
@@ -601,6 +790,8 @@ fn test_quota() -> CodexQuota {
         weekly_window_minutes: Some(10_080),
         weekly_window_present: Some(true),
         reset_credits_available: None,
+        reset_credits: Vec::new(),
+        reset_credits_next_expires_at: None,
         raw_data: None,
     }
 }

@@ -50,5 +50,17 @@ export interface CodexQuota {
   weekly_window_minutes?: number;
   weekly_window_present?: boolean;
   reset_credits_available?: number;
+  reset_credits?: CodexResetCredit[];
+  reset_credits_next_expires_at?: number;
   raw_data?: unknown;
+}
+
+export interface CodexResetCredit {
+  id?: string;
+  status?: string;
+  reset_type?: string;
+  granted_at?: number;
+  expires_at?: number;
+  redeemed_at?: number;
+  raw_status?: string;
 }
