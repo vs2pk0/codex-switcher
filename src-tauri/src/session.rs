@@ -424,17 +424,20 @@ impl SessionStore {
             default_provider.clone(),
             vec![CodexSessionVisibilityRepairProviderSource::Config],
         )];
-        for db_path in self.sqlite_candidate_paths() {
-            for provider in sqlite_provider_ids(&db_path)? {
-                if let Some((_, sources)) = providers.iter_mut().find(|(id, _)| id == &provider) {
-                    if !sources.contains(&CodexSessionVisibilityRepairProviderSource::Sqlite) {
-                        sources.push(CodexSessionVisibilityRepairProviderSource::Sqlite);
+        if sqlite3_available() {
+            for db_path in self.sqlite_candidate_paths() {
+                for provider in sqlite_provider_ids(&db_path)? {
+                    if let Some((_, sources)) = providers.iter_mut().find(|(id, _)| id == &provider)
+                    {
+                        if !sources.contains(&CodexSessionVisibilityRepairProviderSource::Sqlite) {
+                            sources.push(CodexSessionVisibilityRepairProviderSource::Sqlite);
+                        }
+                    } else {
+                        providers.push((
+                            provider,
+                            vec![CodexSessionVisibilityRepairProviderSource::Sqlite],
+                        ));
                     }
-                } else {
-                    providers.push((
-                        provider,
-                        vec![CodexSessionVisibilityRepairProviderSource::Sqlite],
-                    ));
                 }
             }
         }
@@ -499,6 +502,9 @@ impl SessionStore {
         target_provider: &str,
         sessions: Option<&[SessionRepairRecord]>,
     ) -> Result<(usize, Vec<String>), String> {
+        if !sqlite3_available() {
+            return Ok((0, Vec::new()));
+        }
         let mut repaired = 0usize;
         let mut backup_dirs = Vec::new();
         for db_path in self.sqlite_candidate_paths() {
@@ -1035,6 +1041,10 @@ fn run_sqlite(db_path: &Path, sql: &str) -> Result<String, String> {
             ))
         }
     }
+}
+
+fn sqlite3_available() -> bool {
+    Command::new("sqlite3").arg("-version").output().is_ok()
 }
 
 fn sql_quote(value: &str) -> String {

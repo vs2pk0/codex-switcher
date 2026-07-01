@@ -37,8 +37,30 @@ pub struct CodexQuota {
     pub weekly_window_present: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_credits_available: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reset_credits: Vec<CodexResetCredit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_credits_next_expires_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_data: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexResetCredit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redeemed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,6 +135,15 @@ struct AccountDatabase {
     accounts: Vec<CodexAccount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     current_account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CodexCurrentConfig {
+    api_key: Option<String>,
+    provider_base_url: Option<String>,
+    provider_api_key: Option<String>,
+    oauth_email: Option<String>,
+    oauth_access_token: Option<String>,
 }
 
 fn clear_account_quota(account: &mut CodexAccount) {
@@ -213,6 +244,20 @@ impl AccountStore {
             .accounts
             .into_iter()
             .find(|account| account.id == current_id))
+    }
+
+    pub fn detect_current_account_from_codex_config(&self) -> Result<Option<CodexAccount>, String> {
+        let mut database = self.read_database()?;
+        if database.accounts.is_empty() {
+            return Ok(None);
+        }
+        let config = self.read_current_codex_config()?;
+        let Some(account) = match_current_account_from_config(&database.accounts, &config) else {
+            return Ok(None);
+        };
+        database.current_account_id = Some(account.id.clone());
+        self.write_database(&database)?;
+        Ok(Some(account))
     }
 
     pub fn import_from_json(&self, json_content: &str) -> Result<Vec<CodexAccount>, String> {
@@ -707,6 +752,52 @@ impl AccountStore {
         write_string_atomic(&self.database_path(), &content)
     }
 
+    fn read_current_codex_config(&self) -> Result<CodexCurrentConfig, String> {
+        let mut config = CodexCurrentConfig::default();
+        let auth_path = self.codex_home.join("auth.json");
+        if auth_path.exists() {
+            let content = fs::read_to_string(&auth_path)
+                .map_err(|error| format!("读取 auth.json 失败: {}", error))?;
+            let auth: Value = serde_json::from_str(&content)
+                .map_err(|error| format!("解析 auth.json 失败: {}", error))?;
+            config.api_key = read_string(
+                &auth,
+                &["OPENAI_API_KEY", "openai_api_key", "apiKey", "api_key"],
+            );
+            let token_source = auth.get("tokens").unwrap_or(&auth);
+            config.oauth_access_token = read_string(token_source, &["access_token", "accessToken"]);
+            let id_token = read_string(token_source, &["id_token", "idToken"]).unwrap_or_default();
+            config.oauth_email = jwt_claim_string(&id_token, "email")
+                .or_else(|| {
+                    config
+                        .oauth_access_token
+                        .as_deref()
+                        .and_then(|token| jwt_claim_string(token, "email"))
+                })
+                .or_else(|| read_string(&auth, &["email"]));
+        }
+
+        let config_path = self.codex_home.join("config.toml");
+        if config_path.exists() {
+            let document = read_toml_document(&config_path)?;
+            if let Some(provider) = document["model_provider"].as_str().and_then(|provider_id| {
+                document
+                    .get("model_providers")
+                    .and_then(|providers| providers.get(provider_id))
+            }) {
+                config.provider_base_url = provider
+                    .get("base_url")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| normalize_optional(Some(value)));
+                config.provider_api_key = provider
+                    .get("experimental_bearer_token")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| normalize_optional(Some(value)));
+            }
+        }
+        Ok(config)
+    }
+
     fn account_from_import_value(&self, value: &Value) -> Result<CodexAccount, String> {
         if let Some(api_key) = read_string(
             value,
@@ -1004,6 +1095,88 @@ fn normalize_optional(value: Option<&str>) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn normalize_base_url(value: Option<&str>) -> Option<String> {
+    normalize_optional(value).map(|url| url.trim_end_matches('/').to_ascii_lowercase())
+}
+
+fn account_base_url(account: &CodexAccount) -> Option<String> {
+    normalize_base_url(account.api_base_url.as_deref())
+        .or_else(|| Some("https://api.openai.com/v1".to_string()))
+}
+
+fn oauth_identity_matches(account: &CodexAccount, config: &CodexCurrentConfig) -> bool {
+    let email_matches = config
+        .oauth_email
+        .as_deref()
+        .is_some_and(|email| account.email.eq_ignore_ascii_case(email));
+    let token_matches = config
+        .oauth_access_token
+        .as_deref()
+        .is_some_and(|token| account.tokens.access_token == token);
+    email_matches || token_matches
+}
+
+fn match_current_account_from_config(
+    accounts: &[CodexAccount],
+    config: &CodexCurrentConfig,
+) -> Option<CodexAccount> {
+    let provider_base_url = normalize_base_url(config.provider_base_url.as_deref());
+    let api_key = config
+        .provider_api_key
+        .as_deref()
+        .or(config.api_key.as_deref());
+
+    if provider_base_url.is_some() || api_key.is_some() {
+        let mut scored: Vec<(i32, CodexAccount)> = accounts
+            .iter()
+            .filter(|account| account.auth_mode.as_deref() == Some("apikey"))
+            .filter_map(|account| {
+                let base_matches = provider_base_url
+                    .as_deref()
+                    .is_some_and(|base_url| account_base_url(account).as_deref() == Some(base_url));
+                let key_matches = api_key.is_some_and(|key| {
+                    account
+                        .openai_api_key
+                        .as_deref()
+                        .is_some_and(|account_key| account_key == key)
+                });
+                let mut score = 0;
+                if base_matches {
+                    score += 10;
+                }
+                if key_matches {
+                    score += 6;
+                }
+                if let Some(bound_oauth_id) = account.bound_oauth_account_id.as_deref() {
+                    let bound_matches = accounts
+                        .iter()
+                        .find(|candidate| candidate.id == bound_oauth_id)
+                        .is_some_and(|oauth| oauth_identity_matches(oauth, config));
+                    if !base_matches || !bound_matches {
+                        return None;
+                    }
+                    score += 8;
+                } else if !key_matches {
+                    return None;
+                }
+                Some((score, account.clone()))
+            })
+            .collect();
+        scored.sort_by(|left, right| right.0.cmp(&left.0));
+        if let Some((_, account)) = scored.into_iter().next() {
+            return Some(account);
+        }
+    }
+
+    accounts
+        .iter()
+        .find(|account| {
+            account.auth_mode.as_deref() != Some("apikey")
+                && oauth_identity_matches(account, config)
+        })
+        .cloned()
 }
 
 fn validate_api_key_credentials(

@@ -10,6 +10,7 @@ import BadgeStyleModal from "./components/BadgeStyleModal.vue";
 import PlanBadge from "./components/PlanBadge.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
 import UsagePanel from "./components/UsagePanel.vue";
+import appIcon from "./assets/app-icon.png";
 import { defaultBadgeStyles } from "./constants/badgeStyles";
 import {
   addCodexAccountWithApiKey,
@@ -18,6 +19,7 @@ import {
   consumeCodexResetCredit,
   deleteCodexAccount,
   deleteCodexSwitcherBackup,
+  detectCurrentCodexAccount,
   exportCodexAccounts,
   getCodexSwitcherPaths,
   getCodexSwitcherSettings,
@@ -69,7 +71,7 @@ import {
   type CodexSessionVisibilityRepairSummary,
   type CodexTrashedSessionRecord,
 } from "./services/session";
-import type { CodexAccount } from "./types/codex";
+import type { CodexAccount, CodexResetCredit } from "./types/codex";
 
 type ActiveView = "accounts" | "sessions" | "usage" | "apiService" | "settings" | "about";
 
@@ -79,6 +81,8 @@ const usagePanelMounted = ref(false);
 const accounts = ref<CodexAccount[]>([]);
 const currentAccount = ref<CodexAccount | null>(null);
 const loading = ref(false);
+const detectingCurrentAccount = ref(false);
+const accountSearchKeyword = ref("");
 const switchingId = ref("");
 const deletingId = ref("");
 const quotaRefreshingId = ref("");
@@ -97,6 +101,7 @@ const nextQuotaRefreshAt = ref(0);
 const nextCurrentAccountRefreshAt = ref(0);
 const nowMs = ref(Date.now());
 const addModalVisible = ref(false);
+const addModalTitle = ref("接入新账号");
 const badgeStyleVisible = ref(false);
 const privacyMasked = ref(false);
 const addTab = ref("oauth");
@@ -199,6 +204,9 @@ const phoneVisible = ref(false);
 const phoneAccount = ref<CodexAccount | null>(null);
 const phoneForm = reactive({ phone: "" });
 const savingPhone = ref(false);
+const resetCreditVisible = ref(false);
+const resetCreditAccount = ref<CodexAccount | null>(null);
+const selectedResetCreditIndex = ref(0);
 
 const bindingVisible = ref(false);
 const bindingAccount = ref<CodexAccount | null>(null);
@@ -244,15 +252,21 @@ const currentId = computed(() => currentAccount.value?.id ?? "");
 const quotaSortModes = new Set(["weekly_quota", "hourly_quota", "weekly_reset", "hourly_reset", "subscription"]);
 const filteredAccounts = computed(() => {
   const filter = settings.accountTypeFilter || "all";
+  const keyword = accountSearchKeyword.value.trim().toLocaleLowerCase();
   return accounts.value.filter((account) => {
-    if (filter === "all") return true;
-    if (filter === "oauth") return !isApiKeyAccount(account);
-    if (filter === "apikey") return isApiKeyAccount(account);
-    if (filter === "error") return isAccountAbnormal(account);
-    if (filter === "valid") return !isAccountAbnormal(account);
-    if (filter === "pro") return normalizePlanKey(account.plan_type) === "pro";
-    if (filter === "team") return ["team", "business", "enterprise", "edu", "go"].includes(normalizePlanKey(account.plan_type));
-    return normalizePlanKey(account.plan_type) === filter;
+    const matchesType =
+      filter === "all" ||
+      (filter === "oauth" && !isApiKeyAccount(account)) ||
+      (filter === "apikey" && isApiKeyAccount(account)) ||
+      (filter === "error" && isAccountAbnormal(account)) ||
+      (filter === "valid" && !isAccountAbnormal(account)) ||
+      (filter === "pro" && normalizePlanKey(account.plan_type) === "pro") ||
+      (filter === "team" && ["team", "business", "enterprise", "edu", "go"].includes(normalizePlanKey(account.plan_type))) ||
+      normalizePlanKey(account.plan_type) === filter;
+    if (!matchesType) return false;
+    if (!keyword) return true;
+    return [account.email, account.account_name]
+      .some((value) => (value || "").toLocaleLowerCase().includes(keyword));
   });
 });
 const sortedAccounts = computed(() => {
@@ -393,8 +407,6 @@ const currentAccountRefreshCountdown = computed(() => {
   if (
     !settings.monitorQuota ||
     !settings.showQuotaCountdowns ||
-    !currentAccount.value ||
-    !canShowQuota(currentAccount.value) ||
     !nextCurrentAccountRefreshAt.value
   ) {
     return "";
@@ -469,9 +481,9 @@ function formatCountdown(remainingMs: number): string {
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
   if (hours > 0) {
-    return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   }
-  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
 function isApiKeyAccount(account: CodexAccount): boolean {
@@ -835,10 +847,14 @@ function formatDateTime(value?: string): string {
 function expiryDaysLabel(value?: string): string {
   const date = parseFlexibleDate(value);
   if (!date) return "未知";
-  const diffDays = Math.ceil((date.getTime() - Date.now()) / 86_400_000);
-  if (diffDays < 0) return `已过期 ${Math.abs(diffDays)}天`;
-  if (diffDays === 0) return "今天到期";
-  return `${diffDays}天`;
+  const diff = date.getTime() - Date.now();
+  if (diff <= 0) return "已过期";
+  const totalMinutes = Math.floor(diff / 60_000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}天${hours}小时`;
+  return `${hours}小时${minutes}分钟`;
 }
 
 function tokenExpiryStatus(value?: string): "normal" | "expired" {
@@ -883,8 +899,114 @@ function resetCreditCount(account: CodexAccount): number {
   return Number.isFinite(count) ? Math.max(0, Number(count)) : 0;
 }
 
+const resetCreditRecordsForModal = computed(() =>
+  resetCreditAccount.value ? resetCreditRecords(resetCreditAccount.value) : [],
+);
+
+const selectedResetCredit = computed(
+  () => resetCreditRecordsForModal.value[selectedResetCreditIndex.value] ?? null,
+);
+
 function canUseResetCredit(account: CodexAccount): boolean {
   return shouldShowQuota(account) && resetCreditCount(account) > 0;
+}
+
+function resetCreditRecords(account: CodexAccount): CodexResetCredit[] {
+  if (Array.isArray(account.quota?.reset_credits) && account.quota.reset_credits.length > 0) {
+    return account.quota.reset_credits;
+  }
+  return parseResetCreditRecordsFromRawData(account.quota?.raw_data);
+}
+
+function parseResetCreditRecordsFromRawData(rawData: unknown): CodexResetCredit[] {
+  const root = isRecord(rawData) ? rawData : undefined;
+  const container = isRecord(root?.rate_limit_reset_credits)
+    ? root.rate_limit_reset_credits
+    : isRecord(root?.data) && isRecord(root.data.rate_limit_reset_credits)
+      ? root.data.rate_limit_reset_credits
+      : undefined;
+  const credits = Array.isArray(container?.credits)
+    ? container.credits
+    : isRecord(container?.data) && Array.isArray(container.data.credits)
+      ? container.data.credits
+      : [];
+
+  return credits.filter(isRecord).map((credit) => ({
+    id: normalizeScalar(credit.id) || normalizeScalar(credit.credit_id) || normalizeScalar(credit.creditId),
+    status: normalizeScalar(credit.status) || normalizeScalar(credit.state),
+    reset_type: normalizeScalar(credit.type) || normalizeScalar(credit.reset_type) || normalizeScalar(credit.resetType),
+    granted_at:
+      normalizeTimestamp(credit.granted_at) ??
+      normalizeTimestamp(credit.created_at) ??
+      normalizeTimestamp(credit.grantedAt),
+    expires_at:
+      normalizeTimestamp(credit.expires_at) ??
+      normalizeTimestamp(credit.expire_at) ??
+      normalizeTimestamp(credit.expiresAt),
+    redeemed_at:
+      normalizeTimestamp(credit.redeemed_at) ??
+      normalizeTimestamp(credit.used_at) ??
+      normalizeTimestamp(credit.consumed_at) ??
+      normalizeTimestamp(credit.redeemedAt),
+    raw_status: normalizeScalar(credit.status) || normalizeScalar(credit.state),
+  }));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeScalar(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed || undefined;
+  }
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return undefined;
+}
+
+function normalizeTimestamp(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value > 1_000_000_000_000 ? Math.floor(value / 1000) : Math.floor(value);
+  }
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const numeric = Number(trimmed);
+  if (Number.isFinite(numeric)) {
+    return numeric > 1_000_000_000_000 ? Math.floor(numeric / 1000) : Math.floor(numeric);
+  }
+  const date = new Date(trimmed);
+  return Number.isNaN(date.getTime()) ? undefined : Math.floor(date.getTime() / 1000);
+}
+
+function resetCreditStatusKey(credit: CodexResetCredit): "available" | "used" | "expired" | "unknown" {
+  const status = (credit.status || credit.raw_status || "").trim().toLowerCase();
+  if (["redeemed", "used", "consumed"].includes(status)) return "used";
+  if (status === "expired") return "expired";
+  if (status === "available" || !status) {
+    const expiresAt = credit.expires_at;
+    return Number.isFinite(expiresAt) && Number(expiresAt) * 1000 <= Date.now()
+      ? "expired"
+      : "available";
+  }
+  return "unknown";
+}
+
+function isAvailableResetCredit(credit: CodexResetCredit): boolean {
+  return resetCreditStatusKey(credit) === "available";
+}
+
+function resetCreditStatusLabel(credit: CodexResetCredit): string {
+  const key = resetCreditStatusKey(credit);
+  if (key === "available") return "可用";
+  if (key === "used") return "已使用";
+  if (key === "expired") return "已过期";
+  return credit.raw_status || credit.status || "未知";
+}
+
+function formatResetCreditDate(value?: number): string {
+  return Number.isFinite(value) ? formatTime(Number(value)) : "时间未知";
 }
 
 function isFreePlanAccount(account: CodexAccount): boolean {
@@ -908,6 +1030,26 @@ async function loadAccounts(): Promise<void> {
     Message.error(`加载账号失败：${errorText(error)}`);
   } finally {
     loading.value = false;
+  }
+}
+
+async function handleDetectCurrentAccount(): Promise<void> {
+  detectingCurrentAccount.value = true;
+  try {
+    const detected = await detectCurrentCodexAccount();
+    if (!detected) {
+      currentAccount.value = null;
+      Message.warning("未能从当前 Codex 配置匹配到账号");
+      return;
+    }
+    currentAccount.value = detected;
+    nextCurrentAccountRefreshAt.value = 0;
+    resetCurrentAccountQuotaTimer();
+    Message.success(`已读取当前账号：${displayNameForUi(detected)}`);
+  } catch (error) {
+    Message.error(`读取当前账号失败：${errorText(error)}`);
+  } finally {
+    detectingCurrentAccount.value = false;
   }
 }
 
@@ -1007,7 +1149,7 @@ function resetCurrentAccountQuotaTimer(forceNew = false): void {
   }
   const storedNextAt = settings.currentAccountNextRefreshAt;
   setCurrentAccountNextRefreshAt(0, false);
-  if (!settings.monitorQuota || !currentAccount.value || !canShowQuota(currentAccount.value)) return;
+  if (!settings.monitorQuota || !currentAccount.value) return;
   const minutes = clampRefreshMinutes(settings.currentAccountRefreshMinutes);
   const nextAt = forceNew
     ? Date.now() + minutes * 60_000
@@ -1084,32 +1226,67 @@ async function handleRefreshQuota(account: CodexAccount): Promise<void> {
   }
 }
 
-function confirmResetCredit(account: CodexAccount): void {
-  const count = resetCreditCount(account);
+async function confirmResetCredit(account: CodexAccount): Promise<void> {
+  let targetAccount = account;
+  let count = resetCreditCount(targetAccount);
   if (count <= 0) {
     Message.warning("当前账号没有可用的重置次数");
     return;
   }
-  Modal.warning({
-    title: "确认重置额度",
-    content: `将消耗 1 次重置次数来重置 ${displayName(account)} 的当前 Codex 额度窗口。当前可用 ${count} 次，是否继续？`,
-    okText: "确认重置",
-    cancelText: "取消",
-    hideCancel: false,
-    async onOk() {
-      quotaRefreshingId.value = account.id;
-      try {
-        await consumeCodexResetCredit(account.id);
-        await loadAccounts();
-        Message.success("额度已重置");
-      } catch (error) {
-        await loadAccounts();
-        Message.error(`重置额度失败：${errorText(error)}`);
-      } finally {
-        quotaRefreshingId.value = "";
-      }
-    },
-  });
+
+  if (!resetCreditRecords(targetAccount).length) {
+    quotaRefreshingId.value = targetAccount.id;
+    try {
+      const updated = await refreshCodexQuota(targetAccount.id);
+      await loadAccounts();
+      targetAccount = accounts.value.find((item) => item.id === updated.id) ?? updated;
+      count = resetCreditCount(targetAccount);
+    } catch (error) {
+      await loadAccounts();
+      Message.warning(`获取重置次数明细失败：${errorText(error)}`);
+      return;
+    } finally {
+      quotaRefreshingId.value = "";
+    }
+  }
+
+  if (count <= 0) {
+    Message.warning("当前账号没有可用的重置次数");
+    return;
+  }
+  if (!resetCreditRecords(targetAccount).length) {
+    Message.warning("未获取到重置次数明细，请先刷新额度后重试");
+    return;
+  }
+
+  resetCreditAccount.value = targetAccount;
+  const firstAvailableIndex = resetCreditRecords(targetAccount).findIndex(isAvailableResetCredit);
+  selectedResetCreditIndex.value = Math.max(0, firstAvailableIndex);
+  resetCreditVisible.value = true;
+}
+
+async function handleConsumeSelectedResetCredit(): Promise<void> {
+  const account = resetCreditAccount.value;
+  if (!account) return;
+  const selected = selectedResetCredit.value;
+  if (selected && !isAvailableResetCredit(selected)) {
+    Message.warning("请选择一个可用的重置次数");
+    return;
+  }
+  quotaRefreshingId.value = account.id;
+  try {
+    await consumeCodexResetCredit(account.id);
+    resetCreditVisible.value = false;
+    resetCreditAccount.value = null;
+    selectedResetCreditIndex.value = 0;
+    await loadAccounts();
+    Message.success("额度已重置");
+  } catch (error) {
+    await loadAccounts();
+    Message.error(`重置额度失败：${errorText(error)}`);
+  } finally {
+    quotaRefreshingId.value = "";
+  }
 }
 
 async function handleRefreshAllQuotas(showMessage = true): Promise<void> {
@@ -2172,11 +2349,43 @@ async function handleDeleteBackup(backup: CodexSwitcherBackupFile): Promise<void
 }
 
 function openAddModal(tab: "oauth" | "token" | "apikey" = "oauth"): void {
+  addModalTitle.value = "接入新账号";
   addTab.value = tab;
   addModalVisible.value = true;
   if (tab === "oauth" && !oauthUrl.value) {
     void prepareOAuthLogin();
   }
+}
+
+async function copyAccountEmail(account: CodexAccount): Promise<void> {
+  const email = account.email?.trim();
+  if (!email) {
+    Message.warning("这个账号没有可复制的邮箱");
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(email);
+    Message.success(`已复制邮箱：${email}`);
+  } catch (error) {
+    Message.error(`复制邮箱失败：${errorText(error)}`);
+  }
+}
+
+async function openReauthorizeModal(account: CodexAccount): Promise<void> {
+  addModalTitle.value = "重新授权账号";
+  addTab.value = "oauth";
+  addModalVisible.value = true;
+  oauthError.value = "";
+  oauthCallbackInput.value = "";
+  oauthCallbackReceived.value = false;
+  if (oauthLoginId.value) {
+    await cancelCodexOAuthLogin(oauthLoginId.value).catch(() => undefined);
+  }
+  oauthLoginId.value = "";
+  oauthUrl.value = "";
+  await prepareOAuthLogin();
+  const label = displayNameForUi(account);
+  Message.info(`请重新授权：${label}`);
 }
 
 function handleAddTabChange(key: string | number): void {
@@ -2378,6 +2587,10 @@ onUnmounted(() => {
         </a-button>
       </div>
       <div v-if="activeView === 'accounts'" class="command-actions">
+        <a-button :loading="detectingCurrentAccount" @click="handleDetectCurrentAccount">
+          <template #icon><icon-refresh /></template>
+          读取当前账号
+        </a-button>
         <a-button @click="privacyMasked = !privacyMasked">
           <template #icon>
             <icon-eye-invisible v-if="privacyMasked" />
@@ -2420,6 +2633,16 @@ onUnmounted(() => {
             {{ option.label }}
           </a-option>
         </a-select>
+        <a-input
+          v-model="accountSearchKeyword"
+          class="account-search-input"
+          allow-clear
+          placeholder="筛选邮箱 / 昵称"
+          @input="currentPage = 1"
+          @clear="currentPage = 1"
+        >
+          <template #prefix><icon-search /></template>
+        </a-input>
         <a-select v-model="settings.sortMode" class="sort-select" @change="saveSettings">
           <a-option value="created_at">按创建时间</a-option>
           <a-option value="weekly_quota">按周配额</a-option>
@@ -2507,6 +2730,8 @@ onUnmounted(() => {
       @open-export="openExport"
       @confirm-delete="confirmDelete"
       @open-add="openAddModal"
+      @copy-email="copyAccountEmail"
+      @reauthorize="openReauthorizeModal"
     />
 
     <div v-if="activeView === 'accounts' && sortedAccounts.length > settings.pageSize" class="pagination-bar">
@@ -2802,29 +3027,49 @@ onUnmounted(() => {
     />
 
     <section v-if="activeView === 'about'" class="about-panel">
-      <a-card class="about-card" :bordered="false">
-        <div class="about-hero">
-          <span class="about-eyebrow">About</span>
-          <h2>Codex Switcher</h2>
-          <p>本地管理 Codex OAuth 与 API Key 登录态，支持账号切换、会话维护、使用统计和本地 API 服务。</p>
-        </div>
-        <div class="about-grid">
-          <div class="about-metric">
-            <span>当前版本</span>
-            <strong>v{{ appVersion }}</strong>
-          </div>
-          <div class="about-metric">
-            <span>项目主页</span>
-            <strong>GitHub</strong>
-          </div>
-        </div>
-        <div class="about-actions">
-          <a-button type="primary" @click="openGithubProfile">
+      <div class="about-hero">
+        <img :src="appIcon" alt="Codex Switcher" class="about-app-icon" />
+        <h2>Codex Switcher</h2>
+        <div class="about-badges">
+          <span class="about-version">v{{ appVersion }}</span>
+          <a-button class="about-github-button" size="small" @click="openGithubProfile">
             <template #icon><icon-link /></template>
-            打开 GitHub 主页
+            GitHub
           </a-button>
         </div>
-      </a-card>
+        <p>专注 Codex 账号切换、会话维护、使用统计和本地 API 服务的桌面管理工具。</p>
+      </div>
+
+      <div class="about-grid">
+        <button type="button" class="about-tile" @click="openGithubProfile">
+          <span class="about-tile-icon">
+            <icon-user />
+          </span>
+          <strong>作者主页</strong>
+          <span>vs2pk0</span>
+        </button>
+        <button type="button" class="about-tile" @click="openGithubProfile">
+          <span class="about-tile-icon">
+            <icon-code />
+          </span>
+          <strong>开源仓库</strong>
+          <span>codex-switcher</span>
+        </button>
+        <div class="about-tile">
+          <span class="about-tile-icon danger">
+            <icon-heart />
+          </span>
+          <strong>赞助支持</strong>
+          <span>支持项目持续开发</span>
+        </div>
+        <div class="about-tile">
+          <span class="about-tile-icon accent">
+            <icon-message />
+          </span>
+          <strong>意见反馈</strong>
+          <span>报告问题或提交建议</span>
+        </div>
+      </div>
     </section>
 
     <a-modal
@@ -2926,7 +3171,7 @@ onUnmounted(() => {
 
     <a-modal
       v-model:visible="addModalVisible"
-      title="接入新账号"
+      :title="addModalTitle"
       :footer="false"
       width="820px"
       modal-class="add-account-modal"
@@ -3343,6 +3588,72 @@ onUnmounted(() => {
           <a-button type="primary" :loading="savingBinding" @click="handleBindingSave">
             <template #icon><icon-save /></template>
             保存
+          </a-button>
+        </div>
+      </div>
+    </a-modal>
+
+    <a-modal
+      v-model:visible="resetCreditVisible"
+      title="选择重置次数"
+      :footer="false"
+      width="680px"
+      modal-class="reset-credit-modal"
+    >
+      <div v-if="resetCreditAccount" class="reset-credit-modal-body">
+        <div class="reset-credit-modal-head">
+          <div>
+            <span class="modal-eyebrow">Reset Credit</span>
+            <h3>选择要消耗的重置次数</h3>
+            <p>
+              {{ displayNameForUi(resetCreditAccount) }} 当前有
+              {{ resetCreditCount(resetCreditAccount) }} 次可用重置次数。
+            </p>
+          </div>
+          <div class="reset-credit-modal-count">
+            <strong>{{ resetCreditCount(resetCreditAccount) }}</strong>
+            <span>次可用</span>
+          </div>
+        </div>
+
+        <div v-if="resetCreditRecordsForModal.length" class="reset-credit-choice-list">
+          <button
+            v-for="(credit, index) in resetCreditRecordsForModal"
+            :key="credit.id || `${resetCreditAccount.id}-modal-credit-${index}`"
+            class="reset-credit-choice"
+            :class="{
+              selected: selectedResetCreditIndex === index,
+              disabled: !isAvailableResetCredit(credit),
+            }"
+            type="button"
+            :disabled="!isAvailableResetCredit(credit)"
+            @click="selectedResetCreditIndex = index"
+          >
+            <span class="reset-credit-choice-status" :class="`is-${resetCreditStatusKey(credit)}`">
+              {{ resetCreditStatusLabel(credit) }}
+            </span>
+            <span class="reset-credit-choice-main">
+              <strong>第 {{ index + 1 }} 次</strong>
+              <small>发放 {{ formatResetCreditDate(credit.granted_at) }}</small>
+            </span>
+            <span class="reset-credit-choice-time">
+              可用至 {{ formatResetCreditDate(credit.expires_at) }}
+            </span>
+          </button>
+        </div>
+        <a-empty v-else description="暂无重置次数明细，请先刷新额度" />
+
+        <div class="reset-credit-modal-actions">
+          <a-button @click="resetCreditVisible = false">取消</a-button>
+          <a-button
+            type="primary"
+            status="warning"
+            :loading="quotaRefreshingId === resetCreditAccount.id"
+            :disabled="!selectedResetCredit || !isAvailableResetCredit(selectedResetCredit)"
+            @click="handleConsumeSelectedResetCredit"
+          >
+            <template #icon><icon-thunderbolt /></template>
+            重置使用次数
           </a-button>
         </div>
       </div>

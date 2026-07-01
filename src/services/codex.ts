@@ -61,6 +61,10 @@ export function getCurrentCodexAccount(): Promise<CodexAccount | null> {
   return invoke("get_current_codex_account");
 }
 
+export function detectCurrentCodexAccount(): Promise<CodexAccount | null> {
+  return invoke("detect_current_codex_account");
+}
+
 export function importCodexFromJson(jsonContent: string): Promise<CodexAccount[]> {
   return invoke("import_codex_from_json", { jsonContent });
 }

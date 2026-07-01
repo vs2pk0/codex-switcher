@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import type { CodexSwitcherSettings } from "../services/codex";
-import type { CodexAccount } from "../types/codex";
+import type { CodexAccount, CodexResetCredit } from "../types/codex";
 import PlanBadge from "./PlanBadge.vue";
 
 const props = defineProps<{
@@ -34,6 +34,8 @@ const emit = defineEmits<{
   (event: "open-export", account: CodexAccount): void;
   (event: "confirm-delete", account: CodexAccount): void;
   (event: "open-add", tab: string): void;
+  (event: "copy-email", account: CodexAccount): void;
+  (event: "reauthorize", account: CodexAccount): void;
 }>();
 
 const dragOverAccountId = ref("");
@@ -318,7 +320,110 @@ function canUseResetCredit(account: CodexAccount): boolean {
 
 function resetCreditCount(account: CodexAccount): number {
   const count = account.quota?.reset_credits_available;
-  return Number.isFinite(count) ? Math.max(0, Number(count)) : 0;
+  if (Number.isFinite(count)) return Math.max(0, Number(count));
+  return resetCreditRecords(account).filter((credit) => resetCreditStatusKey(credit) === "available").length;
+}
+
+function resetCreditRecords(account: CodexAccount): CodexResetCredit[] {
+  if (Array.isArray(account.quota?.reset_credits) && account.quota.reset_credits.length > 0) {
+    return account.quota.reset_credits;
+  }
+  return parseResetCreditRecordsFromRawData(account.quota?.raw_data);
+}
+
+function hasResetCreditRecords(account: CodexAccount): boolean {
+  return resetCreditRecords(account).length > 0;
+}
+
+function parseResetCreditRecordsFromRawData(rawData: unknown): CodexResetCredit[] {
+  const root = isRecord(rawData) ? rawData : undefined;
+  const container = isRecord(root?.rate_limit_reset_credits)
+    ? root.rate_limit_reset_credits
+    : isRecord(root?.data) && isRecord(root.data.rate_limit_reset_credits)
+      ? root.data.rate_limit_reset_credits
+      : undefined;
+  const credits = Array.isArray(container?.credits)
+    ? container.credits
+    : isRecord(container?.data) && Array.isArray(container.data.credits)
+      ? container.data.credits
+      : [];
+
+  return credits.filter(isRecord).map((credit) => ({
+    id: normalizeScalar(credit.id) || normalizeScalar(credit.credit_id) || normalizeScalar(credit.creditId),
+    status: normalizeScalar(credit.status) || normalizeScalar(credit.state),
+    reset_type: normalizeScalar(credit.type) || normalizeScalar(credit.reset_type) || normalizeScalar(credit.resetType),
+    granted_at:
+      normalizeTimestamp(credit.granted_at) ??
+      normalizeTimestamp(credit.created_at) ??
+      normalizeTimestamp(credit.grantedAt),
+    expires_at:
+      normalizeTimestamp(credit.expires_at) ??
+      normalizeTimestamp(credit.expire_at) ??
+      normalizeTimestamp(credit.expiresAt),
+    redeemed_at:
+      normalizeTimestamp(credit.redeemed_at) ??
+      normalizeTimestamp(credit.used_at) ??
+      normalizeTimestamp(credit.consumed_at) ??
+      normalizeTimestamp(credit.redeemedAt),
+    raw_status: normalizeScalar(credit.status) || normalizeScalar(credit.state),
+  }));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeScalar(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed || undefined;
+  }
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return undefined;
+}
+
+function normalizeTimestamp(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value > 1_000_000_000_000 ? Math.floor(value / 1000) : Math.floor(value);
+  }
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const numeric = Number(trimmed);
+  if (Number.isFinite(numeric)) {
+    return numeric > 1_000_000_000_000 ? Math.floor(numeric / 1000) : Math.floor(numeric);
+  }
+  const date = new Date(trimmed);
+  return Number.isNaN(date.getTime()) ? undefined : Math.floor(date.getTime() / 1000);
+}
+
+function resetCreditStatusKey(credit: CodexResetCredit): "available" | "used" | "expired" | "unknown" {
+  const status = (credit.status || credit.raw_status || "").trim().toLowerCase();
+  if (["redeemed", "used", "consumed"].includes(status)) return "used";
+  if (status === "expired") return "expired";
+  if (status === "available" || !status) {
+    const expiresAt = normalizeDate(credit.expires_at);
+    return expiresAt && expiresAt.getTime() <= Date.now() ? "expired" : "available";
+  }
+  return "unknown";
+}
+
+function resetCreditStatusLabel(credit: CodexResetCredit): string {
+  const key = resetCreditStatusKey(credit);
+  if (key === "available") return "可用";
+  if (key === "used") return "已使用";
+  if (key === "expired") return "已过期";
+  return credit.raw_status || credit.status || "未知";
+}
+
+function resetCreditDateLabel(value?: number): string {
+  return formatDateTime(value) || "时间未知";
+}
+
+function resetCreditEndLabel(credit: CodexResetCredit): string {
+  const usedAt = resetCreditDateLabel(credit.redeemed_at);
+  if (resetCreditStatusKey(credit) === "used" && usedAt !== "时间未知") return `使用 ${usedAt}`;
+  return `可用至 ${resetCreditDateLabel(credit.expires_at)}`;
 }
 
 function quotaWindowLabel(minutes?: number, fallback = "5h"): string {
@@ -356,12 +461,22 @@ function quotaResetDateLabel(value?: string | number): string {
   return formatted ? `更新 ${formatted}` : String(value);
 }
 
+function formatRemainingTimeLabel(targetTime: number): string {
+  const diff = targetTime - Date.now();
+  if (diff <= 0) return "已过期";
+  const totalMinutes = Math.floor(diff / 60_000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}天${hours}小时`;
+  return `${hours}小时${minutes}分钟`;
+}
+
 function expiryDaysLabel(value?: string): string {
   if (!value) return "";
   const date = normalizeDate(value);
   if (!date) return "";
-  const days = Math.max(0, Math.ceil((date.getTime() - Date.now()) / 86_400_000));
-  return `${days}天`;
+  return formatRemainingTimeLabel(date.getTime());
 }
 
 function statusTitle(account: CodexAccount): string {
@@ -373,6 +488,10 @@ function quotaErrorMessage(account: CodexAccount): string {
     return "Token 失效，请重新登录或更换绑定账号";
   }
   return account.quota_error?.message || "额度刷新失败";
+}
+
+function isTokenExpiredError(account: CodexAccount): boolean {
+  return account.quota_error?.code === "token_expired";
 }
 
 function tokenExpiryStatus(value?: string): "valid" | "expired" {
@@ -434,11 +553,18 @@ function formatTime(value?: number | null): string {
               :model-value="selectedAccountIds.has(account.id)"
               @change="emit('toggle-account', account.id)"
             />
-            <span class="account-name" :title="displayAccountName(account)">
+            <span
+              class="account-name"
+              :title="`${displayAccountName(account)}，双击复制邮箱`"
+              @dblclick.stop="emit('copy-email', account)"
+            >
               {{ displayAccountName(account) }}
             </span>
           </div>
           <div class="account-head-actions">
+            <span v-if="account.id === currentId" class="current-account-pill">
+              当前
+            </span>
             <a-tooltip v-if="!isApiKeyAccount(account) && canUseResetCredit(account)" content="可用重置次数">
               <button
                 class="reset-credit-pill"
@@ -521,9 +647,9 @@ function formatTime(value?: number | null): string {
                   <div class="quota-meta">
                     <span>
                       <b>{{ quotaWindowLabel(account.quota.hourly_window_minutes, '5 小时窗口') }}</b>
+                      <em>{{ quotaResetDateLabel(account.quota.hourly_reset_time) }}</em>
                       <small>{{ quotaResetLeftLabel(account.quota.hourly_reset_time) }}</small>
                     </span>
-                    <em>{{ quotaResetDateLabel(account.quota.hourly_reset_time) }}</em>
                   </div>
                 </div>
 
@@ -551,16 +677,34 @@ function formatTime(value?: number | null): string {
                   <div class="quota-meta">
                     <span>
                       <b>{{ quotaWindowLabel(account.quota.weekly_window_minutes, '7 天窗口') }}</b>
+                      <em>{{ quotaResetDateLabel(account.quota.weekly_reset_time) }}</em>
                       <small>{{ quotaResetLeftLabel(account.quota.weekly_reset_time) }}</small>
                     </span>
-                    <em>{{ quotaResetDateLabel(account.quota.weekly_reset_time) }}</em>
                   </div>
                 </div>
+
+                <div
+                  v-if="isFreePlanAccount(account) && account.quota.hourly_window_present !== false"
+                  class="quota-metric quota-placeholder"
+                  aria-hidden="true"
+                />
               </div>
             </div>
           </template>
-          <div v-else-if="shouldShowQuotaError(account) && account.quota_error" class="quota-error">
-            {{ quotaErrorMessage(account) }}
+          <div
+            v-else-if="shouldShowQuotaError(account) && account.quota_error"
+            class="quota-error"
+            :class="{ actionable: isTokenExpiredError(account) }"
+          >
+            <span>{{ quotaErrorMessage(account) }}</span>
+            <a-button
+              v-if="isTokenExpiredError(account)"
+              size="mini"
+              status="danger"
+              @click="emit('reauthorize', account)"
+            >
+              重新授权
+            </a-button>
           </div>
 
           <div
@@ -568,10 +712,19 @@ function formatTime(value?: number | null): string {
             class="status-grid"
             :class="{ single: !(accountSubscriptionUntil(account) && accountTokenExpiresAt(account)) }"
           >
+            <div
+              v-if="!accountSubscriptionUntil(account) && accountTokenExpiresAt(account)"
+              class="status-card status-placeholder"
+              aria-hidden="true"
+            />
+
             <div v-if="accountSubscriptionUntil(account)" class="status-card status-valid">
               <span>
                 <icon-calendar />
-                {{ statusTitle(account) }} {{ expiryDaysLabel(accountSubscriptionUntil(account)) || "已记录" }}
+                {{ statusTitle(account) }}
+                <b class="status-remaining-time">
+                  {{ expiryDaysLabel(accountSubscriptionUntil(account)) || "已记录" }}
+                </b>
               </span>
               <strong>{{ formatDateTime(accountSubscriptionUntil(account)) }}</strong>
             </div>
