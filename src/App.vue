@@ -5,14 +5,27 @@ import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import AccountList from "./components/AccountList.vue";
+import AboutPanel from "./components/AboutPanel.vue";
+import AccountToolbar from "./components/AccountToolbar.vue";
+import AddAccountModal from "./components/AddAccountModal.vue";
 import ApiServicePanel from "./components/ApiServicePanel.vue";
+import AppHeader from "./components/AppHeader.vue";
+import BackupProgressModal from "./components/BackupProgressModal.vue";
 import BadgeStyleModal from "./components/BadgeStyleModal.vue";
-import PlanBadge from "./components/PlanBadge.vue";
+import EditAccountModal from "./components/EditAccountModal.vue";
+import ExportJsonModal from "./components/ExportJsonModal.vue";
+import OAuthBindingModal from "./components/OAuthBindingModal.vue";
+import PhoneModal from "./components/PhoneModal.vue";
+import ResetCreditModal from "./components/ResetCreditModal.vue";
+import SessionPanel from "./components/SessionPanel.vue";
+import SessionRepairModal from "./components/SessionRepairModal.vue";
+import SessionRestoreModal from "./components/SessionRestoreModal.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
+import SortEditorModal from "./components/SortEditorModal.vue";
+import SwitchRepairModal from "./components/SwitchRepairModal.vue";
 import UsagePanel from "./components/UsagePanel.vue";
-import appIcon from "./assets/app-icon.png";
 import { defaultBadgeStyles } from "./constants/badgeStyles";
-import { currentLanguage, formatLocalizedCount, formatLocalizedDuration, setLanguage, t } from "./i18n";
+import { currentLanguage, formatLocalizedDuration, setLanguage, t } from "./i18n";
 import {
   addCodexAccountWithApiKey,
   cancelCodexOAuthLogin,
@@ -73,8 +86,7 @@ import {
   type CodexTrashedSessionRecord,
 } from "./services/session";
 import type { CodexAccount, CodexResetCredit } from "./types/codex";
-
-type ActiveView = "accounts" | "sessions" | "usage" | "apiService" | "settings" | "about";
+import type { ActiveView, SessionGroup } from "./types/ui";
 
 const activeView = ref<ActiveView>("accounts");
 const appVersion = ref("0.1.0");
@@ -107,9 +119,8 @@ const addModalVisible = ref(false);
 const addModalTitle = ref("接入新账号");
 const badgeStyleVisible = ref(false);
 const privacyMasked = ref(false);
-const addTab = ref("oauth");
+const addTab = ref<"oauth" | "token" | "apikey">("oauth");
 const tokenInput = ref("");
-const fileInput = ref<HTMLInputElement | null>(null);
 const importing = ref(false);
 const savingApiKey = ref(false);
 const settingsLoading = ref(false);
@@ -243,14 +254,6 @@ const sessionSearch = reactive({
   titleQuery: "",
   contentQuery: "",
 });
-
-interface SessionGroup {
-  key: string;
-  projectName: string;
-  sessions: CodexSessionRecord[];
-  latestUpdatedAt: number;
-  approximateTokens: number;
-}
 
 const currentId = computed(() => currentAccount.value?.id ?? "");
 const quotaSortModes = new Set(["weekly_quota", "hourly_quota", "weekly_reset", "hourly_reset", "subscription"]);
@@ -1735,14 +1738,7 @@ async function handleLocalImport(): Promise<void> {
   }
 }
 
-function openFileImport(): void {
-  fileInput.value?.click();
-}
-
-async function handleFileImport(event: Event): Promise<void> {
-  const target = event.target as HTMLInputElement;
-  const files = [...(target.files ?? [])];
-  target.value = "";
+async function handleFileImport(files: File[]): Promise<void> {
   if (!files.length) return;
   importing.value = true;
   try {
@@ -2750,171 +2746,40 @@ onUnmounted(() => {
 
 <template>
   <main class="app-shell">
-    <header class="topbar">
-      <div class="brand">
-        <h1>Codex Switcher</h1>
-        <p>{{ t("管理 OAuth 与 API Key 登录态，并写回本机 Codex 配置。") }}</p>
-      </div>
-    </header>
+    <AppHeader
+      :active-view="activeView"
+      :accounts-count="accounts.length"
+      :oauth-count="oauthCount"
+      :api-key-count="apiKeyCount"
+      :current-account-label="currentAccount ? displayNameForUi(currentAccount) : ''"
+      :current-account-error="currentAccount ? quotaErrorLabel(currentAccount) : ''"
+      :detecting-current-account="detectingCurrentAccount"
+      :privacy-masked="privacyMasked"
+      @switch-view="switchView"
+      @detect-current-account="handleDetectCurrentAccount"
+      @toggle-privacy="privacyMasked = !privacyMasked"
+      @open-badge-style="badgeStyleVisible = true"
+      @open-add="openAddModal"
+    />
 
-    <section v-if="activeView === 'accounts'" class="status-line">
-      <a-tag color="arcoblue">{{ t("全部") }} {{ accounts.length }}</a-tag>
-      <a-tag color="green">OAuth {{ oauthCount }}</a-tag>
-      <a-tag color="orange">API Key {{ apiKeyCount }}</a-tag>
-      <span v-if="currentAccount">{{ t("当前：") }} {{ displayNameForUi(currentAccount) }}</span>
-      <a-tag v-if="currentAccount && quotaErrorLabel(currentAccount)" color="red">
-        {{ quotaErrorLabel(currentAccount) }}
-      </a-tag>
-    </section>
-
-    <section class="command-bar">
-      <div class="view-tabs">
-        <a-button :type="activeView === 'accounts' ? 'primary' : 'secondary'" @click="switchView('accounts')">
-          {{ t("账号总览") }}
-        </a-button>
-        <a-button :type="activeView === 'sessions' ? 'primary' : 'secondary'" @click="switchView('sessions')">
-          <template #icon><icon-folder /></template>
-          {{ t("会话管理") }}
-        </a-button>
-        <a-button :type="activeView === 'usage' ? 'primary' : 'secondary'" @click="switchView('usage')">
-          <template #icon><icon-bar-chart /></template>
-          {{ t("使用统计") }}
-        </a-button>
-        <a-button :type="activeView === 'apiService' ? 'primary' : 'secondary'" @click="switchView('apiService')">
-          <template #icon><icon-code /></template>
-          {{ t("API 服务") }}
-        </a-button>
-        <a-button :type="activeView === 'settings' ? 'primary' : 'secondary'" @click="switchView('settings')">
-          <template #icon><icon-settings /></template>
-          {{ t("设置") }}
-        </a-button>
-        <a-button :type="activeView === 'about' ? 'primary' : 'secondary'" @click="switchView('about')">
-          <template #icon><icon-info-circle /></template>
-          {{ t("关于") }}
-        </a-button>
-      </div>
-      <div v-if="activeView === 'accounts'" class="command-actions">
-        <a-button :loading="detectingCurrentAccount" @click="handleDetectCurrentAccount">
-          <template #icon><icon-refresh /></template>
-          {{ t("读取当前账号") }}
-        </a-button>
-        <a-button @click="privacyMasked = !privacyMasked">
-          <template #icon>
-            <icon-eye-invisible v-if="privacyMasked" />
-            <icon-eye v-else />
-          </template>
-          {{ privacyMasked ? t("已隐藏") : t("隐私") }}
-        </a-button>
-        <a-button @click="badgeStyleVisible = true">
-          <template #icon><icon-palette /></template>
-          {{ t("徽章样式") }}
-        </a-button>
-        <a-button type="primary" @click="openAddModal('oauth')">
-          <template #icon><icon-plus /></template>
-          {{ t("添加账号") }}
-        </a-button>
-      </div>
-    </section>
-
-    <section v-if="activeView === 'accounts'" class="account-ops">
-      <div class="account-ops-left">
-        <a-checkbox
-          :model-value="isCurrentPageSelected"
-          @change="(checked) => toggleAllAccounts(Boolean(checked))"
-        >
-          {{ t("全选") }}
-        </a-checkbox>
-        <a-select
-          v-model="settings.accountTypeFilter"
-          class="filter-select"
-          popup-container="body"
-          :scrollbar="false"
-          :trigger-props="{ contentClass: 'account-filter-dropdown' }"
-          @change="() => { currentPage = 1; saveSettings(); }"
-        >
-          <a-option
-            v-for="option in accountTypeOptions"
-            :key="option.value"
-            :value="option.value"
-          >
-            {{ option.label }}
-          </a-option>
-        </a-select>
-        <a-input
-          v-model="accountSearchKeyword"
-          class="account-search-input"
-          allow-clear
-          :placeholder="t('筛选邮箱 / 昵称')"
-          @input="currentPage = 1"
-          @clear="currentPage = 1"
-        >
-          <template #prefix><icon-search /></template>
-        </a-input>
-        <a-select
-          v-model="settings.sortMode"
-          class="sort-select"
-          popup-container="body"
-          :scrollbar="false"
-          :trigger-props="{ contentClass: 'account-filter-dropdown account-sort-dropdown' }"
-          @change="saveSettings"
-        >
-          <a-option value="created_at">{{ t("按创建时间") }}</a-option>
-          <a-option value="weekly_quota">{{ t("按周配额") }}</a-option>
-          <a-option value="hourly_quota">{{ t("按5小时配额") }}</a-option>
-          <a-option value="weekly_reset">{{ t("按周配额重置时间") }}</a-option>
-          <a-option value="hourly_reset">{{ t("按5小时配额重置时间") }}</a-option>
-          <a-option value="subscription">{{ t("按订阅有效期") }}</a-option>
-          <a-option value="custom">{{ t("自定义顺序") }}</a-option>
-        </a-select>
-        <a-button v-if="settings.sortMode === 'custom'" @click="openSortEditor">
-          <template #icon><icon-list /></template>
-          {{ t("编辑排序") }}
-        </a-button>
-        <a-radio-group
-          v-if="showSortDirection"
-          v-model="settings.sortDirection"
-          type="button"
-          size="small"
-          @change="saveSettings"
-        >
-          <a-radio value="desc">{{ t("倒序") }}</a-radio>
-          <a-radio value="asc">{{ t("正序") }}</a-radio>
-        </a-radio-group>
-        <a-select
-          v-model="settings.pageSize"
-          class="page-size-select"
-          @change="() => { currentPage = 1; saveSettings(); }"
-        >
-          <a-option :value="20">{{ t("每页") }} 20</a-option>
-          <a-option :value="50">{{ t("每页") }} 50</a-option>
-          <a-option :value="100">{{ t("每页") }} 100</a-option>
-          <a-option :value="200">{{ t("每页") }} 200</a-option>
-        </a-select>
-        <a-button @click="confirmBindSelectedToApiService">
-          <template #icon><icon-link /></template>
-          {{ t("绑定到 API 服务") }}
-        </a-button>
-        <a-button @click="openBatchExport">
-          <template #icon><icon-download /></template>
-          {{ t("批量导出") }}
-        </a-button>
-        <a-button @click="openAddModal('token')">
-          <template #icon><icon-import /></template>
-          {{ t("批量导入") }}
-        </a-button>
-      </div>
-      <div
-        v-if="currentAccountRefreshCountdown || quotaRefreshCountdown"
-        class="quota-countdown-group"
-      >
-        <span v-if="currentAccountRefreshCountdown" class="quota-countdown primary">
-          {{ t("当前账号") }} {{ currentAccountRefreshCountdown }}
-        </span>
-        <span v-if="quotaRefreshCountdown" class="quota-countdown">
-          {{ t("当前页") }} {{ quotaRefreshCountdown }}
-        </span>
-      </div>
-    </section>
+    <AccountToolbar
+      v-if="activeView === 'accounts'"
+      :settings="settings"
+      :is-current-page-selected="isCurrentPageSelected"
+      :account-type-options="accountTypeOptions"
+      :account-search-keyword="accountSearchKeyword"
+      :show-sort-direction="showSortDirection"
+      :current-account-refresh-countdown="currentAccountRefreshCountdown"
+      :quota-refresh-countdown="quotaRefreshCountdown"
+      @toggle-all="toggleAllAccounts"
+      @update:account-search-keyword="accountSearchKeyword = $event"
+      @reset-page="currentPage = 1"
+      @save-settings="saveSettings"
+      @open-sort-editor="openSortEditor"
+      @bind-selected-to-api-service="confirmBindSelectedToApiService"
+      @batch-export="openBatchExport"
+      @open-add="openAddModal"
+    />
 
     <AccountList
       v-if="activeView === 'accounts'"
@@ -2958,60 +2823,23 @@ onUnmounted(() => {
       />
     </div>
 
-    <a-modal
+    <SortEditorModal
       v-model:visible="sortEditorVisible"
-      title="编辑账号顺序"
-      width="820px"
-      :footer="false"
-      @cancel="closeSortEditor"
-    >
-      <div class="sort-editor">
-        <div class="sort-editor-hint">
-          <span>拖动列表项调整顺序，保存后会写入自定义顺序。</span>
-          <b>{{ sortDraftAccounts.length }} 个账号</b>
-        </div>
-        <div class="sort-editor-list">
-          <article
-            v-for="(account, index) in sortDraftAccounts"
-            :key="account.id"
-            class="sort-editor-row"
-            :class="{
-              dragging: sortDraftDraggingId === account.id,
-              over: sortDraftOverId === account.id,
-            }"
-            @pointerenter="handleSortDraftPointerEnter(account)"
-          >
-            <button
-              class="sort-editor-grip"
-              type="button"
-              title="按住拖动排序"
-              @pointerdown.prevent="handleSortDraftPointerStart($event, account)"
-            >
-              <icon-list />
-            </button>
-            <span class="sort-editor-index">{{ index + 1 }}</span>
-            <div class="sort-editor-main">
-              <strong>{{ displayNameForUi(account) }}</strong>
-              <span>{{ isApiKeyAccount(account) ? "API Key" : "OAuth" }} · {{ account.email || account.id }}</span>
-            </div>
-            <PlanBadge :label="planLabel(account)" :badge-class="planClass(account)" />
-            <a-tag v-if="account.id === currentId" color="arcoblue">当前</a-tag>
-            <div class="sort-editor-actions">
-              <a-button size="mini" :disabled="index === 0" @click="moveSortDraftByStep(account, -1)">
-                <template #icon><icon-up /></template>
-              </a-button>
-              <a-button size="mini" :disabled="index === sortDraftAccounts.length - 1" @click="moveSortDraftByStep(account, 1)">
-                <template #icon><icon-down /></template>
-              </a-button>
-            </div>
-          </article>
-        </div>
-        <div class="sort-editor-footer">
-          <a-button @click="closeSortEditor">取消</a-button>
-          <a-button type="primary" :loading="savingSettings" @click="saveSortEditor">保存排序</a-button>
-        </div>
-      </div>
-    </a-modal>
+      :accounts="sortDraftAccounts"
+      :current-id="currentId"
+      :saving="savingSettings"
+      :sort-draft-dragging-id="sortDraftDraggingId"
+      :sort-draft-over-id="sortDraftOverId"
+      :display-name="displayNameForUi"
+      :is-api-key-account="isApiKeyAccount"
+      :plan-label="planLabel"
+      :plan-class="planClass"
+      @close="closeSortEditor"
+      @save="saveSortEditor"
+      @pointer-start="handleSortDraftPointerStart"
+      @pointer-enter="handleSortDraftPointerEnter"
+      @move-step="moveSortDraftByStep"
+    />
 
     <BadgeStyleModal
       v-model:visible="badgeStyleVisible"
@@ -3020,193 +2848,38 @@ onUnmounted(() => {
       @save="saveSettings"
     />
 
-    <section v-if="activeView === 'sessions'" class="session-panel">
-      <div class="session-toolbar">
-        <div class="session-search">
-          <a-input
-            v-model="sessionSearch.titleQuery"
-            allow-clear
-            :placeholder="t('搜索会话标题')"
-            @press-enter="() => loadSessions()"
-          />
-          <a-input
-            v-model="sessionSearch.contentQuery"
-            allow-clear
-            :placeholder="t('搜索会话内容')"
-            @press-enter="() => loadSessions()"
-          />
-        </div>
-        <div class="session-actions">
-          <a-button
-            :disabled="!activeSessionIds.length"
-            @click="toggleAllSessions"
-          >
-            {{ allSessionsSelected ? t("取消全选") : (sessionTrashMode ? t("全选回收站") : t("全选")) }}
-          </a-button>
-          <a-button
-            :type="sessionTrashMode ? 'secondary' : 'primary'"
-            @click="sessionTrashMode = false; loadSessions()"
-          >
-            {{ t("会话列表") }}
-          </a-button>
-          <a-button
-            :type="sessionTrashMode ? 'primary' : 'secondary'"
-            @click="sessionTrashMode = true; loadSessions()"
-          >
-            {{ t("回收站") }}
-          </a-button>
-          <a-button :loading="sessionLoading" @click="() => loadSessions()">
-            <template #icon><icon-refresh /></template>
-            {{ t("刷新") }}
-          </a-button>
-          <a-button :loading="backupWorking" @click="handleExportSessionBackup">
-            <template #icon><icon-download /></template>
-            {{ backupButtonText }}
-          </a-button>
-          <a-button :loading="sessionBackupLoading" :disabled="backupWorking" @click="openSessionRestoreModal">
-            <template #icon><icon-import /></template>
-            {{ t("恢复会话") }}
-          </a-button>
-          <a-button :loading="sessionRepairing" type="primary" @click="handleRepairSessions">
-            <template #icon><icon-tool /></template>
-            {{ t("修复可见性") }}
-          </a-button>
-          <a-button
-            v-if="!sessionTrashMode"
-            status="danger"
-            :disabled="!selectedSessionIdList.length"
-            @click="handleTrashSessions"
-          >
-            <template #icon><icon-delete /></template>
-            {{ t("移入回收站") }}
-          </a-button>
-          <a-button
-            v-else
-            type="primary"
-            :disabled="!selectedSessionIdList.length"
-            @click="handleRestoreSessions"
-          >
-            <template #icon><icon-undo /></template>
-            {{ t("恢复") }}
-          </a-button>
-        </div>
-      </div>
-
-      <a-spin :loading="sessionLoading" dot>
-        <div v-if="!sessionTrashMode" class="session-list">
-          <section v-for="group in sessionGroups" :key="group.key" class="session-group">
-            <div class="session-group-row">
-              <a-button
-                class="session-expand-button"
-                size="mini"
-                shape="circle"
-                @click="toggleSessionGroupExpanded(group.key)"
-              >
-                <template #icon>
-                  <icon-down v-if="expandedSessionGroups.has(group.key)" />
-                  <icon-right v-else />
-                </template>
-              </a-button>
-              <a-checkbox
-                :model-value="isSessionGroupSelected(group)"
-                @change="toggleSessionGroupSelection(group)"
-              />
-              <icon-folder class="session-group-icon" />
-              <button
-                class="session-group-title"
-                type="button"
-                :title="group.projectName"
-                @click="toggleSessionGroupExpanded(group.key)"
-              >
-                {{ group.projectName }}
-              </button>
-              <span class="session-group-meta">{{ formatLocalizedCount(group.sessions.length, "条会话") }}</span>
-              <span class="token-count">{{ new Intl.NumberFormat("en-US").format(group.approximateTokens) }} tokens</span>
-              <span class="session-group-time">{{ formatTime(group.latestUpdatedAt) }}</span>
-            </div>
-            <div v-if="expandedSessionGroups.has(group.key)" class="session-group-children">
-              <article v-for="session in group.sessions" :key="session.id" class="session-child-row">
-                <a-checkbox
-                  :model-value="selectedSessionIds.has(session.id)"
-                  @change="toggleSession(session.id)"
-                />
-                <div class="session-main session-main-name-only">
-                  <strong class="session-name-only" :title="session.title">
-                    {{ session.title || t("未命名会话") }}
-                  </strong>
-                </div>
-                <div class="session-stat">
-                  <span class="token-count">{{ sessionApproxTokens(session.id) }}</span>
-                  <span>{{ formatTime(session.updatedAt) }}</span>
-                  <a-button size="small" @click="openSessionFolder(session.path)">
-                    <template #icon><icon-folder /></template>
-                    {{ t("打开文件夹") }}
-                  </a-button>
-                </div>
-              </article>
-            </div>
-          </section>
-          <div v-if="!sessions.length" class="session-empty-state">
-            <div class="session-empty-icon">
-              <icon-message />
-            </div>
-            <div class="session-empty-copy">
-              <strong>{{ sessionSearch.titleQuery || sessionSearch.contentQuery ? t("没有匹配的会话") : t("还没有可显示的会话") }}</strong>
-              <span>
-                {{ sessionSearch.titleQuery || sessionSearch.contentQuery
-                  ? t("换个关键词试试，或清空搜索后重新刷新。")
-                  : t("可以先刷新本机会话；如果是切号后看不到旧会话，使用修复可见性重新挂回列表。")
-                }}
-              </span>
-            </div>
-            <div class="session-empty-actions">
-              <a-button type="primary" :loading="sessionLoading" @click="() => loadSessions()">
-                <template #icon><icon-refresh /></template>
-                {{ t("刷新会话") }}
-              </a-button>
-              <a-button :loading="sessionBackupLoading" :disabled="backupWorking" @click="openSessionRestoreModal">
-                <template #icon><icon-import /></template>
-                {{ t("从备份恢复") }}
-              </a-button>
-              <a-button :loading="sessionRepairing" @click="handleRepairSessions">
-                <template #icon><icon-tool /></template>
-                {{ t("修复可见性") }}
-              </a-button>
-            </div>
-          </div>
-        </div>
-
-        <div v-else class="session-list">
-          <article v-for="session in trashedSessions" :key="session.id" class="session-row">
-            <a-checkbox
-              :model-value="selectedSessionIds.has(session.id)"
-              @change="toggleSession(session.id)"
-            />
-            <div class="session-main">
-              <strong :title="session.title">{{ session.title }}</strong>
-              <span :title="session.originalPath">{{ session.originalPath }}</span>
-            </div>
-            <div class="session-stat">
-              <span>{{ t("已删除") }}</span>
-              <span>{{ formatTime(session.deletedAt) }}</span>
-              <a-button size="small" @click="openSessionFolder(session.originalPath)">
-                <template #icon><icon-folder /></template>
-                {{ t("打开文件夹") }}
-              </a-button>
-            </div>
-          </article>
-          <div v-if="!trashedSessions.length" class="session-empty-state compact">
-            <div class="session-empty-icon">
-              <icon-delete />
-            </div>
-            <div class="session-empty-copy">
-              <strong>{{ t("回收站为空") }}</strong>
-              <span>{{ t("被移入回收站的会话会显示在这里，恢复后会回到原来的会话路径。") }}</span>
-            </div>
-          </div>
-        </div>
-      </a-spin>
-    </section>
+    <SessionPanel
+      v-if="activeView === 'sessions'"
+      v-model:session-trash-mode="sessionTrashMode"
+      :session-search="sessionSearch"
+      :session-loading="sessionLoading"
+      :backup-working="backupWorking"
+      :backup-button-text="backupButtonText"
+      :session-backup-loading="sessionBackupLoading"
+      :session-repairing="sessionRepairing"
+      :active-session-ids="activeSessionIds"
+      :all-sessions-selected="allSessionsSelected"
+      :selected-session-ids="selectedSessionIds"
+      :selected-session-id-list="selectedSessionIdList"
+      :expanded-session-groups="expandedSessionGroups"
+      :session-groups="sessionGroups"
+      :sessions="sessions"
+      :trashed-sessions="trashedSessions"
+      :format-time="formatTime"
+      :session-approx-tokens="sessionApproxTokens"
+      :is-session-group-selected="isSessionGroupSelected"
+      @load-sessions="loadSessions"
+      @toggle-all-sessions="toggleAllSessions"
+      @export-session-backup="handleExportSessionBackup"
+      @open-session-restore-modal="openSessionRestoreModal"
+      @repair-sessions="handleRepairSessions"
+      @trash-sessions="handleTrashSessions"
+      @restore-sessions="handleRestoreSessions"
+      @toggle-session-group-expanded="toggleSessionGroupExpanded"
+      @toggle-session-group-selection="toggleSessionGroupSelection"
+      @toggle-session="toggleSession"
+      @open-session-folder="openSessionFolder"
+    />
 
     <UsagePanel
       v-if="usagePanelMounted"
@@ -3240,784 +2913,171 @@ onUnmounted(() => {
       @delete-backup="handleDeleteBackup"
     />
 
-    <section v-if="activeView === 'about'" class="about-panel">
-      <div class="about-hero">
-        <div class="about-icon-wrap">
-          <img :src="appIcon" alt="Codex Switcher" class="about-app-icon" />
-        </div>
-        <span class="about-kicker">{{ t("本地 Codex 管理工具") }}</span>
-        <h2>Codex Switcher</h2>
-        <div class="about-badges">
-          <span class="about-version">v{{ appVersion }}</span>
-          <a-button class="about-github-button" size="small" @click="openRepository">
-            <template #icon><icon-link /></template>
-            GitHub
-          </a-button>
-        </div>
-        <p>{{ t("把账号切换、会话维护、使用统计和本地 API 服务收在一个干净的桌面工作台里。") }}</p>
-      </div>
+    <AboutPanel
+      v-if="activeView === 'about'"
+      :app-version="appVersion"
+      @open-github-profile="openGithubProfile"
+      @open-repository="openRepository"
+      @open-sponsor-page="openSponsorPage"
+      @open-feedback-page="openFeedbackPage"
+      @check-update="checkAppUpdate"
+    />
 
-      <div class="about-grid">
-        <button type="button" class="about-tile" @click="openGithubProfile">
-          <span class="about-tile-icon about-tile-icon-profile">
-            <icon-user />
-          </span>
-          <span class="about-tile-copy">
-            <strong>{{ t("作者主页") }}</strong>
-            <span>{{ t("访问 vs2pk0 的 GitHub 主页") }}</span>
-          </span>
-        </button>
-        <button type="button" class="about-tile" @click="openRepository">
-          <span class="about-tile-icon about-tile-icon-repo">
-            <icon-code />
-          </span>
-          <span class="about-tile-copy">
-            <strong>{{ t("开源仓库") }}</strong>
-            <span>{{ t("查看源码、版本和发布记录") }}</span>
-          </span>
-        </button>
-        <button type="button" class="about-tile" @click="openSponsorPage">
-          <span class="about-tile-icon about-tile-icon-sponsor">
-            <icon-heart />
-          </span>
-          <span class="about-tile-copy">
-            <strong>{{ t("赞助支持") }}</strong>
-            <span>{{ t("查看支付宝、微信和 Binance 收款码") }}</span>
-          </span>
-        </button>
-        <button type="button" class="about-tile" @click="openFeedbackPage">
-          <span class="about-tile-icon about-tile-icon-feedback">
-            <icon-message />
-          </span>
-          <span class="about-tile-copy">
-            <strong>{{ t("问题反馈") }}</strong>
-            <span>{{ t("提交 Issue 或改进建议") }}</span>
-          </span>
-        </button>
-        <button type="button" class="about-tile" @click="checkAppUpdate()">
-          <span class="about-tile-icon about-tile-icon-update">
-            <icon-refresh />
-          </span>
-          <span class="about-tile-copy">
-            <strong>{{ t("检查更新") }}</strong>
-            <span>{{ t("查看最新版本并下载安装包") }}</span>
-          </span>
-        </button>
-      </div>
-    </section>
-
-    <a-modal
+    <SessionRestoreModal
       v-model:visible="sessionRestoreVisible"
-      title="恢复会话数据"
-      :footer="false"
-      width="720px"
-    >
-      <a-spin :loading="sessionBackupLoading" dot>
-        <div v-if="sessionBackupFiles.length" class="session-restore-list">
-          <article v-for="backup in sessionBackupFiles" :key="backup.path" class="session-restore-item">
-            <div class="session-restore-main">
-              <strong>{{ backup.name }}</strong>
-              <span>{{ backup.createdAt }}</span>
-            </div>
-            <a-button type="primary" :disabled="backupWorking" @click="handleRestoreSessionBackup(backup)">
-              <template #icon><icon-import /></template>
-              只恢复会话
-            </a-button>
-          </article>
-        </div>
-        <div v-else class="session-empty-state compact">
-          <div class="session-empty-icon">
-            <icon-archive />
-          </div>
-          <div class="session-empty-copy">
-            <strong>还没有备份文件</strong>
-            <span>先备份一次会话数据，之后就可以从这里只恢复会话。</span>
-          </div>
-          <div class="session-empty-actions">
-            <a-button type="primary" :loading="backupWorking" @click="handleExportSessionBackup">
-              <template #icon><icon-download /></template>
-              立即备份
-            </a-button>
-          </div>
-        </div>
-      </a-spin>
-    </a-modal>
+      :backups="sessionBackupFiles"
+      :loading="sessionBackupLoading"
+      :backup-working="backupWorking"
+      @restore="handleRestoreSessionBackup"
+      @backup-now="handleExportSessionBackup"
+    />
 
-    <a-modal
+    <BackupProgressModal
       v-model:visible="backupProgressVisible"
       :title="backupProgressTitle"
-      :footer="false"
-      :closable="true"
-      :mask-closable="true"
-      width="420px"
-    >
-      <div class="backup-progress-panel">
-        <a-progress
-          :percent="backupProgress / 100"
-          :status="backupProgressStatus === 'failed' ? 'danger' : backupProgressStatus === 'completed' ? 'success' : 'normal'"
-        />
-        <div
-          class="backup-progress-message"
-          :class="{ failed: backupProgressStatus === 'failed' }"
-        >
-          {{ backupProgressMessage }}
-        </div>
-        <a-button
-          v-if="backupProgressStatus !== 'running'"
-          type="primary"
-          long
-          @click="backupProgressVisible = false"
-        >
-          关闭
-        </a-button>
-      </div>
-    </a-modal>
+      :progress="backupProgress"
+      :status="backupProgressStatus"
+      :message="backupProgressMessage"
+    />
 
-    <a-modal
+    <SwitchRepairModal
       v-model:visible="switchRepairVisible"
-      title="Codex 会话不可见"
-      :footer="false"
-      width="860px"
-      modal-class="repair-modal"
-    >
-      <div class="repair-body">
-        <p class="repair-desc">
-          检测到 Codex 已切换到 {{ switchRepairTargetName }}。由于官方机制，这类切换后原有会话可能不会自动显示，正在自动修复会话可见性。
-        </p>
-        <div class="repair-progress-line">
-          <strong>修复进度</strong>
-          <span>{{ switchRepairProgress }}%</span>
-        </div>
-        <a-progress :percent="switchRepairProgress" :show-text="false" />
-        <div v-if="switchRepairResult" class="repair-result success">
-          <strong>修复已完成</strong>
-          <span>{{ switchRepairResult.message }}</span>
-        </div>
-        <div v-else-if="switchRepairError" class="repair-result error">
-          <strong>修复失败</strong>
-          <span>{{ switchRepairError }}</span>
-        </div>
-        <div class="form-actions">
-          <a-button type="primary" @click="closeSwitchRepairModal">关闭</a-button>
-        </div>
-      </div>
-    </a-modal>
+      :target-name="switchRepairTargetName"
+      :progress="switchRepairProgress"
+      :result="switchRepairResult"
+      :error="switchRepairError"
+      @close="closeSwitchRepairModal"
+    />
 
-    <a-modal
+    <AddAccountModal
       v-model:visible="addModalVisible"
       :title="addModalTitle"
-      :footer="false"
-      width="820px"
-      modal-class="add-account-modal"
-    >
-      <div class="add-account-intro">
-        <div>
-          <span class="modal-eyebrow">Account Setup</span>
-          <h3>选择一种方式，把账号接到 Codex Switcher</h3>
-        </div>
-        <p>推荐使用浏览器授权；如果已经有本地 token、JSON 或 API Key，也可以直接导入。</p>
-      </div>
-      <a-tabs v-model:active-key="addTab" class="add-account-tabs" @change="handleAddTabChange">
-        <a-tab-pane key="oauth" title="OAuth 授权">
-          <div class="oauth-connect-layout">
-            <aside class="oauth-guide-card">
-              <span class="modal-eyebrow">Browser Flow</span>
-              <h4>浏览器登录，自动带回授权结果</h4>
-              <ul>
-                <li>先生成一次性授权链接</li>
-                <li>在浏览器完成 OpenAI 登录</li>
-                <li>回调成功后应用会自动保存账号</li>
-              </ul>
-              <div class="oauth-guide-note">
-                如果浏览器没有自动回到应用，可复制地址栏里的 localhost 回调地址继续。
-              </div>
-            </aside>
-            <div class="modal-form oauth-form">
-              <div v-if="oauthError" class="oauth-error">{{ oauthError }}</div>
-              <div v-else-if="oauthCallbackReceived" class="oauth-success">
-                回调已收到，正在写入账号；如果保存失败，可以点下方按钮重试。
-              </div>
-              <div class="oauth-primary-action">
-                <a-button
-                  type="primary"
-                  long
-                  size="large"
-                  :loading="oauthPreparing"
-                  @click="startOrOpenOAuthUrl"
-                >
-                  <template #icon><icon-globe /></template>
-                  {{ oauthUrl ? "继续打开授权页" : "生成并打开授权页" }}
-                </a-button>
-                <a-button v-if="oauthUrl" @click="copyOAuthUrl">
-                  <template #icon><icon-copy /></template>
-                  复制链接
-                </a-button>
-              </div>
-              <div class="oauth-link-block compact">
-                <label>当前授权地址</label>
-                <a-input v-model="oauthUrl" readonly placeholder="点击上方按钮后生成授权地址" />
-              </div>
-              <div class="oauth-manual-box">
-                <div>
-                  <strong>手动完成</strong>
-                  <span>浏览器未自动返回时，把 localhost 回调地址粘贴到这里。</span>
-                </div>
-                <div class="oauth-url-row">
-                  <a-input
-                    v-model="oauthCallbackInput"
-                    placeholder="http://localhost:1455/auth/callback?code=...&state=..."
-                  />
-                  <a-button
-                    type="primary"
-                    :loading="oauthCompleting"
-                    :disabled="!oauthLoginId"
-                    @click="handleOAuthCallbackSubmit"
-                  >
-                    <template #icon><icon-check /></template>
-                    {{ oauthCallbackReceived && !oauthCallbackInput.trim() ? "重试保存" : "完成接入" }}
-                  </a-button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </a-tab-pane>
-        <a-tab-pane key="token" title="Token / JSON">
-          <div class="modal-form">
-            <a-typography-paragraph>
-              粘贴 session JSON、auth.json、账号 JSON、accessToken 或 refresh_token。
-            </a-typography-paragraph>
-            <div class="local-import-actions">
-              <a-button type="primary" :loading="importing" @click="handleLocalImport">
-                <template #icon><icon-folder /></template>
-                获取本地账号
-              </a-button>
-              <a-button :loading="importing" @click="openFileImport">
-                <template #icon><icon-import /></template>
-                从本地文件导入
-              </a-button>
-              <input
-                ref="fileInput"
-                type="file"
-                accept=".json,application/json"
-                multiple
-                class="hidden-file-input"
-                @change="handleFileImport"
-              />
-            </div>
-            <a-textarea
-              v-model="tokenInput"
-              class="token-textarea"
-              :auto-size="{ minRows: 7, maxRows: 12 }"
-              placeholder='示例：{"tokens":{"access_token":"eyJ...","refresh_token":"rt_..."}}'
-            />
-            <div class="form-actions">
-              <a-button @click="addModalVisible = false">取消</a-button>
-              <a-button type="primary" :loading="importing" @click="handleTokenImport">
-                <template #icon><icon-import /></template>
-                导入
-              </a-button>
-            </div>
-          </div>
-        </a-tab-pane>
-        <a-tab-pane key="apikey" title="API Key">
-          <div class="modal-form">
-            <a-form :model="apiKeyForm" layout="vertical">
-              <a-form-item label="账号名称">
-                <a-input v-model="apiKeyForm.accountName" placeholder="例如：本地 codex 代理" />
-              </a-form-item>
-              <a-form-item label="供应商">
-                <a-input v-model="apiKeyForm.apiProviderName" placeholder="OpenAI Official" />
-              </a-form-item>
-              <a-form-item label="Base URL">
-                <a-input v-model="apiKeyForm.apiBaseUrl" placeholder="https://api.openai.com/v1" />
-              </a-form-item>
-              <a-form-item label="官网地址">
-                <a-input v-model="apiKeyForm.apiOfficialUrl" placeholder="https://platform.openai.com" />
-              </a-form-item>
-              <a-form-item label="API Key">
-                <a-input-password
-                  v-model="apiKeyForm.apiKey"
-                  autocomplete="new-password"
-                  placeholder="sk-..."
-                />
-              </a-form-item>
-              <a-form-item v-if="oauthAccounts.length" label="绑定已有 OAuth 账号">
-                <a-select
-                  v-model="apiKeyForm.boundOauthAccountId"
-                  allow-clear
-                  placeholder="可选：用于保留 Codex 会话身份"
-                >
-                  <a-option
-                    v-for="oauth in oauthAccounts"
-                    :key="oauth.id"
-                    :value="oauth.id"
-                  >
-                    {{ displayNameForUi(oauth) }}
-                  </a-option>
-                </a-select>
-              </a-form-item>
-            </a-form>
-            <div class="form-actions">
-              <a-button @click="addModalVisible = false">取消</a-button>
-              <a-button type="primary" :loading="savingApiKey" @click="handleApiKeyAdd">
-                <template #icon><icon-plus /></template>
-                添加
-              </a-button>
-            </div>
-          </div>
-        </a-tab-pane>
-      </a-tabs>
-    </a-modal>
+      :active-tab="addTab"
+      :oauth-url="oauthUrl"
+      :oauth-callback-input="oauthCallbackInput"
+      :oauth-login-id="oauthLoginId"
+      :oauth-preparing="oauthPreparing"
+      :oauth-completing="oauthCompleting"
+      :oauth-error="oauthError"
+      :oauth-callback-received="oauthCallbackReceived"
+      :token-input="tokenInput"
+      :importing="importing"
+      :saving-api-key="savingApiKey"
+      :api-key-form="apiKeyForm"
+      :oauth-accounts="oauthAccounts"
+      :display-name="displayNameForUi"
+      @update:active-tab="addTab = $event"
+      @update:oauth-callback-input="oauthCallbackInput = $event"
+      @update:token-input="tokenInput = $event"
+      @tab-change="handleAddTabChange"
+      @start-or-open-oauth="startOrOpenOAuthUrl"
+      @copy-oauth-url="copyOAuthUrl"
+      @submit-oauth-callback="handleOAuthCallbackSubmit"
+      @local-import="handleLocalImport"
+      @files-import="handleFileImport"
+      @token-import="handleTokenImport"
+      @api-key-add="handleApiKeyAdd"
+    />
 
-    <a-modal
+    <EditAccountModal
       v-model:visible="editVisible"
       :title="editTitle"
-      :footer="false"
-      width="760px"
-    >
-      <div class="modal-form">
-        <a-tabs v-model:active-key="editTab">
-          <a-tab-pane key="form" title="表单">
-            <a-form :model="editForm" layout="vertical">
-              <a-form-item label="账号名称">
-                <a-input v-model="editForm.accountName" placeholder="例如：主力账号" />
-              </a-form-item>
-              <a-form-item v-if="editingAccount && isApiKeyAccount(editingAccount)" label="供应商">
-                <a-input v-model="editForm.apiProviderName" placeholder="OpenAI Official" />
-              </a-form-item>
-              <a-form-item v-if="editingAccount && isApiKeyAccount(editingAccount)" label="Base URL">
-                <a-input v-model="editForm.apiBaseUrl" placeholder="https://api.openai.com/v1" />
-              </a-form-item>
-              <a-form-item v-if="editingAccount && isApiKeyAccount(editingAccount)" label="官网地址">
-                <a-input v-model="editForm.apiOfficialUrl" placeholder="https://platform.openai.com" />
-              </a-form-item>
-              <a-form-item v-if="editingAccount && isApiKeyAccount(editingAccount)" label="API Key">
-                <a-input-password
-                  v-model="editForm.apiKey"
-                  autocomplete="new-password"
-                  placeholder="sk-..."
-                />
-              </a-form-item>
-            </a-form>
-          </a-tab-pane>
-          <a-tab-pane key="json" title="JSON">
-            <a-textarea
-              v-model="editJsonText"
-              class="token-textarea json-edit-area"
-              :auto-size="{ minRows: 12, maxRows: 20 }"
-            />
-          </a-tab-pane>
-        </a-tabs>
-        <div class="form-actions">
-          <a-button @click="editVisible = false">取消</a-button>
-          <a-button type="primary" :loading="editing" @click="handleEditSave">
-            <template #icon><icon-save /></template>
-            保存
-          </a-button>
-        </div>
-      </div>
-    </a-modal>
+      :active-tab="editTab"
+      :editing-account="editingAccount"
+      :edit-form="editForm"
+      :edit-json-text="editJsonText"
+      :editing="editing"
+      :is-api-key-account="isApiKeyAccount"
+      @update:active-tab="editTab = $event"
+      @update:edit-json-text="editJsonText = $event"
+      @save="handleEditSave"
+    />
 
-    <a-modal
+    <ExportJsonModal
       v-model:visible="exportVisible"
-      title="导出 JSON"
-      :footer="false"
-      width="760px"
-    >
-      <div class="modal-form">
-        <div class="export-toolbar">
-          <div class="export-format">
-            <span>导出格式</span>
-            <a-select
-              v-model="exportFormat"
-              size="large"
-              @change="refreshExportText"
-            >
-              <a-option
-                v-for="option in exportFormatOptions"
-                :key="option.value"
-                :value="option.value"
-              >
-                {{ option.label }}
-              </a-option>
-            </a-select>
-          </div>
-          <div>
-            <a-button @click="exportPreviewVisible = !exportPreviewVisible">
-              <template #icon><icon-eye /></template>
-              {{ exportPreviewVisible ? "隐藏预览" : "预览" }}
-            </a-button>
-            <a-button @click="copyExportText">
-              <template #icon><icon-copy /></template>
-              复制
-            </a-button>
-            <a-button type="primary" @click="downloadExportText">
-              <template #icon><icon-download /></template>
-              下载
-            </a-button>
-          </div>
-        </div>
-        <a-textarea
-          :model-value="exportPreviewVisible ? exportText : exportJsonSummary(exportText)"
-          class="token-textarea export-json-viewer"
-          :class="{ collapsed: !exportPreviewVisible }"
-          readonly
-          :auto-size="exportPreviewVisible ? { minRows: 14, maxRows: 24 } : { minRows: 12, maxRows: 12 }"
-        />
-      </div>
-    </a-modal>
+      :title="t('导出 JSON')"
+      :export-format="exportFormat"
+      :export-format-options="exportFormatOptions"
+      :preview-visible="exportPreviewVisible"
+      :text="exportText"
+      :summary="exportJsonSummary(exportText)"
+      @update:export-format="exportFormat = $event"
+      @update:preview-visible="exportPreviewVisible = $event"
+      @format-change="refreshExportText"
+      @copy="copyExportText"
+      @download="downloadExportText"
+    />
 
-    <a-modal
+    <ExportJsonModal
       v-model:visible="batchExportVisible"
-      title="批量导出 JSON"
-      :footer="false"
+      :title="t('批量导出 JSON')"
+      :export-format="exportFormat"
+      :export-format-options="exportFormatOptions"
+      :preview-visible="batchExportPreviewVisible"
+      :text="batchExportText"
+      :summary="exportJsonSummary(batchExportText)"
       width="820px"
-    >
-      <div class="modal-form">
-        <div class="export-toolbar">
-          <div class="export-format">
-            <span>导出格式</span>
-            <a-select
-              v-model="exportFormat"
-              size="large"
-              @change="refreshBatchExportText"
-            >
-              <a-option
-                v-for="option in exportFormatOptions"
-                :key="option.value"
-                :value="option.value"
-              >
-                {{ option.label }}
-              </a-option>
-            </a-select>
-          </div>
-          <div>
-            <a-button @click="batchExportPreviewVisible = !batchExportPreviewVisible">
-              <template #icon><icon-eye /></template>
-              {{ batchExportPreviewVisible ? "隐藏预览" : "预览" }}
-            </a-button>
-            <a-button type="primary" @click="copyBatchExportText">
-              <template #icon><icon-copy /></template>
-              复制
-            </a-button>
-            <a-button type="primary" @click="downloadBatchExportText">
-              <template #icon><icon-download /></template>
-              下载
-            </a-button>
-          </div>
-        </div>
-        <a-textarea
-          :model-value="batchExportPreviewVisible ? batchExportText : exportJsonSummary(batchExportText)"
-          class="token-textarea export-json-viewer"
-          :class="{ collapsed: !batchExportPreviewVisible }"
-          readonly
-          :auto-size="batchExportPreviewVisible ? { minRows: 14, maxRows: 24 } : { minRows: 12, maxRows: 12 }"
-        />
-      </div>
-    </a-modal>
+      @update:export-format="exportFormat = $event"
+      @update:preview-visible="batchExportPreviewVisible = $event"
+      @format-change="refreshBatchExportText"
+      @copy="copyBatchExportText"
+      @download="downloadBatchExportText"
+    />
 
-    <a-modal
+    <PhoneModal
       v-model:visible="phoneVisible"
-      title="绑定手机"
-      :footer="false"
-      width="560px"
-    >
-      <div class="modal-form">
-        <a-typography-paragraph v-if="phoneAccount">
-          给 {{ displayNameForUi(phoneAccount) }} 保存一个绑定手机号，后续会直接显示在账号卡片上。
-        </a-typography-paragraph>
-        <a-form :model="phoneForm" layout="vertical">
-          <a-form-item label="手机号">
-            <a-input v-model="phoneForm.phone" placeholder="+1 (724) 806-2018" />
-          </a-form-item>
-        </a-form>
-        <div class="form-actions">
-          <a-button @click="phoneVisible = false">取消</a-button>
-          <a-button type="primary" :loading="savingPhone" @click="handlePhoneSave">
-            <template #icon><icon-save /></template>
-            保存
-          </a-button>
-        </div>
-      </div>
-    </a-modal>
+      :account="phoneAccount"
+      :phone-form="phoneForm"
+      :saving="savingPhone"
+      :display-name="displayNameForUi"
+      @save="handlePhoneSave"
+    />
 
-    <a-modal
+    <OAuthBindingModal
       v-model:visible="bindingVisible"
-      :title="t('绑定 OAuth 账号')"
-      :footer="false"
-      width="840px"
-    >
-      <div class="modal-form">
-        <a-typography-paragraph>
-          {{ t("API Key 账号绑定 OAuth 后，切换时会同时写入 OAuth Token 与 API Key 配置，便于修复会话身份。") }}
-        </a-typography-paragraph>
-        <div class="oauth-bind-list">
-          <button
-            type="button"
-            class="oauth-bind-card unlink"
-            :class="{ selected: !bindingForm.boundOauthAccountId }"
-            @click="bindingForm.boundOauthAccountId = ''"
-          >
-            <span class="oauth-bind-check">
-              <icon-check v-if="!bindingForm.boundOauthAccountId" />
-            </span>
-            <div class="oauth-bind-option-title">
-              <strong>{{ t("不绑定 OAuth") }}</strong>
-              <span>{{ t("切换时仅写入 API Key 配置") }}</span>
-            </div>
-          </button>
+      :binding-form="bindingForm"
+      :saving="savingBinding"
+      :oauth-accounts="oauthAccounts"
+      :display-name="displayNameForUi"
+      :is-free-plan-account="isFreePlanAccount"
+      :quota-color="quotaColor"
+      :quota-window-label="quotaWindowLabel"
+      :quota-reset-label="quotaResetLabel"
+      :plan-label="planLabel"
+      :plan-class="planClass"
+      @save="handleBindingSave"
+    />
 
-          <button
-            v-for="oauth in oauthAccounts"
-            :key="oauth.id"
-            type="button"
-            class="oauth-bind-card"
-            :class="{ selected: bindingForm.boundOauthAccountId === oauth.id }"
-            @click="bindingForm.boundOauthAccountId = oauth.id"
-          >
-            <span class="oauth-bind-check">
-              <icon-check v-if="bindingForm.boundOauthAccountId === oauth.id" />
-            </span>
-            <div class="oauth-bind-option">
-              <div class="oauth-bind-option-head">
-                <div class="oauth-bind-option-title">
-                  <strong>{{ displayNameForUi(oauth) }}</strong>
-                  <span>OAuth · {{ oauth.email || oauth.id }}</span>
-                </div>
-                <PlanBadge :label="planLabel(oauth)" :badge-class="planClass(oauth)" />
-              </div>
-              <div v-if="oauth.quota" class="oauth-bind-quota">
-                <div v-if="oauth.quota.hourly_window_present !== false">
-                  <span>
-                    <icon-calendar v-if="isFreePlanAccount(oauth)" />
-                    <icon-clock-circle v-else />
-                    {{ isFreePlanAccount(oauth) ? t("长周期") : t("短周期") }}
-                  </span>
-                  <strong :style="{ color: quotaColor(oauth.quota.hourly_percentage) }">
-                    {{ oauth.quota.hourly_percentage }}%
-                  </strong>
-                  <small>{{ quotaWindowLabel(oauth.quota.hourly_window_minutes, '5 小时窗口') }}</small>
-                  <em>{{ quotaResetLabel(oauth.quota.hourly_reset_time) }}</em>
-                </div>
-                <div
-                  v-if="!isFreePlanAccount(oauth) && oauth.quota.weekly_window_present !== false"
-                >
-                  <span><icon-calendar /> {{ t("长周期") }}</span>
-                  <strong :style="{ color: quotaColor(oauth.quota.weekly_percentage) }">
-                    {{ oauth.quota.weekly_percentage }}%
-                  </strong>
-                  <small>{{ quotaWindowLabel(oauth.quota.weekly_window_minutes, '7 天窗口') }}</small>
-                  <em>{{ quotaResetLabel(oauth.quota.weekly_reset_time) }}</em>
-                </div>
-              </div>
-              <div v-else-if="oauth.quota_error" class="oauth-bind-quota-error">
-                {{ oauth.quota_error.message }}
-              </div>
-            </div>
-          </button>
-          <a-empty v-if="!oauthAccounts.length" :description="t('暂无可绑定的 OAuth 账号')" />
-        </div>
-        <div class="form-actions">
-          <a-button @click="bindingVisible = false">{{ t("取消") }}</a-button>
-          <a-button type="primary" :loading="savingBinding" @click="handleBindingSave">
-            <template #icon><icon-save /></template>
-            {{ t("保存") }}
-          </a-button>
-        </div>
-      </div>
-    </a-modal>
-
-    <a-modal
+    <ResetCreditModal
       v-model:visible="resetCreditVisible"
-      :title="t('选择重置次数')"
-      :footer="false"
-      width="680px"
-      modal-class="reset-credit-modal"
-    >
-      <div v-if="resetCreditAccount" class="reset-credit-modal-body">
-        <div class="reset-credit-modal-head">
-          <div>
-            <span class="modal-eyebrow">Reset Credit</span>
-            <h3>{{ t("选择要消耗的重置次数") }}</h3>
-            <p>
-              {{ displayNameForUi(resetCreditAccount) }} {{ t("当前有") }}
-              {{ formatLocalizedCount(resetCreditCount(resetCreditAccount), "次") }} {{ t("可用重置次数") }}。
-            </p>
-          </div>
-          <div class="reset-credit-modal-count">
-            <strong>{{ resetCreditCount(resetCreditAccount) }}</strong>
-            <span>{{ t("次可用") }}</span>
-          </div>
-        </div>
+      :account="resetCreditAccount"
+      :records="resetCreditRecordsForModal"
+      :selected-index="selectedResetCreditIndex"
+      :selected-credit="selectedResetCredit"
+      :quota-refreshing-id="quotaRefreshingId"
+      :display-name="displayNameForUi"
+      :reset-credit-count="resetCreditCount"
+      :is-available-reset-credit="isAvailableResetCredit"
+      :reset-credit-status-key="resetCreditStatusKey"
+      :reset-credit-status-label="resetCreditStatusLabel"
+      :format-reset-credit-date="formatResetCreditDate"
+      @update:selected-index="selectedResetCreditIndex = $event"
+      @consume="handleConsumeSelectedResetCredit"
+    />
 
-        <div v-if="resetCreditRecordsForModal.length" class="reset-credit-choice-list">
-          <button
-            v-for="(credit, index) in resetCreditRecordsForModal"
-            :key="credit.id || `${resetCreditAccount.id}-modal-credit-${index}`"
-            class="reset-credit-choice"
-            :class="{
-              selected: selectedResetCreditIndex === index,
-              disabled: !isAvailableResetCredit(credit),
-            }"
-            type="button"
-            :disabled="!isAvailableResetCredit(credit)"
-            @click="selectedResetCreditIndex = index"
-          >
-            <span class="reset-credit-choice-status" :class="`is-${resetCreditStatusKey(credit)}`">
-              {{ resetCreditStatusLabel(credit) }}
-            </span>
-            <span class="reset-credit-choice-main">
-              <strong>{{ t(`第 ${index + 1} 次`) }}</strong>
-              <small>{{ t("发放") }} {{ formatResetCreditDate(credit.granted_at) }}</small>
-            </span>
-            <span class="reset-credit-choice-time">
-              {{ t("可用至") }} {{ formatResetCreditDate(credit.expires_at) }}
-            </span>
-          </button>
-        </div>
-        <a-empty v-else :description="t('暂无重置次数明细，请先刷新额度')" />
-
-        <div class="reset-credit-modal-actions">
-          <a-button @click="resetCreditVisible = false">{{ t("取消") }}</a-button>
-          <a-button
-            type="primary"
-            status="warning"
-            :loading="quotaRefreshingId === resetCreditAccount.id"
-            :disabled="!selectedResetCredit || !isAvailableResetCredit(selectedResetCredit)"
-            @click="handleConsumeSelectedResetCredit"
-          >
-            <template #icon><icon-thunderbolt /></template>
-            {{ t("重置使用次数") }}
-          </a-button>
-        </div>
-      </div>
-    </a-modal>
-
-    <a-modal
+    <SessionRepairModal
       v-model:visible="repairVisible"
-      title="找回会话显示"
-      :footer="false"
-      width="900px"
-      modal-class="repair-modal"
-    >
-      <div class="repair-body">
-        <div class="repair-hero">
-          <div>
-            <span class="modal-eyebrow">Session Recovery</span>
-            <h3>把切号后消失的会话重新挂回列表</h3>
-            <p>
-              会同步整理 Codex 本地索引与状态库，让侧边栏重新识别已有会话；适合 OAuth 和 API Key 之间切换后使用。
-            </p>
-          </div>
-          <div class="repair-summary-card">
-            <strong>{{ selectedSessionIdList.length || sessions.length }}</strong>
-            <span>{{ selectedSessionIdList.length ? "条已选会话" : "条可处理会话" }}</span>
-          </div>
-        </div>
-
-        <div class="repair-section repair-section-inline">
-          <div class="repair-section-copy">
-            <span class="repair-section-title">处理强度</span>
-            <small>优先使用轻量模式；仍然看不到再切到完整重建。</small>
-          </div>
-          <div class="repair-card-grid">
-            <button
-              class="repair-option-card"
-              :class="{ selected: repairMode === 'quick' }"
-              type="button"
-              @click="repairMode = 'quick'"
-            >
-              <strong>轻量同步</strong>
-              <small>更新状态库并补齐缺失记录，速度更快。</small>
-            </button>
-            <button
-              class="repair-option-card"
-              :class="{ selected: repairMode === 'deep' }"
-              type="button"
-              @click="repairMode = 'deep'"
-            >
-              <strong>完整重建</strong>
-              <small>额外重写 session_index，适合普通同步无效时。</small>
-            </button>
-          </div>
-        </div>
-
-        <div class="repair-control-panel">
-          <div class="repair-section">
-            <span class="repair-section-title">Codex 实例</span>
-            <a-select v-model="repairTargetInstanceId" placeholder="默认实例">
-              <a-option
-                v-for="instance in repairInstances"
-                :key="instance.id"
-                :value="instance.id"
-              >
-                {{ instance.name }} · {{ instance.currentProvider }}
-              </a-option>
-            </a-select>
-          </div>
-          <div class="repair-section">
-            <span class="repair-section-title">实例覆盖</span>
-            <div class="repair-segmented">
-              <button
-                :class="{ selected: repairInstanceScope === 'target' }"
-                type="button"
-                @click="repairInstanceScope = 'target'"
-              >
-                当前实例
-              </button>
-              <button
-                :class="{ selected: repairInstanceScope === 'all' }"
-                type="button"
-                @click="repairInstanceScope = 'all'"
-              >
-                本机全部
-              </button>
-            </div>
-          </div>
-          <div class="repair-section">
-            <span class="repair-section-title">会话覆盖</span>
-            <div class="repair-segmented">
-              <button
-                :class="{ selected: effectiveRepairSessionScope === 'all' }"
-                type="button"
-                @click="repairSessionScope = 'all'"
-              >
-                全部 {{ sessions.length }}
-              </button>
-              <button
-                :class="{ selected: effectiveRepairSessionScope === 'selected' }"
-                :disabled="!selectedSessionIdList.length"
-                type="button"
-                @click="repairSessionScope = 'selected'"
-              >
-                已选 {{ selectedSessionIdList.length }}
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <div v-if="repairResult" class="repair-result">
-          <strong>{{ repairResult.message }}</strong>
-          <span v-if="repairResult.changedRolloutFileCount !== undefined">
-            会话文件 {{ repairResult.changedRolloutFileCount }} 个
-          </span>
-          <span>SQLite {{ repairResult.updatedSqliteRowCount ?? repairResult.repaired }} 条</span>
-          <span v-if="repairResult.updatedSqliteTimestampRowCount">
-            时间记录 {{ repairResult.updatedSqliteTimestampRowCount }} 条
-          </span>
-          <span v-if="repairResult.addedSessionIndexEntryCount">
-            session_index {{ repairResult.addedSessionIndexEntryCount }} 条
-          </span>
-        </div>
-
-        <div class="form-actions">
-          <a-button @click="repairVisible = false">关闭</a-button>
-          <a-button type="primary" :loading="sessionRepairing" @click="runRepairSessions">
-            <template #icon><icon-refresh /></template>
-            立即找回
-          </a-button>
-        </div>
-      </div>
-    </a-modal>
+      v-model:repair-mode="repairMode"
+      v-model:repair-target-instance-id="repairTargetInstanceId"
+      v-model:repair-instance-scope="repairInstanceScope"
+      v-model:repair-session-scope="repairSessionScope"
+      :selected-count="selectedSessionIdList.length"
+      :total-count="sessions.length"
+      :repair-instances="repairInstances"
+      :effective-repair-session-scope="effectiveRepairSessionScope"
+      :repair-result="repairResult"
+      :session-repairing="sessionRepairing"
+      @run="runRepairSessions"
+    />
   </main>
 </template>

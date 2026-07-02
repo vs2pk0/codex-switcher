@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { addCodexAccountWithApiKey, openExternalUrl, type CodexSwitcherSettings } from "../services/codex";
+import { t } from "../i18n";
 import type { CodexAccount } from "../types/codex";
 import PlanBadge from "./PlanBadge.vue";
 import {
@@ -96,17 +97,17 @@ const progressDetail = computed(() => {
   if (!progress.value) return "";
   const total = progress.value.totalBytes || 0;
   const downloaded = progress.value.downloadedBytes || 0;
-  if (progress.value.status === "installing") return "安装中";
+  if (progress.value.status === "installing") return t("安装中");
   if (progress.value.status === "done") return "100%";
-  if (progress.value.status === "failed") return "失败";
-  if (progress.value.status === "cancelled") return "已取消";
-  if (!total) return downloaded > 0 ? `${formatBytes(downloaded)} · 正在下载` : "准备中";
+  if (progress.value.status === "failed") return t("失败");
+  if (progress.value.status === "cancelled") return t("已取消");
+  if (!total) return downloaded > 0 ? `${formatBytes(downloaded)} · ${t("正在下载")}` : t("准备中");
   return `${formatBytes(downloaded)} / ${formatBytes(total)}`;
 });
 const serviceStatusText = computed(() => {
-  if (running.value) return `运行中 · PID ${state.value?.service.pid || "--"}`;
-  if (serviceReady.value) return "已安装，当前未启动";
-  return "未安装，首次开启时会下载服务";
+  if (running.value) return `${t("运行中")} · PID ${state.value?.service.pid || "--"}`;
+  if (serviceReady.value) return t("已安装，当前未启动");
+  return t("未安装，首次开启时会下载服务");
 });
 const apiBaseUrl = computed(() => `http://127.0.0.1:${form.port || 17877}/v1`);
 const firstApiKey = computed(() => form.apiKeys.find((key) => key.trim())?.trim() || "");
@@ -386,9 +387,9 @@ function isFreePlanAccount(account: CodexAccount): boolean {
 
 function quotaWindowLabel(minutes?: number, fallback = "5 小时窗口"): string {
   if (!minutes || !Number.isFinite(minutes)) return fallback;
-  if (minutes % (60 * 24) === 0) return `${minutes / 60 / 24} 天窗口`;
-  if (minutes % 60 === 0) return `${minutes / 60} 小时窗口`;
-  return `${minutes} 分钟窗口`;
+  if (minutes % (60 * 24) === 0) return t(`${minutes / 60 / 24} 天窗口`);
+  if (minutes % 60 === 0) return t(`${minutes / 60} 小时窗口`);
+  return t(`${minutes} 分钟窗口`);
 }
 
 function quotaColor(value?: number): string {
@@ -420,11 +421,11 @@ function quotaResetLeftLabel(value?: string | number): string {
 
 function quotaResetDateLabel(value?: string | number): string {
   const date = normalizeDate(value);
-  if (!date) return "等待刷新";
+  if (!date) return t("等待刷新");
   const pad = (input: number) => String(input).padStart(2, "0");
-  return `更新 ${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(
+  return t(`更新 ${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(
     date.getHours(),
-  )}:${pad(date.getMinutes())}`;
+  )}:${pad(date.getMinutes())}`);
 }
 
 function openBindAccounts(): void {
@@ -685,7 +686,7 @@ function formatBytes(bytes?: number | null): string {
 }
 
 function formatTime(seconds?: number | null): string {
-  if (!seconds) return "未检测";
+  if (!seconds) return t("未检测");
   return new Intl.DateTimeFormat("zh-CN", {
     year: "numeric",
     month: "2-digit",
@@ -732,25 +733,25 @@ onUnmounted(() => {
           <a-card :bordered="false" class="api-service-hero">
             <div class="api-service-hero-top">
               <div>
-                <h2>API 服务</h2>
-                <p>按需下载并运行 CLIProxyAPI，本地服务文件保存在 .codex_switcher。</p>
+                <h2>{{ t("API 服务") }}</h2>
+                <p>{{ t("按需下载并运行 CLIProxyAPI，本地服务文件保存在 .codex_switcher。") }}</p>
               </div>
               <a-tag :color="running ? 'green' : serviceReady ? 'arcoblue' : 'gray'">
-                {{ running ? "运行中" : serviceReady ? "已安装" : "未安装" }}
+                {{ running ? t("运行中") : serviceReady ? t("已安装") : t("未安装") }}
               </a-tag>
             </div>
 
             <div class="api-service-status">
               <div>
-                <span>服务状态</span>
+                <span>{{ t("服务状态") }}</span>
                 <strong>{{ serviceStatusText }}</strong>
               </div>
               <div>
-                <span>当前版本</span>
-                <strong>{{ currentRuntime?.version || "未安装" }}</strong>
+                <span>{{ t("当前版本") }}</span>
+                <strong>{{ currentRuntime?.version || t("未安装") }}</strong>
               </div>
               <div>
-                <span>访问地址</span>
+                <span>{{ t("访问地址") }}</span>
                 <button
                   class="api-service-url-button"
                   type="button"
@@ -766,14 +767,14 @@ onUnmounted(() => {
 
             <div v-if="progress" class="api-service-progress">
               <div>
-                <strong>{{ progress.message || (downloading ? "正在处理服务包" : "下载状态") }}</strong>
+                <strong>{{ progress.message || (downloading ? t("正在处理服务包") : t("下载状态")) }}</strong>
                 <span>
                   {{ progress.assetName || "CLIProxyAPI" }}
                   · {{ progressDetail }}
                 </span>
               </div>
               <a-progress :percent="progressPercent" :status="progressStatus" />
-              <a-button v-if="downloading" size="small" @click="cancelDownload">取消下载</a-button>
+              <a-button v-if="downloading" size="small" @click="cancelDownload">{{ t("取消下载") }}</a-button>
             </div>
 
             <div class="api-service-actions">
@@ -785,7 +786,7 @@ onUnmounted(() => {
                 @click="addToAccountOverview"
               >
                 <template #icon><icon-plus /></template>
-                添加到账号总览
+                {{ t("添加到账号总览") }}
               </a-button>
               <a-button
                 v-if="!running"
@@ -794,15 +795,15 @@ onUnmounted(() => {
                 @click="start"
               >
                 <template #icon><icon-play-arrow /></template>
-                {{ serviceReady ? "开启服务" : "下载并开启" }}
+                {{ serviceReady ? t("开启服务") : t("下载并开启") }}
               </a-button>
               <a-button v-else status="danger" :loading="stopping" @click="stop">
                 <template #icon><icon-pause /></template>
-                停止服务
+                {{ t("停止服务") }}
               </a-button>
               <a-button :loading="checking" @click="checkUpdate">
                 <template #icon><icon-refresh /></template>
-                检测更新
+                {{ t("检测更新") }}
               </a-button>
               <a-button
                 type="primary"
@@ -812,7 +813,7 @@ onUnmounted(() => {
                 @click="downloadUpdate"
               >
                 <template #icon><icon-download /></template>
-                下载更新
+                {{ t("下载更新") }}
               </a-button>
               <a-button
                 html-type="button"
@@ -822,55 +823,55 @@ onUnmounted(() => {
                 @click.stop="resetService"
               >
                 <template #icon><icon-delete /></template>
-                重置服务
+                {{ t("重置服务") }}
               </a-button>
               <a-button :disabled="!serviceReady" @click="openBindAccounts">
                 <template #icon><icon-link /></template>
-                绑定账号
+                {{ t("绑定账号") }}
               </a-button>
               <a-button :disabled="!serviceReady" @click="openDeleteAccounts">
                 <template #icon><icon-delete /></template>
-                删除账号
+                {{ t("删除账号") }}
               </a-button>
             </div>
           </a-card>
 
-          <a-card v-if="serviceReady" title="服务配置" :bordered="false" class="api-service-card">
+          <a-card v-if="serviceReady" :title="t('服务配置')" :bordered="false" class="api-service-card">
             <a-form :model="form" layout="vertical">
               <div class="api-service-form-grid">
-                <a-form-item label="端口">
+                <a-form-item :label="t('端口')">
                   <a-input-number v-model="form.port" :min="1" :max="65535" mode="button" />
                 </a-form-item>
-                <a-form-item label="管理密钥">
+                <a-form-item :label="t('管理密钥')">
                   <a-input-password v-model="form.managementKey" allow-clear />
                 </a-form-item>
-                <a-form-item label="自动更新">
+                <a-form-item :label="t('自动更新')">
                   <a-switch v-model="form.autoUpdate" />
                 </a-form-item>
-                <a-form-item label="检测间隔">
+                <a-form-item :label="t('检测间隔')">
                   <a-input-number
                     v-model="form.autoUpdateIntervalHours"
                     :min="1"
                     :max="720"
                     mode="button"
                   >
-                    <template #suffix>小时</template>
+                    <template #suffix>{{ t("小时") }}</template>
                   </a-input-number>
                 </a-form-item>
               </div>
               <div class="api-service-key-head">
                 <div>
-                  <strong>API 密钥</strong>
-                  <span>默认使用第一个密钥添加账号，调用地址：{{ apiBaseUrl }}</span>
+                  <strong>{{ t("API 密钥") }}</strong>
+                  <span>{{ t("默认使用第一个密钥添加账号，调用地址：") }}{{ apiBaseUrl }}</span>
                 </div>
                 <div>
                   <a-button size="small" @click="regenerateApiKeys">
                     <template #icon><icon-refresh /></template>
-                    随机重生成
+                    {{ t("随机重生成") }}
                   </a-button>
                   <a-button size="small" type="primary" @click="addApiKey">
                     <template #icon><icon-plus /></template>
-                    添加密钥
+                    {{ t("添加密钥") }}
                   </a-button>
                 </div>
               </div>
@@ -881,7 +882,7 @@ onUnmounted(() => {
                     v-model="form.apiKeys[index]"
                     class="api-service-key-input"
                     :type="isApiKeyVisible(index) ? 'text' : 'password'"
-                    placeholder="请输入 API 密钥"
+                    :placeholder="t('请输入 API 密钥')"
                   />
                   <a-button
                     class="api-service-key-visibility"
@@ -905,51 +906,51 @@ onUnmounted(() => {
                 </div>
               </div>
               <a-button type="primary" :loading="saving" :disabled="running" @click="saveSettings">
-                保存配置
+                {{ t("保存配置") }}
               </a-button>
-              <p v-if="running" class="api-service-note">服务运行中不能修改端口或密钥，请先停止服务。</p>
+              <p v-if="running" class="api-service-note">{{ t("服务运行中不能修改端口或密钥，请先停止服务。") }}</p>
             </a-form>
           </a-card>
         </div>
 
         <aside class="api-service-side">
-          <a-card title="更新信息" :bordered="false" class="api-service-card">
+          <a-card :title="t('更新信息')" :bordered="false" class="api-service-card">
             <div class="api-service-info-list">
               <div>
-                <span>最新版本</span>
-                <strong>{{ updateInfo?.latestVersion || "未检测" }}</strong>
+                <span>{{ t("最新版本") }}</span>
+                <strong>{{ updateInfo?.latestVersion || t("未检测") }}</strong>
               </div>
               <div>
-                <span>匹配平台</span>
+                <span>{{ t("匹配平台") }}</span>
                 <strong>{{ updateInfo?.target || currentRuntime?.target || "--" }}</strong>
               </div>
               <div>
-                <span>上次检测</span>
+                <span>{{ t("上次检测") }}</span>
                 <strong>{{ formatTime(state?.settings.lastUpdateCheckAt) }}</strong>
               </div>
             </div>
           </a-card>
 
-          <a-card title="本地目录" :bordered="false" class="api-service-card">
+          <a-card :title="t('本地目录')" :bordered="false" class="api-service-card">
             <div class="api-service-paths">
               <div>
-                <span>服务目录</span>
+                <span>{{ t("服务目录") }}</span>
                 <code>{{ state?.baseDir || "~/.codex_switcher/api-service" }}</code>
               </div>
               <div>
-                <span>运行时</span>
+                <span>{{ t("运行时") }}</span>
                 <code>{{ state?.runtimeDir || "--" }}</code>
               </div>
               <div>
-                <span>工作区</span>
+                <span>{{ t("工作区") }}</span>
                 <code>{{ state?.workspaceDir || "--" }}</code>
               </div>
               <div>
-                <span>配置文件</span>
+                <span>{{ t("配置文件") }}</span>
                 <code>{{ state?.configPath || "--" }}</code>
               </div>
               <div>
-                <span>认证目录</span>
+                <span>{{ t("认证目录") }}</span>
                 <code>{{ state?.authDir || "--" }}</code>
               </div>
             </div>
@@ -960,21 +961,21 @@ onUnmounted(() => {
 
     <a-modal
       v-model:visible="bindVisible"
-      title="绑定账号到 API 服务"
+      :title="t('绑定账号到 API 服务')"
       width="760px"
       :footer="false"
     >
       <div class="api-service-account-modal">
-        <p>选择 OAuth 账号后会转换为 CPA 格式，并写入 API 服务的认证目录。</p>
+        <p>{{ t("选择 OAuth 账号后会转换为 CPA 格式，并写入 API 服务的认证目录。") }}</p>
         <div v-if="oauthAccounts.length" class="api-service-account-select-all">
           <a-checkbox
             :model-value="allBindSelected"
             :indeterminate="bindSelectionIndeterminate"
             @change="(checked) => toggleAllBindAccounts(Boolean(checked))"
           >
-            全选
+            {{ t("全选") }}
           </a-checkbox>
-          <span>已选 {{ selectedBindCount }} / {{ oauthAccounts.length }}</span>
+          <span>{{ t("已选") }} {{ selectedBindCount }} / {{ oauthAccounts.length }}</span>
         </div>
         <div class="api-service-account-list">
           <label v-for="account in oauthAccounts" :key="account.id" class="api-service-account-row">
@@ -990,23 +991,23 @@ onUnmounted(() => {
                   <span>
                     <icon-calendar v-if="isFreePlanAccount(account)" />
                     <icon-clock-circle v-else />
-                    {{ isFreePlanAccount(account) ? "长周期" : "短周期" }}
+                    {{ isFreePlanAccount(account) ? t("长周期") : t("短周期") }}
                   </span>
                   <strong :style="{ color: quotaColor(account.quota.hourly_percentage) }">
                     {{ account.quota.hourly_percentage }}%
                   </strong>
-                  <small>{{ quotaWindowLabel(account.quota.hourly_window_minutes, '5 小时窗口') }}</small>
+                  <small>{{ quotaWindowLabel(account.quota.hourly_window_minutes, t('5 小时窗口')) }}</small>
                   <em>{{ quotaResetLeftLabel(account.quota.hourly_reset_time) }}</em>
                 </div>
                 <div
                   v-if="!isFreePlanAccount(account) && account.quota.weekly_window_present !== false"
                   class="api-service-quota-line"
                 >
-                  <span><icon-calendar /> 长周期</span>
+                  <span><icon-calendar /> {{ t("长周期") }}</span>
                   <strong :style="{ color: quotaColor(account.quota.weekly_percentage) }">
                     {{ account.quota.weekly_percentage }}%
                   </strong>
-                  <small>{{ quotaWindowLabel(account.quota.weekly_window_minutes, '7 天窗口') }}</small>
+                  <small>{{ quotaWindowLabel(account.quota.weekly_window_minutes, t('7 天窗口')) }}</small>
                   <em>{{ quotaResetLeftLabel(account.quota.weekly_reset_time) }}</em>
                 </div>
               </div>
@@ -1019,9 +1020,9 @@ onUnmounted(() => {
           <a-empty v-if="!oauthAccounts.length" description="暂无可绑定的 OAuth 账号" />
         </div>
         <div class="api-service-modal-actions">
-          <a-button @click="bindVisible = false">取消</a-button>
+          <a-button @click="bindVisible = false">{{ t("取消") }}</a-button>
           <a-button type="primary" :loading="bindingAccounts" @click="bindSelectedAccounts">
-            确认绑定
+            {{ t("确认绑定") }}
           </a-button>
         </div>
       </div>
@@ -1029,21 +1030,21 @@ onUnmounted(() => {
 
     <a-modal
       v-model:visible="deleteVisible"
-      title="删除 API 服务账号"
+      :title="t('删除 API 服务账号')"
       width="760px"
       :footer="false"
     >
       <div class="api-service-account-modal">
-        <p>这里从认证目录 JSON 内容解析邮箱匹配账号，删除会移除对应 CPA 认证文件。</p>
+        <p>{{ t("这里从认证目录 JSON 内容解析邮箱匹配账号，删除会移除对应 CPA 认证文件。") }}</p>
         <div v-if="boundAccounts.length" class="api-service-account-select-all">
           <a-checkbox
             :model-value="allDeleteSelected"
             :indeterminate="deleteSelectionIndeterminate"
             @change="(checked) => toggleAllDeleteAccounts(Boolean(checked))"
           >
-            全选
+            {{ t("全选") }}
           </a-checkbox>
-          <span>已选 {{ selectedDeleteCount }} / {{ boundAccounts.length }}</span>
+          <span>{{ t("已选") }} {{ selectedDeleteCount }} / {{ boundAccounts.length }}</span>
         </div>
         <div class="api-service-account-list">
           <label v-for="account in boundAccounts" :key="account.path" class="api-service-account-row">
@@ -1053,7 +1054,7 @@ onUnmounted(() => {
             />
             <div class="api-service-account-main">
               <strong>{{ account.email }}</strong>
-              <span>CPA 认证账号</span>
+              <span>{{ t("CPA 认证账号") }}</span>
               <template v-if="boundSourceAccount(account)?.quota">
                 <div class="api-service-account-quota">
                   <div
@@ -1063,23 +1064,23 @@ onUnmounted(() => {
                     <span>
                       <icon-calendar v-if="isFreePlanAccount(boundSourceAccount(account)!)" />
                       <icon-clock-circle v-else />
-                      {{ isFreePlanAccount(boundSourceAccount(account)!) ? "长周期" : "短周期" }}
+                      {{ isFreePlanAccount(boundSourceAccount(account)!) ? t("长周期") : t("短周期") }}
                     </span>
                     <strong :style="{ color: quotaColor(boundSourceAccount(account)!.quota!.hourly_percentage) }">
                       {{ boundSourceAccount(account)!.quota!.hourly_percentage }}%
                     </strong>
-                    <small>{{ quotaWindowLabel(boundSourceAccount(account)!.quota!.hourly_window_minutes, '5 小时窗口') }}</small>
+                    <small>{{ quotaWindowLabel(boundSourceAccount(account)!.quota!.hourly_window_minutes, t('5 小时窗口')) }}</small>
                     <em>{{ quotaResetLeftLabel(boundSourceAccount(account)!.quota!.hourly_reset_time) }}</em>
                   </div>
                   <div
                     v-if="!isFreePlanAccount(boundSourceAccount(account)!) && boundSourceAccount(account)!.quota!.weekly_window_present !== false"
                     class="api-service-quota-line"
                   >
-                    <span><icon-calendar /> 长周期</span>
+                    <span><icon-calendar /> {{ t("长周期") }}</span>
                     <strong :style="{ color: quotaColor(boundSourceAccount(account)!.quota!.weekly_percentage) }">
                       {{ boundSourceAccount(account)!.quota!.weekly_percentage }}%
                     </strong>
-                    <small>{{ quotaWindowLabel(boundSourceAccount(account)!.quota!.weekly_window_minutes, '7 天窗口') }}</small>
+                    <small>{{ quotaWindowLabel(boundSourceAccount(account)!.quota!.weekly_window_minutes, t('7 天窗口')) }}</small>
                     <em>{{ quotaResetLeftLabel(boundSourceAccount(account)!.quota!.weekly_reset_time) }}</em>
                   </div>
                 </div>
@@ -1093,9 +1094,9 @@ onUnmounted(() => {
           <a-empty v-if="!boundAccounts.length" description="认证目录里暂无账号" />
         </div>
         <div class="api-service-modal-actions">
-          <a-button @click="deleteVisible = false">取消</a-button>
+          <a-button @click="deleteVisible = false">{{ t("取消") }}</a-button>
           <a-button status="danger" :loading="deletingBoundAccounts" @click="deleteSelectedBoundAccounts">
-            确认删除
+            {{ t("确认删除") }}
           </a-button>
         </div>
       </div>
