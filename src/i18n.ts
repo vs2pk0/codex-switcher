@@ -1,4 +1,5 @@
 import { nextTick, ref, watch } from "vue";
+import type { WatchStopHandle } from "vue";
 import type { Message, Modal } from "@arco-design/web-vue";
 
 export type AppLanguage = "zh-CN" | "zh-TW" | "en" | "ru";
@@ -14,6 +15,7 @@ const textNodeSources = new WeakMap<Text, string>();
 const patchedMessages = new WeakSet<object>();
 const patchedModals = new WeakSet<object>();
 let observer: MutationObserver | null = null;
+let stopLanguageWatch: WatchStopHandle | null = null;
 let pendingTranslate = false;
 
 export const currentLanguage = ref<AppLanguage>(readStoredLanguage());
@@ -97,6 +99,8 @@ const en: Record<string, string> = {
   "打开备份目录": "Open Backup Directory",
   "恢复": "Restore",
   "删除": "Delete",
+  "开始恢复": "Start Restore",
+  "恢复完整备份": "Restore Full Backup",
   "还没有备份": "No backups yet",
   "点击“手动备份”会把账号、设置、统计缓存、费用规则与所有 Codex 会话记录打包成 ZIP。":
     "Click \"Manual Backup\" to package accounts, settings, statistics cache, pricing rules, and all Codex sessions into a ZIP.",
@@ -119,6 +123,15 @@ const en: Record<string, string> = {
   "导入": "Import",
   "添加": "Add",
   "编辑": "Edit",
+  "表单": "Form",
+  "JSON": "JSON",
+  "Base URL": "Base URL",
+  "API Key": "API Key",
+  "接入新账号": "Add Account",
+  "重新授权账号": "Reauthorize Account",
+  "编辑账号": "Edit Account",
+  "编辑 API Key": "Edit API Key",
+  "编辑 OAuth 账号": "Edit OAuth Account",
   "切换": "Switch",
   "置顶账号": "Pin account",
   "取消置顶": "Unpin account",
@@ -180,6 +193,8 @@ const en: Record<string, string> = {
   "每日": "Daily",
   "每周": "Weekly",
   "累计": "Total",
+  "时段": "Period",
+  "当日": "Day",
   "暂无活动数据": "No activity data",
   "调用流水": "Call Logs",
   "来源汇总": "Sources",
@@ -253,6 +268,11 @@ const en: Record<string, string> = {
   "重置服务": "Reset Service",
   "绑定账号": "Bind Accounts",
   "删除账号": "Delete Accounts",
+  "重置 API 服务": "Reset API Service",
+  "确认重置": "Confirm Reset",
+  "API 服务已开启": "API Service started",
+  "API 服务已停止": "API Service stopped",
+  "API 服务已重置": "API Service reset",
   "服务配置": "Service Config",
   "端口": "Port",
   "管理密钥": "Admin Key",
@@ -267,6 +287,7 @@ const en: Record<string, string> = {
   "安装中": "Installing",
   "失败": "Failed",
   "已取消": "Cancelled",
+  "未检测": "Not checked",
   "正在下载": "Downloading",
   "准备中": "Preparing",
   "已安装，当前未启动": "Installed, currently stopped",
@@ -277,6 +298,17 @@ const en: Record<string, string> = {
   "添加到账号总览": "Add to Accounts",
   "默认使用第一个密钥添加账号，调用地址：": "The first key is used by default when adding an account. Base URL: ",
   "请输入 API 密钥": "Enter an API key",
+  "请先添加一个 API 密钥": "Add an API key first",
+  "至少保留一个 API 密钥": "Keep at least one API key",
+  "API 服务配置已保存": "API service config saved",
+  "请先下载并开启 API 服务": "Download and start the API service first",
+  "本地 API 服务": "Local API Service",
+  "请选择要绑定的 OAuth 账号": "Select OAuth accounts to bind",
+  "请选择要删除的 API 服务账号": "Select API service accounts to delete",
+  "认证目录里暂无账号": "No accounts in the auth directory",
+  "API 服务已更新并重新启动": "API service updated and restarted",
+  "API 服务更新已安装": "API service update installed",
+  "下载已取消": "Download cancelled",
   "服务运行中不能修改端口或密钥，请先停止服务。":
     "Ports and keys cannot be changed while the service is running. Stop the service first.",
   "绑定账号到 API 服务": "Bind Accounts to API Service",
@@ -326,6 +358,11 @@ const en: Record<string, string> = {
   "配置文件": "Config File",
   "认证目录": "Auth Directory",
   "浏览器登录，自动带回授权结果": "Sign in with browser and return the authorization result automatically.",
+  "账号接入": "Account Setup",
+  "浏览器授权流程": "Browser Flow",
+  "选择一种方式，把账号接到 Codex Switcher": "Choose how to connect an account to Codex Switcher",
+  "推荐使用浏览器授权；如果已经有本地 token、JSON 或 API Key，也可以直接导入。":
+    "Browser authorization is recommended. Existing local token, JSON, or API Key data can also be imported directly.",
   "生成并打开授权页": "Generate and Open Auth Page",
   "继续打开授权页": "Open Auth Page Again",
   "复制链接": "Copy Link",
@@ -335,6 +372,9 @@ const en: Record<string, string> = {
   "从本地文件导入": "Import from local file",
   "获取本地账号": "Import local account",
   "账号名称": "Account Name",
+  "例如：主力账号": "e.g. Primary account",
+  "例如：本地 codex 代理": "e.g. Local Codex proxy",
+  "示例：": "Example: ",
   "供应商": "Provider",
   "导出 JSON": "Export JSON",
   "批量导出 JSON": "Batch Export JSON",
@@ -346,7 +386,18 @@ const en: Record<string, string> = {
   "恢复会话数据": "Restore Session Data",
   "只恢复会话": "Restore Sessions Only",
   "立即备份": "Backup Now",
+  "正在备份": "Backing Up",
+  "正在备份数据": "Backing Up Data",
+  "正在备份会话数据": "Backing Up Session Data",
+  "正在启动备份任务...": "Starting backup task...",
+  "正在备份...": "Backing up...",
+  "正在备份会话文件...": "Backing up session files...",
+  "正在恢复完整备份": "Restoring Full Backup",
+  "正在恢复会话数据": "Restoring Session Data",
+  "正在准备恢复账号、设置与会话数据...": "Preparing to restore accounts, settings, and sessions...",
+  "正在准备恢复 Codex 会话数据...": "Preparing to restore Codex session data...",
   "选择重置次数": "Choose Reset Credit",
+  "重置次数": "Reset Credit",
   "选择要消耗的重置次数": "Choose a reset credit to use",
   "当前有": "currently has",
   "次可用": "available",
@@ -354,6 +405,7 @@ const en: Record<string, string> = {
   "暂无重置次数明细，请先刷新额度": "No reset credit details. Refresh quota first.",
   "重置使用次数": "Use Reset Credit",
   "找回会话显示": "Recover Session Visibility",
+  "会话恢复": "Session Recovery",
   "立即找回": "Recover Now",
   "轻量同步": "Light Sync",
   "完整重建": "Full Rebuild",
@@ -490,6 +542,8 @@ const ru: Record<string, string> = {
   "打开备份目录": "Открыть папку",
   "恢复": "Восстановить",
   "删除": "Удалить",
+  "开始恢复": "Начать восстановление",
+  "恢复完整备份": "Восстановить полную копию",
   "还没有备份": "Резервных копий пока нет",
   "点击“手动备份”会把账号、设置、统计缓存、费用规则与所有 Codex 会话记录打包成 ZIP。":
     "Нажмите «Создать копию», чтобы упаковать аккаунты, настройки, кэш статистики, правила цен и все сессии Codex в ZIP.",
@@ -512,6 +566,15 @@ const ru: Record<string, string> = {
   "导入": "Импорт",
   "添加": "Добавить",
   "编辑": "Изменить",
+  "表单": "Форма",
+  "JSON": "JSON",
+  "Base URL": "Base URL",
+  "API Key": "API Key",
+  "接入新账号": "Добавить аккаунт",
+  "重新授权账号": "Повторная авторизация",
+  "编辑账号": "Изменить аккаунт",
+  "编辑 API Key": "Изменить API Key",
+  "编辑 OAuth 账号": "Изменить OAuth-аккаунт",
   "切换": "Переключить",
   "置顶账号": "Закрепить",
   "取消置顶": "Открепить",
@@ -573,6 +636,8 @@ const ru: Record<string, string> = {
   "每日": "По дням",
   "每周": "По неделям",
   "累计": "Всего",
+  "时段": "Период",
+  "当日": "День",
   "暂无活动数据": "Нет данных активности",
   "调用流水": "Вызовы",
   "来源汇总": "Источники",
@@ -644,6 +709,11 @@ const ru: Record<string, string> = {
   "重置服务": "Сброс сервиса",
   "绑定账号": "Привязать аккаунты",
   "删除账号": "Удалить аккаунты",
+  "重置 API 服务": "Сброс API-сервиса",
+  "确认重置": "Подтвердить сброс",
+  "API 服务已开启": "API-сервис запущен",
+  "API 服务已停止": "API-сервис остановлен",
+  "API 服务已重置": "API-сервис сброшен",
   "服务配置": "Конфигурация сервиса",
   "端口": "Порт",
   "管理密钥": "Ключ администратора",
@@ -658,6 +728,7 @@ const ru: Record<string, string> = {
   "安装中": "Установка",
   "失败": "Ошибка",
   "已取消": "Отменено",
+  "未检测": "Не проверено",
   "正在下载": "Загрузка",
   "准备中": "Подготовка",
   "已安装，当前未启动": "Установлен, сейчас остановлен",
@@ -668,6 +739,17 @@ const ru: Record<string, string> = {
   "添加到账号总览": "Добавить в аккаунты",
   "默认使用第一个密钥添加账号，调用地址：": "Первый ключ используется при добавлении аккаунта. Base URL: ",
   "请输入 API 密钥": "Введите API-ключ",
+  "请先添加一个 API 密钥": "Сначала добавьте API-ключ",
+  "至少保留一个 API 密钥": "Оставьте хотя бы один API-ключ",
+  "API 服务配置已保存": "Конфигурация API-сервиса сохранена",
+  "请先下载并开启 API 服务": "Сначала скачайте и запустите API-сервис",
+  "本地 API 服务": "Локальный API-сервис",
+  "请选择要绑定的 OAuth 账号": "Выберите OAuth-аккаунты для привязки",
+  "请选择要删除的 API 服务账号": "Выберите аккаунты API-сервиса для удаления",
+  "认证目录里暂无账号": "В каталоге авторизации пока нет аккаунтов",
+  "API 服务已更新并重新启动": "API-сервис обновлен и перезапущен",
+  "API 服务更新已安装": "Обновление API-сервиса установлено",
+  "下载已取消": "Загрузка отменена",
   "服务运行中不能修改端口或密钥，请先停止服务。":
     "Порт и ключи нельзя менять во время работы сервиса. Сначала остановите сервис.",
   "绑定账号到 API 服务": "Привязать аккаунты к API-сервису",
@@ -714,13 +796,30 @@ const ru: Record<string, string> = {
   "匹配平台": "Платформа",
   "上次检测": "Последняя проверка",
   "本地目录": "Локальные папки",
+  "服务目录": "Папка сервиса",
+  "运行时": "Среда выполнения",
+  "工作区": "Рабочая папка",
+  "配置文件": "Файл конфигурации",
+  "认证目录": "Папка авторизации",
   "浏览器登录，自动带回授权结果": "Войдите в браузере, результат вернется автоматически.",
+  "账号接入": "Подключение аккаунта",
+  "浏览器授权流程": "Авторизация в браузере",
+  "选择一种方式，把账号接到 Codex Switcher": "Выберите способ подключения аккаунта к Codex Switcher",
+  "推荐使用浏览器授权；如果已经有本地 token、JSON 或 API Key，也可以直接导入。":
+    "Рекомендуется авторизация в браузере. Локальный token, JSON или API Key также можно импортировать напрямую.",
   "生成并打开授权页": "Создать и открыть страницу",
   "继续打开授权页": "Открыть страницу снова",
   "复制链接": "Копировать ссылку",
   "手动完成": "Завершить вручную",
   "完成接入": "Готово",
   "重试保存": "Повторить сохранение",
+  "从本地文件导入": "Импорт из локального файла",
+  "获取本地账号": "Импорт локального аккаунта",
+  "账号名称": "Имя аккаунта",
+  "例如：主力账号": "например: основной аккаунт",
+  "例如：本地 codex 代理": "например: локальный Codex-прокси",
+  "示例：": "Пример: ",
+  "供应商": "Провайдер",
   "导出 JSON": "Экспорт JSON",
   "批量导出 JSON": "Массовый экспорт JSON",
   "导出格式": "Формат экспорта",
@@ -728,13 +827,25 @@ const ru: Record<string, string> = {
   "隐藏预览": "Скрыть предпросмотр",
   "复制": "Копировать",
   "下载": "Скачать",
+  "正在备份": "Создание копии",
+  "正在备份数据": "Создание копии данных",
+  "正在备份会话数据": "Создание копии сессий",
+  "正在启动备份任务...": "Запуск задачи резервного копирования...",
+  "正在备份...": "Создание копии...",
+  "正在备份会话文件...": "Создание копии файлов сессий...",
+  "正在恢复完整备份": "Восстановление полной копии",
+  "正在恢复会话数据": "Восстановление сессий",
+  "正在准备恢复账号、设置与会话数据...": "Подготовка восстановления аккаунтов, настроек и сессий...",
+  "正在准备恢复 Codex 会话数据...": "Подготовка восстановления данных сессий Codex...",
   "选择重置次数": "Выбрать сброс",
+  "重置次数": "Сбросы",
   "选择要消耗的重置次数": "Выберите сброс для использования",
   "当前有": "сейчас доступно",
   "次可用": "доступно",
   "发放": "Выдано",
   "暂无重置次数明细，请先刷新额度": "Нет сведений о сбросах. Сначала обновите квоту.",
   "重置使用次数": "Использовать сброс",
+  "会话恢复": "Восстановление сессий",
   "本地 Codex 管理工具": "Локальный инструмент управления Codex",
   "把账号切换、会话维护、使用统计和本地 API 服务收在一个干净的桌面工作台里。":
     "Удобное рабочее место для переключения аккаунтов, обслуживания сессий, статистики и локального API-сервиса.",
@@ -980,6 +1091,7 @@ export function t(value: unknown): string {
 export function installDomI18n(root: HTMLElement = document.body): void {
   translateElement(root);
   observer?.disconnect();
+  stopLanguageWatch?.();
   observer = new MutationObserver(() => queueTranslateDocument());
   observer.observe(root, {
     childList: true,
@@ -988,7 +1100,7 @@ export function installDomI18n(root: HTMLElement = document.body): void {
     attributes: true,
     attributeFilter: ["placeholder", "title", "aria-label"],
   });
-  watch(currentLanguage, () => queueTranslateDocument());
+  stopLanguageWatch = watch(currentLanguage, () => queueTranslateDocument());
 }
 
 export function installArcoI18n(message: ArcoMessage, modal: ArcoModal): void {
@@ -1124,6 +1236,43 @@ function restoreDynamicSourceText(text: string): string | null {
   const records = text.match(/^(\d+)\s+(?:records|записей)$/);
   if (records) return `共 ${records[1]} 条记录`;
 
+  const countUnit = text.match(/^(\d+)\s+(days|times|items|records|rules|sessions|accounts|дн\.|раз|шт\.|записей|правил|сессий|аккаунтов)$/);
+  if (countUnit) {
+    const units: Record<string, string> = {
+      days: "天",
+      "дн.": "天",
+      times: "次",
+      "раз": "次",
+      items: "个",
+      "шт.": "个",
+      records: "条记录",
+      "записей": "条记录",
+      rules: "条规则",
+      "правил": "条规则",
+      sessions: "条会话",
+      "сессий": "条会话",
+      accounts: "个账号",
+      "аккаунтов": "个账号",
+    };
+    const unit = units[countUnit[2]];
+    return unit ? `${countUnit[1]} ${unit}` : null;
+  }
+
+  const windowText = text.match(/^(?:(\d+)\s+min window|Окно\s+(\d+)\s+мин)$/);
+  if (windowText) return `${windowText[1] || windowText[2]} 分钟窗口`;
+
+  const hourWindowText = text.match(/^(?:(\d+)h window|Окно\s+(\d+)\s+ч)$/);
+  if (hourWindowText) return `${hourWindowText[1] || hourWindowText[2]} 小时窗口`;
+
+  const dayWindowText = text.match(/^(?:(\d+)\s+day window|Окно\s+(\d+)\s+дн\.)$/);
+  if (dayWindowText) return `${dayWindowText[1] || dayWindowText[2]} 天窗口`;
+
+  const averageCost = text.match(/^(.+)\s+(?:times|раз)\s*·\s*(?:avg|сред\.)\s*(.+)$/);
+  if (averageCost) return `${averageCost[1]} 次 · 平均 ${averageCost[2]}`;
+
+  const costText = text.match(/^(.+)\s+(?:times|раз)\s*·\s*(.+)$/);
+  if (costText) return `${costText[1]} 次 · ${costText[2]}`;
+
   return null;
 }
 
@@ -1143,7 +1292,7 @@ function translateDynamicText(text: string, dict: Record<string, string>): strin
   const isEnglish = dict === en;
   if (!isRussian && !isEnglish) return null;
 
-  const countUnit = text.match(/^(\d+)\s*(天|次|个|条记录|条规则|条会话)$/);
+  const countUnit = text.match(/^(\d+)\s*(天|次|个|条记录|条规则|条会话|个账号)$/);
   if (countUnit) {
     const [, count, unit] = countUnit;
     const units: Record<string, [string, string]> = {
@@ -1153,6 +1302,7 @@ function translateDynamicText(text: string, dict: Record<string, string>): strin
       条记录: ["records", "записей"],
       条规则: ["rules", "правил"],
       条会话: ["sessions", "сессий"],
+      个账号: ["accounts", "аккаунтов"],
     };
     const translatedUnit = units[unit]?.[isEnglish ? 0 : 1];
     return translatedUnit ? `${count} ${translatedUnit}` : null;
@@ -1180,6 +1330,13 @@ function translateDynamicText(text: string, dict: Record<string, string>): strin
     return isEnglish
       ? `Manual Backup ${manualBackupProgress[1]}%`
       : `Создание копии ${manualBackupProgress[1]}%`;
+  }
+
+  const backupProgress = text.match(/^备份\s*(\d+)%$/);
+  if (backupProgress) {
+    return isEnglish
+      ? `Backup ${backupProgress[1]}%`
+      : `Копия ${backupProgress[1]}%`;
   }
 
   const minutesWindow = text.match(/^(\d+)\s*分钟窗口$/);
@@ -1220,6 +1377,48 @@ function translateDynamicText(text: string, dict: Record<string, string>): strin
     return isEnglish
       ? `${costText[1]} times · ${costText[2]}`
       : `${costText[1]} раз · ${costText[2]}`;
+  }
+
+  const deleteAccount = text.match(/^确认删除\s+(.+)？此操作只删除本工具保存的账号记录，不会删除 Codex 程序本身。$/);
+  if (deleteAccount) {
+    return isEnglish
+      ? `Delete ${deleteAccount[1]}? This only removes the account record saved by this tool. The Codex app itself will not be deleted.`
+      : `Удалить ${deleteAccount[1]}? Будет удалена только запись аккаунта в этом инструменте. Само приложение Codex не удаляется.`;
+  }
+
+  const resetConfig = text.match(/^确认删除本机 Codex 目录下的 config\.toml？删除后 Codex 会按默认配置重新生成或使用默认设置。$/);
+  if (resetConfig) {
+    return isEnglish
+      ? "Delete config.toml under the local Codex directory? Codex will recreate it or use defaults afterward."
+      : "Удалить config.toml из локальной папки Codex? После этого Codex создаст его заново или использует настройки по умолчанию.";
+  }
+
+  const resetApiService = text.match(/^将先停止 API 服务，然后删除 ~\/\.codex_switcher\/api-service 下的运行时、配置、工作区和下载缓存。此操作不会删除账号总览里的账号，是否继续？$/);
+  if (resetApiService) {
+    return isEnglish
+      ? "The API service will be stopped, then runtime, config, workspace, and download cache under ~/.codex_switcher/api-service will be removed. Accounts in the overview will not be deleted. Continue?"
+      : "API-сервис будет остановлен, затем будут удалены runtime, конфигурация, рабочая папка и кэш загрузок в ~/.codex_switcher/api-service. Аккаунты в обзоре не удаляются. Продолжить?";
+  }
+
+  const trashSessions = text.match(/^确认将\s+(\d+)\s+个会话移入回收站？移入后可以在回收站中恢复。$/);
+  if (trashSessions) {
+    return isEnglish
+      ? `Move ${trashSessions[1]} sessions to Trash? They can be restored from Trash later.`
+      : `Переместить ${trashSessions[1]} сессий в корзину? Их можно будет восстановить из корзины.`;
+  }
+
+  const movedSessions = text.match(/^已移动\s+(\d+)\s+个会话到回收站$/);
+  if (movedSessions) {
+    return isEnglish
+      ? `Moved ${movedSessions[1]} sessions to Trash`
+      : `${movedSessions[1]} сессий перемещено в корзину`;
+  }
+
+  const restoredSessions = text.match(/^已恢复\s+(\d+)\s+个会话$/);
+  if (restoredSessions) {
+    return isEnglish
+      ? `Restored ${restoredSessions[1]} sessions`
+      : `Восстановлено ${restoredSessions[1]} сессий`;
   }
 
   const unreadableSessions = text.match(/^有\s*(\d+)\s*个会话文件暂时无法读取，已跳过这些文件。$/);

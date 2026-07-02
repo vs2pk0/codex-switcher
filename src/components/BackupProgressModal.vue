@@ -17,7 +17,7 @@ defineEmits<{
 <template>
   <a-modal
     :visible="visible"
-    :title="title"
+    :title="t(title)"
     :footer="false"
     :closable="true"
     :mask-closable="true"
@@ -33,7 +33,7 @@ defineEmits<{
         class="backup-progress-message"
         :class="{ failed: status === 'failed' }"
       >
-        {{ message }}
+        {{ t(message) }}
       </div>
       <a-button
         v-if="status !== 'running'"

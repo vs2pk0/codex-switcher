@@ -36,7 +36,7 @@ defineEmits<{
     <div v-if="account" class="reset-credit-modal-body">
       <div class="reset-credit-modal-head">
         <div>
-          <span class="modal-eyebrow">Reset Credit</span>
+          <span class="modal-eyebrow">{{ t("重置次数") }}</span>
           <h3>{{ t("选择要消耗的重置次数") }}</h3>
           <p>
             {{ displayName(account) }} {{ t("当前有") }}
