@@ -6,6 +6,7 @@ import {
   BADGE_STYLE_OPTIONS,
   defaultBadgeStyles,
 } from "../constants/badgeStyles";
+import { t } from "../i18n";
 import PlanBadge from "./PlanBadge.vue";
 
 const props = defineProps<{
@@ -59,7 +60,7 @@ watch(
 <template>
   <a-modal
     :visible="visible"
-    title="徽章图标样式"
+    :title="t('徽章图标样式')"
     width="1080px"
     :footer="false"
     modal-class="badge-style-modal"
@@ -86,8 +87,8 @@ watch(
       class="badge-style-section"
     >
       <div class="badge-style-section-head">
-        <h3>{{ type.label }} 徽章样式</h3>
-        <span>30 套视觉方案</span>
+        <h3>{{ type.label }} {{ t("徽章样式") }}</h3>
+        <span>{{ t("30 套视觉方案") }}</span>
       </div>
       <div class="badge-style-grid badge-style-grid-modal">
         <button
@@ -107,9 +108,9 @@ watch(
     <div class="badge-modal-footer">
       <a-button @click="restoreDefault">
         <template #icon><icon-refresh /></template>
-        恢复默认
+        {{ t("恢复默认") }}
       </a-button>
-      <a-button type="primary" :loading="saving" @click="confirm">确认</a-button>
+      <a-button type="primary" :loading="saving" @click="confirm">{{ t("确认") }}</a-button>
     </div>
   </a-modal>
 </template>
