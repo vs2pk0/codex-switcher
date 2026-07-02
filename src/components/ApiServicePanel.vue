@@ -203,7 +203,7 @@ async function saveSettings(): Promise<void> {
     state.value = next;
     syncForm(next);
     scheduleAutoUpdate();
-    Message.success("API 服务配置已保存");
+    Message.success(t("API 服务配置已保存"));
   } catch (error) {
     Message.error(`保存失败：${errorText(error)}`);
   } finally {
@@ -213,12 +213,12 @@ async function saveSettings(): Promise<void> {
 
 async function addToAccountOverview(): Promise<void> {
   if (!serviceReady.value) {
-    Message.warning("请先下载并开启 API 服务");
+    Message.warning(t("请先下载并开启 API 服务"));
     return;
   }
   const apiKey = firstApiKey.value;
   if (!apiKey) {
-    Message.error("请先添加一个 API 密钥");
+    Message.error(t("请先添加一个 API 密钥"));
     return;
   }
   addingAccount.value = true;
@@ -248,7 +248,7 @@ async function start(): Promise<void> {
     syncForm(next);
     scheduleAutoUpdate();
     progress.value = null;
-    Message.success("API 服务已开启");
+    Message.success(t("API 服务已开启"));
   } catch (error) {
     Message.error(`开启失败：${errorText(error)}`);
   } finally {
@@ -264,7 +264,7 @@ async function stop(): Promise<void> {
     state.value = next;
     syncForm(next);
     scheduleAutoUpdate();
-    Message.success("API 服务已停止");
+    Message.success(t("API 服务已停止"));
   } catch (error) {
     Message.error(`停止失败：${errorText(error)}`);
   } finally {
@@ -436,7 +436,7 @@ function openBindAccounts(): void {
 async function bindSelectedAccounts(): Promise<void> {
   const ids = [...selectedBindIds.value];
   if (!ids.length) {
-    Message.warning("请选择要绑定的 OAuth 账号");
+    Message.warning(t("请选择要绑定的 OAuth 账号"));
     return;
   }
   bindingAccounts.value = true;
@@ -469,7 +469,7 @@ async function loadBoundAccounts(): Promise<void> {
 async function deleteSelectedBoundAccounts(): Promise<void> {
   const emails = [...selectedDeleteEmails.value];
   if (!emails.length) {
-    Message.warning("请选择要删除的 API 服务账号");
+    Message.warning(t("请选择要删除的 API 服务账号"));
     return;
   }
   deletingBoundAccounts.value = true;
@@ -583,7 +583,7 @@ async function downloadUpdate(): Promise<void> {
         message: next.service.running ? "API 服务已更新并重新启动" : "API 服务更新已安装",
       };
     }
-    Message.success("API 服务更新已安装");
+    Message.success(t("API 服务更新已安装"));
   } catch (error) {
     progress.value = {
       status: errorText(error).includes("下载已取消") ? "cancelled" : "failed",
@@ -593,7 +593,7 @@ async function downloadUpdate(): Promise<void> {
       message: errorText(error).includes("下载已取消") ? "下载已取消" : errorText(error),
     };
     if (errorText(error).includes("下载已取消")) {
-      Message.info("下载已取消");
+      Message.info(t("下载已取消"));
     } else {
       Message.error(`下载更新失败：${errorText(error)}`);
     }
@@ -627,7 +627,7 @@ function addApiKey(): void {
 
 function removeApiKey(index: number): void {
   if (form.apiKeys.length <= 1) {
-    Message.warning("至少保留一个 API 密钥");
+    Message.warning(t("至少保留一个 API 密钥"));
     return;
   }
   form.apiKeys.splice(index, 1);
@@ -767,7 +767,7 @@ onUnmounted(() => {
 
             <div v-if="progress" class="api-service-progress">
               <div>
-                <strong>{{ progress.message || (downloading ? t("正在处理服务包") : t("下载状态")) }}</strong>
+                <strong>{{ progress.message ? t(progress.message) : downloading ? t("正在处理服务包") : t("下载状态") }}</strong>
                 <span>
                   {{ progress.assetName || "CLIProxyAPI" }}
                   · {{ progressDetail }}
@@ -1017,7 +1017,7 @@ onUnmounted(() => {
             </div>
             <PlanBadge :label="planLabel(account)" :badge-class="planClass(account)" />
           </label>
-          <a-empty v-if="!oauthAccounts.length" description="暂无可绑定的 OAuth 账号" />
+          <a-empty v-if="!oauthAccounts.length" :description="t('暂无可绑定的 OAuth 账号')" />
         </div>
         <div class="api-service-modal-actions">
           <a-button @click="bindVisible = false">{{ t("取消") }}</a-button>
@@ -1091,7 +1091,7 @@ onUnmounted(() => {
             </div>
             <PlanBadge :label="boundPlanLabel(account)" :badge-class="boundPlanClass(account)" />
           </label>
-          <a-empty v-if="!boundAccounts.length" description="认证目录里暂无账号" />
+          <a-empty v-if="!boundAccounts.length" :description="t('认证目录里暂无账号')" />
         </div>
         <div class="api-service-modal-actions">
           <a-button @click="deleteVisible = false">{{ t("取消") }}</a-button>

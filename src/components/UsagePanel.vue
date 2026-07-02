@@ -230,9 +230,9 @@ const dailyActivityBlocks = computed<ActivityBlock[]>(() => {
     const requests = hours.reduce((sum, item) => sum + item.requests, 0);
     return {
       key: `daily-${segment.start}`,
-      label: segment.label,
+      label: t(segment.label),
       subtitle: segment.subtitle,
-      detail: `${formatFullNumber(tokens)} Tokens · ${requests} 次`,
+      detail: `${formatFullNumber(tokens)} Tokens · ${formatLocalizedCount(requests, "次")}`,
       timestamp: hours[0]?.timestamp ?? 0,
       tokens,
       requests,
@@ -256,7 +256,7 @@ const weeklyActivityBlocks = computed<ActivityBlock[]>(() => {
       ...activityDayToCellSource(day),
       label: activityWeekdayLabel(day),
       subtitle: day.date,
-      detail: `${formatFullNumber(value)} Tokens · ${day.requests} 次`,
+      detail: `${formatFullNumber(value)} Tokens · ${formatLocalizedCount(day.requests, "次")}`,
       value,
       level: activityLevel(value, max),
       percent: max > 0 ? Math.max(8, Math.round((value / max) * 100)) : 0,

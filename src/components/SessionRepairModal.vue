@@ -42,7 +42,7 @@ defineEmits<{
     <div class="repair-body">
       <div class="repair-hero">
         <div>
-          <span class="modal-eyebrow">Session Recovery</span>
+          <span class="modal-eyebrow">{{ t("会话恢复") }}</span>
           <h3>{{ t("把切号后消失的会话重新挂回列表") }}</h3>
           <p>
             {{ t("会同步整理 Codex 本地索引与状态库，让侧边栏重新识别已有会话；适合 OAuth 和 API Key 之间切换后使用。") }}

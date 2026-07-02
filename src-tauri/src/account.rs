@@ -156,14 +156,19 @@ fn select_account_value_for_update<'a>(
     value: &'a Value,
     old_account: &CodexAccount,
 ) -> Result<&'a Value, String> {
-    let Some(accounts) = value.get("accounts").and_then(Value::as_array) else {
+    let accounts = match value {
+        Value::Array(items) => Some(items),
+        _ => value.get("accounts").and_then(Value::as_array),
+    };
+    let Some(accounts) = accounts else {
         return Ok(value);
     };
     if accounts.is_empty() {
         return Err("导出 JSON 中没有账号数据".to_string());
     }
     if let Some(account) = accounts.iter().find(|candidate| {
-        read_string(candidate, &["id"]).as_deref() == Some(old_account.id.as_str())
+        read_string(candidate, &["id", "account_id", "accountId"]).as_deref()
+            == Some(old_account.id.as_str())
     }) {
         return Ok(account);
     }
@@ -572,11 +577,12 @@ impl AccountStore {
             .ok_or_else(|| "账号不存在".to_string())?;
 
         let import_value = select_account_value_for_update(&value, &old_account)?;
+        let has_explicit_local_id = read_string(import_value, &["id"]).is_some();
         let mut updated = match serde_json::from_value::<CodexAccount>(import_value.clone()) {
             Ok(account) => account,
             Err(_) => self.account_from_import_value(import_value)?,
         };
-        if updated.id.trim().is_empty() {
+        if updated.id.trim().is_empty() || !has_explicit_local_id {
             updated.id = old_account.id.clone();
         }
         if updated.created_at <= 0 {
@@ -845,7 +851,7 @@ impl AccountStore {
             .unwrap_or_else(|| format!("codex-{}@local", short_hash(&access_token, 8)));
         let now = now_timestamp();
         let mut account = CodexAccount {
-            id: read_string(value, &["id"])
+            id: read_string(value, &["id", "account_id", "accountId"])
                 .unwrap_or_else(|| build_oauth_account_id(&email, &access_token)),
             email,
             account_name: read_string(value, &["account_name", "name"]),
@@ -1329,6 +1335,7 @@ fn apply_import_metadata(account: &mut CodexAccount, value: &Value) {
             "tokenExpiresAt",
             "expires_at",
             "expiresAt",
+            "expired",
         ],
     )
     .or_else(|| jwt_claim_string(&account.tokens.access_token, "exp"))

@@ -137,7 +137,7 @@ const backupProgressMessage = ref("");
 const backupProgressTitle = ref("正在备份");
 const backupProgressStatus = ref<"running" | "completed" | "failed">("running");
 const backupButtonText = computed(() =>
-  backupWorking.value ? `备份 ${Math.round(backupProgress.value)}%` : "备份",
+  backupWorking.value ? t(`备份 ${Math.round(backupProgress.value)}%`) : t("备份"),
 );
 const sessionRestoreVisible = ref(false);
 const expandedLayout = ref(false);
@@ -1091,6 +1091,7 @@ async function loadSettings(): Promise<void> {
     appPaths.value = nextPaths;
     backupFiles.value = nextBackups;
     resetQuotaTimer();
+    resetCurrentAccountQuotaTimer();
   } catch (error) {
     Message.error(`加载设置失败：${errorText(error)}`);
   } finally {
@@ -1146,6 +1147,7 @@ async function saveSettings(): Promise<void> {
     Object.assign(settings, saved);
     setLanguage(settings.language);
     resetQuotaTimer();
+    resetCurrentAccountQuotaTimer();
     Message.success("设置已保存");
   } catch (error) {
     Message.error(`保存设置失败：${errorText(error)}`);
@@ -1177,7 +1179,6 @@ function resetQuotaTimer(forceNew = false): void {
   const storedNextAt = settings.quotaNextRefreshAt;
   setQuotaNextRefreshAt(0, false);
   if (!settings.monitorQuota) {
-    resetCurrentAccountQuotaTimer();
     return;
   }
   const minutes = clampRefreshMinutes(settings.quotaRefreshMinutes);
@@ -1185,7 +1186,6 @@ function resetQuotaTimer(forceNew = false): void {
     ? Date.now() + minutes * 60_000
     : normalizedNextRefreshAt(storedNextAt, minutes);
   scheduleQuotaTimer(nextAt);
-  resetCurrentAccountQuotaTimer();
 }
 
 function scheduleCurrentAccountQuotaTimer(nextAt: number): void {
@@ -2337,9 +2337,26 @@ async function handleTrashSessions(): Promise<void> {
     Message.warning("请先选择会话");
     return;
   }
-  const summary = await moveSessionsToTrashAcrossInstances(ids);
-  Message.success(`已移动 ${summary.moved} 个会话到回收站`);
-  await loadSessions();
+  Modal.warning({
+    title: "移入回收站",
+    content: `确认将 ${ids.length} 个会话移入回收站？移入后可以在回收站中恢复。`,
+    okText: "移入回收站",
+    cancelText: "取消",
+    hideCancel: false,
+    async onOk() {
+      await trashSelectedSessions(ids);
+    },
+  });
+}
+
+async function trashSelectedSessions(ids: string[]): Promise<void> {
+  try {
+    const summary = await moveSessionsToTrashAcrossInstances(ids);
+    Message.success(`已移动 ${summary.moved} 个会话到回收站`);
+    await loadSessions();
+  } catch (error) {
+    Message.error(`移入回收站失败：${errorText(error)}`);
+  }
 }
 
 async function handleRestoreSessions(): Promise<void> {

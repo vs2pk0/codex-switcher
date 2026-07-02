@@ -30,7 +30,7 @@ defineEmits<{
 <template>
   <a-modal
     :visible="visible"
-    :title="title"
+    :title="t(title)"
     :footer="false"
     width="760px"
     @update:visible="$emit('update:visible', $event)"
@@ -45,13 +45,13 @@ defineEmits<{
             <a-form-item v-if="editingAccount && isApiKeyAccount(editingAccount)" :label="t('供应商')">
               <a-input v-model="editForm.apiProviderName" placeholder="OpenAI Official" />
             </a-form-item>
-            <a-form-item v-if="editingAccount && isApiKeyAccount(editingAccount)" label="Base URL">
+            <a-form-item v-if="editingAccount && isApiKeyAccount(editingAccount)" :label="t('Base URL')">
               <a-input v-model="editForm.apiBaseUrl" placeholder="https://api.openai.com/v1" />
             </a-form-item>
             <a-form-item v-if="editingAccount && isApiKeyAccount(editingAccount)" :label="t('官网地址')">
               <a-input v-model="editForm.apiOfficialUrl" placeholder="https://platform.openai.com" />
             </a-form-item>
-            <a-form-item v-if="editingAccount && isApiKeyAccount(editingAccount)" label="API Key">
+            <a-form-item v-if="editingAccount && isApiKeyAccount(editingAccount)" :label="t('API Key')">
               <a-input-password
                 v-model="editForm.apiKey"
                 autocomplete="new-password"
@@ -60,7 +60,7 @@ defineEmits<{
             </a-form-item>
           </a-form>
         </a-tab-pane>
-        <a-tab-pane key="json" title="JSON">
+        <a-tab-pane key="json" :title="t('JSON')">
           <a-textarea
             :model-value="editJsonText"
             class="token-textarea json-edit-area"

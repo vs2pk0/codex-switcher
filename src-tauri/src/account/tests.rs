@@ -35,6 +35,34 @@ fn imports_token_json_and_persists_account() {
 }
 
 #[test]
+fn imports_flat_token_account_from_root_array() {
+    let (_storage, _codex, store) = test_store();
+    let input = json!([
+        {
+            "id_token": "id-token",
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "account_id": "remote-account-id",
+            "email": "owner@example.com",
+            "type": "codex",
+            "expired": "2026-07-11T11:13:41.000Z"
+        }
+    ]);
+
+    let imported = store
+        .import_from_json(&input.to_string())
+        .expect("import root array account");
+
+    assert_eq!(imported.len(), 1);
+    assert_eq!(imported[0].email, "owner@example.com");
+    assert_eq!(imported[0].tokens.access_token, "access-token");
+    assert_eq!(
+        imported[0].access_token_expires_at.as_deref(),
+        Some("2026-07-11T11:13:41.000Z")
+    );
+}
+
+#[test]
 fn imports_account_metadata_for_phone_expiry_and_binding() {
     let (_storage, _codex, store) = test_store();
     let input = json!({
@@ -200,6 +228,51 @@ fn updates_account_from_editable_json() {
 
     assert_eq!(updated.account_name.as_deref(), Some("编辑后的账号"));
     assert_eq!(updated.tokens.access_token, "access-token-2");
+}
+
+#[test]
+fn updates_account_from_root_array_flat_token_json() {
+    let (_storage, _codex, store) = test_store();
+    let account = store
+        .import_from_json(
+            &json!({
+                "email": "owner@example.com",
+                "tokens": {
+                    "id_token": "id-token",
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import account")
+        .remove(0);
+
+    let updated = store
+        .update_account_from_json(
+            &account.id,
+            &json!([
+                {
+                    "id_token": "id-token-array",
+                    "access_token": "access-token-array",
+                    "refresh_token": "refresh-token-array",
+                    "account_id": "remote-account-id",
+                    "email": "owner@example.com",
+                    "type": "codex",
+                    "expired": "2026-07-11T11:13:41.000Z"
+                }
+            ])
+            .to_string(),
+        )
+        .expect("update account from root array");
+
+    assert_eq!(updated.email, "owner@example.com");
+    assert_eq!(updated.id, account.id);
+    assert_eq!(updated.tokens.access_token, "access-token-array");
+    assert_eq!(
+        updated.access_token_expires_at.as_deref(),
+        Some("2026-07-11T11:13:41.000Z")
+    );
 }
 
 #[test]

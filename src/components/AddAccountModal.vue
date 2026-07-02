@@ -71,7 +71,7 @@ function handleTabChange(key: string | number): void {
 <template>
   <a-modal
     :visible="visible"
-    :title="title"
+    :title="t(title)"
     :footer="false"
     width="820px"
     modal-class="add-account-modal"
@@ -79,7 +79,7 @@ function handleTabChange(key: string | number): void {
   >
     <div class="add-account-intro">
       <div>
-        <span class="modal-eyebrow">Account Setup</span>
+        <span class="modal-eyebrow">{{ t("账号接入") }}</span>
         <h3>{{ t("选择一种方式，把账号接到 Codex Switcher") }}</h3>
       </div>
       <p>{{ t("推荐使用浏览器授权；如果已经有本地 token、JSON 或 API Key，也可以直接导入。") }}</p>
@@ -88,7 +88,7 @@ function handleTabChange(key: string | number): void {
       <a-tab-pane key="oauth" :title="t('OAuth 授权')">
         <div class="oauth-connect-layout">
           <aside class="oauth-guide-card">
-            <span class="modal-eyebrow">Browser Flow</span>
+            <span class="modal-eyebrow">{{ t("浏览器授权流程") }}</span>
             <h4>{{ t("浏览器登录，自动带回授权结果") }}</h4>
             <ul>
               <li>{{ t("先生成一次性授权链接") }}</li>
@@ -149,7 +149,7 @@ function handleTabChange(key: string | number): void {
           </div>
         </div>
       </a-tab-pane>
-      <a-tab-pane key="token" title="Token / JSON">
+      <a-tab-pane key="token" :title="t('Token / JSON')">
         <div class="modal-form">
           <a-typography-paragraph>
             {{ t("粘贴 session JSON、auth.json、账号 JSON、accessToken 或 refresh_token。") }}
@@ -188,7 +188,7 @@ function handleTabChange(key: string | number): void {
           </div>
         </div>
       </a-tab-pane>
-      <a-tab-pane key="apikey" title="API Key">
+      <a-tab-pane key="apikey" :title="t('API Key')">
         <div class="modal-form">
           <a-form :model="apiKeyForm" layout="vertical">
             <a-form-item :label="t('账号名称')">
@@ -197,13 +197,13 @@ function handleTabChange(key: string | number): void {
             <a-form-item :label="t('供应商')">
               <a-input v-model="apiKeyForm.apiProviderName" placeholder="OpenAI Official" />
             </a-form-item>
-            <a-form-item label="Base URL">
+            <a-form-item :label="t('Base URL')">
               <a-input v-model="apiKeyForm.apiBaseUrl" placeholder="https://api.openai.com/v1" />
             </a-form-item>
             <a-form-item :label="t('官网地址')">
               <a-input v-model="apiKeyForm.apiOfficialUrl" placeholder="https://platform.openai.com" />
             </a-form-item>
-            <a-form-item label="API Key">
+            <a-form-item :label="t('API Key')">
               <a-input-password
                 v-model="apiKeyForm.apiKey"
                 autocomplete="new-password"
