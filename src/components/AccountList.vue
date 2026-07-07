@@ -7,6 +7,7 @@ import PlanBadge from "./PlanBadge.vue";
 
 const props = defineProps<{
   accounts: CodexAccount[];
+  hasAnyAccount: boolean;
   currentId: string;
   selectedAccountIds: Set<string>;
   settings: CodexSwitcherSettings;
@@ -816,6 +817,10 @@ function formatTime(value?: number | null): string {
           </div>
         </footer>
       </a-card>
+    </section>
+
+    <section v-else-if="hasAnyAccount" class="account-filter-empty">
+      <a-empty :description="t('无数据')" />
     </section>
 
     <section v-else class="empty-wrap">

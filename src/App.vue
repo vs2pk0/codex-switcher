@@ -44,6 +44,7 @@ import {
   listCodexSwitcherSessionBackups,
   listCodexAccounts,
   openExternalUrl,
+  refreshAllCodexQuotas,
   refreshCodexQuota,
   resetCodexConfigToml,
   restoreCodexSwitcherBackup,
@@ -123,6 +124,7 @@ const addTab = ref<"oauth" | "token" | "apikey">("oauth");
 const tokenInput = ref("");
 const importing = ref(false);
 const savingApiKey = ref(false);
+const refreshingAllQuotas = ref(false);
 const settingsLoading = ref(false);
 const savingSettings = ref(false);
 const appPaths = ref<CodexSwitcherPaths | null>(null);
@@ -357,6 +359,7 @@ const oauthCount = computed(
 const apiKeyCount = computed(
   () => accounts.value.filter((account) => isApiKeyAccount(account)).length,
 );
+const abnormalAccountCount = computed(() => accounts.value.filter(isAccountAbnormal).length);
 const oauthAccounts = computed(() => accounts.value.filter((account) => !isApiKeyAccount(account)));
 const sortDraftAccounts = computed(() => {
   const accountMap = new Map(accounts.value.map((account) => [account.id, account]));
@@ -381,10 +384,12 @@ const sessionGroups = computed<SessionGroup[]>(() => {
       sessions: [],
       latestUpdatedAt: 0,
       approximateTokens: 0,
+      sizeBytes: 0,
     };
     group.sessions.push(session);
     group.latestUpdatedAt = Math.max(group.latestUpdatedAt, session.updatedAt);
     group.approximateTokens += sessionStats.value.find((item) => item.sessionId === session.id)?.approximateTokens ?? 0;
+    group.sizeBytes += session.sizeBytes || 0;
     groups.set(key, group);
   }
   return [...groups.values()]
@@ -1231,22 +1236,22 @@ function scheduleNextQuotaCycle(): void {
 async function runScheduledCurrentAccountQuotaRefresh(): Promise<void> {
   if (scheduledCurrentAccountRefreshRunning) return;
   scheduledCurrentAccountRefreshRunning = true;
-  scheduleNextCurrentAccountQuotaCycle();
   try {
     await handleRefreshCurrentQuota(false, false);
   } finally {
     scheduledCurrentAccountRefreshRunning = false;
+    scheduleNextCurrentAccountQuotaCycle();
   }
 }
 
 async function runScheduledQuotaRefresh(): Promise<void> {
   if (scheduledQuotaRefreshRunning) return;
   scheduledQuotaRefreshRunning = true;
-  scheduleNextQuotaCycle();
   try {
     await handleRefreshAllQuotas(false, false);
   } finally {
     scheduledQuotaRefreshRunning = false;
+    scheduleNextQuotaCycle();
   }
 }
 
@@ -1377,20 +1382,55 @@ async function handleRefreshAllQuotas(
 ): Promise<void> {
   if (!settings.monitorQuota) return;
   quotaRefreshingId.value = "__all__";
+  let refreshedCount = 0;
+  let failedCount = 0;
   try {
     const candidates = pagedAccounts.value.filter(canShowQuota);
     for (const account of candidates) {
       quotaRefreshingId.value = account.id;
-      await refreshCodexQuota(account.id);
+      try {
+        await refreshCodexQuota(account.id);
+        refreshedCount += 1;
+      } catch {
+        failedCount += 1;
+      }
     }
     await loadAccounts();
     if (settings.monitorQuota && updateNextRefresh) {
       resetQuotaTimer(true);
     }
-    if (showMessage) Message.success(`已刷新当前页 ${candidates.length} 个账号额度`);
+    if (showMessage) {
+      if (failedCount > 0) {
+        Message.warning(`已刷新当前页 ${refreshedCount} 个账号额度，${failedCount} 个失败`);
+      } else {
+        Message.success(`已刷新当前页 ${refreshedCount} 个账号额度`);
+      }
+    }
   } catch (error) {
+    await loadAccounts();
     if (showMessage) Message.warning(`批量刷新额度失败：${errorText(error)}`);
   } finally {
+    quotaRefreshingId.value = "";
+  }
+}
+
+async function handleRefreshEveryQuota(): Promise<void> {
+  if (!settings.monitorQuota) {
+    Message.warning("请先在设置中开启额度监控");
+    return;
+  }
+  refreshingAllQuotas.value = true;
+  quotaRefreshingId.value = "__all__";
+  try {
+    const count = await refreshAllCodexQuotas();
+    await loadAccounts();
+    resetQuotaTimer(true);
+    Message.success(count > 0 ? `已刷新全部 ${count} 个账号额度` : "没有可刷新的 OAuth 账号");
+  } catch (error) {
+    await loadAccounts();
+    Message.warning(`刷新全部额度失败：${errorText(error)}`);
+  } finally {
+    refreshingAllQuotas.value = false;
     quotaRefreshingId.value = "";
   }
 }
@@ -2768,6 +2808,7 @@ onUnmounted(() => {
       :accounts-count="accounts.length"
       :oauth-count="oauthCount"
       :api-key-count="apiKeyCount"
+      :abnormal-count="abnormalAccountCount"
       :current-account-label="currentAccount ? displayNameForUi(currentAccount) : ''"
       :current-account-error="currentAccount ? quotaErrorLabel(currentAccount) : ''"
       :detecting-current-account="detectingCurrentAccount"
@@ -2788,6 +2829,7 @@ onUnmounted(() => {
       :show-sort-direction="showSortDirection"
       :current-account-refresh-countdown="currentAccountRefreshCountdown"
       :quota-refresh-countdown="quotaRefreshCountdown"
+      :refreshing-all-quotas="refreshingAllQuotas"
       @toggle-all="toggleAllAccounts"
       @update:account-search-keyword="accountSearchKeyword = $event"
       @reset-page="currentPage = 1"
@@ -2795,12 +2837,14 @@ onUnmounted(() => {
       @open-sort-editor="openSortEditor"
       @bind-selected-to-api-service="confirmBindSelectedToApiService"
       @batch-export="openBatchExport"
+      @refresh-all-quotas="handleRefreshEveryQuota"
       @open-add="openAddModal"
     />
 
     <AccountList
       v-if="activeView === 'accounts'"
       :accounts="pagedAccounts"
+      :has-any-account="accounts.length > 0"
       :current-id="currentId"
       :selected-account-ids="selectedAccountIds"
       :settings="settings"

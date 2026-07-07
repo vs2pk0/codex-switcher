@@ -236,6 +236,8 @@ function changeLanguage(value: unknown): void {
                   </a-button>
                   <a-popconfirm
                     :content="t('确认删除这个备份文件？')"
+                    :ok-text="t('确认')"
+                    :cancel-text="t('取消')"
                     @ok="emit('delete-backup', backup)"
                   >
                     <a-button status="danger" :disabled="backupWorking">

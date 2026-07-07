@@ -1369,7 +1369,12 @@ onBeforeUnmount(() => {
                 <span>{{ formatLocalizedCount(pricingList.length, "条规则") }}</span>
               </div>
               <div class="usage-pricing-actions">
-                <a-popconfirm :content="t('恢复内置 GPT/Codex 单价会覆盖当前 pricing.json，确定继续？')" @ok="restoreDefaultPricing">
+                <a-popconfirm
+                  :content="t('恢复内置 GPT/Codex 单价会覆盖当前 pricing.json，确定继续？')"
+                  :ok-text="t('确认')"
+                  :cancel-text="t('取消')"
+                  @ok="restoreDefaultPricing"
+                >
                   <a-button :loading="pricingLoading">
                     <template #icon><icon-refresh /></template>
                     {{ t("恢复默认") }}
@@ -1409,7 +1414,12 @@ onBeforeUnmount(() => {
                           <a-button size="mini" @click="openEditPricing(item)">
                             <template #icon><icon-edit /></template>
                           </a-button>
-                          <a-popconfirm :content="t('确定删除这条模型单价？')" @ok="removePricing(item.modelId)">
+                          <a-popconfirm
+                            :content="t('确定删除这条模型单价？')"
+                            :ok-text="t('确认')"
+                            :cancel-text="t('取消')"
+                            @ok="removePricing(item.modelId)"
+                          >
                             <a-button size="mini" status="danger">
                               <template #icon><icon-delete /></template>
                             </a-button>

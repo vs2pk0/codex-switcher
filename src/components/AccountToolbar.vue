@@ -10,6 +10,7 @@ defineProps<{
   showSortDirection: boolean;
   currentAccountRefreshCountdown: string;
   quotaRefreshCountdown: string;
+  refreshingAllQuotas: boolean;
 }>();
 
 defineEmits<{
@@ -20,6 +21,7 @@ defineEmits<{
   (event: "open-sort-editor"): void;
   (event: "bind-selected-to-api-service"): void;
   (event: "batch-export"): void;
+  (event: "refresh-all-quotas"): void;
   (event: "open-add", tab: "oauth" | "token" | "apikey"): void;
 }>();
 </script>
@@ -113,9 +115,18 @@ defineEmits<{
       </a-button>
     </div>
     <div
-      v-if="currentAccountRefreshCountdown || quotaRefreshCountdown"
+      v-if="settings.monitorQuota || currentAccountRefreshCountdown || quotaRefreshCountdown"
       class="quota-countdown-group"
     >
+      <a-button
+        size="small"
+        :loading="refreshingAllQuotas"
+        :disabled="!settings.monitorQuota"
+        @click="$emit('refresh-all-quotas')"
+      >
+        <template #icon><icon-refresh /></template>
+        {{ t("刷新全部额度") }}
+      </a-button>
       <span v-if="currentAccountRefreshCountdown" class="quota-countdown primary">
         {{ t("当前账号") }} {{ currentAccountRefreshCountdown }}
       </span>

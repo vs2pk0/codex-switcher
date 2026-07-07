@@ -8,6 +8,7 @@ export interface CodexSessionRecord {
   updatedAt: number;
   messageCount: number;
   charCount: number;
+  sizeBytes: number;
 }
 
 export interface CodexTrashedSessionRecord {

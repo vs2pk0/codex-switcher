@@ -16,6 +16,7 @@ pub struct CodexSessionRecord {
     pub updated_at: i64,
     pub message_count: usize,
     pub char_count: usize,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1055,12 +1056,14 @@ fn build_session_record(path: &Path, content: &str) -> Result<CodexSessionRecord
     let title = extract_title(content).unwrap_or_else(|| file_stem(path));
     let project_name = extract_project_name(content).unwrap_or_else(|| "未归属项目".to_string());
     let id = extract_session_id(content).unwrap_or_else(|| session_id_for_path(path));
-    let updated_at = fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
+    let metadata = fs::metadata(path).ok();
+    let updated_at = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok())
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default();
+    let size_bytes = metadata.map(|metadata| metadata.len()).unwrap_or_default();
     Ok(CodexSessionRecord {
         id,
         title,
@@ -1072,6 +1075,7 @@ fn build_session_record(path: &Path, content: &str) -> Result<CodexSessionRecord
             .filter(|line| !line.trim().is_empty())
             .count(),
         char_count: content.chars().count(),
+        size_bytes,
     })
 }
 
