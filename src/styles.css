@@ -119,10 +119,10 @@ textarea {
 
 .account-ops {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   justify-content: space-between;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   width: min(1880px, calc(100vw - clamp(36px, 4.4vw, 64px)));
   margin: 0 auto 16px;
   padding: 10px 12px;
@@ -134,21 +134,38 @@ textarea {
 
 .account-ops-left {
   display: flex;
-  flex-wrap: wrap;
+  flex: 1 1 auto;
+  flex-wrap: nowrap;
   align-items: center;
-  gap: 10px;
+  min-width: 0;
+  gap: 8px;
+}
+
+.account-ops .arco-checkbox {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.account-ops .arco-btn {
+  flex: 0 0 auto;
+  padding: 0 12px;
+  white-space: nowrap;
 }
 
 .sort-select {
-  width: 220px;
+  flex: 0 0 190px;
+  width: 190px;
 }
 
 .filter-select {
-  width: 138px;
+  flex: 0 0 132px;
+  width: 132px;
 }
 
 .account-search-input {
-  width: 230px;
+  flex: 0 1 210px;
+  width: 210px;
+  min-width: 170px;
 }
 
 .account-search-input .arco-input-prefix {
@@ -178,14 +195,17 @@ textarea {
 }
 
 .page-size-select {
-  width: 120px;
+  flex: 0 0 112px;
+  width: 112px;
 }
 
 .quota-countdown-group {
   display: inline-flex;
-  flex-wrap: wrap;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
   justify-content: flex-end;
-  gap: 8px;
+  gap: 7px;
+  white-space: nowrap;
 }
 
 .quota-countdown {
@@ -989,7 +1009,7 @@ textarea {
 
 .session-group-row {
   display: grid;
-  grid-template-columns: 30px 24px 22px minmax(150px, 1fr) auto auto auto;
+  grid-template-columns: 30px 24px 22px minmax(150px, 1fr) auto auto auto auto;
   align-items: center;
   gap: 10px;
   min-height: 58px;
@@ -1021,10 +1041,17 @@ textarea {
 }
 
 .session-group-meta,
+.session-size,
 .session-group-time {
   color: var(--muted);
   font-size: 13px;
   white-space: nowrap;
+}
+
+.session-size {
+  font-family:
+    "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-weight: 720;
 }
 
 .session-group-children {
@@ -1122,6 +1149,12 @@ textarea {
   border: 1px solid rgba(85, 113, 156, 0.14);
   background: #eef5ff;
   white-space: nowrap;
+}
+
+.session-stat .session-size {
+  min-width: 74px;
+  color: #667894;
+  text-align: center;
 }
 
 .session-stat .token-count {
@@ -3785,6 +3818,20 @@ textarea {
 .empty-wrap {
   min-height: calc(100vh - 190px);
   padding: 10px 0 28px;
+}
+
+.account-filter-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 360px;
+  padding: 42px 0;
+}
+
+.account-filter-empty .arco-empty-description {
+  color: #708098;
+  font-size: 15px;
+  font-weight: 650;
 }
 
 .empty-panel {

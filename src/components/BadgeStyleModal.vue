@@ -48,6 +48,10 @@ function confirm(): void {
   close();
 }
 
+function badgeSectionTitle(label: string): string {
+  return t("{name} 的徽章样式").replace("{name}", label);
+}
+
 watch(
   () => props.visible,
   (visible) => {
@@ -87,7 +91,7 @@ watch(
       class="badge-style-section"
     >
       <div class="badge-style-section-head">
-        <h3>{{ type.label }} {{ t("徽章样式") }}</h3>
+        <h3>{{ badgeSectionTitle(type.label) }}</h3>
         <span>{{ t("30 套视觉方案") }}</span>
       </div>
       <div class="badge-style-grid badge-style-grid-modal">
@@ -100,7 +104,7 @@ watch(
           @click="selectStyle(type.key, style.value)"
         >
           <PlanBadge :label="type.label" :badge-class="[type.planClass, `badge-${style.value}`]" />
-          <strong>{{ style.label }}</strong>
+          <strong>{{ t(style.label) }}</strong>
         </button>
       </div>
     </section>

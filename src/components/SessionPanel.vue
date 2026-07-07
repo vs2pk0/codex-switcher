@@ -38,6 +38,20 @@ defineEmits<{
   (event: "toggle-session", id: string): void;
   (event: "open-session-folder", path: string): void;
 }>();
+
+function formatFileSize(bytes?: number | null): string {
+  const safeBytes = typeof bytes === "number" && Number.isFinite(bytes) ? bytes : 0;
+  if (safeBytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = safeBytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const digits = value >= 10 || unitIndex === 0 ? 0 : 1;
+  return `${value.toFixed(digits)} ${units[unitIndex]}`;
+}
 </script>
 
 <template>
@@ -143,6 +157,7 @@ defineEmits<{
             </button>
             <span class="session-group-meta">{{ formatLocalizedCount(group.sessions.length, "条会话") }}</span>
             <span class="token-count">{{ new Intl.NumberFormat("en-US").format(group.approximateTokens) }} tokens</span>
+            <span class="session-size">{{ formatFileSize(group.sizeBytes) }}</span>
             <span class="session-group-time">{{ formatTime(group.latestUpdatedAt) }}</span>
           </div>
           <div v-if="expandedSessionGroups.has(group.key)" class="session-group-children">
@@ -158,6 +173,7 @@ defineEmits<{
               </div>
               <div class="session-stat">
                 <span class="token-count">{{ sessionApproxTokens(session.id) }}</span>
+                <span class="session-size">{{ formatFileSize(session.sizeBytes) }}</span>
                 <span>{{ formatTime(session.updatedAt) }}</span>
                 <a-button size="small" @click="$emit('open-session-folder', session.path)">
                   <template #icon><icon-folder /></template>

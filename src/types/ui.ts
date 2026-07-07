@@ -8,4 +8,5 @@ export interface SessionGroup {
   sessions: CodexSessionRecord[];
   latestUpdatedAt: number;
   approximateTokens: number;
+  sizeBytes: number;
 }

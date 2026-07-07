@@ -7,6 +7,7 @@ defineProps<{
   accountsCount: number;
   oauthCount: number;
   apiKeyCount: number;
+  abnormalCount: number;
   currentAccountLabel: string;
   currentAccountError: string;
   detectingCurrentAccount: boolean;
@@ -34,6 +35,7 @@ defineEmits<{
     <a-tag color="arcoblue">{{ t("全部") }} {{ accountsCount }}</a-tag>
     <a-tag color="green">OAuth {{ oauthCount }}</a-tag>
     <a-tag color="orange">API Key {{ apiKeyCount }}</a-tag>
+    <a-tag v-if="abnormalCount" color="red">{{ t("异常账号") }} {{ abnormalCount }}</a-tag>
     <span v-if="currentAccountLabel">{{ t("当前：") }} {{ currentAccountLabel }}</span>
     <a-tag v-if="currentAccountError" color="red">
       {{ currentAccountError }}

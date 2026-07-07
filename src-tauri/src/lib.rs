@@ -382,38 +382,87 @@ fn start_oauth_callback_listener(app_handle: AppHandle, login_id: String) -> Res
 
     thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10 * 60);
-        while Instant::now() < deadline && oauth::is_login_active(&login_id) {
+        let mut callback_received = false;
+        let mut close_deadline: Option<Instant> = None;
+        while Instant::now() < deadline
+            && (oauth::is_login_active(&login_id) || close_deadline.is_some())
+        {
+            if close_deadline.is_some_and(|target| Instant::now() >= target) {
+                break;
+            }
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let mut buffer = [0_u8; 4096];
                     let size = stream.read(&mut buffer).unwrap_or(0);
                     let request = String::from_utf8_lossy(&buffer[..size]);
-                    let callback_result = request
+                    let request_path = request
                         .lines()
                         .next()
                         .and_then(|line| line.split_whitespace().nth(1))
-                        .ok_or_else(|| "OAuth 回调请求格式无效".to_string())
-                        .and_then(|path| {
-                            oauth::submit_callback_url(
-                                &login_id,
-                                &format!(
-                                    "{}{}",
-                                    oauth::redirect_uri().trim_end_matches("/auth/callback"),
-                                    path
+                        .unwrap_or("/");
+
+                    if request_path.starts_with("/close-tab") {
+                        let html = oauth_close_tab_html();
+                        let body = html.as_bytes();
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(body);
+                        close_oauth_callback_tab_soon();
+                        close_deadline = Some(Instant::now() + Duration::from_secs(2));
+                        continue;
+                    }
+
+                    if request_path == "/favicon.ico" {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        continue;
+                    }
+
+                    if !request_path.starts_with("/auth/callback") {
+                        let body = b"Not Found";
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(body);
+                        continue;
+                    }
+
+                    let should_emit = !callback_received;
+                    let callback_result = if callback_received {
+                        Ok(())
+                    } else {
+                        oauth::submit_callback_url(
+                            &login_id,
+                            &format!(
+                                "{}{}",
+                                oauth::redirect_uri().trim_end_matches("/auth/callback"),
+                                request_path
+                            ),
+                        )
+                    };
+                    let (ok, message, html) = match callback_result {
+                        Ok(()) => {
+                            callback_received = true;
+                            close_deadline = Some(Instant::now() + Duration::from_secs(45));
+                            (
+                                true,
+                                "已收到 OAuth 回调，正在保存账号".to_string(),
+                                oauth_callback_html(
+                                    true,
+                                    "授权回调已收到",
+                                    "正在回到 Codex Switcher 保存账号，本页面将自动关闭。",
                                 ),
                             )
-                        });
-                    let (ok, message, html) = match callback_result {
-                        Ok(()) => (
-                            true,
-                            "已收到 OAuth 回调，正在保存账号".to_string(),
-                            oauth_callback_html(
-                                true,
-                                "授权回调已收到",
-                                "正在回到 Codex Switcher 保存账号，本页面将自动关闭。",
-                            ),
-                        ),
+                        }
                         Err(error) => {
+                            close_deadline = Some(Instant::now() + Duration::from_secs(60));
                             let html = oauth_callback_html(
                                 false,
                                 "授权回调失败",
@@ -429,15 +478,16 @@ fn start_oauth_callback_listener(app_handle: AppHandle, login_id: String) -> Res
                         body.len()
                     );
                     let _ = stream.write_all(body);
-                    let _ = app_handle.emit(
-                        "codex-oauth-callback-received",
-                        CodexOAuthCallbackEvent {
-                            login_id: login_id.clone(),
-                            ok,
-                            message,
-                        },
-                    );
-                    break;
+                    if should_emit {
+                        let _ = app_handle.emit(
+                            "codex-oauth-callback-received",
+                            CodexOAuthCallbackEvent {
+                                login_id: login_id.clone(),
+                                ok,
+                                message,
+                            },
+                        );
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(200));
@@ -459,6 +509,46 @@ fn start_oauth_callback_listener(app_handle: AppHandle, login_id: String) -> Res
     Ok(())
 }
 
+fn oauth_close_tab_html() -> String {
+    r#"<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>Codex OAuth</title>
+  </head>
+  <body>
+    <script>
+      try { window.close(); } catch (_) {}
+    </script>
+  </body>
+</html>"#
+        .to_string()
+}
+
+fn close_oauth_callback_tab_soon() {
+    thread::spawn(|| {
+        thread::sleep(Duration::from_millis(220));
+        close_oauth_callback_tab();
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn close_oauth_callback_tab() {
+    let script = r#"
+tell application "System Events"
+  set browserNames to {"Safari", "Google Chrome", "Chromium", "Microsoft Edge", "Brave Browser", "Arc", "Firefox"}
+  set frontApp to name of first application process whose frontmost is true
+  if browserNames contains frontApp then
+    keystroke "w" using command down
+  end if
+end tell
+"#;
+    let _ = Command::new("osascript").arg("-e").arg(script).status();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn close_oauth_callback_tab() {}
+
 fn oauth_callback_html(success: bool, title: &str, description: &str) -> String {
     let status_class = if success { "success" } else { "error" };
     let icon = if success { "✓" } else { "!" };
@@ -476,6 +566,14 @@ fn oauth_callback_html(success: bool, title: &str, description: &str) -> String 
             var closeButton = document.getElementById('closeButton');
             var closeHint = document.getElementById('closeHint');
             var closeStatus = document.getElementById('closeStatus');
+            var nativeCloseRequested = false;
+            function requestNativeClose() {
+              if (nativeCloseRequested) return;
+              nativeCloseRequested = true;
+              try {
+                fetch('/close-tab', { method: 'POST', keepalive: true }).catch(function () {});
+              } catch (_) {}
+            }
             function markBlocked() {
               if (document.hidden) return;
               if (closeButton) closeButton.textContent = '关闭标签页';
@@ -483,6 +581,7 @@ fn oauth_callback_html(success: bool, title: &str, description: &str) -> String 
               if (closeHint) closeHint.className = 'hint blocked';
             }
             function tryClose() {
+              requestNativeClose();
               try { window.close(); } catch (_) {}
             }
             closeButton && closeButton.addEventListener('click', function () {
@@ -1113,6 +1212,14 @@ async fn refresh_all_codex_quotas() -> Result<i32, String> {
     let accounts = AccountStore::default().list_accounts()?;
     let mut count = 0;
     for account in accounts {
+        if account.auth_mode.as_deref() == Some("apikey")
+            || account
+                .openai_api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty())
+        {
+            continue;
+        }
         match fetch_codex_quota_for_account(&account.id).await {
             Ok(quota) => {
                 if AccountStore::default()
