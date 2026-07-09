@@ -57,6 +57,10 @@ struct CodexSwitcherSettings {
     account_type_filter: String,
     #[serde(default = "default_page_size")]
     page_size: u64,
+    #[serde(default = "default_account_view_mode")]
+    account_view_mode: String,
+    #[serde(default = "default_sidebar_enabled")]
+    sidebar_enabled: bool,
     #[serde(default = "default_show_quota_countdowns")]
     show_quota_countdowns: bool,
     #[serde(default = "default_badge_style")]
@@ -85,6 +89,8 @@ impl Default for CodexSwitcherSettings {
             pinned_account_ids: Vec::new(),
             account_type_filter: default_account_type_filter(),
             page_size: default_page_size(),
+            account_view_mode: default_account_view_mode(),
+            sidebar_enabled: default_sidebar_enabled(),
             show_quota_countdowns: default_show_quota_countdowns(),
             badge_style: default_badge_style(),
             badge_styles: default_badge_styles(),
@@ -105,6 +111,7 @@ impl CodexSwitcherSettings {
             self.current_account_next_refresh_at,
             self.current_account_refresh_minutes,
         );
+        self.account_view_mode = normalize_account_view_mode(&self.account_view_mode);
         self.language = normalize_language(&self.language);
         self
     }
@@ -144,6 +151,21 @@ fn default_account_type_filter() -> String {
 
 fn default_page_size() -> u64 {
     50
+}
+
+fn default_account_view_mode() -> String {
+    "card".to_string()
+}
+
+fn default_sidebar_enabled() -> bool {
+    true
+}
+
+fn normalize_account_view_mode(value: &str) -> String {
+    match value {
+        "compact" | "table" => value.to_string(),
+        _ => default_account_view_mode(),
+    }
 }
 
 fn default_show_quota_countdowns() -> bool {

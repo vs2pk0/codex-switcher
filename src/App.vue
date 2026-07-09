@@ -144,8 +144,10 @@ const backupButtonText = computed(() =>
 const sessionRestoreVisible = ref(false);
 const expandedLayout = ref(false);
 let windowResizeTimer: number | undefined;
+let initialLayoutWidth = 0;
 let viewLoadTimer: number | undefined;
 let initialPrewarmTimer: number | undefined;
+const EXPANDED_LAYOUT_WIDTH_DELTA = 80;
 const settings = reactive<CodexSwitcherSettings>({
   monitorQuota: false,
   quotaRefreshMinutes: 10,
@@ -158,6 +160,8 @@ const settings = reactive<CodexSwitcherSettings>({
   pinnedAccountIds: [],
   accountTypeFilter: "all",
   pageSize: 50,
+  accountViewMode: "card",
+  sidebarEnabled: true,
   showQuotaCountdowns: true,
   badgeStyle: "classic",
   badgeStyles: defaultBadgeStyles(),
@@ -434,6 +438,10 @@ function clampRefreshMinutes(value: unknown, fallback = 10): number {
   return Math.max(1, Math.min(1440, Math.round(minutes)));
 }
 
+function normalizeAccountViewMode(value: unknown): CodexSwitcherSettings["accountViewMode"] {
+  return value === "compact" || value === "table" ? value : "card";
+}
+
 function normalizedNextRefreshAt(value: unknown, minutes: number): number {
   const intervalMs = clampRefreshMinutes(minutes) * 60_000;
   const parsed = Number(value || 0);
@@ -460,6 +468,8 @@ function scheduleCountdownSettingsPersist(): void {
       pinnedAccountIds: settings.pinnedAccountIds || [],
       accountTypeFilter: settings.accountTypeFilter || "all",
       pageSize: Math.max(1, Number(settings.pageSize || 50)),
+      accountViewMode: normalizeAccountViewMode(settings.accountViewMode),
+      sidebarEnabled: settings.sidebarEnabled ?? true,
       quotaRefreshMinutes: clampRefreshMinutes(settings.quotaRefreshMinutes),
       currentAccountRefreshMinutes: clampRefreshMinutes(settings.currentAccountRefreshMinutes),
       quotaNextRefreshAt: settings.monitorQuota ? Math.floor(settings.quotaNextRefreshAt || 0) : 0,
@@ -1084,6 +1094,8 @@ async function loadSettings(): Promise<void> {
       pinnedAccountIds: nextSettings.pinnedAccountIds || [],
       accountTypeFilter: nextSettings.accountTypeFilter || "all",
       pageSize: Math.max(1, Number(nextSettings.pageSize || 50)),
+      accountViewMode: normalizeAccountViewMode(nextSettings.accountViewMode),
+      sidebarEnabled: nextSettings.sidebarEnabled ?? true,
       quotaRefreshMinutes: clampRefreshMinutes(nextSettings.quotaRefreshMinutes),
       currentAccountRefreshMinutes: clampRefreshMinutes(nextSettings.currentAccountRefreshMinutes),
       quotaNextRefreshAt: Number(nextSettings.quotaNextRefreshAt || 0),
@@ -1139,6 +1151,8 @@ async function saveSettings(): Promise<void> {
       pinnedAccountIds: settings.pinnedAccountIds || [],
       accountTypeFilter: settings.accountTypeFilter || "all",
       pageSize: Math.max(1, Number(settings.pageSize || 50)),
+      accountViewMode: normalizeAccountViewMode(settings.accountViewMode),
+      sidebarEnabled: settings.sidebarEnabled ?? true,
       quotaRefreshMinutes: clampRefreshMinutes(settings.quotaRefreshMinutes),
       currentAccountRefreshMinutes: clampRefreshMinutes(settings.currentAccountRefreshMinutes),
       quotaNextRefreshAt: settings.monitorQuota ? Math.floor(settings.quotaNextRefreshAt || 0) : 0,
@@ -1527,6 +1541,10 @@ function toggleAllAccounts(checked: boolean): void {
     else next.delete(account.id);
   }
   selectedAccountIds.value = next;
+}
+
+function clearSelectedAccounts(): void {
+  selectedAccountIds.value = new Set();
 }
 
 async function openBatchExport(): Promise<void> {
@@ -2713,16 +2731,20 @@ function scheduleInitialPrewarm(): void {
 }
 
 async function syncExpandedLayout(): Promise<void> {
+  if (!initialLayoutWidth && window.innerWidth > 0) {
+    initialLayoutWidth = window.innerWidth;
+  }
+  const resizedWider =
+    initialLayoutWidth > 0 && window.innerWidth >= initialLayoutWidth + EXPANDED_LAYOUT_WIDTH_DELTA;
   try {
     const currentWindow = getCurrentWindow();
     const [maximized, fullscreen] = await Promise.all([
       currentWindow.isMaximized(),
       currentWindow.isFullscreen(),
     ]);
-    expandedLayout.value = maximized || fullscreen;
+    expandedLayout.value = maximized || fullscreen || resizedWider;
   } catch {
-    expandedLayout.value =
-      window.innerWidth >= Math.max(1600, window.screen.availWidth - 80);
+    expandedLayout.value = resizedWider;
   }
 }
 
@@ -2802,9 +2824,10 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <main class="app-shell">
+  <main class="app-shell" :class="{ 'sidebar-disabled': !settings.sidebarEnabled }">
     <AppHeader
       :active-view="activeView"
+      :sidebar-enabled="settings.sidebarEnabled"
       :accounts-count="accounts.length"
       :oauth-count="oauthCount"
       :api-key-count="apiKeyCount"
@@ -2812,9 +2835,12 @@ onUnmounted(() => {
       :current-account-label="currentAccount ? displayNameForUi(currentAccount) : ''"
       :current-account-error="currentAccount ? quotaErrorLabel(currentAccount) : ''"
       :detecting-current-account="detectingCurrentAccount"
+      :refreshing-all-quotas="refreshingAllQuotas"
+      :monitor-quota="settings.monitorQuota"
       :privacy-masked="privacyMasked"
       @switch-view="switchView"
       @detect-current-account="handleDetectCurrentAccount"
+      @refresh-all-quotas="handleRefreshEveryQuota"
       @toggle-privacy="privacyMasked = !privacyMasked"
       @open-badge-style="badgeStyleVisible = true"
       @open-add="openAddModal"
@@ -2829,7 +2855,6 @@ onUnmounted(() => {
       :show-sort-direction="showSortDirection"
       :current-account-refresh-countdown="currentAccountRefreshCountdown"
       :quota-refresh-countdown="quotaRefreshCountdown"
-      :refreshing-all-quotas="refreshingAllQuotas"
       @toggle-all="toggleAllAccounts"
       @update:account-search-keyword="accountSearchKeyword = $event"
       @reset-page="currentPage = 1"
@@ -2837,7 +2862,6 @@ onUnmounted(() => {
       @open-sort-editor="openSortEditor"
       @bind-selected-to-api-service="confirmBindSelectedToApiService"
       @batch-export="openBatchExport"
-      @refresh-all-quotas="handleRefreshEveryQuota"
       @open-add="openAddModal"
     />
 
@@ -2874,14 +2898,37 @@ onUnmounted(() => {
       @reauthorize="openReauthorizeModal"
     />
 
-    <div v-if="activeView === 'accounts' && sortedAccounts.length > settings.pageSize" class="pagination-bar">
+    <div v-if="activeView === 'accounts' && sortedAccounts.length" class="pagination-bar">
+      <div class="pagination-selection">
+        <span>{{ t("已选择") }} {{ selectedAccountIdList.length }} {{ t("个账号") }}</span>
+        <a-button
+          v-if="selectedAccountIdList.length"
+          size="mini"
+          type="text"
+          @click="clearSelectedAccounts"
+        >
+          {{ t("清空选择") }}
+        </a-button>
+      </div>
       <a-pagination
         v-model:current="currentPage"
         :total="sortedAccounts.length"
         :page-size="settings.pageSize"
-        show-total
-        show-jumper
       />
+      <div class="pagination-summary">
+        <span>{{ t("共") }} {{ sortedAccounts.length }} {{ t("条") }}</span>
+        <a-select
+          v-model="settings.pageSize"
+          size="small"
+          class="pagination-page-size"
+          @change="() => { currentPage = 1; saveSettings(); }"
+        >
+          <a-option :value="20">20 {{ t("条/页") }}</a-option>
+          <a-option :value="50">50 {{ t("条/页") }}</a-option>
+          <a-option :value="100">100 {{ t("条/页") }}</a-option>
+          <a-option :value="200">200 {{ t("条/页") }}</a-option>
+        </a-select>
+      </div>
     </div>
 
     <SortEditorModal
