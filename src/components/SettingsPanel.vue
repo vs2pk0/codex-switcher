@@ -62,7 +62,7 @@ function changeLanguage(value: unknown): void {
   <section class="settings-panel">
     <a-spin :loading="loading" dot>
       <div class="settings-grid">
-        <a-card :title="t('数据')" :bordered="false" class="settings-card">
+        <a-card :title="t('数据')" :bordered="false" class="settings-card settings-data">
           <div class="path-row">
             <span>{{ t("应用目录") }}</span>
             <a-input :model-value="appPaths?.appDir || ''" readonly />
@@ -128,7 +128,7 @@ function changeLanguage(value: unknown): void {
           </div>
         </a-card>
 
-        <a-card :title="t('刷新')" :bordered="false" class="settings-card">
+        <a-card :title="t('刷新')" :bordered="false" class="settings-card settings-refresh">
           <a-form :model="settings" layout="vertical">
             <a-form-item :label="t('监控额度')">
               <a-switch v-model="settings.monitorQuota" @change="emit('save')" />
@@ -175,6 +175,9 @@ function changeLanguage(value: unknown): void {
                 </a-option>
               </a-select>
             </a-form-item>
+            <a-form-item :label="t('侧边栏')">
+              <a-switch v-model="settings.sidebarEnabled" @change="emit('save')" />
+            </a-form-item>
             <a-form-item :label="t('每行固定账号数')">
               <a-radio-group v-model="settings.maxColumns" type="button" @change="emit('save')">
                 <a-radio :value="3">{{ t("3 个") }}</a-radio>
@@ -195,7 +198,7 @@ function changeLanguage(value: unknown): void {
           </a-form>
         </a-card>
 
-        <a-card :title="t('配置')" :bordered="false" class="settings-card">
+        <a-card :title="t('配置')" :bordered="false" class="settings-card settings-config">
           <p class="settings-hint">
             {{ t("重置会删除本机 Codex 目录下的 config.toml，适合切换配置异常时恢复默认配置。") }}
           </p>

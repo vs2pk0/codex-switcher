@@ -20,6 +20,8 @@ export interface CodexSwitcherSettings {
   pinnedAccountIds: string[];
   accountTypeFilter: string;
   pageSize: number;
+  accountViewMode: "card" | "compact" | "table";
+  sidebarEnabled: boolean;
   showQuotaCountdowns: boolean;
   badgeStyle: string;
   badgeStyles: Record<string, string>;

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { Message } from "@arco-design/web-vue";
 import { computed, ref } from "vue";
 import type { CodexSwitcherSettings } from "../services/codex";
 import type { CodexAccount, CodexResetCredit } from "../types/codex";
@@ -50,6 +51,11 @@ const gridClass = computed(() => {
   };
 });
 
+const accountViewMode = computed(() => {
+  const mode = props.settings.accountViewMode;
+  return mode === "compact" || mode === "table" ? mode : "card";
+});
+
 function isPinned(account: CodexAccount): boolean {
   return (props.settings.pinnedAccountIds || []).includes(account.id);
 }
@@ -79,6 +85,34 @@ function handleDrop(event: DragEvent, account: CodexAccount): void {
 function handleDragEnd(): void {
   dragOverAccountId.value = "";
   emit("drag-end");
+}
+
+function handleCardClick(event: MouseEvent, account: CodexAccount): void {
+  if (isInteractiveClick(event)) return;
+  emit("toggle-account", account.id);
+}
+
+function isInteractiveClick(event: MouseEvent): boolean {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return false;
+  return Boolean(
+    target.closest(
+      [
+        "button",
+        "a",
+        "input",
+        "textarea",
+        "select",
+        "label",
+        "[role='button']",
+        "[contenteditable='true']",
+        ".arco-checkbox",
+        ".arco-btn",
+        ".arco-trigger",
+        ".card-actions",
+      ].join(","),
+    ),
+  );
 }
 
 function isApiKeyAccount(account: CodexAccount): boolean {
@@ -117,6 +151,10 @@ function displayIdentity(value: string): string {
 function displayAccountName(account: CodexAccount): string {
   const raw = displayName(account);
   return displayIdentity(raw);
+}
+
+function displayAccountEmail(account: CodexAccount): string {
+  return displayIdentity(account.email || displayName(account));
 }
 
 function boundOAuthAccount(account: CodexAccount): CodexAccount | undefined {
@@ -288,6 +326,11 @@ function accountLoginLine(account: CodexAccount): string {
   return `API Key: ${maskSecret(account.openai_api_key || account.openaiApiKey)}`;
 }
 
+function accountAuthLine(account: CodexAccount): string {
+  if (isApiKeyAccount(account)) return accountLoginLine(account);
+  return account.tokens.refresh_token ? t("OAuth 登录") : t("Token 登录");
+}
+
 function isFreePlanAccount(account: CodexAccount): boolean {
   return !isApiKeyAccount(account) && normalizePlanKey(account.plan_type) === "free";
 }
@@ -307,6 +350,31 @@ function apiBaseUrlLine(account: CodexAccount): string {
 
 function apiOfficialUrl(account: CodexAccount): string {
   return (account.api_official_url || account.apiOfficialUrl)?.trim() ?? "";
+}
+
+function apiOfficialHost(account: CodexAccount): string {
+  const value = apiOfficialUrl(account);
+  if (!value) return "";
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return value.replace(/\/+$/, "");
+  }
+}
+
+async function copyText(value: string, successLabel: string): Promise<void> {
+  const text = value.trim();
+  if (!text) {
+    Message.warning(t("没有可复制的内容"));
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    Message.success(t(successLabel));
+  } catch {
+    Message.error(t("复制失败，请手动选择内容复制"));
+  }
 }
 
 function maskSecret(value?: string): string {
@@ -428,11 +496,11 @@ function resetCreditEndLabel(credit: CodexResetCredit): string {
   return `${t("可用至")} ${resetCreditDateLabel(credit.expires_at)}`;
 }
 
-function quotaWindowLabel(minutes?: number, fallback = "5h"): string {
-  if (!minutes) return t(fallback);
-  if (minutes % (60 * 24) === 0) return t(`${minutes / 60 / 24} 天窗口`);
-  if (minutes % 60 === 0) return t(`${minutes / 60} 小时窗口`);
-  return t(`${minutes} 分钟窗口`);
+function quotaWindowShortLabel(minutes?: number, fallbackMinutes = 300): string {
+  const value = minutes || fallbackMinutes;
+  if (value % (60 * 24) === 0) return `${value / 60 / 24} ${t("天")}`;
+  if (value % 60 === 0) return `${value / 60} ${t("小时")}`;
+  return `${value} ${t("分钟")}`;
 }
 
 function quotaColor(value?: number): string {
@@ -440,6 +508,38 @@ function quotaColor(value?: number): string {
   if (percentage >= 70) return "#22c55e";
   if (percentage >= 40) return "#f59e0b";
   return "#ef4444";
+}
+
+function quotaPercentLabel(value?: number): string {
+  return Number.isFinite(value) ? `${value}%` : "--";
+}
+
+function quotaDotStyle(value?: number): Record<string, string> {
+  return { background: quotaColor(value) };
+}
+
+function quotaProgressStyle(value?: number): Record<string, string> {
+  const width = Number.isFinite(value) ? Math.max(0, Math.min(100, Number(value))) : 0;
+  return {
+    width: `${width}%`,
+    background: quotaColor(value),
+  };
+}
+
+function accountSubscriptionClass(account: CodexAccount): string {
+  const value = accountSubscriptionUntil(account);
+  if (!value) return "unknown";
+  const date = normalizeDate(value);
+  if (date && date.getTime() <= Date.now()) return "expired";
+  return "active";
+}
+
+function accountSubscriptionBadge(account: CodexAccount): string {
+  const value = accountSubscriptionUntil(account);
+  if (!value) return t("未获得订阅信息");
+  const date = normalizeDate(value);
+  if (date && date.getTime() <= Date.now()) return t("已过期");
+  return expiryDaysLabel(value) || t("已记录");
 }
 
 function quotaResetLeftLabel(value?: string | number): string {
@@ -527,7 +627,7 @@ function formatTime(value?: number | null): string {
 
 <template>
   <a-spin class="accounts-spin" :loading="loading" dot>
-    <section v-if="accounts.length" class="account-grid" :class="gridClass">
+    <section v-if="accounts.length && accountViewMode === 'card'" class="account-grid" :class="gridClass">
       <a-card
         v-for="account in accounts"
         :key="account.id"
@@ -535,6 +635,7 @@ function formatTime(value?: number | null): string {
         :class="{
           active: account.id === currentId,
           pinned: isPinned(account),
+          'api-key-account': isApiKeyAccount(account),
           draggable: settings.sortMode === 'custom',
           'drag-over': dragOverAccountId === account.id,
         }"
@@ -546,79 +647,100 @@ function formatTime(value?: number | null): string {
         @dragleave="dragOverAccountId = ''"
         @dragend="handleDragEnd"
         @drop="handleDrop($event, account)"
+        @click="handleCardClick($event, account)"
       >
         <div class="account-head">
-          <div class="account-title">
-            <a-checkbox
-              class="account-check"
-              :model-value="selectedAccountIds.has(account.id)"
-              @change="emit('toggle-account', account.id)"
-            />
-            <span
-              class="account-name"
-              :title="`${displayAccountName(account)}, ${t('双击复制邮箱')}`"
-              @dblclick.stop="emit('copy-email', account)"
-            >
-              {{ displayAccountName(account) }}
-            </span>
-          </div>
-          <div class="account-head-actions">
-            <span v-if="account.id === currentId" class="current-account-pill">
-              {{ t("当前") }}
-            </span>
-            <a-tooltip v-if="!isApiKeyAccount(account) && canUseResetCredit(account)" :content="t('可用重置次数')">
-              <button
-                class="reset-credit-pill"
-                type="button"
-                :disabled="quotaRefreshingId === account.id"
-                @click.stop="emit('reset-credit', account)"
-              >
-                <icon-thunderbolt />
-                {{ resetCreditCount(account) }}
-              </button>
-            </a-tooltip>
-            <a-tooltip :content="isPinned(account) ? t('取消置顶') : t('置顶账号')">
-              <button
-                class="pin-button"
-                :class="{ active: isPinned(account) }"
-                type="button"
-                @click.stop="emit('toggle-pin', account)"
-              >
-                <icon-pushpin />
-              </button>
-            </a-tooltip>
-            <PlanBadge :label="planLabel(account)" :badge-class="planClass(account)" />
+          <div class="account-identity-card">
+            <div class="account-check-zone" @click.stop>
+              <a-checkbox
+                class="account-check"
+                :model-value="selectedAccountIds.has(account.id)"
+                @change="emit('toggle-account', account.id)"
+              />
+            </div>
+            <div class="account-title">
+              <div class="account-title-main">
+                <span
+                  class="account-name"
+                  :title="`${displayAccountEmail(account)}, ${t('双击复制邮箱')}`"
+                  @dblclick.stop="emit('copy-email', account)"
+                >
+                  {{ displayAccountEmail(account) }}
+                </span>
+              </div>
+              <div class="account-action-meta">
+                <small>{{ t("账号 ID") }}: {{ shortAccountId(account) }}</small>
+                <span v-if="account.id === currentId" class="current-account-pill identity-current-pill">
+                  {{ t("当前") }}
+                </span>
+                <span v-else class="identity-current-placeholder" aria-hidden="true" />
+                <PlanBadge :label="planLabel(account)" :badge-class="planClass(account)" />
+              </div>
+            </div>
           </div>
         </div>
 
-        <div v-if="isApiKeyAccount(account)" class="account-summary">
-          <div class="chip-line">
-            <a-button class="soft-chip" size="mini" @click="emit('open-binding', account)">
+        <div v-if="isApiKeyAccount(account)" class="account-summary api-key-summary">
+          <div class="chip-line api-bind-line">
+            <a-button class="soft-chip api-bind-chip" size="mini" @click.stop="emit('open-binding', account)">
               <template #icon><icon-link /></template>
               {{ boundOAuthName(account) === t("未绑定") ? t("绑定 OAuth") : boundOAuthName(account) }}
             </a-button>
           </div>
 
-          <div class="login-line">{{ accountLoginLine(account) }}</div>
-          <div class="login-line full-url" :title="apiBaseUrl(account)">
-            {{ apiBaseUrlLine(account) }}
+          <div class="api-key-info-card">
+            <div class="api-key-info-row">
+              <span class="api-key-info-icon api-key-info-icon-key"><icon-link /></span>
+              <span class="api-key-info-text">
+                <b>API Key</b>
+                <em>{{ maskSecret(account.openai_api_key || account.openaiApiKey) }}</em>
+              </span>
+              <a-tooltip :content="t('复制 API Key')">
+                <a-button
+                  class="api-key-copy-btn"
+                  size="small"
+                  :title="t('复制 API Key')"
+                  @click.stop="copyText(account.openai_api_key || account.openaiApiKey || '', '已复制 API Key')"
+                >
+                  <template #icon><icon-copy /></template>
+                </a-button>
+              </a-tooltip>
+            </div>
+            <div class="api-key-info-row">
+              <span class="api-key-info-icon api-key-info-icon-url"><icon-link /></span>
+              <span class="api-key-info-text">
+                <b>Base URL</b>
+                <em :title="apiBaseUrl(account)">{{ apiBaseUrl(account) || t("未设置") }}</em>
+              </span>
+              <a-tooltip :content="t('复制 Base URL')">
+                <a-button
+                  class="api-key-copy-btn"
+                  size="small"
+                  :title="t('复制 Base URL')"
+                  @click.stop="copyText(apiBaseUrl(account), '已复制 Base URL')"
+                >
+                  <template #icon><icon-copy /></template>
+                </a-button>
+              </a-tooltip>
+            </div>
           </div>
           <button
             v-if="apiOfficialUrl(account)"
             class="official-link"
             type="button"
             :title="apiOfficialUrl(account)"
-            @click="emit('open-official-url', apiOfficialUrl(account))"
+            @click.stop="emit('open-official-url', apiOfficialUrl(account))"
           >
             <icon-link />
             <span>
               <b>{{ t("官网地址") }}</b>
-              <em>{{ apiOfficialUrl(account) }}</em>
+              <em>{{ apiOfficialHost(account) }}</em>
             </span>
+            <icon-link />
           </button>
         </div>
 
-        <div class="account-health">
+        <div v-if="!isApiKeyAccount(account)" class="account-health">
           <template v-if="shouldShowQuota(account) && account.quota">
             <div class="quota-panel">
               <div class="quota-panel-head">
@@ -627,12 +749,14 @@ function formatTime(value?: number | null): string {
               </div>
               <div class="quota-metrics" :class="{ single: isFreePlanAccount(account) }">
                 <div v-if="account.quota.hourly_window_present !== false" class="quota-metric">
-                  <div class="quota-metric-top">
-                    <span>
+                  <div class="quota-metric-main">
+                    <span class="quota-window-label">
                       <icon-calendar v-if="isFreePlanAccount(account)" />
                       <icon-clock-circle v-else />
-                      {{ isFreePlanAccount(account) ? t("长周期") : t("短周期") }}
+                      {{ quotaWindowShortLabel(account.quota.hourly_window_minutes, isFreePlanAccount(account) ? 43200 : 300) }}
                     </span>
+                    <em>{{ quotaResetDateLabel(account.quota.hourly_reset_time) }}</em>
+                    <small>{{ quotaResetLeftLabel(account.quota.hourly_reset_time) }}</small>
                     <strong :style="{ color: quotaColor(account.quota.hourly_percentage) }">
                       {{ account.quota.hourly_percentage }}%
                     </strong>
@@ -645,24 +769,19 @@ function formatTime(value?: number | null): string {
                       }"
                     />
                   </div>
-                  <div class="quota-meta">
-                    <span>
-                      <b>{{ quotaWindowLabel(account.quota.hourly_window_minutes, '5 小时窗口') }}</b>
-                      <em>{{ quotaResetDateLabel(account.quota.hourly_reset_time) }}</em>
-                      <small>{{ quotaResetLeftLabel(account.quota.hourly_reset_time) }}</small>
-                    </span>
-                  </div>
                 </div>
 
                 <div
                   v-if="!isFreePlanAccount(account) && account.quota.weekly_window_present !== false"
                   class="quota-metric"
                 >
-                  <div class="quota-metric-top">
-                    <span>
+                  <div class="quota-metric-main">
+                    <span class="quota-window-label">
                       <icon-calendar />
-                      {{ t("长周期") }}
+                      {{ quotaWindowShortLabel(account.quota.weekly_window_minutes, 10080) }}
                     </span>
+                    <em>{{ quotaResetDateLabel(account.quota.weekly_reset_time) }}</em>
+                    <small>{{ quotaResetLeftLabel(account.quota.weekly_reset_time) }}</small>
                     <strong :style="{ color: quotaColor(account.quota.weekly_percentage) }">
                       {{ account.quota.weekly_percentage }}%
                     </strong>
@@ -674,13 +793,6 @@ function formatTime(value?: number | null): string {
                         background: quotaColor(account.quota.weekly_percentage),
                       }"
                     />
-                  </div>
-                  <div class="quota-meta">
-                    <span>
-                      <b>{{ quotaWindowLabel(account.quota.weekly_window_minutes, '7 天窗口') }}</b>
-                      <em>{{ quotaResetDateLabel(account.quota.weekly_reset_time) }}</em>
-                      <small>{{ quotaResetLeftLabel(account.quota.weekly_reset_time) }}</small>
-                    </span>
                   </div>
                 </div>
 
@@ -708,41 +820,43 @@ function formatTime(value?: number | null): string {
             </a-button>
           </div>
 
-          <div
-            v-if="!isBoundApiKeyAccount(account) && (accountSubscriptionUntil(account) || accountTokenExpiresAt(account))"
-            class="status-grid"
-            :class="{ single: !(accountSubscriptionUntil(account) && accountTokenExpiresAt(account)) }"
-          >
+          <div v-if="!isBoundApiKeyAccount(account)" class="status-grid">
             <div
-              v-if="!accountSubscriptionUntil(account) && accountTokenExpiresAt(account)"
-              class="status-card status-placeholder"
-              aria-hidden="true"
-            />
-
-            <div v-if="accountSubscriptionUntil(account)" class="status-card status-valid">
-              <span>
-                <icon-calendar />
-                {{ statusTitle(account) }}
-                <b class="status-remaining-time">
-                  {{ expiryDaysLabel(accountSubscriptionUntil(account)) || t("已记录") }}
-                </b>
-              </span>
-              <strong>{{ formatDateTime(accountSubscriptionUntil(account)) }}</strong>
+              class="status-card"
+              :class="accountSubscriptionUntil(account) ? 'status-valid' : 'status-placeholder'"
+              :aria-hidden="accountSubscriptionUntil(account) ? undefined : 'true'"
+            >
+              <template v-if="accountSubscriptionUntil(account)">
+                <span>
+                  <icon-calendar />
+                  {{ statusTitle(account) }}
+                  <b class="status-remaining-time">
+                    {{ expiryDaysLabel(accountSubscriptionUntil(account)) || t("已记录") }}
+                  </b>
+                </span>
+                <strong>{{ formatDateTime(accountSubscriptionUntil(account)) }}</strong>
+              </template>
             </div>
 
-            <div v-if="accountTokenExpiresAt(account)" class="status-card status-token-expired">
-              <span>
-                <icon-clock-circle />
-                {{ tokenExpiryStatus(accountTokenExpiresAt(account)) === "expired" ? t("Token 失效") : t("Token 可用") }}
-              </span>
-              <strong>{{ formatDateTime(accountTokenExpiresAt(account)) }}</strong>
+            <div
+              class="status-card"
+              :class="accountTokenExpiresAt(account) ? 'status-token-expired' : 'status-placeholder'"
+              :aria-hidden="accountTokenExpiresAt(account) ? undefined : 'true'"
+            >
+              <template v-if="accountTokenExpiresAt(account)">
+                <span>
+                  <icon-clock-circle />
+                  {{ tokenExpiryStatus(accountTokenExpiresAt(account)) === "expired" ? t("Token 失效") : t("Token 可用") }}
+                </span>
+                <strong>{{ formatDateTime(accountTokenExpiresAt(account)) }}</strong>
+              </template>
             </div>
           </div>
         </div>
 
         <footer class="card-footer">
           <div class="footer-meta">
-            <span>{{ formatTime(account.last_used) }}</span>
+            <small class="account-last-used">{{ formatTime(account.last_used) }}</small>
             <button
               v-if="!isApiKeyAccount(account) && account.bound_phone"
               class="footer-phone"
@@ -753,12 +867,34 @@ function formatTime(value?: number | null): string {
               {{ displayPhone(account.bound_phone) }}
             </button>
           </div>
-          <div class="card-actions">
+          <div class="card-actions" @click.stop>
+            <a-tooltip :content="isPinned(account) ? t('取消置顶') : t('置顶账号')">
+              <a-button
+                size="small"
+                :title="isPinned(account) ? t('取消置顶') : t('置顶账号')"
+                :class="{ 'action-active': isPinned(account) }"
+                @click="emit('toggle-pin', account)"
+              >
+                <template #icon><icon-pushpin /></template>
+              </a-button>
+            </a-tooltip>
+            <a-tooltip v-if="canUseResetCredit(account)" :content="t('重置额度')">
+              <a-button
+                size="small"
+                :title="`${t('重置额度')} ${resetCreditCount(account)}`"
+                :loading="quotaRefreshingId === account.id"
+                @click="emit('reset-credit', account)"
+              >
+                <template #icon><icon-thunderbolt /></template>
+              </a-button>
+            </a-tooltip>
+            <span v-else class="action-placeholder" aria-hidden="true" />
             <a-tooltip v-if="!isApiKeyAccount(account)" :content="t('绑定手机')">
               <a-button size="small" :title="t('绑定手机')" @click="emit('open-phone', account)">
                 <template #icon><icon-phone /></template>
               </a-button>
             </a-tooltip>
+            <span v-else class="action-placeholder" aria-hidden="true" />
             <a-tooltip :content="t('编辑')">
               <a-button size="small" :title="t('编辑')" @click="emit('open-edit', account)">
                 <template #icon><icon-edit /></template>
@@ -784,16 +920,7 @@ function formatTime(value?: number | null): string {
                 <template #icon><icon-refresh /></template>
               </a-button>
             </a-tooltip>
-            <a-tooltip v-if="canUseResetCredit(account)" :content="t('重置额度')">
-              <a-button
-                size="small"
-                :title="t('重置额度')"
-                :loading="quotaRefreshingId === account.id"
-                @click="emit('reset-credit', account)"
-              >
-                <template #icon><icon-thunderbolt /></template>
-              </a-button>
-            </a-tooltip>
+            <span v-else class="action-placeholder" aria-hidden="true" />
             <a-tooltip :content="t('导出')">
               <a-button
                 size="small"
@@ -817,6 +944,268 @@ function formatTime(value?: number | null): string {
           </div>
         </footer>
       </a-card>
+    </section>
+
+    <section v-else-if="accounts.length && accountViewMode === 'compact'" class="account-compact-grid">
+      <div
+        v-for="account in accounts"
+        :key="account.id"
+        class="account-compact-row"
+        :class="{
+          active: account.id === currentId,
+          pinned: isPinned(account),
+          draggable: settings.sortMode === 'custom',
+          'drag-over': dragOverAccountId === account.id,
+        }"
+        :draggable="settings.sortMode === 'custom'"
+        @dragstart="handleDragStart($event, account)"
+        @dragenter="handleDragOver($event, account)"
+        @dragover="handleDragOver($event, account)"
+        @dragleave="dragOverAccountId = ''"
+        @dragend="handleDragEnd"
+        @drop="handleDrop($event, account)"
+      >
+        <a-checkbox
+          class="account-check"
+          :model-value="selectedAccountIds.has(account.id)"
+          @change="emit('toggle-account', account.id)"
+        />
+        <button
+          class="compact-account-name"
+          type="button"
+          :title="`${displayAccountName(account)}, ${t('双击复制邮箱')}`"
+          @dblclick.stop="emit('copy-email', account)"
+        >
+          {{ displayAccountName(account) }}
+        </button>
+        <span v-if="account.id === currentId" class="current-account-pill compact-current">{{ t("当前") }}</span>
+        <span v-if="shouldShowQuota(account) && account.quota" class="compact-quota-pair">
+          <span>
+            <i :style="quotaDotStyle(account.quota.hourly_percentage)" />
+            {{ quotaPercentLabel(account.quota.hourly_percentage) }}
+          </span>
+          <span>
+            <i :style="quotaDotStyle(account.quota.weekly_percentage)" />
+            {{ isFreePlanAccount(account) ? "--" : quotaPercentLabel(account.quota.weekly_percentage) }}
+          </span>
+        </span>
+        <span v-else-if="shouldShowQuotaError(account)" class="compact-quota-error">
+          {{ t("异常") }}
+        </span>
+        <span v-else class="compact-quota-pair muted">
+          <span><i />--</span>
+          <span><i />--</span>
+        </span>
+        <span
+          v-if="accountSubscriptionUntil(account)"
+          class="compact-subscription"
+          :class="accountSubscriptionClass(account)"
+        >
+          {{ accountSubscriptionBadge(account) }}
+        </span>
+        <a-tooltip v-if="!isApiKeyAccount(account)" :content="t('刷新额度')">
+          <button
+            class="compact-text-action"
+            type="button"
+            :disabled="quotaRefreshingId === account.id"
+            @click="emit('refresh-quota', account)"
+          >
+            {{ t("刷新") }}
+          </button>
+        </a-tooltip>
+        <PlanBadge :label="planLabel(account)" :badge-class="planClass(account)" />
+        <a-tooltip :content="isPinned(account) ? t('取消置顶') : t('置顶账号')">
+          <button
+            class="compact-icon-action"
+            :class="{ active: isPinned(account) }"
+            type="button"
+            @click.stop="emit('toggle-pin', account)"
+          >
+            <icon-pushpin />
+          </button>
+        </a-tooltip>
+        <a-tooltip :content="t('编辑')">
+          <button class="compact-icon-action" type="button" @click="emit('open-edit', account)">
+            <icon-file />
+          </button>
+        </a-tooltip>
+        <a-tooltip :content="t('切换')">
+          <button
+            class="compact-icon-action primary"
+            type="button"
+            :disabled="switchingId === account.id"
+            @click="emit('switch-account', account)"
+          >
+            <icon-play-arrow />
+          </button>
+        </a-tooltip>
+      </div>
+    </section>
+
+    <section v-else-if="accounts.length && accountViewMode === 'table'" class="account-table-wrap">
+      <table class="account-table">
+        <thead>
+          <tr>
+            <th class="account-table-check"></th>
+            <th>{{ t("邮箱") }}</th>
+            <th>{{ t("订阅") }}</th>
+            <th>{{ t("订阅信息") }}</th>
+            <th>{{ t("配额状态") }}</th>
+            <th>{{ t("操作") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="account in accounts"
+            :key="account.id"
+            :class="{
+              active: account.id === currentId,
+              draggable: settings.sortMode === 'custom',
+              'drag-over': dragOverAccountId === account.id,
+            }"
+            :draggable="settings.sortMode === 'custom'"
+            @dragstart="handleDragStart($event, account)"
+            @dragenter="handleDragOver($event, account)"
+            @dragover="handleDragOver($event, account)"
+            @dragleave="dragOverAccountId = ''"
+            @dragend="handleDragEnd"
+            @drop="handleDrop($event, account)"
+          >
+            <td class="account-table-check">
+              <a-checkbox
+                :model-value="selectedAccountIds.has(account.id)"
+                @change="emit('toggle-account', account.id)"
+              />
+            </td>
+            <td>
+              <div class="table-account-main">
+                <button
+                  type="button"
+                  :title="`${displayAccountName(account)}, ${t('双击复制邮箱')}`"
+                  @dblclick.stop="emit('copy-email', account)"
+                >
+                  {{ displayAccountName(account) }}
+                </button>
+                <span>
+                  {{ accountAuthLine(account) }}
+                  <template v-if="account.id === currentId"> · {{ t("当前") }}</template>
+                </span>
+                <small>{{ t("用户 ID") }}: {{ shortAccountId(account) }}</small>
+              </div>
+            </td>
+            <td>
+              <PlanBadge :label="planLabel(account)" :badge-class="planClass(account)" />
+            </td>
+            <td>
+              <div class="table-subscription">
+                <span :class="accountSubscriptionClass(account)">
+                  {{ accountSubscriptionBadge(account) }}
+                </span>
+                <small>{{ accountSubscriptionUntil(account) ? formatDateTime(accountSubscriptionUntil(account)) : t("未获得订阅信息") }}</small>
+              </div>
+            </td>
+            <td>
+              <div v-if="shouldShowQuota(account) && account.quota" class="table-quota-stack">
+                <div class="table-quota-line">
+                  <span>{{ isFreePlanAccount(account) ? t("长周期") : "5h" }}</span>
+                  <div><i :style="quotaProgressStyle(account.quota.hourly_percentage)" /></div>
+                  <strong :style="{ color: quotaColor(account.quota.hourly_percentage) }">
+                    {{ quotaPercentLabel(account.quota.hourly_percentage) }}
+                  </strong>
+                  <small>{{ quotaResetLeftLabel(account.quota.hourly_reset_time) }}</small>
+                </div>
+                <div v-if="!isFreePlanAccount(account)" class="table-quota-line">
+                  <span>{{ t("周配额") }}</span>
+                  <div><i :style="quotaProgressStyle(account.quota.weekly_percentage)" /></div>
+                  <strong :style="{ color: quotaColor(account.quota.weekly_percentage) }">
+                    {{ quotaPercentLabel(account.quota.weekly_percentage) }}
+                  </strong>
+                  <small>{{ quotaResetLeftLabel(account.quota.weekly_reset_time) }}</small>
+                </div>
+              </div>
+              <div
+                v-else-if="shouldShowQuotaError(account) && account.quota_error"
+                class="table-quota-error"
+              >
+                <span>{{ quotaErrorMessage(account) }}</span>
+                <a-button
+                  v-if="isTokenExpiredError(account)"
+                  size="mini"
+                  status="danger"
+                  @click="emit('reauthorize', account)"
+                >
+                  {{ t("重新授权") }}
+                </a-button>
+              </div>
+              <span v-else class="table-muted">{{ t("未获得订阅信息") }}</span>
+            </td>
+            <td>
+              <div class="table-actions">
+                <a-tooltip v-if="!isApiKeyAccount(account)" :content="t('绑定手机')">
+                  <a-button size="mini" @click="emit('open-phone', account)">
+                    <template #icon><icon-phone /></template>
+                  </a-button>
+                </a-tooltip>
+                <a-tooltip :content="isPinned(account) ? t('取消置顶') : t('置顶账号')">
+                  <a-button size="mini" @click.stop="emit('toggle-pin', account)">
+                    <template #icon><icon-pushpin /></template>
+                  </a-button>
+                </a-tooltip>
+                <a-tooltip :content="t('编辑')">
+                  <a-button size="mini" @click="emit('open-edit', account)">
+                    <template #icon><icon-file /></template>
+                  </a-button>
+                </a-tooltip>
+                <a-tooltip :content="t('切换')">
+                  <a-button
+                    size="mini"
+                    :loading="switchingId === account.id"
+                    @click="emit('switch-account', account)"
+                  >
+                    <template #icon><icon-play-arrow /></template>
+                  </a-button>
+                </a-tooltip>
+                <a-tooltip v-if="!isApiKeyAccount(account)" :content="t('刷新额度')">
+                  <a-button
+                    size="mini"
+                    :loading="quotaRefreshingId === account.id"
+                    @click="emit('refresh-quota', account)"
+                  >
+                    <template #icon><icon-refresh /></template>
+                  </a-button>
+                </a-tooltip>
+                <a-tooltip v-if="canUseResetCredit(account)" :content="t('重置额度')">
+                  <a-button
+                    size="mini"
+                    :loading="quotaRefreshingId === account.id"
+                    @click="emit('reset-credit', account)"
+                  >
+                    <template #icon><icon-thunderbolt /></template>
+                  </a-button>
+                </a-tooltip>
+                <a-tooltip :content="t('导出')">
+                  <a-button
+                    size="mini"
+                    :loading="exportingId === account.id"
+                    @click="emit('open-export', account)"
+                  >
+                    <template #icon><icon-download /></template>
+                  </a-button>
+                </a-tooltip>
+                <a-tooltip :content="t('删除')">
+                  <a-button
+                    size="mini"
+                    :loading="deletingId === account.id"
+                    @click="emit('confirm-delete', account)"
+                  >
+                    <template #icon><icon-delete /></template>
+                  </a-button>
+                </a-tooltip>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </section>
 
     <section v-else-if="hasAnyAccount" class="account-filter-empty">

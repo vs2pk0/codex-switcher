@@ -2,7 +2,7 @@
 import type { CodexSwitcherSettings } from "../services/codex";
 import { t } from "../i18n";
 
-defineProps<{
+const props = defineProps<{
   settings: CodexSwitcherSettings;
   isCurrentPageSelected: boolean;
   accountTypeOptions: Array<{ label: string; value: string }>;
@@ -10,10 +10,9 @@ defineProps<{
   showSortDirection: boolean;
   currentAccountRefreshCountdown: string;
   quotaRefreshCountdown: string;
-  refreshingAllQuotas: boolean;
 }>();
 
-defineEmits<{
+const emit = defineEmits<{
   (event: "toggle-all", checked: boolean): void;
   (event: "update:account-search-keyword", value: string): void;
   (event: "reset-page"): void;
@@ -21,9 +20,28 @@ defineEmits<{
   (event: "open-sort-editor"): void;
   (event: "bind-selected-to-api-service"): void;
   (event: "batch-export"): void;
-  (event: "refresh-all-quotas"): void;
   (event: "open-add", tab: "oauth" | "token" | "apikey"): void;
 }>();
+
+type AccountViewMode = CodexSwitcherSettings["accountViewMode"];
+
+const accountViewModes: AccountViewMode[] = ["card", "compact", "table"];
+const accountViewModeLabels: Record<AccountViewMode, string> = {
+  card: "卡片视图",
+  compact: "紧凑视图",
+  table: "表格视图",
+};
+
+function accountViewModeLabel(): string {
+  return t(accountViewModeLabels[props.settings.accountViewMode] ?? accountViewModeLabels.card);
+}
+
+function cycleAccountViewMode(): void {
+  const currentIndex = accountViewModes.indexOf(props.settings.accountViewMode);
+  const nextIndex = currentIndex >= 0 ? (currentIndex + 1) % accountViewModes.length : 0;
+  props.settings.accountViewMode = accountViewModes[nextIndex];
+  emit("save-settings");
+}
 </script>
 
 <template>
@@ -101,6 +119,15 @@ defineEmits<{
         <a-option :value="100">{{ t("每页") }} 100</a-option>
         <a-option :value="200">{{ t("每页") }} 200</a-option>
       </a-select>
+      <a-tooltip :content="`${t('切换视图')}：${accountViewModeLabel()}`">
+        <a-button
+          class="account-view-icon-button"
+          :title="`${t('切换视图')}：${accountViewModeLabel()}`"
+          @click="cycleAccountViewMode"
+        >
+          <template #icon><icon-list /></template>
+        </a-button>
+      </a-tooltip>
       <a-button @click="$emit('bind-selected-to-api-service')">
         <template #icon><icon-link /></template>
         {{ t("绑定到 API 服务") }}
@@ -118,15 +145,6 @@ defineEmits<{
       v-if="settings.monitorQuota || currentAccountRefreshCountdown || quotaRefreshCountdown"
       class="quota-countdown-group"
     >
-      <a-button
-        size="small"
-        :loading="refreshingAllQuotas"
-        :disabled="!settings.monitorQuota"
-        @click="$emit('refresh-all-quotas')"
-      >
-        <template #icon><icon-refresh /></template>
-        {{ t("刷新全部额度") }}
-      </a-button>
       <span v-if="currentAccountRefreshCountdown" class="quota-countdown primary">
         {{ t("当前账号") }} {{ currentAccountRefreshCountdown }}
       </span>
