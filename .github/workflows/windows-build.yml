@@ -9,17 +9,60 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  windows:
-    name: Windows x64
-    runs-on: windows-latest
+  prepare-release:
+    name: Prepare version release
+    runs-on: ubuntu-latest
+
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Prepare release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          tag="v${version}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "Release ${tag} already exists; installers will be replaced in place."
+          else
+            gh release create "${tag}" \
+              --draft \
+              --title "Codex Switcher ${tag}" \
+              --notes "Desktop builds are in progress for ${GITHUB_SHA}" \
+              --target "${GITHUB_SHA}"
+          fi
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    needs: prepare-release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -47,23 +90,35 @@ jobs:
           }
           Get-ChildItem -Path "release-assets/windows" | Select-Object FullName, Length, LastWriteTime
 
-      - name: Upload Windows installers
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-installers
-          path: release-assets/windows/*
-          if-no-files-found: error
+      - name: Upload Windows installers to release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $assets = @(Get-ChildItem -Path "release-assets/windows" -File)
+          if (-not $assets) {
+            throw "No Windows installer assets found."
+          }
+          $assetPaths = @($assets | ForEach-Object { $_.FullName })
+          & gh release upload $env:RELEASE_TAG @assetPaths --clobber
+          if ($LASTEXITCODE -ne 0) {
+            throw "Uploading Windows installers to release failed with exit code $LASTEXITCODE."
+          }
 
   macos:
     name: macOS
-    runs-on: macos-latest
+    runs-on: macos-15
+    needs: prepare-release
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -92,53 +147,44 @@ jobs:
           fi
           ls -lh "release-assets/macos"
 
-      - name: Upload macOS installers
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-installers
-          path: release-assets/macos/*
-          if-no-files-found: error
+      - name: Upload macOS installers to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          assets=()
+          while IFS= read -r asset; do
+            assets+=("${asset}")
+          done < <(find "release-assets/macos" -type f | sort)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No macOS installer assets found." >&2
+            exit 1
+          fi
+          gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
 
-  release:
-    name: Publish version release
+  finalize-release:
+    name: Finalize version release
     runs-on: ubuntu-latest
     needs:
+      - prepare-release
       - windows
       - macos
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Download release assets
-        uses: actions/download-artifact@v4
-        with:
-          path: release-assets
-
       - name: Publish release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
         run: |
           set -euo pipefail
-          version="$(node -p "require('./package.json').version")"
-          tag="v${version}"
-          title="Codex Switcher ${tag}"
-          notes="Automated Windows and macOS build for ${GITHUB_SHA}"
-          mapfile -t assets < <(find "release-assets" -type f | sort)
-          if [ "${#assets[@]}" -eq 0 ]; then
-            echo "No release assets found." >&2
-            exit 1
-          fi
-
-          if gh release view "${tag}" >/dev/null 2>&1; then
-            gh release edit "${tag}" --title "${title}" --notes "${notes}" --target "${GITHUB_SHA}" --latest
-          else
-            gh release create "${tag}" --title "${title}" --notes "${notes}" --target "${GITHUB_SHA}" --latest
-          fi
-          gh release upload "${tag}" "${assets[@]}" --clobber
+          gh release edit "${RELEASE_TAG}" \
+            --draft=false \
+            --latest \
+            --title "Codex Switcher ${RELEASE_TAG}" \
+            --notes "Automated Windows and macOS build for ${GITHUB_SHA}" \
+            --target "${GITHUB_SHA}"
