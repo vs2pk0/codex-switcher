@@ -510,7 +510,7 @@ impl SessionStore {
         let mut backup_dirs = Vec::new();
         for db_path in self.sqlite_candidate_paths() {
             let backup_dir = backup_sqlite_file(&self.codex_home, &db_path)?;
-            let changed = repair_sqlite_db(&db_path, target_provider, sessions, &self.codex_home)?;
+            let changed = repair_sqlite_db(&db_path, target_provider, sessions)?;
             if changed > 0 {
                 backup_dirs.push(backup_dir);
                 repaired += changed;
@@ -670,7 +670,6 @@ fn repair_sqlite_db(
     db_path: &Path,
     target_provider: &str,
     sessions: Option<&[SessionRepairRecord]>,
-    codex_home: &Path,
 ) -> Result<usize, String> {
     if !db_path.exists() {
         return Ok(0);
@@ -681,7 +680,7 @@ fn repair_sqlite_db(
     }
     let before = sqlite_count_repairable_rows(db_path, target_provider, sessions)?;
     if before == 0 {
-        return sqlite_insert_missing_session_rows(db_path, target_provider, sessions, codex_home);
+        return sqlite_insert_missing_session_rows(db_path, target_provider, sessions);
     }
     let escaped_provider = sql_quote(target_provider);
     let set_clause = sqlite_repair_set_clause(&columns, &escaped_provider);
@@ -691,8 +690,7 @@ fn repair_sqlite_db(
     }
     let sql = format!("UPDATE threads SET {set_clause} WHERE {where_clause};");
     run_sqlite(db_path, &sql)?;
-    let inserted =
-        sqlite_insert_missing_session_rows(db_path, target_provider, sessions, codex_home)?;
+    let inserted = sqlite_insert_missing_session_rows(db_path, target_provider, sessions)?;
     Ok(before + inserted)
 }
 
@@ -791,7 +789,6 @@ fn sqlite_insert_missing_session_rows(
     db_path: &Path,
     target_provider: &str,
     sessions: Option<&[SessionRepairRecord]>,
-    codex_home: &Path,
 ) -> Result<usize, String> {
     let Some(sessions) = sessions else {
         return Ok(0);
@@ -816,6 +813,7 @@ fn sqlite_insert_missing_session_rows(
         if exists > 0 {
             continue;
         }
+        let metadata = sqlite_metadata_for_session(session);
         let mut names = Vec::new();
         let mut values = Vec::new();
         push_sql_value(&mut names, &mut values, &columns, "id", &session.id);
@@ -834,28 +832,75 @@ fn sqlite_insert_missing_session_rows(
             "first_user_message",
             &session.title,
         );
+        push_sql_value(&mut names, &mut values, &columns, "preview", &session.title);
+        push_sql_value(
+            &mut names,
+            &mut values,
+            &columns,
+            "source",
+            &metadata.source,
+        );
+        push_sql_value(&mut names, &mut values, &columns, "cwd", &metadata.cwd);
+        push_sql_value(
+            &mut names,
+            &mut values,
+            &columns,
+            "cli_version",
+            &metadata.cli_version,
+        );
+        push_sql_value(
+            &mut names,
+            &mut values,
+            &columns,
+            "sandbox_policy",
+            &metadata.sandbox_policy,
+        );
+        push_sql_value(
+            &mut names,
+            &mut values,
+            &columns,
+            "approval_mode",
+            &metadata.approval_mode,
+        );
+        push_sql_value(&mut names, &mut values, &columns, "history_mode", "legacy");
         push_sql_value(&mut names, &mut values, &columns, "thread_source", "user");
         if columns.contains("has_user_event") {
             names.push("has_user_event".to_string());
             values.push("1".to_string());
         }
+        push_sql_i64(
+            &mut names,
+            &mut values,
+            &columns,
+            "created_at",
+            metadata.created_at,
+        );
+        push_sql_i64(
+            &mut names,
+            &mut values,
+            &columns,
+            "created_at_ms",
+            metadata.created_at.saturating_mul(1000),
+        );
         if columns.contains("updated_at") {
             names.push("updated_at".to_string());
             values.push(session.updated_at.to_string());
         }
         if columns.contains("updated_at_ms") {
             names.push("updated_at_ms".to_string());
-            values.push((session.updated_at * 1000).to_string());
+            values.push(session.updated_at.saturating_mul(1000).to_string());
+        }
+        if columns.contains("recency_at") {
+            names.push("recency_at".to_string());
+            values.push(session.updated_at.to_string());
+        }
+        if columns.contains("recency_at_ms") {
+            names.push("recency_at_ms".to_string());
+            values.push(session.updated_at.saturating_mul(1000).to_string());
         }
         if columns.contains("rollout_path") {
-            let relative_path = session
-                .path
-                .strip_prefix(codex_home)
-                .unwrap_or(&session.path)
-                .to_string_lossy()
-                .to_string();
             names.push("rollout_path".to_string());
-            values.push(sql_quote(&relative_path));
+            values.push(sql_quote(&session.path.to_string_lossy()));
         }
         if names.is_empty() {
             continue;
@@ -871,6 +916,98 @@ fn sqlite_insert_missing_session_rows(
     Ok(inserted)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionSqliteMetadata {
+    created_at: i64,
+    source: String,
+    cwd: String,
+    cli_version: String,
+    sandbox_policy: String,
+    approval_mode: String,
+}
+
+fn sqlite_metadata_for_session(session: &SessionRepairRecord) -> SessionSqliteMetadata {
+    let mut metadata = SessionSqliteMetadata {
+        created_at: session.updated_at,
+        source: "cli".to_string(),
+        cwd: String::new(),
+        cli_version: String::new(),
+        sandbox_policy: "read-only".to_string(),
+        approval_mode: "on-request".to_string(),
+    };
+    let Ok(content) = fs::read_to_string(&session.path) else {
+        return metadata;
+    };
+    for line in content.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let item_type = value.get("type").and_then(Value::as_str);
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        if item_type == Some("session_meta") {
+            if let Some(timestamp) = payload
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("timestamp").and_then(Value::as_str))
+                .and_then(parse_rfc3339_timestamp)
+            {
+                metadata.created_at = timestamp;
+            }
+            if let Some(source) = payload.get("source").and_then(metadata_value_to_string) {
+                metadata.source = source;
+            }
+            if let Some(cwd) = payload.get("cwd").and_then(Value::as_str) {
+                metadata.cwd = cwd.to_string();
+            }
+            if let Some(cli_version) = payload.get("cli_version").and_then(Value::as_str) {
+                metadata.cli_version = cli_version.to_string();
+            }
+        } else if item_type == Some("turn_context") {
+            if metadata.cwd.is_empty() {
+                if let Some(cwd) = payload.get("cwd").and_then(Value::as_str) {
+                    metadata.cwd = cwd.to_string();
+                }
+            }
+            if let Some(policy) = payload
+                .get("permission_profile")
+                .filter(|value| !value.is_null())
+                .and_then(metadata_value_to_string)
+                .or_else(|| {
+                    payload
+                        .get("sandbox_policy")
+                        .and_then(metadata_value_to_string)
+                })
+            {
+                metadata.sandbox_policy = policy;
+            }
+            if let Some(mode) = payload
+                .get("approval_policy")
+                .and_then(metadata_value_to_string)
+            {
+                metadata.approval_mode = mode;
+            }
+        }
+    }
+    metadata
+}
+
+fn metadata_value_to_string(value: &Value) -> Option<String> {
+    let text = match value {
+        Value::String(text) => text.clone(),
+        Value::Null => return None,
+        other => other.to_string(),
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn parse_rfc3339_timestamp(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.timestamp())
+}
+
 fn push_sql_value(
     names: &mut Vec<String>,
     values: &mut Vec<String>,
@@ -881,6 +1018,19 @@ fn push_sql_value(
     if columns.contains(column) {
         names.push(column.to_string());
         values.push(sql_quote(value));
+    }
+}
+
+fn push_sql_i64(
+    names: &mut Vec<String>,
+    values: &mut Vec<String>,
+    columns: &HashSet<String>,
+    column: &str,
+    value: i64,
+) {
+    if columns.contains(column) {
+        names.push(column.to_string());
+        values.push(value.to_string());
     }
 }
 
@@ -1475,6 +1625,68 @@ mod tests {
             "SELECT model_provider || '|' || has_user_event || '|' || thread_source FROM threads WHERE id = 'session-1';",
         );
         assert_eq!(row.trim(), "relay|1|user");
+    }
+
+    #[test]
+    fn repair_visibility_inserts_rows_for_current_required_thread_schema() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-required.jsonl");
+        fs::write(
+            &session_path,
+            concat!(
+                r#"{"timestamp":"2026-07-01T08:30:00Z","type":"session_meta","payload":{"id":"session-required","timestamp":"2026-07-01T08:30:00Z","cwd":"/tmp/demo","cli_version":"0.130.0","source":"vscode","model_provider":"openai"}}"#,
+                "\n",
+                r#"{"type":"turn_context","payload":{"cwd":"/tmp/demo","approval_policy":"never","sandbox_policy":"danger-full-access"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"role":"user","content":[{"text":"hello"}]}}"#,
+                "\n"
+            ),
+        )
+        .expect("write session");
+        fs::write(
+            codex.path().join("config.toml"),
+            "model_provider = \"relay\"\n",
+        )
+        .expect("write config");
+        let db_path = codex.path().join("state_5.sqlite");
+        run_sqlite_test(
+            &db_path,
+            r#"
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    model_provider TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    sandbox_policy TEXT NOT NULL,
+                    approval_mode TEXT NOT NULL,
+                    has_user_event INTEGER NOT NULL DEFAULT 0
+                );
+                "#,
+        );
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let summary = store.repair_visibility().expect("repair");
+
+        assert_eq!(summary.updated_sqlite_row_count, 1);
+        let row = run_sqlite_test_output(
+            &db_path,
+            "SELECT (created_at > 0) || '|' || (updated_at > 0) || '|' || source || '|' || model_provider || '|' || cwd || '|' || sandbox_policy || '|' || approval_mode || '|' || has_user_event FROM threads WHERE id = 'session-required';",
+        );
+        assert_eq!(
+            row.trim(),
+            "1|1|vscode|relay|/tmp/demo|danger-full-access|never|1"
+        );
+        let rollout_path = run_sqlite_test_output(
+            &db_path,
+            "SELECT rollout_path FROM threads WHERE id = 'session-required';",
+        );
+        assert_eq!(rollout_path.trim(), session_path.to_string_lossy());
     }
 
     #[test]

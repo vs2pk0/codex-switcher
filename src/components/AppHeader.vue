@@ -126,6 +126,7 @@ const sidebarCollapsed = ref(true);
     </div>
     <div v-if="activeView === 'accounts'" class="command-actions">
       <a-button
+        class="command-button command-quota"
         :loading="refreshingAllQuotas"
         :disabled="!monitorQuota"
         @click="$emit('refresh-all-quotas')"
@@ -133,22 +134,34 @@ const sidebarCollapsed = ref(true);
         <template #icon><icon-refresh /></template>
         {{ t("刷新全部额度") }}
       </a-button>
-      <a-button :loading="detectingCurrentAccount" @click="$emit('detect-current-account')">
+      <a-button
+        class="command-button command-detect"
+        :loading="detectingCurrentAccount"
+        @click="$emit('detect-current-account')"
+      >
         <template #icon><icon-refresh /></template>
         {{ t("读取当前账号") }}
       </a-button>
-      <a-button @click="$emit('toggle-privacy')">
+      <a-button
+        class="command-button command-privacy"
+        :class="{ 'is-active': privacyMasked }"
+        @click="$emit('toggle-privacy')"
+      >
         <template #icon>
           <icon-eye-invisible v-if="privacyMasked" />
           <icon-eye v-else />
         </template>
         {{ privacyMasked ? t("已隐藏") : t("隐私") }}
       </a-button>
-      <a-button @click="$emit('open-badge-style')">
+      <a-button class="command-button command-badge" @click="$emit('open-badge-style')">
         <template #icon><icon-palette /></template>
         {{ t("徽章样式") }}
       </a-button>
-      <a-button type="primary" @click="$emit('open-add', 'oauth')">
+      <a-button
+        type="primary"
+        class="command-button command-add"
+        @click="$emit('open-add', 'oauth')"
+      >
         <template #icon><icon-plus /></template>
         {{ t("添加账号") }}
       </a-button>

@@ -212,6 +212,53 @@ struct CodexSwitcherPaths {
     codex_home: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CodexConfigFileContent {
+    kind: String,
+    name: String,
+    path: String,
+    content: String,
+    exists: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexConfigFileKind {
+    AuthJson,
+    ConfigToml,
+}
+
+impl CodexConfigFileKind {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auth" | "auth.json" => Ok(Self::AuthJson),
+            "config" | "config.toml" => Ok(Self::ConfigToml),
+            _ => Err("只允许编辑 auth.json 或 config.toml".to_string()),
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::AuthJson => "auth",
+            Self::ConfigToml => "config",
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::AuthJson => "auth.json",
+            Self::ConfigToml => "config.toml",
+        }
+    }
+
+    fn default_content(self) -> &'static str {
+        match self {
+            Self::AuthJson => "{}\n",
+            Self::ConfigToml => "",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexSwitcherBackupFile {
@@ -859,6 +906,167 @@ fn update_codex_switcher_settings(
     let settings = settings.normalized();
     write_switcher_settings(&settings)?;
     Ok(settings)
+}
+
+fn codex_config_file_path(codex_home: &Path, kind: CodexConfigFileKind) -> PathBuf {
+    codex_home.join(kind.file_name())
+}
+
+fn read_codex_config_file_from(
+    codex_home: &Path,
+    kind: CodexConfigFileKind,
+) -> Result<CodexConfigFileContent, String> {
+    let path = codex_config_file_path(codex_home, kind);
+    let exists = path.is_file();
+    let content = if exists {
+        std::fs::read_to_string(&path)
+            .map_err(|error| format!("读取 Codex {} 失败: {}", kind.file_name(), error))?
+    } else {
+        kind.default_content().to_string()
+    };
+    Ok(CodexConfigFileContent {
+        kind: kind.key().to_string(),
+        name: kind.file_name().to_string(),
+        path: path.to_string_lossy().to_string(),
+        content,
+        exists,
+    })
+}
+
+fn parse_auth_json_object(content: &str) -> Result<Value, String> {
+    let value = serde_json::from_str::<Value>(content)
+        .map_err(|error| format!("auth.json JSON 格式错误: {}", error))?;
+    if !value.is_object() {
+        return Err("auth.json 顶层必须是 JSON 对象".to_string());
+    }
+    Ok(value)
+}
+
+fn validate_codex_config_content(kind: CodexConfigFileKind, content: &str) -> Result<(), String> {
+    match kind {
+        CodexConfigFileKind::AuthJson => {
+            parse_auth_json_object(content)?;
+        }
+        CodexConfigFileKind::ConfigToml => {
+            if !content.trim().is_empty() {
+                content
+                    .parse::<toml_edit::Document>()
+                    .map_err(|error| format!("config.toml TOML 格式错误: {}", error))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn format_codex_config_content(kind: CodexConfigFileKind, content: &str) -> Result<String, String> {
+    match kind {
+        CodexConfigFileKind::AuthJson => {
+            let value = parse_auth_json_object(content)?;
+            serde_json::to_string_pretty(&value)
+                .map(|formatted| format!("{}\n", formatted))
+                .map_err(|error| format!("格式化 auth.json 失败: {}", error))
+        }
+        CodexConfigFileKind::ConfigToml => {
+            if content.trim().is_empty() {
+                return Ok(String::new());
+            }
+            let document = content
+                .parse::<toml_edit::Document>()
+                .map_err(|error| format!("config.toml TOML 格式错误: {}", error))?;
+            let formatted = document.to_string();
+            Ok(if formatted.ends_with('\n') {
+                formatted
+            } else {
+                format!("{}\n", formatted)
+            })
+        }
+    }
+}
+
+fn write_codex_config_file_to(
+    codex_home: &Path,
+    kind: CodexConfigFileKind,
+    content: &str,
+) -> Result<CodexConfigFileContent, String> {
+    validate_codex_config_content(kind, content)?;
+    std::fs::create_dir_all(codex_home)
+        .map_err(|error| format!("创建 Codex 目录失败: {}", error))?;
+    let path = codex_config_file_path(codex_home, kind);
+    let backup_path = if path.is_file() {
+        let backup_path = path.with_file_name(format!("{}.codex-switcher.bak", kind.file_name()));
+        std::fs::copy(&path, &backup_path).map_err(|error| {
+            format!(
+                "备份 Codex {} 失败 ({}): {}",
+                kind.file_name(),
+                backup_path.display(),
+                error
+            )
+        })?;
+        Some(backup_path)
+    } else {
+        None
+    };
+    let tmp_path = path.with_file_name(format!(
+        ".{}.codex-switcher-{:016x}.tmp",
+        kind.file_name(),
+        rand::thread_rng().gen::<u64>()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut tmp_file = options
+        .open(&tmp_path)
+        .map_err(|error| format!("创建 Codex {} 临时文件失败: {}", kind.file_name(), error))?;
+    let write_result = tmp_file
+        .write_all(content.as_bytes())
+        .and_then(|_| tmp_file.sync_all());
+    drop(tmp_file);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!(
+            "写入 Codex {} 临时文件失败: {}",
+            kind.file_name(),
+            error
+        ));
+    }
+    #[cfg(windows)]
+    if path.is_file() {
+        std::fs::remove_file(&path)
+            .map_err(|error| format!("准备替换 Codex {} 失败: {}", kind.file_name(), error))?;
+    }
+    if let Err(error) = std::fs::rename(&tmp_path, &path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        if let Some(backup_path) = backup_path {
+            let _ = std::fs::copy(backup_path, &path);
+        }
+        return Err(format!("保存 Codex {} 失败: {}", kind.file_name(), error));
+    }
+    read_codex_config_file_from(codex_home, kind)
+}
+
+#[tauri::command]
+fn read_codex_config_file(file_kind: String) -> Result<CodexConfigFileContent, String> {
+    let kind = CodexConfigFileKind::parse(&file_kind)?;
+    read_codex_config_file_from(&default_codex_home(), kind)
+}
+
+#[tauri::command]
+fn format_codex_config_file(file_kind: String, content: String) -> Result<String, String> {
+    let kind = CodexConfigFileKind::parse(&file_kind)?;
+    format_codex_config_content(kind, &content)
+}
+
+#[tauri::command]
+fn write_codex_config_file(
+    file_kind: String,
+    content: String,
+) -> Result<CodexConfigFileContent, String> {
+    let kind = CodexConfigFileKind::parse(&file_kind)?;
+    write_codex_config_file_to(&default_codex_home(), kind, &content)
 }
 
 #[tauri::command]
@@ -2264,9 +2472,77 @@ fn compact_http_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_entry_restore_target, default_codex_home, parse_codex_quota, switcher_data_dir,
+        backup_entry_restore_target, default_codex_home, format_codex_config_content,
+        parse_codex_quota, read_codex_config_file_from, switcher_data_dir,
+        write_codex_config_file_to, CodexConfigFileKind,
     };
     use serde_json::json;
+    use tempfile::tempdir;
+
+    #[test]
+    fn codex_config_editor_round_trips_and_backs_up_supported_files() {
+        let codex = tempdir().expect("codex tempdir");
+        let missing = read_codex_config_file_from(codex.path(), CodexConfigFileKind::AuthJson)
+            .expect("read missing auth");
+        assert!(!missing.exists);
+        assert_eq!(missing.content, "{}\n");
+
+        let first_auth = r#"{"OPENAI_API_KEY":null,"tokens":{"access_token":"token-1"}}"#;
+        let saved =
+            write_codex_config_file_to(codex.path(), CodexConfigFileKind::AuthJson, first_auth)
+                .expect("save auth");
+        assert!(saved.exists);
+        assert_eq!(saved.content, first_auth);
+
+        let second_auth = r#"{"OPENAI_API_KEY":"sk-test","tokens":{}}"#;
+        write_codex_config_file_to(codex.path(), CodexConfigFileKind::AuthJson, second_auth)
+            .expect("replace auth");
+        assert_eq!(
+            std::fs::read_to_string(codex.path().join("auth.json.codex-switcher.bak"))
+                .expect("read auth backup"),
+            first_auth
+        );
+
+        let config = "model_provider = \"openai\"\n";
+        write_codex_config_file_to(codex.path(), CodexConfigFileKind::ConfigToml, config)
+            .expect("save config");
+        assert_eq!(
+            std::fs::read_to_string(codex.path().join("config.toml")).expect("read config"),
+            config
+        );
+    }
+
+    #[test]
+    fn codex_config_editor_rejects_invalid_content_and_formats_json() {
+        let codex = tempdir().expect("codex tempdir");
+        assert!(write_codex_config_file_to(
+            codex.path(),
+            CodexConfigFileKind::AuthJson,
+            "{invalid"
+        )
+        .is_err());
+        assert!(
+            write_codex_config_file_to(codex.path(), CodexConfigFileKind::AuthJson, "null")
+                .is_err()
+        );
+        assert!(write_codex_config_file_to(
+            codex.path(),
+            CodexConfigFileKind::ConfigToml,
+            "model_provider = ["
+        )
+        .is_err());
+        assert!(!codex.path().join("auth.json").exists());
+        assert!(!codex.path().join("config.toml").exists());
+
+        let formatted = format_codex_config_content(
+            CodexConfigFileKind::AuthJson,
+            r#"{"tokens":{"access_token":"token-1"}}"#,
+        )
+        .expect("format auth");
+        assert!(formatted.contains("\n  \"tokens\": {"));
+        assert!(formatted.ends_with('\n'));
+        assert!(CodexConfigFileKind::parse("other.json").is_err());
+    }
 
     #[test]
     fn backup_restore_target_accepts_known_backup_roots() {
@@ -2391,6 +2667,9 @@ pub fn run() {
             restart_codex_app,
             get_codex_switcher_settings,
             update_codex_switcher_settings,
+            read_codex_config_file,
+            format_codex_config_file,
+            write_codex_config_file,
             reset_codex_config_toml,
             get_codex_switcher_paths,
             export_codex_switcher_backup,

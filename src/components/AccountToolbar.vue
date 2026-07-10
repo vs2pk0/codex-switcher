@@ -58,7 +58,11 @@ function cycleAccountViewMode(): void {
         class="filter-select"
         popup-container="body"
         :scrollbar="false"
-        :trigger-props="{ contentClass: 'account-filter-dropdown' }"
+        :trigger-props="{
+          contentClass: 'account-filter-dropdown account-type-dropdown',
+          autoFitPopupWidth: false,
+          autoFitPopupMinWidth: true,
+        }"
         @change="() => { $emit('reset-page'); $emit('save-settings'); }"
       >
         <a-option
@@ -103,7 +107,6 @@ function cycleAccountViewMode(): void {
         v-if="showSortDirection"
         v-model="settings.sortDirection"
         type="button"
-        size="small"
         @change="$emit('save-settings')"
       >
         <a-radio value="desc">{{ t("倒序") }}</a-radio>
@@ -128,29 +131,33 @@ function cycleAccountViewMode(): void {
           <template #icon><icon-list /></template>
         </a-button>
       </a-tooltip>
-      <a-button @click="$emit('bind-selected-to-api-service')">
-        <template #icon><icon-link /></template>
-        {{ t("绑定到 API 服务") }}
-      </a-button>
-      <a-button @click="$emit('batch-export')">
-        <template #icon><icon-download /></template>
-        {{ t("批量导出") }}
-      </a-button>
-      <a-button @click="$emit('open-add', 'token')">
-        <template #icon><icon-import /></template>
-        {{ t("批量导入") }}
-      </a-button>
     </div>
-    <div
-      v-if="settings.monitorQuota || currentAccountRefreshCountdown || quotaRefreshCountdown"
-      class="quota-countdown-group"
-    >
-      <span v-if="currentAccountRefreshCountdown" class="quota-countdown primary">
-        {{ t("当前账号") }} {{ currentAccountRefreshCountdown }}
-      </span>
-      <span v-if="quotaRefreshCountdown" class="quota-countdown">
-        {{ t("当前页") }} {{ quotaRefreshCountdown }}
-      </span>
+    <div class="account-ops-footer">
+      <div class="account-batch-actions">
+        <a-button class="batch-action batch-bind" @click="$emit('bind-selected-to-api-service')">
+          <template #icon><icon-link /></template>
+          {{ t("绑定到 API 服务") }}
+        </a-button>
+        <a-button class="batch-action batch-export" @click="$emit('batch-export')">
+          <template #icon><icon-download /></template>
+          {{ t("批量导出") }}
+        </a-button>
+        <a-button class="batch-action batch-import" @click="$emit('open-add', 'token')">
+          <template #icon><icon-import /></template>
+          {{ t("批量导入") }}
+        </a-button>
+      </div>
+      <div
+        v-if="settings.monitorQuota || currentAccountRefreshCountdown || quotaRefreshCountdown"
+        class="quota-countdown-group"
+      >
+        <span v-if="currentAccountRefreshCountdown" class="quota-countdown primary">
+          {{ t("当前账号") }} {{ currentAccountRefreshCountdown }}
+        </span>
+        <span v-if="quotaRefreshCountdown" class="quota-countdown">
+          {{ t("当前页") }} {{ quotaRefreshCountdown }}
+        </span>
+      </div>
     </div>
   </section>
 </template>

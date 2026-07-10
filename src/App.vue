@@ -12,6 +12,7 @@ import ApiServicePanel from "./components/ApiServicePanel.vue";
 import AppHeader from "./components/AppHeader.vue";
 import BackupProgressModal from "./components/BackupProgressModal.vue";
 import BadgeStyleModal from "./components/BadgeStyleModal.vue";
+import CodexConfigEditorModal from "./components/CodexConfigEditorModal.vue";
 import EditAccountModal from "./components/EditAccountModal.vue";
 import ExportJsonModal from "./components/ExportJsonModal.vue";
 import OAuthBindingModal from "./components/OAuthBindingModal.vue";
@@ -35,11 +36,13 @@ import {
   deleteCodexSwitcherBackup,
   detectCurrentCodexAccount,
   exportCodexAccounts,
+  formatCodexConfigFile,
   getCodexSwitcherPaths,
   getCodexSwitcherSettings,
   getCurrentCodexAccount,
   importCodexFromJson,
   importCodexFromLocal,
+  readCodexConfigFile,
   listCodexSwitcherBackups,
   listCodexSwitcherSessionBackups,
   listCodexAccounts,
@@ -56,12 +59,15 @@ import {
   switchCodexAccount,
   submitCodexOAuthCallbackUrl,
   updateCodexSwitcherSettings,
+  writeCodexConfigFile,
   updateCodexAccountPhone,
   updateCodexAccountFromJson,
   updateCodexAccountProfile,
   updateCodexApiKeyBoundOAuthAccount,
   updateCodexApiKeyCredentials,
   type CodexExportFormat,
+  type CodexConfigFileContent,
+  type CodexConfigFileKind,
   type CodexSwitcherBackupFile,
   type CodexSwitcherBackupProgressEvent,
   type CodexSwitcherPaths,
@@ -127,6 +133,13 @@ const savingApiKey = ref(false);
 const refreshingAllQuotas = ref(false);
 const settingsLoading = ref(false);
 const savingSettings = ref(false);
+const configEditorVisible = ref(false);
+const configEditorKind = ref<CodexConfigFileKind>("auth");
+const configEditorFile = ref<CodexConfigFileContent | null>(null);
+const configEditorContent = ref("");
+const configEditorLoading = ref(false);
+const configEditorSaving = ref(false);
+const configEditorFormatting = ref(false);
 const appPaths = ref<CodexSwitcherPaths | null>(null);
 const backupFiles = ref<CodexSwitcherBackupFile[]>([]);
 const backupLoading = ref(false);
@@ -2371,6 +2384,62 @@ async function runRepairSessions(): Promise<void> {
   }
 }
 
+async function loadConfigEditorFile(): Promise<void> {
+  const requestedKind = configEditorKind.value;
+  configEditorLoading.value = true;
+  try {
+    const file = await readCodexConfigFile(requestedKind);
+    if (configEditorKind.value !== requestedKind) return;
+    configEditorFile.value = file;
+    configEditorContent.value = file.content;
+  } catch (error) {
+    Message.error(`读取配置文件失败：${errorText(error)}`);
+  } finally {
+    if (configEditorKind.value === requestedKind) configEditorLoading.value = false;
+  }
+}
+
+async function openConfigEditor(fileKind: CodexConfigFileKind): Promise<void> {
+  configEditorKind.value = fileKind;
+  configEditorFile.value = null;
+  configEditorContent.value = "";
+  configEditorVisible.value = true;
+  await loadConfigEditorFile();
+}
+
+async function formatConfigEditorContent(): Promise<void> {
+  configEditorFormatting.value = true;
+  try {
+    configEditorContent.value = await formatCodexConfigFile(
+      configEditorKind.value,
+      configEditorContent.value,
+    );
+    Message.success("格式检查通过");
+  } catch (error) {
+    Message.error(`格式检查失败：${errorText(error)}`);
+  } finally {
+    configEditorFormatting.value = false;
+  }
+}
+
+async function saveConfigEditorContent(): Promise<void> {
+  const hadExistingFile = configEditorFile.value?.exists === true;
+  configEditorSaving.value = true;
+  try {
+    const file = await writeCodexConfigFile(
+      configEditorKind.value,
+      configEditorContent.value,
+    );
+    configEditorFile.value = file;
+    configEditorContent.value = file.content;
+    Message.success(`已保存 ${file.name}${hadExistingFile ? "，原文件已自动备份" : ""}`);
+  } catch (error) {
+    Message.error(`保存配置文件失败：${errorText(error)}`);
+  } finally {
+    configEditorSaving.value = false;
+  }
+}
+
 function confirmResetConfig(): void {
   Modal.warning({
     title: "重置 config.toml",
@@ -3014,6 +3083,7 @@ onUnmounted(() => {
       :backup-progress="backupProgress"
       @save="saveSettings"
       @open-path="openSessionFolder"
+      @edit-codex-file="openConfigEditor"
       @reset-config="confirmResetConfig"
       @export-backup="handleExportBackup"
       @refresh-backups="loadBackups"
@@ -3029,6 +3099,19 @@ onUnmounted(() => {
       @open-sponsor-page="openSponsorPage"
       @open-feedback-page="openFeedbackPage"
       @check-update="checkAppUpdate"
+    />
+
+    <CodexConfigEditorModal
+      v-model:visible="configEditorVisible"
+      v-model:content="configEditorContent"
+      :file-kind="configEditorKind"
+      :file="configEditorFile"
+      :loading="configEditorLoading"
+      :saving="configEditorSaving"
+      :formatting="configEditorFormatting"
+      @reload="loadConfigEditorFile"
+      @format="formatConfigEditorContent"
+      @save="saveConfigEditorContent"
     />
 
     <SessionRestoreModal
