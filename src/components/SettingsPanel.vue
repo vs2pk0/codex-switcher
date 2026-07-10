@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type {
+  CodexConfigFileKind,
   CodexSwitcherBackupFile,
   CodexSwitcherPaths,
   CodexSwitcherSettings,
@@ -20,6 +21,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (event: "save"): void;
   (event: "open-path", path: string): void;
+  (event: "edit-codex-file", fileKind: CodexConfigFileKind): void;
   (event: "reset-config"): void;
   (event: "export-backup"): void;
   (event: "refresh-backups"): void;
@@ -200,12 +202,23 @@ function changeLanguage(value: unknown): void {
 
         <a-card :title="t('配置')" :bordered="false" class="settings-card settings-config">
           <p class="settings-hint">
-            {{ t("重置会删除本机 Codex 目录下的 config.toml，适合切换配置异常时恢复默认配置。") }}
+            {{ t("直接查看并编辑本机 Codex 配置文件，保存前会检查格式并自动备份原文件。") }}
           </p>
-          <a-button status="danger" @click="emit('reset-config')">
-            <template #icon><icon-delete /></template>
-            {{ t("重置 config.toml") }}
-          </a-button>
+          <div class="settings-config-actions">
+            <a-button type="primary" @click="emit('edit-codex-file', 'auth')">
+              <template #icon><icon-code /></template>
+              {{ t("编辑 auth.json") }}
+            </a-button>
+            <a-button @click="emit('edit-codex-file', 'config')">
+              <template #icon><icon-edit /></template>
+              {{ t("编辑 config.toml") }}
+            </a-button>
+            <a-divider />
+            <a-button status="danger" @click="emit('reset-config')">
+              <template #icon><icon-delete /></template>
+              {{ t("重置 config.toml") }}
+            </a-button>
+          </div>
         </a-card>
         <a-card :title="t('备份')" :bordered="false" class="settings-card settings-backup">
           <div class="backup-actions">

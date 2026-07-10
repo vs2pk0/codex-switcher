@@ -41,6 +41,16 @@ export interface CodexSwitcherPaths {
   codexHome: string;
 }
 
+export type CodexConfigFileKind = "auth" | "config";
+
+export interface CodexConfigFileContent {
+  kind: CodexConfigFileKind;
+  name: "auth.json" | "config.toml";
+  path: string;
+  content: string;
+  exists: boolean;
+}
+
 export interface CodexSwitcherBackupFile {
   name: string;
   path: string;
@@ -215,6 +225,26 @@ export function updateCodexSwitcherSettings(
 
 export function getCodexSwitcherPaths(): Promise<CodexSwitcherPaths> {
   return invoke("get_codex_switcher_paths");
+}
+
+export function readCodexConfigFile(
+  fileKind: CodexConfigFileKind,
+): Promise<CodexConfigFileContent> {
+  return invoke("read_codex_config_file", { fileKind });
+}
+
+export function formatCodexConfigFile(
+  fileKind: CodexConfigFileKind,
+  content: string,
+): Promise<string> {
+  return invoke("format_codex_config_file", { fileKind, content });
+}
+
+export function writeCodexConfigFile(
+  fileKind: CodexConfigFileKind,
+  content: string,
+): Promise<CodexConfigFileContent> {
+  return invoke("write_codex_config_file", { fileKind, content });
 }
 
 export function exportCodexSwitcherBackup(): Promise<CodexSwitcherBackupFile> {

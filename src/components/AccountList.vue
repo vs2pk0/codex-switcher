@@ -864,7 +864,7 @@ function formatTime(value?: number | null): string {
               @click="emit('open-phone', account)"
             >
               <icon-phone />
-              {{ displayPhone(account.bound_phone) }}
+              <span>{{ displayPhone(account.bound_phone) }}</span>
             </button>
           </div>
           <div class="card-actions" @click.stop>
@@ -1101,7 +1101,9 @@ function formatTime(value?: number | null): string {
                 <span :class="accountSubscriptionClass(account)">
                   {{ accountSubscriptionBadge(account) }}
                 </span>
-                <small>{{ accountSubscriptionUntil(account) ? formatDateTime(accountSubscriptionUntil(account)) : t("未获得订阅信息") }}</small>
+                <small v-if="accountSubscriptionUntil(account)">
+                  {{ formatDateTime(accountSubscriptionUntil(account)) }}
+                </small>
               </div>
             </td>
             <td>

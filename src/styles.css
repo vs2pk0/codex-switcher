@@ -441,6 +441,104 @@ textarea {
   gap: 10px;
 }
 
+.command-actions .command-button.arco-btn {
+  height: 38px;
+  padding: 0 14px;
+  border-width: 1px;
+  border-style: solid;
+  border-radius: 8px;
+  font-weight: 760;
+  box-shadow:
+    0 6px 16px rgba(15, 23, 42, 0.05),
+    inset 0 1px 0 rgba(255, 255, 255, 0.72);
+  transition:
+    color 0.18s ease,
+    border-color 0.18s ease,
+    background 0.18s ease,
+    box-shadow 0.18s ease,
+    transform 0.18s ease;
+}
+
+.command-actions .command-button.arco-btn:not(:disabled):hover {
+  transform: translateY(-1px);
+}
+
+.command-actions .command-quota.arco-btn {
+  border-color: rgba(37, 99, 235, 0.2);
+  color: #1d4ed8;
+  background: linear-gradient(180deg, #f8fbff, #eff6ff);
+}
+
+.command-actions .command-quota.arco-btn:not(:disabled):hover {
+  border-color: rgba(37, 99, 235, 0.38);
+  color: #1e40af;
+  background: #eaf2ff;
+  box-shadow: 0 9px 20px rgba(37, 99, 235, 0.13);
+}
+
+.command-actions .command-detect.arco-btn {
+  border-color: rgba(8, 145, 178, 0.2);
+  color: #0e7490;
+  background: linear-gradient(180deg, #f7feff, #ecfeff);
+}
+
+.command-actions .command-detect.arco-btn:hover {
+  border-color: rgba(8, 145, 178, 0.38);
+  color: #155e75;
+  background: #e6fbff;
+  box-shadow: 0 9px 20px rgba(8, 145, 178, 0.12);
+}
+
+.command-actions .command-privacy.arco-btn {
+  border-color: rgba(5, 150, 105, 0.2);
+  color: #047857;
+  background: linear-gradient(180deg, #f8fffc, #ecfdf5);
+}
+
+.command-actions .command-privacy.arco-btn:hover,
+.command-actions .command-privacy.arco-btn.is-active {
+  border-color: rgba(5, 150, 105, 0.38);
+  color: #065f46;
+  background: #dcfce7;
+  box-shadow: 0 9px 20px rgba(5, 150, 105, 0.12);
+}
+
+.command-actions .command-badge.arco-btn {
+  border-color: rgba(124, 58, 237, 0.2);
+  color: #6d28d9;
+  background: linear-gradient(180deg, #fdfbff, #f5f3ff);
+}
+
+.command-actions .command-badge.arco-btn:hover {
+  border-color: rgba(124, 58, 237, 0.36);
+  color: #5b21b6;
+  background: #ede9fe;
+  box-shadow: 0 9px 20px rgba(124, 58, 237, 0.12);
+}
+
+.command-actions .command-add.arco-btn {
+  border-color: transparent;
+  color: #fff;
+  background: linear-gradient(135deg, #2563eb, #4f46e5);
+  box-shadow: 0 10px 24px rgba(37, 99, 235, 0.24);
+}
+
+.command-actions .command-add.arco-btn:hover {
+  border-color: transparent;
+  color: #fff;
+  background: linear-gradient(135deg, #1d4ed8, #4338ca);
+  box-shadow: 0 13px 28px rgba(37, 99, 235, 0.3);
+}
+
+.command-actions .command-button.arco-btn:disabled {
+  border-color: #e2e8f0;
+  color: #94a3b8;
+  background: #f8fafc;
+  box-shadow: none;
+  opacity: 0.82;
+  transform: none;
+}
+
 .status-line {
   display: flex;
   align-items: center;
@@ -453,11 +551,8 @@ textarea {
 }
 
 .account-ops {
-  display: flex;
-  flex-wrap: nowrap;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
+  display: grid;
+  gap: 10px;
   width: 100%;
   margin: 0 0 16px;
   padding: 9px 10px;
@@ -465,13 +560,12 @@ textarea {
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.86);
   box-shadow: 0 12px 30px rgba(20, 35, 55, 0.07);
-  overflow: hidden;
+  overflow: visible;
 }
 
 .account-ops-left {
   display: flex;
-  flex: 1 1 auto;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   align-items: center;
   min-width: 0;
   gap: 7px;
@@ -499,12 +593,51 @@ textarea {
 
 .account-ops .arco-radio-button {
   min-width: 36px;
+  border-radius: 6px;
+  color: #64748b;
+  background: transparent;
   white-space: nowrap;
 }
 
+.account-ops .arco-radio-button:hover {
+  color: #1d4ed8;
+  background: #eff6ff;
+}
+
+.account-ops .arco-radio-button.arco-radio-checked {
+  color: #1d4ed8;
+  background: #eaf2ff;
+  box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.14);
+}
+
+.account-ops-left .arco-select-view-single,
+.account-search-input .arco-input-wrapper {
+  border: 1px solid rgba(100, 116, 139, 0.12);
+  border-radius: 7px;
+  background: rgba(248, 250, 252, 0.94);
+  transition:
+    border-color 0.18s ease,
+    background 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+.account-ops-left .arco-select-view-single:hover,
+.account-search-input .arco-input-wrapper:hover {
+  border-color: rgba(37, 99, 235, 0.24);
+  background: #fff;
+}
+
+.account-ops-left .arco-select-view-focus,
+.account-ops-left .arco-select-view-opened,
+.account-search-input .arco-input-focus {
+  border-color: rgba(37, 99, 235, 0.42);
+  background: #fff;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.08);
+}
+
 .sort-select {
-  flex: 0 0 132px;
-  width: 132px;
+  flex: 0 0 150px;
+  width: 150px;
 }
 
 .filter-select {
@@ -513,10 +646,10 @@ textarea {
 }
 
 .account-search-input {
-  flex: 0 0 180px;
-  width: 180px;
+  flex: 1 1 240px;
+  width: auto;
   min-width: 150px;
-  max-width: 180px;
+  max-width: none;
 }
 
 .account-search-input .arco-input-prefix {
@@ -545,6 +678,11 @@ textarea {
   display: none;
 }
 
+.account-type-dropdown {
+  width: 220px;
+  max-width: calc(100vw - 24px);
+}
+
 .page-size-select {
   flex: 0 0 116px;
   width: 116px;
@@ -562,6 +700,87 @@ textarea {
   width: 38px;
   min-width: 38px;
   padding: 0;
+  border-color: rgba(79, 70, 229, 0.16);
+  color: #4f46e5;
+  background: #f5f3ff;
+}
+
+.account-view-icon-button:hover {
+  border-color: rgba(79, 70, 229, 0.34);
+  color: #4338ca;
+  background: #ede9fe;
+}
+
+.account-batch-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.account-batch-actions .batch-action.arco-btn {
+  height: 36px;
+  padding: 0 12px;
+  border-width: 1px;
+  border-style: solid;
+  border-radius: 7px;
+  font-weight: 740;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
+  transition:
+    color 0.18s ease,
+    border-color 0.18s ease,
+    background 0.18s ease,
+    box-shadow 0.18s ease,
+    transform 0.18s ease;
+}
+
+.account-batch-actions .batch-action.arco-btn:hover {
+  transform: translateY(-1px);
+}
+
+.account-batch-actions .batch-bind.arco-btn {
+  border-color: rgba(79, 70, 229, 0.18);
+  color: #4338ca;
+  background: #f5f3ff;
+}
+
+.account-batch-actions .batch-bind.arco-btn:hover {
+  border-color: rgba(79, 70, 229, 0.34);
+  background: #ede9fe;
+  box-shadow: 0 8px 18px rgba(79, 70, 229, 0.1);
+}
+
+.account-batch-actions .batch-export.arco-btn {
+  border-color: rgba(5, 150, 105, 0.18);
+  color: #047857;
+  background: #ecfdf5;
+}
+
+.account-batch-actions .batch-export.arco-btn:hover {
+  border-color: rgba(5, 150, 105, 0.34);
+  background: #dcfce7;
+  box-shadow: 0 8px 18px rgba(5, 150, 105, 0.1);
+}
+
+.account-batch-actions .batch-import.arco-btn {
+  border-color: rgba(217, 119, 6, 0.2);
+  color: #b45309;
+  background: #fffbeb;
+}
+
+.account-batch-actions .batch-import.arco-btn:hover {
+  border-color: rgba(217, 119, 6, 0.36);
+  background: #fef3c7;
+  box-shadow: 0 8px 18px rgba(217, 119, 6, 0.1);
+}
+
+.account-ops-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  min-width: 0;
 }
 
 .quota-countdown-group {
@@ -570,7 +789,6 @@ textarea {
   flex-wrap: nowrap;
   justify-content: flex-end;
   gap: 7px;
-  margin-left: auto;
   white-space: nowrap;
 }
 
@@ -596,15 +814,51 @@ textarea {
   background: linear-gradient(180deg, rgba(245, 247, 255, 0.94), rgba(224, 231, 255, 0.56));
 }
 
-@media (max-width: 1180px) {
-  .account-ops {
-    flex-wrap: wrap;
-    overflow: visible;
+@media (max-width: 760px) {
+  .account-ops-footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .account-batch-actions {
+    width: 100%;
+    justify-content: flex-end;
   }
 
   .quota-countdown-group {
     width: 100%;
-    justify-content: flex-start;
+    justify-content: flex-end;
+  }
+}
+
+@media (min-width: 1700px) {
+  .account-ops {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .account-ops-left {
+    flex: 0 1 auto;
+    flex-wrap: nowrap;
+  }
+
+  .account-search-input {
+    flex: 0 1 320px;
+    width: clamp(220px, 16vw, 320px);
+    max-width: 320px;
+  }
+
+  .account-ops-footer {
+    flex: 1 1 auto;
+    gap: 10px;
+  }
+
+  .account-batch-actions {
+    margin-left: auto;
+  }
+
+  .quota-countdown-group {
     margin-left: 0;
   }
 }
@@ -2871,12 +3125,12 @@ textarea {
 
 .account-grid.columns-5.expanded .quota-metric {
   gap: 6px;
-  min-height: 62px;
-  padding: 8px 7px;
+  min-height: 68px;
+  padding: 9px 8px;
 }
 
 .account-grid.columns-5.expanded .quota-metrics {
-  grid-auto-rows: 62px;
+  grid-auto-rows: 68px;
 }
 
 .account-grid.columns-5.expanded .quota-bar {
@@ -2884,37 +3138,35 @@ textarea {
 }
 
   .account-grid.columns-5.expanded .quota-metric-main {
-    grid-template-columns: auto minmax(118px, 1fr) auto auto;
-    column-gap: 3px;
-    row-gap: 0;
+    grid-template-columns: minmax(0, 1fr) auto;
+    column-gap: 6px;
+    row-gap: 3px;
   }
 
   .account-grid.columns-5.expanded .quota-window-label {
     gap: 4px;
-    max-width: 42px;
+    max-width: none;
+    font-size: 12px;
+  }
+
+  .account-grid.columns-5.expanded .quota-metric-main em {
+    max-width: 100%;
     overflow: hidden;
     font-size: 10px;
     text-overflow: ellipsis;
   }
 
-  .account-grid.columns-5.expanded .quota-metric-main em {
-    max-width: none;
-    overflow: visible;
-    font-size: 8.5px;
-    text-overflow: clip;
-  }
-
   .account-grid.columns-5.expanded .quota-metric-main small {
-    max-width: 50px;
+    max-width: 72px;
     padding: 3px 4px;
     overflow: hidden;
-    font-size: 8px;
+    font-size: 9px;
     text-overflow: ellipsis;
   }
 
   .account-grid.columns-5.expanded .quota-metric-main strong {
     min-width: 28px;
-    font-size: 13px;
+    font-size: 14px;
   }
 
   .account-grid.columns-5.expanded .status-card {
@@ -3436,8 +3688,8 @@ textarea {
   height: 14px;
   border: 0;
   border-radius: 999px;
-  color: rgba(22, 101, 52, 0.95);
-  background: rgba(240, 253, 244, 0.92);
+  color: rgba(255, 255, 255, 0.96);
+  background: rgba(15, 23, 42, 0.22);
 }
 
 .plan-badge.api.badge-stamp {
@@ -3824,11 +4076,7 @@ textarea {
   min-width: 76px;
   height: 24px;
   padding: 0 11px;
-  border-color: #86efac;
   border-radius: 999px;
-  color: #ecfdf5;
-  background: linear-gradient(135deg, #22c55e, #16a34a 55%, #047857);
-  box-shadow: 0 9px 24px rgba(22, 163, 74, 0.23);
   clip-path: none;
   transform: none;
 }
@@ -3894,7 +4142,9 @@ textarea {
 
 .footer-phone {
   display: inline-flex;
-  max-width: 165px;
+  flex: 0 1 auto;
+  max-width: min(165px, 58%);
+  min-width: 0;
   align-items: center;
   gap: 6px;
   overflow: hidden;
@@ -3908,6 +4158,13 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
   cursor: pointer;
+}
+
+.footer-phone span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .soft-chip {
@@ -4108,23 +4365,21 @@ textarea {
 }
 
 .account-health {
-  display: grid;
+  --account-status-bottom: 14px;
+  --account-status-inline: 22px;
+  position: relative;
+  display: block;
   flex: 1 1 auto;
-  grid-template-rows: auto minmax(0, 1fr) 98px;
-  gap: 7px;
   margin-top: 0;
-  min-height: 252px;
-  padding: 0 22px;
-}
-
-.account-health > .quota-panel,
-.account-health > .quota-error {
-  grid-row: 1;
+  min-height: 274px;
+  padding: 8px 22px 114px;
 }
 
 .account-health > .status-grid {
-  grid-row: 3;
-  align-self: end;
+  position: absolute;
+  right: var(--account-status-inline);
+  bottom: var(--account-status-bottom);
+  left: var(--account-status-inline);
 }
 
 .quota-panel {
@@ -4190,14 +4445,17 @@ textarea {
 
 .quota-metric-main {
   display: grid;
-  grid-template-columns: auto minmax(132px, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 6px;
+  column-gap: 8px;
+  row-gap: 4px;
   min-width: 0;
 }
 
 .quota-window-label {
   display: inline-flex;
+  grid-column: 1;
+  grid-row: 1;
   align-items: center;
   gap: 6px;
   min-width: 0;
@@ -4208,19 +4466,24 @@ textarea {
 }
 
 .quota-metric-main em {
-  overflow: visible;
+  grid-column: 1;
+  grid-row: 2;
+  overflow: hidden;
   min-width: 0;
   color: #526176;
   font-size: 12px;
   font-style: normal;
   font-weight: 760;
   line-height: 1.35;
-  text-overflow: clip;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .quota-metric-main small {
   display: inline-flex;
+  grid-column: 2;
+  grid-row: 2;
+  justify-self: end;
   flex: 0 0 auto;
   padding: 3px 8px;
   border-radius: 999px;
@@ -4233,6 +4496,9 @@ textarea {
 }
 
 .quota-metric-main strong {
+  grid-column: 2;
+  grid-row: 1;
+  justify-self: end;
   min-width: 34px;
   font-size: 16px;
   font-weight: 860;
@@ -4936,12 +5202,143 @@ textarea {
   line-height: 1.7;
 }
 
+.settings-config-actions {
+  display: grid;
+  gap: 10px;
+}
+
+.settings-config-actions .arco-btn {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.settings-config-actions .arco-divider-horizontal {
+  margin: 2px 0;
+}
+
+.codex-config-editor-modal {
+  width: min(960px, calc(100vw - 48px)) !important;
+}
+
+.codex-config-editor-modal .arco-modal-body {
+  max-height: calc(100vh - 150px);
+  overflow: auto;
+  padding: 18px 22px 20px;
+}
+
+.codex-config-editor-modal .arco-spin,
+.codex-config-editor-modal .arco-spin-children {
+  display: block;
+  width: 100%;
+}
+
+.config-editor-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-main);
+  font-weight: 820;
+}
+
+.config-editor-title em {
+  padding: 3px 7px;
+  border-radius: 999px;
+  color: #2563eb;
+  background: rgba(219, 234, 254, 0.82);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 820;
+}
+
+.config-editor-body {
+  display: grid;
+  gap: 14px;
+}
+
+.config-editor-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(85, 113, 156, 0.14);
+  border-radius: 8px;
+  background: rgba(248, 250, 252, 0.82);
+}
+
+.config-editor-meta > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.config-editor-meta strong {
+  color: var(--text-main);
+  font-size: 14px;
+}
+
+.config-editor-meta span {
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.config-editor-meta code {
+  min-width: 0;
+  overflow: hidden;
+  color: #526176;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.config-editor-warning {
+  margin: 0;
+}
+
+.config-code-editor textarea {
+  min-height: min(52vh, 500px) !important;
+  overflow: auto !important;
+  color: #1f2937;
+  background:
+    linear-gradient(90deg, rgba(219, 234, 254, 0.34), transparent 42px),
+    #fbfdff;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.65;
+  tab-size: 2;
+  white-space: pre;
+}
+
+.config-editor-actions,
+.config-editor-actions > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.config-editor-actions {
+  justify-content: space-between;
+}
+
+@media (max-width: 760px) {
+  .config-editor-meta,
+  .config-editor-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .config-editor-actions > div {
+    justify-content: flex-end;
+  }
+}
+
 .card-footer {
   display: grid;
   gap: 8px;
   margin-top: 0;
   min-height: 106px;
-  padding: 10px 22px 13px;
+  padding: 10px 14px 13px;
   border-top: 1px solid rgba(85, 113, 156, 0.18);
 }
 
@@ -4957,18 +5354,20 @@ textarea {
 }
 
 .card-actions {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  min-height: 42px;
+  gap: 4px;
+  min-width: 0;
+  min-height: 38px;
 }
 
 .card-actions .arco-btn {
-  width: 42px;
-  flex: 0 0 42px;
+  width: 100%;
+  max-width: 42px;
   min-width: 0;
-  height: 42px;
+  height: 38px;
+  justify-self: center;
   border: 0;
   border-radius: 8px;
   color: #46566b;
@@ -4978,9 +5377,10 @@ textarea {
 
 .card-actions .action-placeholder {
   display: inline-flex;
-  width: 42px;
-  height: 42px;
-  flex: 0 0 42px;
+  width: 100%;
+  max-width: 42px;
+  height: 38px;
+  justify-self: center;
   visibility: hidden;
   pointer-events: none;
 }
@@ -4990,23 +5390,24 @@ textarea {
 }
 
 .account-grid.columns-5.expanded .card-actions .arco-btn {
-  width: 26px;
-  flex-basis: 26px;
+  width: 100%;
+  max-width: 26px;
   height: 26px;
   border-radius: 6px;
   font-size: 14px;
 }
 
 .account-grid.columns-5.expanded .card-actions .action-placeholder {
-  width: 26px;
+  width: 100%;
+  max-width: 26px;
   height: 26px;
-  flex-basis: 26px;
 }
 
 .account-grid.columns-5.expanded .account-health {
-  gap: 8px;
-  min-height: 214px;
-  padding: 12px 12px 0;
+  --account-status-bottom: 10px;
+  --account-status-inline: 12px;
+  min-height: 264px;
+  padding: 12px 12px 96px;
 }
 
 .account-grid.columns-5.expanded .card-footer {
@@ -5017,9 +5418,10 @@ textarea {
 
 .account-grid.columns-5.expanded .status-grid {
   grid-template-rows: 38px 38px;
-  gap: 7px;
-  min-height: 83px;
-  margin-bottom: 6px;
+  gap: 10px;
+  min-height: 86px;
+  height: 86px;
+  margin-bottom: 0;
 }
 
 .account-grid.columns-5.expanded .status-placeholder {
@@ -5082,7 +5484,8 @@ textarea {
   }
 
   .account-health {
-    padding: 0 14px;
+    --account-status-inline: 14px;
+    padding: 0 14px 114px;
   }
 
   .card-footer {
@@ -5094,8 +5497,8 @@ textarea {
   }
 
   .card-actions .arco-btn {
-    width: 38px;
-    flex-basis: 38px;
+    width: 100%;
+    max-width: 38px;
     height: 38px;
   }
 }
@@ -5118,10 +5521,11 @@ textarea {
   display: grid;
   grid-template-columns: 1fr;
   grid-template-rows: 44px 44px;
-  gap: 8px;
+  gap: 12px;
   margin-top: 0;
-  margin-bottom: 8px;
-  min-height: 96px;
+  margin-bottom: 0;
+  min-height: 100px;
+  height: 100px;
 }
 
 .status-grid.single {
@@ -5147,11 +5551,11 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 8px;
   min-width: 0;
   min-height: 44px;
   height: 44px;
-  padding: 10px 14px;
+  padding: 9px 12px;
   border: 1px solid rgba(85, 113, 156, 0.14);
   border-radius: 8px;
   color: #40516a;
@@ -5162,10 +5566,11 @@ textarea {
 .status-card span {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  flex: 1 1 auto;
+  gap: 6px;
   min-width: 0;
   color: #40516a;
-  font-size: 16px;
+  font-size: 13px;
   font-weight: 820;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -5173,19 +5578,26 @@ textarea {
 }
 
 .status-remaining-time {
-  font-size: 13px;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11px;
   font-weight: 820;
   letter-spacing: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .status-card strong {
+  flex: 0 1 48%;
+  min-width: 0;
   overflow: hidden;
   color: #526176;
   font-family:
     "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-  font-size: 14px;
+  font-size: 12px;
   font-weight: 760;
   text-overflow: ellipsis;
+  text-align: right;
   white-space: nowrap;
 }
 
