@@ -3193,7 +3193,7 @@ textarea {
 
 .account-compact-row {
   display: grid;
-  grid-template-columns: auto minmax(150px, 1fr) auto auto auto auto auto auto auto auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto auto auto auto auto auto auto;
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -3208,6 +3208,12 @@ textarea {
     background 0.18s ease,
     box-shadow 0.18s ease,
     transform 0.18s ease;
+}
+
+@media (max-width: 1320px) {
+  .account-compact-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .account-compact-row:hover {
@@ -3553,13 +3559,18 @@ textarea {
 }
 
 .table-actions {
-  display: inline-flex;
+  display: flex;
+  width: 100%;
   flex-wrap: nowrap;
-  gap: 8px;
+  justify-content: flex-end;
+  gap: 4px;
 }
 
 .table-actions .arco-btn {
-  width: 28px;
+  flex: 1 1 0;
+  width: auto;
+  min-width: 0;
+  max-width: 28px;
   height: 28px;
   padding: 0;
   color: #7b8ba2;
@@ -5296,9 +5307,279 @@ textarea {
   margin: 0;
 }
 
+.config-editor-search {
+  display: grid;
+  grid-template-columns: auto minmax(180px, 1fr) auto auto auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid rgba(37, 99, 235, 0.2);
+  border-radius: 8px;
+  background: rgba(239, 246, 255, 0.72);
+}
+
+.config-editor-search > .arco-icon {
+  color: #2563eb;
+  font-size: 16px;
+}
+
+.config-editor-search-input .arco-input-wrapper {
+  border-color: rgba(85, 113, 156, 0.2);
+  background: #fff;
+}
+
+.config-editor-search-count {
+  min-width: 52px;
+  color: var(--text-soft);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 11px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.config-editor-search .arco-btn {
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  padding: 0;
+  border-color: rgba(85, 113, 156, 0.16);
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.api-model-modal-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-main);
+  font-weight: 820;
+}
+
+.api-model-modal-body {
+  display: grid;
+  gap: 14px;
+}
+
+.api-model-account-summary {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.8fr) minmax(240px, 1.5fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(85, 113, 156, 0.16);
+  border-radius: 8px;
+  background: rgba(248, 250, 252, 0.86);
+}
+
+.api-model-account-summary > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.api-model-account-summary span {
+  color: var(--text-soft);
+  font-size: 11px;
+  font-weight: 720;
+}
+
+.api-model-account-summary strong,
+.api-model-account-summary code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-main);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-model-access-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.api-model-access-alert,
+.api-model-access-alert .arco-alert-content {
+  min-width: 0;
+}
+
+.api-model-access-retry {
+  white-space: nowrap;
+}
+
+.api-model-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.api-model-toolbar > span {
+  color: var(--text-soft);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.api-model-compatibility-alert {
+  margin: 0;
+}
+
+.api-key-model-modal .arco-spin,
+.api-key-model-modal .arco-spin-children {
+  display: block;
+  width: 100%;
+}
+
+.api-model-list {
+  display: grid;
+  gap: 8px;
+  max-height: min(52vh, 520px);
+  overflow: auto;
+  padding: 2px;
+}
+
+.api-model-option {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid rgba(85, 113, 156, 0.16);
+  border-radius: 8px;
+  color: var(--text-main);
+  background: rgba(255, 255, 255, 0.96);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
+}
+
+.api-model-option:not(:disabled):hover {
+  border-color: rgba(37, 99, 235, 0.34);
+  background: rgba(239, 246, 255, 0.58);
+}
+
+.api-model-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.api-model-option.selected {
+  border-color: rgba(37, 99, 235, 0.72);
+  background: rgba(239, 246, 255, 0.92);
+  box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.1);
+}
+
+.api-model-option-check {
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(85, 113, 156, 0.2);
+  border-radius: 999px;
+  color: #fff;
+  background: #fff;
+}
+
+.api-model-option.selected .api-model-option-check {
+  border-color: #2563eb;
+  background: #2563eb;
+}
+
+.api-model-option-main {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.api-model-option-main strong {
+  overflow: hidden;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-model-option-main small {
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.api-model-empty {
+  min-height: 250px;
+  padding-top: 54px;
+  border: 1px dashed rgba(85, 113, 156, 0.2);
+  border-radius: 8px;
+  background: rgba(248, 250, 252, 0.5);
+}
+
+.api-model-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 2px;
+}
+
+@media (max-width: 760px) {
+  .api-model-access-row {
+    grid-template-columns: 1fr;
+  }
+
+  .api-model-access-retry {
+    justify-self: start;
+  }
+
+  .api-model-account-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .api-model-account-summary > .arco-tag {
+    justify-self: start;
+  }
+
+  .api-model-toolbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .api-model-toolbar > span {
+    display: none;
+  }
+
+  .api-model-option {
+    grid-template-columns: 28px minmax(0, 1fr) auto;
+  }
+
+  .api-model-option > .arco-tag:last-child {
+    grid-column: 2 / -1;
+    justify-self: start;
+  }
+}
+
+.config-code-editor-shell {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  border-radius: 8px;
+}
+
+.config-code-editor {
+  position: relative;
+  z-index: 2;
+  display: block;
+}
+
 .config-code-editor textarea {
+  height: min(52vh, 500px) !important;
   min-height: min(52vh, 500px) !important;
-  overflow: auto !important;
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
+  overflow-wrap: anywhere;
   color: #1f2937;
   background:
     linear-gradient(90deg, rgba(219, 234, 254, 0.34), transparent 42px),
@@ -5306,8 +5587,77 @@ textarea {
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
   font-size: 13px;
   line-height: 1.65;
+  resize: none;
   tab-size: 2;
-  white-space: pre;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.config-code-highlight-layer {
+  position: absolute;
+  inset: 1px;
+  z-index: 1;
+  overflow: hidden;
+  border-radius: 7px;
+  background:
+    linear-gradient(90deg, rgba(219, 234, 254, 0.34), transparent 42px),
+    #fbfdff;
+  pointer-events: none;
+}
+
+.config-code-highlight-content {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: 100%;
+  margin: 0;
+  padding: 4px 12px;
+  color: #1f2937;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+  tab-size: 2;
+  transform-origin: left top;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.config-code-search-match {
+  padding: 0;
+  border-radius: 2px;
+  color: inherit;
+  background: rgba(250, 204, 21, 0.46);
+  box-shadow: inset 0 -1px 0 rgba(202, 138, 4, 0.42);
+}
+
+.config-code-search-match.active {
+  color: #7c2d12;
+  background: rgba(251, 146, 60, 0.82);
+  box-shadow: 0 0 0 1px rgba(234, 88, 12, 0.38);
+}
+
+.config-code-editor-shell.search-highlight-active .config-code-editor,
+.config-code-editor-shell.search-highlight-active .config-code-editor:hover,
+.config-code-editor-shell.search-highlight-active .config-code-editor:focus-within {
+  background: transparent !important;
+}
+
+.config-code-editor-shell.search-highlight-active .config-code-editor textarea {
+  color: transparent !important;
+  background: transparent !important;
+  caret-color: #1f2937;
+  -webkit-text-fill-color: transparent;
+}
+
+.config-code-editor-shell.search-highlight-active .config-code-editor textarea::selection {
+  background: rgba(37, 99, 235, 0.2);
+}
+
+.config-code-editor-shell.search-highlight-active .config-code-editor textarea::placeholder {
+  color: var(--text-soft);
+  -webkit-text-fill-color: var(--text-soft);
 }
 
 .config-editor-actions,
@@ -5330,6 +5680,12 @@ textarea {
 
   .config-editor-actions > div {
     justify-content: flex-end;
+  }
+
+  .config-editor-search {
+    grid-template-columns: auto minmax(0, 1fr) auto auto auto auto;
+    gap: 5px;
+    padding: 7px;
   }
 }
 
@@ -5354,20 +5710,20 @@ textarea {
 }
 
 .card-actions {
-  display: grid;
-  grid-template-columns: repeat(8, minmax(0, 1fr));
+  display: flex;
+  flex-wrap: nowrap;
   align-items: center;
-  gap: 4px;
+  justify-content: flex-start;
+  gap: clamp(4px, 0.4vw, 8px);
   min-width: 0;
   min-height: 38px;
 }
 
 .card-actions .arco-btn {
-  width: 100%;
-  max-width: 42px;
-  min-width: 0;
+  flex: 0 1 36px;
+  width: 36px;
+  min-width: 28px;
   height: 38px;
-  justify-self: center;
   border: 0;
   border-radius: 8px;
   color: #46566b;
@@ -5375,32 +5731,58 @@ textarea {
   box-shadow: none;
 }
 
-.card-actions .action-placeholder {
-  display: inline-flex;
+.account-grid.columns-4.expanded .card-actions {
   width: 100%;
-  max-width: 42px;
-  height: 38px;
-  justify-self: center;
-  visibility: hidden;
-  pointer-events: none;
-}
-
-.account-grid.columns-5.expanded .card-actions {
   gap: 4px;
 }
 
-.account-grid.columns-5.expanded .card-actions .arco-btn {
+.account-grid.columns-4.expanded .card-actions .arco-btn {
+  flex: 1 1 0;
+  width: auto;
+  min-width: 0;
+  max-width: 32px;
+  height: 32px;
+}
+
+.account-grid.columns-5.expanded .card-actions {
   width: 100%;
+  gap: 2px;
+}
+
+.account-grid.columns-5.expanded .card-actions .arco-btn {
+  flex: 1 1 0;
+  width: auto;
+  min-width: 0;
   max-width: 26px;
   height: 26px;
   border-radius: 6px;
   font-size: 14px;
 }
 
-.account-grid.columns-5.expanded .card-actions .action-placeholder {
-  width: 100%;
-  max-width: 26px;
-  height: 26px;
+.account-card:not(.api-key-account) .card-actions {
+  justify-content: space-between;
+  gap: clamp(6px, 0.5vw, 10px);
+}
+
+.account-card.api-key-account .card-actions {
+  justify-content: flex-start;
+  gap: clamp(8px, 0.7vw, 12px);
+}
+
+.account-grid.columns-5.expanded .account-card:not(.api-key-account) .card-actions {
+  gap: 4px;
+}
+
+.account-grid.columns-5.expanded .account-card.api-key-account .card-actions {
+  gap: 8px;
+}
+
+.account-grid.columns-4.expanded .account-card:not(.api-key-account) .card-actions {
+  gap: 4px;
+}
+
+.account-grid.columns-4.expanded .account-card.api-key-account .card-actions {
+  gap: 8px;
 }
 
 .account-grid.columns-5.expanded .account-health {
@@ -5493,12 +5875,13 @@ textarea {
   }
 
   .card-actions {
-    gap: 6px;
+    gap: 4px;
   }
 
   .card-actions .arco-btn {
-    width: 100%;
-    max-width: 38px;
+    flex-basis: 34px;
+    width: 34px;
+    min-width: 28px;
     height: 38px;
   }
 }

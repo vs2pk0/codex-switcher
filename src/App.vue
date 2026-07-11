@@ -9,6 +9,7 @@ import AboutPanel from "./components/AboutPanel.vue";
 import AccountToolbar from "./components/AccountToolbar.vue";
 import AddAccountModal from "./components/AddAccountModal.vue";
 import ApiServicePanel from "./components/ApiServicePanel.vue";
+import ApiKeyModelModal from "./components/ApiKeyModelModal.vue";
 import AppHeader from "./components/AppHeader.vue";
 import BackupProgressModal from "./components/BackupProgressModal.vue";
 import BadgeStyleModal from "./components/BadgeStyleModal.vue";
@@ -30,12 +31,14 @@ import { currentLanguage, formatLocalizedDuration, setLanguage, t } from "./i18n
 import {
   addCodexAccountWithApiKey,
   cancelCodexOAuthLogin,
+  checkCodexApiKeyModelAccess,
   completeCodexOAuthLogin,
   consumeCodexResetCredit,
   deleteCodexAccount,
   deleteCodexSwitcherBackup,
   detectCurrentCodexAccount,
   exportCodexAccounts,
+  fetchCodexApiKeyModels,
   formatCodexConfigFile,
   getCodexSwitcherPaths,
   getCodexSwitcherSettings,
@@ -56,6 +59,7 @@ import {
   startCodexSwitcherBackup,
   startCodexSwitcherSessionBackup,
   startCodexOAuthLogin,
+  setCodexApiKeyDefaultModel,
   switchCodexAccount,
   submitCodexOAuthCallbackUrl,
   updateCodexSwitcherSettings,
@@ -66,6 +70,7 @@ import {
   updateCodexApiKeyBoundOAuthAccount,
   updateCodexApiKeyCredentials,
   type CodexExportFormat,
+  type CodexApiKeyModel,
   type CodexConfigFileContent,
   type CodexConfigFileKind,
   type CodexSwitcherBackupFile,
@@ -246,6 +251,19 @@ const bindingVisible = ref(false);
 const bindingAccount = ref<CodexAccount | null>(null);
 const bindingForm = reactive({ boundOauthAccountId: "" });
 const savingBinding = ref(false);
+const apiModelVisible = ref(false);
+const apiModelAccount = ref<CodexAccount | null>(null);
+const apiModels = ref<CodexApiKeyModel[]>([]);
+const selectedApiModel = ref("");
+const fetchingApiModels = ref(false);
+const savingApiModel = ref(false);
+const apiModelAccessStatus = ref<"idle" | "checking" | "matched" | "mismatched" | "error">(
+  "idle",
+);
+const apiModelAccessError = ref("");
+let apiModelAccessSequence = 0;
+let apiModelRequestSequence = 0;
+let apiModelSaveSequence = 0;
 
 const sessions = ref<CodexSessionRecord[]>([]);
 const trashedSessions = ref<CodexTrashedSessionRecord[]>([]);
@@ -2217,6 +2235,121 @@ function openBinding(account: CodexAccount): void {
   bindingVisible.value = true;
 }
 
+function openApiModels(account: CodexAccount): void {
+  if (!isApiKeyAccount(account)) return;
+  apiModelRequestSequence += 1;
+  apiModelSaveSequence += 1;
+  apiModelAccount.value = account;
+  apiModels.value = [];
+  selectedApiModel.value = account.default_model || account.defaultModel || "";
+  fetchingApiModels.value = false;
+  savingApiModel.value = false;
+  apiModelAccessStatus.value = "checking";
+  apiModelAccessError.value = "";
+  apiModelVisible.value = true;
+  void checkApiModelAccess();
+}
+
+function updateApiModelVisible(visible: boolean): void {
+  apiModelVisible.value = visible;
+  if (visible) return;
+  apiModelAccessSequence += 1;
+  apiModelRequestSequence += 1;
+  apiModelSaveSequence += 1;
+  apiModelAccessStatus.value = "idle";
+  apiModelAccessError.value = "";
+  fetchingApiModels.value = false;
+  savingApiModel.value = false;
+}
+
+async function checkApiModelAccess(): Promise<boolean> {
+  const account = apiModelAccount.value;
+  if (!account || !apiModelVisible.value) return false;
+  const accountId = account.id;
+  const accessSequence = ++apiModelAccessSequence;
+  apiModelAccessStatus.value = "checking";
+  apiModelAccessError.value = "";
+  try {
+    const allowed = await checkCodexApiKeyModelAccess(accountId);
+    if (
+      accessSequence !== apiModelAccessSequence ||
+      apiModelAccount.value?.id !== accountId ||
+      !apiModelVisible.value
+    ) {
+      return false;
+    }
+    apiModelAccessStatus.value = allowed ? "matched" : "mismatched";
+    return allowed;
+  } catch (error) {
+    if (
+      accessSequence !== apiModelAccessSequence ||
+      apiModelAccount.value?.id !== accountId ||
+      !apiModelVisible.value
+    ) {
+      return false;
+    }
+    apiModelAccessStatus.value = "error";
+    apiModelAccessError.value = errorText(error);
+    return false;
+  }
+}
+
+async function handleFetchApiModels(): Promise<void> {
+  const account = apiModelAccount.value;
+  if (!account) return;
+  const accountId = account.id;
+  const requestSequence = ++apiModelRequestSequence;
+  fetchingApiModels.value = true;
+  try {
+    const models = await fetchCodexApiKeyModels(accountId);
+    if (
+      requestSequence !== apiModelRequestSequence ||
+      apiModelAccount.value?.id !== accountId ||
+      !apiModelVisible.value
+    ) {
+      return;
+    }
+    apiModels.value = models;
+    if (!models.length) {
+      Message.warning(t("API 服务没有返回可用模型"));
+    }
+  } catch (error) {
+    if (requestSequence !== apiModelRequestSequence || apiModelAccount.value?.id !== accountId) return;
+    Message.error(`${t("获取模型列表失败")}：${errorText(error)}`);
+  } finally {
+    if (requestSequence === apiModelRequestSequence) fetchingApiModels.value = false;
+  }
+}
+
+async function handleSaveApiModel(): Promise<void> {
+  const account = apiModelAccount.value;
+  const modelId = selectedApiModel.value.trim();
+  if (!account || !modelId) {
+    Message.warning(t("请选择默认模型"));
+    return;
+  }
+  if (apiModelAccessStatus.value !== "matched") {
+    Message.warning(t("当前 Codex 配置不是此 API Key，请先切换到该账号后再设置模型。"));
+    return;
+  }
+  const accountId = account.id;
+  const saveSequence = ++apiModelSaveSequence;
+  savingApiModel.value = true;
+  try {
+    await setCodexApiKeyDefaultModel({ accountId, modelId });
+    await loadAccounts();
+    if (saveSequence !== apiModelSaveSequence || apiModelAccount.value?.id !== accountId) return;
+    updateApiModelVisible(false);
+    Message.success(t("默认模型已保存并写入 config.toml"));
+  } catch (error) {
+    if (saveSequence !== apiModelSaveSequence || apiModelAccount.value?.id !== accountId) return;
+    Message.error(`${t("保存默认模型失败")}：${errorText(error)}`);
+    await checkApiModelAccess();
+  } finally {
+    if (saveSequence === apiModelSaveSequence) savingApiModel.value = false;
+  }
+}
+
 async function handleBindingSave(): Promise<void> {
   if (!bindingAccount.value) return;
   savingBinding.value = true;
@@ -2424,14 +2557,16 @@ async function formatConfigEditorContent(): Promise<void> {
 
 async function saveConfigEditorContent(): Promise<void> {
   const hadExistingFile = configEditorFile.value?.exists === true;
+  const savedKind = configEditorKind.value;
   configEditorSaving.value = true;
   try {
     const file = await writeCodexConfigFile(
-      configEditorKind.value,
+      savedKind,
       configEditorContent.value,
     );
     configEditorFile.value = file;
     configEditorContent.value = file.content;
+    if (savedKind === "config") await loadAccounts();
     Message.success(`已保存 ${file.name}${hadExistingFile ? "，原文件已自动备份" : ""}`);
   } catch (error) {
     Message.error(`保存配置文件失败：${errorText(error)}`);
@@ -2450,6 +2585,7 @@ function confirmResetConfig(): void {
     onOk: async () => {
       try {
         const deleted = await resetCodexConfigToml();
+        await loadAccounts();
         Message.success(deleted ? "已删除 config.toml" : "config.toml 不存在，无需重置");
       } catch (error) {
         Message.error(`重置失败：${errorText(error)}`);
@@ -2958,6 +3094,7 @@ onUnmounted(() => {
       @open-binding="openBinding"
       @open-official-url="openOfficialUrl"
       @open-edit="openEdit"
+      @open-models="openApiModels"
       @switch-account="handleSwitch"
       @refresh-quota="handleRefreshQuota"
       @open-export="openExport"
@@ -3237,6 +3374,21 @@ onUnmounted(() => {
       :plan-label="planLabel"
       :plan-class="planClass"
       @save="handleBindingSave"
+    />
+
+    <ApiKeyModelModal
+      :visible="apiModelVisible"
+      v-model:selected-model="selectedApiModel"
+      :account="apiModelAccount"
+      :models="apiModels"
+      :loading="fetchingApiModels"
+      :saving="savingApiModel"
+      :access-status="apiModelAccessStatus"
+      :access-error="apiModelAccessError"
+      @update:visible="updateApiModelVisible"
+      @check-access="checkApiModelAccess"
+      @fetch="handleFetchApiModels"
+      @save="handleSaveApiModel"
     />
 
     <ResetCreditModal
