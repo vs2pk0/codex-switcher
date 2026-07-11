@@ -51,6 +51,11 @@ export interface CodexConfigFileContent {
   exists: boolean;
 }
 
+export interface CodexApiKeyModel {
+  id: string;
+  ownedBy?: string;
+}
+
 export interface CodexSwitcherBackupFile {
   name: string;
   path: string;
@@ -149,6 +154,24 @@ export function updateCodexApiKeyCredentials(input: {
     apiOfficialUrl: input.apiOfficialUrl || null,
     apiOfficialURL: input.apiOfficialUrl || null,
     api_official_url: input.apiOfficialUrl || null,
+  });
+}
+
+export function fetchCodexApiKeyModels(accountId: string): Promise<CodexApiKeyModel[]> {
+  return invoke("fetch_codex_api_key_models", { accountId });
+}
+
+export function checkCodexApiKeyModelAccess(accountId: string): Promise<boolean> {
+  return invoke("check_codex_api_key_model_access", { accountId });
+}
+
+export function setCodexApiKeyDefaultModel(input: {
+  accountId: string;
+  modelId: string;
+}): Promise<CodexAccount> {
+  return invoke("set_codex_api_key_default_model", {
+    accountId: input.accountId,
+    modelId: input.modelId,
   });
 }
 

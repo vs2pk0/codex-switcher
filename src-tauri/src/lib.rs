@@ -5,7 +5,8 @@ mod session;
 mod usage;
 
 use account::{
-    AccountStore, ApiKeyAccountBindingInput, CodexAccount, CodexQuota, CodexResetCredit,
+    write_bytes_atomic, AccountStore, ApiKeyAccountBindingInput, CodexAccount, CodexQuota,
+    CodexResetCredit,
 };
 use oauth::CodexOAuthLoginStartResponse;
 use rand::Rng;
@@ -16,7 +17,7 @@ use session::{
     CodexSessionVisibilityRepairInstanceList, CodexSessionVisibilityRepairProviderList,
     CodexSessionVisibilityRepairSummary, CodexTrashedSessionRecord, SessionStore,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -36,6 +37,18 @@ struct CodexOAuthCallbackEvent {
     ok: bool,
     message: String,
 }
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CodexApiKeyModel {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owned_by: Option<String>,
+}
+
+const MAX_API_MODEL_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_API_MODELS: usize = 500;
+const MAX_API_MODEL_ID_CHARS: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -339,6 +352,168 @@ fn update_codex_api_key_credentials(
         api_provider_name,
         api_official_url,
     )
+}
+
+fn codex_models_endpoint(base_url: Option<&str>) -> Result<String, String> {
+    let base_url = base_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("https://api.openai.com/v1");
+    let mut url =
+        reqwest::Url::parse(base_url).map_err(|error| format!("Base URL 无效: {}", error))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("Base URL 必须是有效的 http:// 或 https:// 地址".to_string());
+    }
+    let path = url.path().trim_end_matches('/');
+    if !path.ends_with("/models") {
+        let models_path = if path.is_empty() {
+            "/models".to_string()
+        } else {
+            format!("{}/models", path)
+        };
+        url.set_path(&models_path);
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+fn parse_codex_api_key_models(body: &str) -> Result<Vec<CodexApiKeyModel>, String> {
+    let payload = serde_json::from_str::<Value>(body)
+        .map_err(|error| format!("解析模型列表 JSON 失败: {}", error))?;
+    let items = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| payload.get("models").and_then(Value::as_array))
+        .or_else(|| payload.as_array())
+        .ok_or_else(|| "模型列表响应中缺少 data 或 models 数组".to_string())?;
+
+    let mut seen = HashSet::new();
+    let mut models = Vec::new();
+    for item in items {
+        let Some(id) = (match item {
+            Value::String(id) => Some(id.as_str()),
+            Value::Object(fields) => fields
+                .get("id")
+                .or_else(|| fields.get("model"))
+                .or_else(|| fields.get("name"))
+                .and_then(Value::as_str),
+            _ => None,
+        })
+        .map(str::trim) else {
+            continue;
+        };
+        if id.is_empty()
+            || id.chars().count() > MAX_API_MODEL_ID_CHARS
+            || id.chars().any(char::is_control)
+            || !seen.insert(id.to_ascii_lowercase())
+        {
+            continue;
+        }
+        let owned_by = item.as_object().and_then(|fields| {
+            fields
+                .get("owned_by")
+                .or_else(|| fields.get("ownedBy"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .filter(|value| {
+                    value.chars().count() <= MAX_API_MODEL_ID_CHARS
+                        && !value.chars().any(char::is_control)
+                })
+                .map(ToOwned::to_owned)
+        });
+        models.push(CodexApiKeyModel {
+            id: id.to_string(),
+            owned_by,
+        });
+        if models.len() >= MAX_API_MODELS {
+            break;
+        }
+    }
+    models.sort_by(|left, right| {
+        left.id
+            .to_ascii_lowercase()
+            .cmp(&right.id.to_ascii_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(models)
+}
+
+#[tauri::command]
+async fn fetch_codex_api_key_models(account_id: String) -> Result<Vec<CodexApiKeyModel>, String> {
+    let account = AccountStore::default()
+        .list_accounts()?
+        .into_iter()
+        .find(|account| account.id == account_id)
+        .ok_or_else(|| "账号不存在".to_string())?;
+    if account.auth_mode.as_deref() != Some("apikey") {
+        return Err("只有 API Key 账号可以获取模型列表".to_string());
+    }
+    let api_key = account
+        .openai_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "API Key 账号缺少 OPENAI_API_KEY".to_string())?;
+    let endpoint = codex_models_endpoint(account.api_base_url.as_deref())?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("创建模型列表请求失败: {}", error))?;
+    let mut response = client
+        .get(&endpoint)
+        .bearer_auth(api_key)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|error| format!("请求模型列表失败: {}", error))?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_API_MODEL_RESPONSE_BYTES as u64)
+    {
+        return Err(format!(
+            "模型列表响应超过 {} MiB 限制",
+            MAX_API_MODEL_RESPONSE_BYTES / 1024 / 1024
+        ));
+    }
+    let status = response.status();
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("读取模型列表响应失败: {}", error))?
+    {
+        if body.len() + chunk.len() > MAX_API_MODEL_RESPONSE_BYTES {
+            return Err(format!(
+                "模型列表响应超过 {} MiB 限制",
+                MAX_API_MODEL_RESPONSE_BYTES / 1024 / 1024
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8_lossy(&body).into_owned();
+    if !status.is_success() {
+        return Err(format!(
+            "模型列表接口返回 {}: {}",
+            status,
+            compact_http_body(&body)
+        ));
+    }
+    parse_codex_api_key_models(&body)
+}
+
+#[tauri::command]
+fn check_codex_api_key_model_access(account_id: String) -> Result<bool, String> {
+    AccountStore::default().check_api_key_model_access(&account_id)
+}
+
+#[tauri::command]
+fn set_codex_api_key_default_model(
+    account_id: String,
+    model_id: String,
+) -> Result<CodexAccount, String> {
+    AccountStore::default().update_api_key_default_model(&account_id, model_id)
 }
 
 #[tauri::command]
@@ -983,6 +1158,45 @@ fn format_codex_config_content(kind: CodexConfigFileKind, content: &str) -> Resu
     }
 }
 
+fn read_file_snapshot(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    std::fs::read(path)
+        .map(Some)
+        .map_err(|error| format!("读取回滚快照失败 ({}): {}", path.display(), error))
+}
+
+fn restore_file_snapshot(path: &Path, snapshot: Option<&[u8]>) -> Result<(), String> {
+    if let Some(content) = snapshot {
+        return write_bytes_atomic(path, content);
+    }
+    if path.exists() {
+        std::fs::remove_file(path)
+            .map_err(|error| format!("移除新增配置失败 ({}): {}", path.display(), error))?;
+    }
+    Ok(())
+}
+
+fn rollback_file_on_error<T>(
+    result: Result<T, String>,
+    path: &Path,
+    snapshot: Option<&[u8]>,
+) -> Result<T, String> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(state_error) => match restore_file_snapshot(path, snapshot) {
+            Ok(()) => Err(state_error),
+            Err(rollback_error) => Err(format!(
+                "{}；回滚 {} 失败: {}",
+                state_error,
+                path.display(),
+                rollback_error
+            )),
+        },
+    }
+}
+
 fn write_codex_config_file_to(
     codex_home: &Path,
     kind: CodexConfigFileKind,
@@ -1006,40 +1220,7 @@ fn write_codex_config_file_to(
     } else {
         None
     };
-    let tmp_path = path.with_file_name(format!(
-        ".{}.codex-switcher-{:016x}.tmp",
-        kind.file_name(),
-        rand::thread_rng().gen::<u64>()
-    ));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut tmp_file = options
-        .open(&tmp_path)
-        .map_err(|error| format!("创建 Codex {} 临时文件失败: {}", kind.file_name(), error))?;
-    let write_result = tmp_file
-        .write_all(content.as_bytes())
-        .and_then(|_| tmp_file.sync_all());
-    drop(tmp_file);
-    if let Err(error) = write_result {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!(
-            "写入 Codex {} 临时文件失败: {}",
-            kind.file_name(),
-            error
-        ));
-    }
-    #[cfg(windows)]
-    if path.is_file() {
-        std::fs::remove_file(&path)
-            .map_err(|error| format!("准备替换 Codex {} 失败: {}", kind.file_name(), error))?;
-    }
-    if let Err(error) = std::fs::rename(&tmp_path, &path) {
-        let _ = std::fs::remove_file(&tmp_path);
+    if let Err(error) = write_bytes_atomic(&path, content.as_bytes()) {
         if let Some(backup_path) = backup_path {
             let _ = std::fs::copy(backup_path, &path);
         }
@@ -1066,23 +1247,45 @@ fn write_codex_config_file(
     content: String,
 ) -> Result<CodexConfigFileContent, String> {
     let kind = CodexConfigFileKind::parse(&file_kind)?;
-    write_codex_config_file_to(&default_codex_home(), kind, &content)
+    let codex_home = default_codex_home();
+    let path = codex_config_file_path(&codex_home, kind);
+    let snapshot = (kind == CodexConfigFileKind::ConfigToml)
+        .then(|| read_file_snapshot(&path))
+        .transpose()?
+        .flatten();
+    let written = write_codex_config_file_to(&codex_home, kind, &content)?;
+    if kind == CodexConfigFileKind::ConfigToml {
+        rollback_file_on_error(
+            AccountStore::default().release_current_api_key_default_model(),
+            &path,
+            snapshot.as_deref(),
+        )?;
+    }
+    Ok(written)
 }
 
 #[tauri::command]
 fn reset_codex_config_toml() -> Result<bool, String> {
     let path = default_codex_home().join("config.toml");
-    if !path.exists() {
-        return Ok(false);
-    }
-    std::fs::remove_file(&path).map_err(|error| {
-        format!(
-            "删除 Codex config.toml 失败 ({}): {}",
-            path.display(),
-            error
-        )
-    })?;
-    Ok(true)
+    let snapshot = read_file_snapshot(&path)?;
+    let removed = if path.exists() {
+        std::fs::remove_file(&path).map_err(|error| {
+            format!(
+                "删除 Codex config.toml 失败 ({}): {}",
+                path.display(),
+                error
+            )
+        })?;
+        true
+    } else {
+        false
+    };
+    rollback_file_on_error(
+        AccountStore::default().release_current_api_key_default_model(),
+        &path,
+        snapshot.as_deref(),
+    )?;
+    Ok(removed)
 }
 
 #[tauri::command]
@@ -2473,11 +2676,91 @@ fn compact_http_body(body: &str) -> String {
 mod tests {
     use super::{
         backup_entry_restore_target, default_codex_home, format_codex_config_content,
-        parse_codex_quota, read_codex_config_file_from, switcher_data_dir,
-        write_codex_config_file_to, CodexConfigFileKind,
+        parse_codex_api_key_models, parse_codex_quota, read_codex_config_file_from,
+        rollback_file_on_error, switcher_data_dir, write_codex_config_file_to, CodexApiKeyModel,
+        CodexConfigFileKind,
     };
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn model_endpoint_preserves_provider_prefix_and_avoids_duplicate_suffix() {
+        assert_eq!(
+            super::codex_models_endpoint(Some("https://relay.example/sub2api/"))
+                .expect("models endpoint"),
+            "https://relay.example/sub2api/models"
+        );
+        assert_eq!(
+            super::codex_models_endpoint(Some("https://relay.example/v1/models?cache=1"))
+                .expect("existing models endpoint"),
+            "https://relay.example/v1/models"
+        );
+        assert!(super::codex_models_endpoint(Some("file:///tmp/models")).is_err());
+    }
+
+    #[test]
+    fn model_list_parser_supports_openai_and_compatible_payloads() {
+        let standard = parse_codex_api_key_models(
+            r#"{"object":"list","data":[{"id":"gpt-5.6-sol","owned_by":"custom"},{"id":"gpt-5.5"},{"id":"gpt-5.5"}]}"#,
+        )
+        .expect("standard model response");
+        assert_eq!(
+            standard,
+            vec![
+                CodexApiKeyModel {
+                    id: "gpt-5.5".to_string(),
+                    owned_by: None,
+                },
+                CodexApiKeyModel {
+                    id: "gpt-5.6-sol".to_string(),
+                    owned_by: Some("custom".to_string()),
+                },
+            ]
+        );
+
+        let compatible = parse_codex_api_key_models(
+            r#"{"models":["model-b",{"name":"model-a","ownedBy":"relay"}]}"#,
+        )
+        .expect("compatible model response");
+        assert_eq!(compatible[0].id, "model-a");
+        assert_eq!(compatible[0].owned_by.as_deref(), Some("relay"));
+        assert_eq!(compatible[1].id, "model-b");
+        assert!(parse_codex_api_key_models(r#"{"result":[]}"#).is_err());
+
+        let invalid_ids = json!({
+            "data": [
+                { "id": "x".repeat(super::MAX_API_MODEL_ID_CHARS + 1) },
+                { "id": "invalid\nmodel" }
+            ]
+        });
+        assert!(parse_codex_api_key_models(&invalid_ids.to_string())
+            .expect("invalid ids are ignored")
+            .is_empty());
+    }
+
+    #[test]
+    fn config_state_failure_restores_existing_or_missing_file_snapshot() {
+        let codex = tempdir().expect("codex tempdir");
+        let config_path = codex.path().join("config.toml");
+        std::fs::write(&config_path, b"model = \"changed\"\n").expect("write changed config");
+
+        let error = rollback_file_on_error::<()>(
+            Err("保存账号状态失败".to_string()),
+            &config_path,
+            Some(b"model = \"original\"\n"),
+        )
+        .expect_err("surface state failure");
+        assert_eq!(error, "保存账号状态失败");
+        assert_eq!(
+            std::fs::read(&config_path).expect("read restored config"),
+            b"model = \"original\"\n"
+        );
+
+        std::fs::write(&config_path, b"model = \"new\"\n").expect("write new config");
+        rollback_file_on_error::<()>(Err("保存账号状态失败".to_string()), &config_path, None)
+            .expect_err("surface state failure for new file");
+        assert!(!config_path.exists());
+    }
 
     #[test]
     fn codex_config_editor_round_trips_and_backs_up_supported_files() {
@@ -2651,6 +2934,9 @@ pub fn run() {
             import_codex_from_local,
             add_codex_account_with_api_key,
             update_codex_api_key_credentials,
+            fetch_codex_api_key_models,
+            check_codex_api_key_model_access,
+            set_codex_api_key_default_model,
             update_codex_account_profile,
             update_codex_account_from_json,
             update_codex_api_key_bound_oauth_account,

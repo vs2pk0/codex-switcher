@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
-use toml_edit::{value, Document};
+use toml_edit::{value, Document, Item};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -87,6 +89,12 @@ pub struct CodexAccount {
     pub api_provider_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_official_url: Option<String>,
+    #[serde(
+        default,
+        alias = "defaultModel",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,6 +143,26 @@ struct AccountDatabase {
     accounts: Vec<CodexAccount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     current_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_model_config_backup: Option<ManagedModelConfigBackup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ManagedModelConfigBackup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    root_items: BTreeMap<String, String>,
+    #[serde(default)]
+    features_table_existed: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    feature_items: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    provider_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    provider_items: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    touched_provider_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -260,6 +288,14 @@ impl AccountStore {
         let Some(account) = match_current_account_from_config(&database.accounts, &config) else {
             return Ok(None);
         };
+        if database
+            .managed_model_config_backup
+            .as_ref()
+            .and_then(|backup| backup.managed_account_id.as_deref())
+            != Some(account.id.as_str())
+        {
+            database.managed_model_config_backup = None;
+        }
         database.current_account_id = Some(account.id.clone());
         self.write_database(&database)?;
         Ok(Some(account))
@@ -355,7 +391,12 @@ impl AccountStore {
         upsert_account(&mut database.accounts, account.clone());
         if was_current {
             database.current_account_id = Some(account.id.clone());
-            write_codex_auth_projection(&self.codex_home, &account, &database.accounts)?;
+            write_codex_auth_projection(
+                &self.codex_home,
+                &account,
+                &database.accounts,
+                ManagedModelTransition::default(),
+            )?;
         } else if current_api_key_depends_on_refreshed_oauth {
             if let Some(current) = database
                 .accounts
@@ -363,7 +404,12 @@ impl AccountStore {
                 .find(|candidate| current_id.as_deref() == Some(candidate.id.as_str()))
                 .cloned()
             {
-                write_codex_auth_projection(&self.codex_home, &current, &database.accounts)?;
+                write_codex_auth_projection(
+                    &self.codex_home,
+                    &current,
+                    &database.accounts,
+                    ManagedModelTransition::default(),
+                )?;
             }
         }
         self.write_database(&database)?;
@@ -378,39 +424,13 @@ impl AccountStore {
         api_official_url: Option<String>,
         account_name: Option<String>,
     ) -> Result<CodexAccount, String> {
-        let (api_key, api_base_url) =
-            validate_api_key_credentials(&api_key, api_base_url.as_deref())?;
-        let api_official_url = validate_optional_url(api_official_url.as_deref(), "官网地址")?;
-        let now = now_timestamp();
-        let id = build_api_key_account_id(&api_key);
-        let account = CodexAccount {
-            id,
-            email: build_api_key_email(&api_key),
-            account_name: normalize_optional(account_name.as_deref())
-                .or_else(|| normalize_optional(api_provider_name.as_deref())),
-            auth_mode: Some("apikey".to_string()),
-            openai_api_key: Some(api_key),
+        let account = build_api_key_account_record(
+            api_key,
             api_base_url,
-            api_provider_name: normalize_optional(api_provider_name.as_deref()),
+            api_provider_name,
             api_official_url,
-            plan_type: Some("api_key".to_string()),
-            auth_file_plan_type: None,
-            bound_oauth_account_id: None,
-            bound_oauth_use_local_gateway: false,
-            bound_phone: None,
-            subscription_active_until: None,
-            access_token_expires_at: None,
-            quota: None,
-            quota_error: None,
-            usage_updated_at: None,
-            tokens: CodexTokens {
-                id_token: String::new(),
-                access_token: String::new(),
-                refresh_token: None,
-            },
-            created_at: now,
-            last_used: now,
-        };
+            account_name,
+        )?;
 
         let mut database = self.read_database()?;
         upsert_account(&mut database.accounts, account.clone());
@@ -470,6 +490,135 @@ impl AccountStore {
         let updated = account.clone();
         self.write_database(&database)?;
         Ok(updated)
+    }
+
+    pub fn update_api_key_default_model(
+        &self,
+        account_id: &str,
+        model_id: String,
+    ) -> Result<CodexAccount, String> {
+        let model_id = validate_default_model(&model_id)?;
+        let mut database = self.read_database()?;
+        let account_index = database
+            .accounts
+            .iter()
+            .position(|account| account.id == account_id)
+            .ok_or_else(|| "账号不存在".to_string())?;
+        if database.accounts[account_index].auth_mode.as_deref() != Some("apikey") {
+            return Err("只有 API Key 账号可以设置默认模型".to_string());
+        }
+
+        let current_config = self.read_current_codex_config()?;
+        if !strict_api_key_model_access_matches(
+            &database.accounts,
+            &database.accounts[account_index],
+            &current_config,
+        ) {
+            return Err("当前 Codex 配置不是该 API Key 账号，请先切换到该账号后重试".to_string());
+        }
+
+        if database
+            .managed_model_config_backup
+            .as_ref()
+            .and_then(|backup| backup.managed_account_id.as_deref())
+            != Some(account_id)
+        {
+            database.managed_model_config_backup = None;
+        }
+        database.current_account_id = Some(account_id.to_string());
+
+        let mut previous_model = database.accounts[account_index].default_model.clone();
+        let config_path = self.codex_home.join("config.toml");
+        let config_before_update = fs::read_to_string(&config_path)
+            .map_err(|error| format!("读取 config.toml 失败: {}", error))?;
+        let config_document = read_toml_document(&config_path)?;
+        if previous_model
+            .as_deref()
+            .is_some_and(|model| config_document.get("model").and_then(Item::as_str) != Some(model))
+        {
+            database.managed_model_config_backup = None;
+            previous_model = None;
+        }
+        let previous_model_was_gpt_5_6 = is_gpt_5_6_model(previous_model.as_deref());
+        let next_model_is_gpt_5_6 = is_gpt_5_6_model(Some(&model_id));
+        database.accounts[account_index].default_model = Some(model_id);
+        database.accounts[account_index].last_used = now_timestamp();
+        if database.managed_model_config_backup.is_none() {
+            database.managed_model_config_backup =
+                Some(capture_managed_model_config(&config_document, account_id));
+        }
+        let provider_id = api_key_provider_id(&database.accounts[account_index]);
+        if let Some(backup) = database.managed_model_config_backup.as_mut() {
+            backup.managed_account_id = Some(account_id.to_string());
+            if next_model_is_gpt_5_6 && !backup.touched_provider_ids.contains(&provider_id) {
+                backup.touched_provider_ids.push(provider_id);
+            }
+        }
+        let updated = database.accounts[account_index].clone();
+        write_api_key_provider_config(
+            &self.codex_home,
+            &updated,
+            ManagedModelTransition {
+                restore_model: false,
+                restore_gpt_5_6: previous_model_was_gpt_5_6 && !next_model_is_gpt_5_6,
+                expected_model: previous_model,
+                restore_provider_ids: database
+                    .managed_model_config_backup
+                    .as_ref()
+                    .map(|backup| backup.touched_provider_ids.clone())
+                    .filter(|ids| !ids.is_empty())
+                    .unwrap_or_else(|| {
+                        if previous_model_was_gpt_5_6 {
+                            vec![api_key_provider_id(&updated)]
+                        } else {
+                            Vec::new()
+                        }
+                    }),
+                backup: database.managed_model_config_backup.clone(),
+            },
+        )?;
+        rollback_config_on_error(
+            self.write_database(&database),
+            &config_path,
+            &config_before_update,
+        )?;
+        Ok(updated)
+    }
+
+    pub fn check_api_key_model_access(&self, account_id: &str) -> Result<bool, String> {
+        let database = self.read_database()?;
+        let Some(account) = database
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+        else {
+            return Err("账号不存在".to_string());
+        };
+        if account.auth_mode.as_deref() != Some("apikey") {
+            return Ok(false);
+        }
+        let current_config = self.read_current_codex_config()?;
+        Ok(strict_api_key_model_access_matches(
+            &database.accounts,
+            account,
+            &current_config,
+        ))
+    }
+
+    pub fn release_current_api_key_default_model(&self) -> Result<bool, String> {
+        let mut database = self.read_database()?;
+        let mut changed = database.managed_model_config_backup.take().is_some();
+        if let Some(current_id) = database.current_account_id.as_deref() {
+            if let Some(account) = database.accounts.iter_mut().find(|account| {
+                account.id == current_id && account.auth_mode.as_deref() == Some("apikey")
+            }) {
+                changed |= account.default_model.take().is_some();
+            }
+        }
+        if changed {
+            self.write_database(&database)?;
+        }
+        Ok(changed)
     }
 
     pub fn update_account_profile(
@@ -538,7 +687,12 @@ impl AccountStore {
         let updated = account.clone();
 
         if is_current {
-            write_codex_auth_projection(&self.codex_home, &updated, &database.accounts)?;
+            write_codex_auth_projection(
+                &self.codex_home,
+                &updated,
+                &database.accounts,
+                ManagedModelTransition::default(),
+            )?;
         }
         self.write_database(&database)?;
         Ok(updated)
@@ -577,14 +731,12 @@ impl AccountStore {
             .ok_or_else(|| "账号不存在".to_string())?;
 
         let import_value = select_account_value_for_update(&value, &old_account)?;
-        let has_explicit_local_id = read_string(import_value, &["id"]).is_some();
+        let explicit_local_id = read_string(import_value, &["id"]);
         let mut updated = match serde_json::from_value::<CodexAccount>(import_value.clone()) {
             Ok(account) => account,
             Err(_) => self.account_from_import_value(import_value)?,
         };
-        if updated.id.trim().is_empty() || !has_explicit_local_id {
-            updated.id = old_account.id.clone();
-        }
+        updated.id = explicit_local_id.unwrap_or_else(|| old_account.id.clone());
         if updated.created_at <= 0 {
             updated.created_at = old_account.created_at;
         }
@@ -593,14 +745,148 @@ impl AccountStore {
         }
         apply_import_metadata(&mut updated, import_value);
 
+        if updated.auth_mode.as_deref() == Some("apikey") {
+            updated.default_model = updated
+                .default_model
+                .as_deref()
+                .map(validate_default_model)
+                .transpose()?;
+        }
+        if updated.id != old_account.id
+            && database
+                .accounts
+                .iter()
+                .any(|account| account.id == updated.id)
+        {
+            return Err(format!("账号 ID 已存在: {}", updated.id));
+        }
+
         let was_current = database.current_account_id.as_deref() == Some(account_id);
-        database
-            .accounts
-            .retain(|account| account.id != account_id && account.id != updated.id);
+        let refresh_current_bound_api = !was_current
+            && database
+                .current_account_id
+                .as_deref()
+                .and_then(|current_id| {
+                    database
+                        .accounts
+                        .iter()
+                        .find(|account| account.id == current_id)
+                })
+                .is_some_and(|account| {
+                    account.auth_mode.as_deref() == Some("apikey")
+                        && account.bound_oauth_account_id.as_deref()
+                            == Some(old_account.id.as_str())
+                });
+        let mut model_transition = ManagedModelTransition::default();
+        let mut target_default_model = None;
+        if was_current {
+            if database
+                .managed_model_config_backup
+                .as_ref()
+                .is_some_and(|backup| {
+                    backup.managed_account_id.as_deref() != Some(old_account.id.as_str())
+                })
+            {
+                database.managed_model_config_backup = None;
+            }
+            let config_document = read_toml_document(&self.codex_home.join("config.toml"))?;
+            let mut previous_default_model = (old_account.auth_mode.as_deref() == Some("apikey"))
+                .then(|| {
+                    old_account
+                        .default_model
+                        .as_deref()
+                        .and_then(|model| normalize_optional(Some(model)))
+                })
+                .flatten();
+            if previous_default_model.as_deref().is_some_and(|model| {
+                config_document.get("model").and_then(Item::as_str) != Some(model)
+            }) {
+                database.managed_model_config_backup = None;
+                previous_default_model = None;
+            }
+            target_default_model = (updated.auth_mode.as_deref() == Some("apikey"))
+                .then(|| {
+                    updated
+                        .default_model
+                        .as_deref()
+                        .and_then(|model| normalize_optional(Some(model)))
+                })
+                .flatten();
+            if target_default_model.is_some() && database.managed_model_config_backup.is_none() {
+                database.managed_model_config_backup =
+                    Some(capture_managed_model_config(&config_document, &updated.id));
+            }
+            if let Some(backup) = database.managed_model_config_backup.as_mut() {
+                backup.managed_account_id = Some(updated.id.clone());
+                if is_gpt_5_6_model(target_default_model.as_deref()) {
+                    let provider_id = api_key_provider_id(&updated);
+                    if !backup.touched_provider_ids.contains(&provider_id) {
+                        backup.touched_provider_ids.push(provider_id);
+                    }
+                }
+            }
+            let leaving_managed_model = target_default_model.is_none()
+                && (previous_default_model.is_some()
+                    || database.managed_model_config_backup.is_some());
+            let legacy_previous_provider_id = is_gpt_5_6_model(previous_default_model.as_deref())
+                .then(|| api_key_provider_id(&old_account));
+            let restore_provider_ids = database
+                .managed_model_config_backup
+                .as_ref()
+                .map(|backup| backup.touched_provider_ids.clone())
+                .filter(|ids| !ids.is_empty())
+                .or_else(|| legacy_previous_provider_id.map(|id| vec![id]))
+                .unwrap_or_default();
+            model_transition = ManagedModelTransition {
+                restore_model: leaving_managed_model,
+                restore_gpt_5_6: leaving_managed_model
+                    || (is_gpt_5_6_model(previous_default_model.as_deref())
+                        && !is_gpt_5_6_model(target_default_model.as_deref())),
+                expected_model: previous_default_model,
+                restore_provider_ids,
+                backup: database.managed_model_config_backup.clone(),
+            };
+        }
+
+        if updated.id != old_account.id {
+            for account in &mut database.accounts {
+                if account.bound_oauth_account_id.as_deref() == Some(old_account.id.as_str()) {
+                    account.bound_oauth_account_id = Some(updated.id.clone());
+                }
+            }
+        }
+        database.accounts.retain(|account| account.id != account_id);
         database.accounts.insert(0, updated.clone());
         if was_current {
             database.current_account_id = Some(updated.id.clone());
-            write_codex_auth_projection(&self.codex_home, &updated, &database.accounts)?;
+            write_codex_auth_projection(
+                &self.codex_home,
+                &updated,
+                &database.accounts,
+                model_transition,
+            )?;
+            if target_default_model.is_none() {
+                database.managed_model_config_backup = None;
+            }
+        } else if refresh_current_bound_api {
+            if let Some(current) = database
+                .current_account_id
+                .as_deref()
+                .and_then(|current_id| {
+                    database
+                        .accounts
+                        .iter()
+                        .find(|account| account.id == current_id)
+                })
+                .cloned()
+            {
+                write_codex_auth_projection(
+                    &self.codex_home,
+                    &current,
+                    &database.accounts,
+                    ManagedModelTransition::default(),
+                )?;
+            }
         }
         self.write_database(&database)?;
         Ok(updated)
@@ -684,11 +970,43 @@ impl AccountStore {
 
     pub fn delete_account(&self, account_id: &str) -> Result<(), String> {
         let mut database = self.read_database()?;
+        let removed_account = database
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .cloned()
+            .ok_or_else(|| "账号不存在".to_string())?;
+        let removed_was_current = database.current_account_id.as_deref() == Some(account_id);
+        if removed_was_current
+            && (removed_account.default_model.is_some()
+                || database.managed_model_config_backup.is_some())
+        {
+            write_managed_model_transition_only(
+                &self.codex_home,
+                ManagedModelTransition {
+                    restore_model: true,
+                    restore_gpt_5_6: true,
+                    expected_model: removed_account.default_model.clone(),
+                    restore_provider_ids: database
+                        .managed_model_config_backup
+                        .as_ref()
+                        .map(|backup| backup.touched_provider_ids.clone())
+                        .filter(|ids| !ids.is_empty())
+                        .unwrap_or_else(|| {
+                            if is_gpt_5_6_model(removed_account.default_model.as_deref()) {
+                                vec![api_key_provider_id(&removed_account)]
+                            } else {
+                                Vec::new()
+                            }
+                        }),
+                    backup: database.managed_model_config_backup.clone(),
+                },
+            )?;
+            database.managed_model_config_backup = None;
+        }
         let before = database.accounts.len();
         database.accounts.retain(|account| account.id != account_id);
-        if database.accounts.len() == before {
-            return Err("账号不存在".to_string());
-        }
+        debug_assert!(database.accounts.len() < before);
         let mut removed_bound_references = false;
         for account in &mut database.accounts {
             if account.bound_oauth_account_id.as_deref() == Some(account_id) {
@@ -698,7 +1016,7 @@ impl AccountStore {
                 removed_bound_references = true;
             }
         }
-        if database.current_account_id.as_deref() == Some(account_id) {
+        if removed_was_current {
             database.current_account_id = None;
         }
         if removed_bound_references {
@@ -709,7 +1027,12 @@ impl AccountStore {
                     .find(|account| account.id == current_id)
                     .cloned()
                 {
-                    write_codex_auth_projection(&self.codex_home, &current, &database.accounts)?;
+                    write_codex_auth_projection(
+                        &self.codex_home,
+                        &current,
+                        &database.accounts,
+                        ManagedModelTransition::default(),
+                    )?;
                 }
             }
         }
@@ -718,15 +1041,99 @@ impl AccountStore {
 
     pub fn switch_account(&self, account_id: &str) -> Result<CodexAccount, String> {
         let mut database = self.read_database()?;
-        let account = database
+        if database
+            .managed_model_config_backup
+            .as_ref()
+            .and_then(|backup| backup.managed_account_id.as_deref())
+            != database.current_account_id.as_deref()
+        {
+            database.managed_model_config_backup = None;
+        }
+        let previous_account_index = database
+            .current_account_id
+            .as_deref()
+            .filter(|current_id| *current_id != account_id)
+            .and_then(|current_id| {
+                database
+                    .accounts
+                    .iter()
+                    .position(|account| account.id == current_id)
+            });
+        let config_document = read_toml_document(&self.codex_home.join("config.toml"))?;
+        let mut previous_default_model = previous_account_index
+            .and_then(|index| {
+                let account = &database.accounts[index];
+                (account.auth_mode.as_deref() == Some("apikey"))
+                    .then_some(account.default_model.as_deref())
+                    .flatten()
+            })
+            .and_then(|model| normalize_optional(Some(model)));
+        if previous_default_model
+            .as_deref()
+            .is_some_and(|model| config_document.get("model").and_then(Item::as_str) != Some(model))
+        {
+            if let Some(index) = previous_account_index {
+                database.accounts[index].default_model = None;
+            }
+            database.managed_model_config_backup = None;
+            previous_default_model = None;
+        }
+        let target_index = database
             .accounts
-            .iter_mut()
-            .find(|account| account.id == account_id)
+            .iter()
+            .position(|account| account.id == account_id)
             .ok_or_else(|| "账号不存在".to_string())?;
-        account.last_used = now_timestamp();
-        let switched = account.clone();
+        let target_default_model = (database.accounts[target_index].auth_mode.as_deref()
+            == Some("apikey"))
+        .then(|| database.accounts[target_index].default_model.as_deref())
+        .flatten()
+        .and_then(|model| normalize_optional(Some(model)));
+        if target_default_model.is_some() && database.managed_model_config_backup.is_none() {
+            database.managed_model_config_backup =
+                Some(capture_managed_model_config(&config_document, account_id));
+        }
+        if let Some(backup) = database.managed_model_config_backup.as_mut() {
+            backup.managed_account_id = Some(account_id.to_string());
+            if is_gpt_5_6_model(target_default_model.as_deref()) {
+                let provider_id = api_key_provider_id(&database.accounts[target_index]);
+                if !backup.touched_provider_ids.contains(&provider_id) {
+                    backup.touched_provider_ids.push(provider_id);
+                }
+            }
+        }
+        let leaving_managed_model = target_default_model.is_none()
+            && (previous_default_model.is_some() || database.managed_model_config_backup.is_some());
+        let legacy_previous_provider_id = previous_account_index
+            .filter(|_| is_gpt_5_6_model(previous_default_model.as_deref()))
+            .map(|index| api_key_provider_id(&database.accounts[index]));
+        let restore_provider_ids = database
+            .managed_model_config_backup
+            .as_ref()
+            .map(|backup| backup.touched_provider_ids.clone())
+            .filter(|ids| !ids.is_empty())
+            .or_else(|| legacy_previous_provider_id.map(|id| vec![id]))
+            .unwrap_or_default();
+        let model_transition = ManagedModelTransition {
+            restore_model: leaving_managed_model,
+            restore_gpt_5_6: leaving_managed_model
+                || (is_gpt_5_6_model(previous_default_model.as_deref())
+                    && !is_gpt_5_6_model(target_default_model.as_deref())),
+            expected_model: previous_default_model,
+            restore_provider_ids,
+            backup: database.managed_model_config_backup.clone(),
+        };
+        database.accounts[target_index].last_used = now_timestamp();
+        let switched = database.accounts[target_index].clone();
 
-        write_codex_auth_projection(&self.codex_home, &switched, &database.accounts)?;
+        write_codex_auth_projection(
+            &self.codex_home,
+            &switched,
+            &database.accounts,
+            model_transition,
+        )?;
+        if target_default_model.is_none() {
+            database.managed_model_config_backup = None;
+        }
         database.current_account_id = Some(switched.id.clone());
         self.write_database(&database)?;
         Ok(switched)
@@ -809,7 +1216,7 @@ impl AccountStore {
             value,
             &["OPENAI_API_KEY", "openai_api_key", "apiKey", "api_key"],
         ) {
-            let mut account = self.add_api_key_account(
+            let mut account = build_api_key_account_record(
                 api_key,
                 read_string(value, &["base_url", "api_base_url", "apiBaseUrl"]),
                 read_string(value, &["api_provider_name", "providerName", "provider"]),
@@ -860,6 +1267,7 @@ impl AccountStore {
             api_base_url: None,
             api_provider_name: None,
             api_official_url: None,
+            default_model: None,
             plan_type: None,
             auth_file_plan_type: None,
             bound_oauth_account_id: None,
@@ -1124,6 +1532,43 @@ fn oauth_identity_matches(account: &CodexAccount, config: &CodexCurrentConfig) -
     email_matches || token_matches
 }
 
+fn strict_api_key_model_access_matches(
+    accounts: &[CodexAccount],
+    account: &CodexAccount,
+    config: &CodexCurrentConfig,
+) -> bool {
+    if account.auth_mode.as_deref() != Some("apikey") {
+        return false;
+    }
+    let Some(account_api_key) = account
+        .openai_api_key
+        .as_deref()
+        .and_then(|value| normalize_optional(Some(value)))
+    else {
+        return false;
+    };
+    if config.provider_api_key.as_deref() != Some(account_api_key.as_str())
+        || normalize_base_url(config.provider_base_url.as_deref()) != account_base_url(account)
+        || config
+            .api_key
+            .as_deref()
+            .is_some_and(|auth_api_key| auth_api_key != account_api_key.as_str())
+    {
+        return false;
+    }
+
+    if let Some(bound_oauth_id) = account.bound_oauth_account_id.as_deref() {
+        return accounts
+            .iter()
+            .find(|candidate| {
+                candidate.id == bound_oauth_id && candidate.auth_mode.as_deref() != Some("apikey")
+            })
+            .is_some_and(|oauth| oauth_identity_matches(oauth, config));
+    }
+
+    config.api_key.as_deref() == Some(account_api_key.as_str())
+}
+
 fn match_current_account_from_config(
     accounts: &[CodexAccount],
     config: &CodexCurrentConfig,
@@ -1205,6 +1650,59 @@ fn validate_api_key_credentials(
         }
     }
     Ok((api_key, api_base_url))
+}
+
+fn build_api_key_account_record(
+    api_key: String,
+    api_base_url: Option<String>,
+    api_provider_name: Option<String>,
+    api_official_url: Option<String>,
+    account_name: Option<String>,
+) -> Result<CodexAccount, String> {
+    let (api_key, api_base_url) = validate_api_key_credentials(&api_key, api_base_url.as_deref())?;
+    let api_official_url = validate_optional_url(api_official_url.as_deref(), "官网地址")?;
+    let now = now_timestamp();
+    Ok(CodexAccount {
+        id: build_api_key_account_id(&api_key),
+        email: build_api_key_email(&api_key),
+        account_name: normalize_optional(account_name.as_deref())
+            .or_else(|| normalize_optional(api_provider_name.as_deref())),
+        auth_mode: Some("apikey".to_string()),
+        openai_api_key: Some(api_key),
+        api_base_url,
+        api_provider_name: normalize_optional(api_provider_name.as_deref()),
+        api_official_url,
+        default_model: None,
+        plan_type: Some("api_key".to_string()),
+        auth_file_plan_type: None,
+        bound_oauth_account_id: None,
+        bound_oauth_use_local_gateway: false,
+        bound_phone: None,
+        subscription_active_until: None,
+        access_token_expires_at: None,
+        quota: None,
+        quota_error: None,
+        usage_updated_at: None,
+        tokens: CodexTokens {
+            id_token: String::new(),
+            access_token: String::new(),
+            refresh_token: None,
+        },
+        created_at: now,
+        last_used: now,
+    })
+}
+
+fn validate_default_model(model_id: &str) -> Result<String, String> {
+    let model_id =
+        normalize_optional(Some(model_id)).ok_or_else(|| "默认模型不能为空".to_string())?;
+    if model_id.chars().count() > 256 {
+        return Err("默认模型名称不能超过 256 个字符".to_string());
+    }
+    if model_id.chars().any(char::is_control) {
+        return Err("默认模型名称不能包含控制字符".to_string());
+    }
+    Ok(model_id)
 }
 
 fn validate_optional_url(value: Option<&str>, label: &str) -> Result<Option<String>, String> {
@@ -1307,6 +1805,8 @@ fn apply_import_metadata(account: &mut CodexAccount, value: &Value) {
         ],
     )
     .or_else(|| account.api_official_url.clone());
+    account.default_model = read_string(value, &["default_model", "defaultModel", "model"])
+        .or_else(|| account.default_model.clone());
     account.subscription_active_until = read_scalar_string(
         value,
         &[
@@ -1406,6 +1906,7 @@ fn token_export_account(account: &CodexAccount, accounts: &[CodexAccount]) -> Co
         .unwrap_or_else(|| account.clone());
     source.account_name = account.account_name.clone().or(source.account_name);
     source.bound_phone = account.bound_phone.clone().or(source.bound_phone);
+    source.default_model = account.default_model.clone().or(source.default_model);
     source
 }
 
@@ -1526,6 +2027,13 @@ fn insert_account_metadata(payload: &mut serde_json::Map<String, Value>, account
     {
         payload.insert("api_official_url".to_string(), Value::String(official_url));
     }
+    if let Some(default_model) = account
+        .default_model
+        .as_deref()
+        .and_then(|value| normalize_optional(Some(value)))
+    {
+        payload.insert("default_model".to_string(), Value::String(default_model));
+    }
     if let Some(phone) = account
         .bound_phone
         .as_deref()
@@ -1623,10 +2131,127 @@ fn jwt_payload_value(token: &str) -> Option<Value> {
     serde_json::from_slice(&decoded).ok()
 }
 
+const MANAGED_MODEL_ROOT_KEYS: [&str; 8] = [
+    "model",
+    "model_reasoning_effort",
+    "disable_response_storage",
+    "network_access",
+    "windows_wsl_setup_acknowledged",
+    "requires_openai_auth",
+    "supports_websockets",
+    "websocket_v2",
+];
+const MANAGED_GPT_5_6_ROOT_KEYS: [&str; 7] = [
+    "model_reasoning_effort",
+    "disable_response_storage",
+    "network_access",
+    "windows_wsl_setup_acknowledged",
+    "requires_openai_auth",
+    "supports_websockets",
+    "websocket_v2",
+];
+const MANAGED_GPT_5_6_FEATURE_KEYS: [&str; 5] = [
+    "goals",
+    "js_repl",
+    "memories",
+    "websocket_v2",
+    "supports_websockets",
+];
+const MANAGED_GPT_5_6_PROVIDER_KEYS: [&str; 2] = ["supports_websockets", "websocket_v2"];
+
+#[derive(Debug, Clone, Default)]
+struct ManagedModelTransition {
+    restore_model: bool,
+    restore_gpt_5_6: bool,
+    expected_model: Option<String>,
+    restore_provider_ids: Vec<String>,
+    backup: Option<ManagedModelConfigBackup>,
+}
+
+fn capture_managed_model_config(
+    document: &Document,
+    managed_account_id: &str,
+) -> ManagedModelConfigBackup {
+    let root_items = MANAGED_MODEL_ROOT_KEYS
+        .iter()
+        .filter_map(|key| {
+            document
+                .get(key)
+                .map(|item| ((*key).to_string(), item.to_string()))
+        })
+        .collect();
+    let features = document.get("features").and_then(Item::as_table_like);
+    let feature_items = MANAGED_GPT_5_6_FEATURE_KEYS
+        .iter()
+        .filter_map(|key| {
+            features
+                .and_then(|table| table.get(key))
+                .map(|item| ((*key).to_string(), item.to_string()))
+        })
+        .collect();
+    let mut provider_ids = Vec::new();
+    let mut provider_items = BTreeMap::new();
+    if let Some(providers) = document
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+    {
+        for (provider_id, provider) in providers.iter() {
+            let Some(provider) = provider.as_table_like() else {
+                continue;
+            };
+            provider_ids.push(provider_id.to_string());
+            let items = MANAGED_GPT_5_6_PROVIDER_KEYS
+                .iter()
+                .filter_map(|key| {
+                    provider
+                        .get(key)
+                        .map(|item| ((*key).to_string(), item.to_string()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            if !items.is_empty() {
+                provider_items.insert(provider_id.to_string(), items);
+            }
+        }
+    }
+    ManagedModelConfigBackup {
+        managed_account_id: Some(managed_account_id.to_string()),
+        root_items,
+        features_table_existed: features.is_some(),
+        feature_items,
+        provider_ids,
+        provider_items,
+        touched_provider_ids: Vec::new(),
+    }
+}
+
+fn parse_managed_backup_item(raw: &str) -> Result<Item, String> {
+    let mut document = format!("__codex_switcher_value = {}\n", raw)
+        .parse::<Document>()
+        .map_err(|error| format!("恢复 Codex 模型配置失败: {}", error))?;
+    document
+        .as_table_mut()
+        .remove("__codex_switcher_value")
+        .ok_or_else(|| "恢复 Codex 模型配置失败: 备份项为空".to_string())
+}
+
+fn restore_table_item(
+    table: &mut dyn toml_edit::TableLike,
+    key: &str,
+    backup_items: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if let Some(raw) = backup_items.get(key) {
+        table.insert(key, parse_managed_backup_item(raw)?);
+    } else {
+        table.remove(key);
+    }
+    Ok(())
+}
+
 fn write_codex_auth_projection(
     codex_home: &Path,
     account: &CodexAccount,
     accounts: &[CodexAccount],
+    model_transition: ManagedModelTransition,
 ) -> Result<(), String> {
     fs::create_dir_all(codex_home).map_err(|error| format!("创建 Codex 目录失败: {}", error))?;
     let auth_value = if account.auth_mode.as_deref() == Some("apikey") {
@@ -1683,14 +2308,18 @@ fn write_codex_auth_projection(
     )?;
 
     if account.auth_mode.as_deref() == Some("apikey") {
-        write_api_key_provider_config(codex_home, account)?;
+        write_api_key_provider_config(codex_home, account, model_transition)?;
     } else {
-        write_official_provider_config(codex_home)?;
+        write_official_provider_config(codex_home, model_transition)?;
     }
     Ok(())
 }
 
-fn write_api_key_provider_config(codex_home: &Path, account: &CodexAccount) -> Result<(), String> {
+fn write_api_key_provider_config(
+    codex_home: &Path,
+    account: &CodexAccount,
+    model_transition: ManagedModelTransition,
+) -> Result<(), String> {
     let api_key = account
         .openai_api_key
         .as_deref()
@@ -1701,7 +2330,7 @@ fn write_api_key_provider_config(codex_home: &Path, account: &CodexAccount) -> R
         .as_deref()
         .and_then(|value| normalize_optional(Some(value)))
         .unwrap_or_else(|| "API Key".to_string());
-    let provider_id = sanitize_provider_id(&provider_name).unwrap_or_else(|| "api_key".to_string());
+    let provider_id = api_key_provider_id(account);
     let base_url = account
         .api_base_url
         .as_deref()
@@ -1711,24 +2340,240 @@ fn write_api_key_provider_config(codex_home: &Path, account: &CodexAccount) -> R
     let config_path = codex_home.join("config.toml");
     let mut document = read_toml_document(&config_path)?;
     document["model_provider"] = value(provider_id.clone());
+    let default_model = account
+        .default_model
+        .as_deref()
+        .and_then(|model| normalize_optional(Some(model)));
+    let uses_gpt_5_6 = is_gpt_5_6_model(default_model.as_deref());
+    apply_managed_model_transition(&mut document, &model_transition)?;
+    if let Some(model) = default_model {
+        document["model"] = value(model);
+    }
+    if uses_gpt_5_6 {
+        document["model_reasoning_effort"] = value("high");
+        document["disable_response_storage"] = value(true);
+        document["network_access"] = value("enabled");
+        document["windows_wsl_setup_acknowledged"] = value(true);
+        document["requires_openai_auth"] = value(true);
+        document["features"]["goals"] = value(true);
+        document["features"]["js_repl"] = value(false);
+        document["features"]["memories"] = value(true);
+        document.as_table_mut().remove("supports_websockets");
+        document.as_table_mut().remove("websocket_v2");
+        if let Some(features) = document["features"].as_table_like_mut() {
+            features.remove("websocket_v2");
+            features.remove("supports_websockets");
+        }
+    }
     let provider = &mut document["model_providers"][&provider_id];
     provider["name"] = value(provider_name);
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
     provider["experimental_bearer_token"] = value(api_key);
-    provider["supports_websockets"] = value(false);
     if let Some(table) = provider.as_table_like_mut() {
         table.remove("env_key");
+        if uses_gpt_5_6 {
+            table.remove("supports_websockets");
+            table.remove("websocket_v2");
+        } else if table.get("supports_websockets").is_none() {
+            table.insert("supports_websockets", value(false));
+        }
     }
     write_string_atomic(&config_path, &document.to_string())
 }
 
-fn write_official_provider_config(codex_home: &Path) -> Result<(), String> {
+fn write_official_provider_config(
+    codex_home: &Path,
+    model_transition: ManagedModelTransition,
+) -> Result<(), String> {
     let config_path = codex_home.join("config.toml");
     let mut document = read_toml_document(&config_path)?;
+    apply_managed_model_transition(&mut document, &model_transition)?;
     document["model_provider"] = value("openai");
     write_string_atomic(&config_path, &document.to_string())
+}
+
+fn write_managed_model_transition_only(
+    codex_home: &Path,
+    model_transition: ManagedModelTransition,
+) -> Result<(), String> {
+    let config_path = codex_home.join("config.toml");
+    let mut document = read_toml_document(&config_path)?;
+    apply_managed_model_transition(&mut document, &model_transition)?;
+    write_string_atomic(&config_path, &document.to_string())
+}
+
+fn apply_managed_model_transition(
+    document: &mut Document,
+    transition: &ManagedModelTransition,
+) -> Result<(), String> {
+    if !transition.restore_model && !transition.restore_gpt_5_6 {
+        return Ok(());
+    }
+    if transition
+        .expected_model
+        .as_deref()
+        .is_some_and(|expected| document.get("model").and_then(Item::as_str) != Some(expected))
+    {
+        return Ok(());
+    }
+
+    if let Some(backup) = transition.backup.as_ref() {
+        if transition.restore_model {
+            restore_table_item(document.as_table_mut(), "model", &backup.root_items)?;
+        }
+        if transition.restore_gpt_5_6 {
+            for key in MANAGED_GPT_5_6_ROOT_KEYS {
+                if managed_gpt_5_6_root_value_is_unchanged(document, key) {
+                    restore_table_item(document.as_table_mut(), key, &backup.root_items)?;
+                }
+            }
+            if let Some(features) = document
+                .get_mut("features")
+                .and_then(Item::as_table_like_mut)
+            {
+                for key in MANAGED_GPT_5_6_FEATURE_KEYS {
+                    if managed_gpt_5_6_feature_value_is_unchanged(features, key) {
+                        restore_table_item(features, key, &backup.feature_items)?;
+                    }
+                }
+                if !backup.features_table_existed && features.is_empty() {
+                    document.as_table_mut().remove("features");
+                }
+            }
+            for provider_id in &transition.restore_provider_ids {
+                let provider_existed = backup.provider_ids.iter().any(|id| id == provider_id);
+                let provider_backup = backup.provider_items.get(provider_id);
+                if let Some(provider) = document
+                    .get_mut("model_providers")
+                    .and_then(Item::as_table_like_mut)
+                    .and_then(|providers| providers.get_mut(provider_id))
+                    .and_then(Item::as_table_like_mut)
+                {
+                    if provider_existed || provider_backup.is_some() {
+                        let empty = BTreeMap::new();
+                        let items = provider_backup.unwrap_or(&empty);
+                        for key in MANAGED_GPT_5_6_PROVIDER_KEYS {
+                            if provider.get(key).is_none() {
+                                restore_table_item(provider, key, items)?;
+                            }
+                        }
+                    } else {
+                        for key in MANAGED_GPT_5_6_PROVIDER_KEYS {
+                            if provider.get(key).is_none() {
+                                provider.remove(key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if transition.restore_model {
+        document.as_table_mut().remove("model");
+    }
+    if transition.restore_gpt_5_6 {
+        remove_legacy_managed_gpt_5_6_values(document, &transition.restore_provider_ids);
+    }
+    Ok(())
+}
+
+fn managed_gpt_5_6_root_value_is_unchanged(document: &Document, key: &str) -> bool {
+    match key {
+        "model_reasoning_effort" => document.get(key).and_then(Item::as_str) == Some("high"),
+        "disable_response_storage" | "windows_wsl_setup_acknowledged" | "requires_openai_auth" => {
+            document.get(key).and_then(Item::as_bool) == Some(true)
+        }
+        "network_access" => document.get(key).and_then(Item::as_str) == Some("enabled"),
+        "supports_websockets" | "websocket_v2" => document.get(key).is_none(),
+        _ => false,
+    }
+}
+
+fn managed_gpt_5_6_feature_value_is_unchanged(
+    features: &dyn toml_edit::TableLike,
+    key: &str,
+) -> bool {
+    match key {
+        "goals" | "memories" => features.get(key).and_then(Item::as_bool) == Some(true),
+        "js_repl" => features.get(key).and_then(Item::as_bool) == Some(false),
+        "supports_websockets" | "websocket_v2" => features.get(key).is_none(),
+        _ => false,
+    }
+}
+
+fn remove_legacy_managed_gpt_5_6_values(document: &mut Document, provider_ids: &[String]) {
+    let root_values_match = [
+        (
+            "model_reasoning_effort",
+            document["model_reasoning_effort"].as_str() == Some("high"),
+        ),
+        (
+            "disable_response_storage",
+            document["disable_response_storage"].as_bool() == Some(true),
+        ),
+        (
+            "network_access",
+            document["network_access"].as_str() == Some("enabled"),
+        ),
+        (
+            "windows_wsl_setup_acknowledged",
+            document["windows_wsl_setup_acknowledged"].as_bool() == Some(true),
+        ),
+        (
+            "requires_openai_auth",
+            document["requires_openai_auth"].as_bool() == Some(true),
+        ),
+    ];
+    for (key, matches) in root_values_match {
+        if matches {
+            document.as_table_mut().remove(key);
+        }
+    }
+    if let Some(features) = document
+        .get_mut("features")
+        .and_then(Item::as_table_like_mut)
+    {
+        for (key, matches) in [
+            (
+                "goals",
+                features.get("goals").and_then(Item::as_bool) == Some(true),
+            ),
+            (
+                "js_repl",
+                features.get("js_repl").and_then(Item::as_bool) == Some(false),
+            ),
+            (
+                "memories",
+                features.get("memories").and_then(Item::as_bool) == Some(true),
+            ),
+        ] {
+            if matches {
+                features.remove(key);
+            }
+        }
+    }
+    for provider_id in provider_ids {
+        if let Some(provider) = document
+            .get_mut("model_providers")
+            .and_then(Item::as_table_like_mut)
+            .and_then(|providers| providers.get_mut(provider_id))
+            .and_then(Item::as_table_like_mut)
+        {
+            provider.remove("websocket_v2");
+        }
+    }
+}
+
+fn is_gpt_5_6_model(model: Option<&str>) -> bool {
+    model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|value| value == "gpt-5.6" || value.starts_with("gpt-5.6-"))
 }
 
 fn read_toml_document(path: &Path) -> Result<Document, String> {
@@ -1761,13 +2606,120 @@ fn sanitize_provider_id(raw: &str) -> Option<String> {
     }
 }
 
+fn api_key_provider_id(account: &CodexAccount) -> String {
+    account
+        .api_provider_name
+        .as_deref()
+        .and_then(sanitize_provider_id)
+        .unwrap_or_else(|| "api_key".to_string())
+}
+
 fn write_string_atomic(path: &Path, content: &str) -> Result<(), String> {
+    write_bytes_atomic(path, content.as_bytes())
+}
+
+pub(super) fn write_bytes_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("创建目录失败: {}", error))?;
     }
-    let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, content).map_err(|error| format!("写入临时文件失败: {}", error))?;
-    fs::rename(&tmp_path, path).map_err(|error| format!("替换文件失败: {}", error))
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("codex-data");
+    let tmp_path = path.with_file_name(format!(
+        ".{}.codex-switcher-{:016x}.tmp",
+        file_name,
+        rand::random::<u64>()
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut tmp_file = options
+        .open(&tmp_path)
+        .map_err(|error| format!("创建临时文件失败: {}", error))?;
+    if let Err(error) = tmp_file
+        .write_all(content)
+        .and_then(|_| tmp_file.sync_all())
+    {
+        drop(tmp_file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("写入临时文件失败: {}", error));
+    }
+    drop(tmp_file);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            REPLACEFILE_WRITE_THROUGH,
+        };
+
+        let wide_path = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let wide_tmp_path = tmp_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let replaced = unsafe {
+            if path.is_file() {
+                ReplaceFileW(
+                    wide_path.as_ptr(),
+                    wide_tmp_path.as_ptr(),
+                    std::ptr::null(),
+                    REPLACEFILE_WRITE_THROUGH,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            } else {
+                MoveFileExW(
+                    wide_tmp_path.as_ptr(),
+                    wide_path.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            }
+        };
+        if replaced == 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("替换文件失败: {}", error));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Err(error) = fs::rename(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("替换文件失败: {}", error));
+        }
+        Ok(())
+    }
+}
+
+fn rollback_config_on_error<T>(
+    result: Result<T, String>,
+    config_path: &Path,
+    config_before_update: &str,
+) -> Result<T, String> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(database_error) => match write_string_atomic(config_path, config_before_update) {
+            Ok(()) => Err(database_error),
+            Err(rollback_error) => Err(format!(
+                "{}；回滚 config.toml 失败: {}",
+                database_error, rollback_error
+            )),
+        },
+    }
 }
 
 #[cfg(test)]

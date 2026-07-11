@@ -32,6 +32,7 @@ const emit = defineEmits<{
   (event: "open-binding", account: CodexAccount): void;
   (event: "open-official-url", url: string): void;
   (event: "open-edit", account: CodexAccount): void;
+  (event: "open-models", account: CodexAccount): void;
   (event: "switch-account", account: CodexAccount): void;
   (event: "refresh-quota", account: CodexAccount): void;
   (event: "open-export", account: CodexAccount): void;
@@ -888,16 +889,19 @@ function formatTime(value?: number | null): string {
                 <template #icon><icon-thunderbolt /></template>
               </a-button>
             </a-tooltip>
-            <span v-else class="action-placeholder" aria-hidden="true" />
             <a-tooltip v-if="!isApiKeyAccount(account)" :content="t('绑定手机')">
               <a-button size="small" :title="t('绑定手机')" @click="emit('open-phone', account)">
                 <template #icon><icon-phone /></template>
               </a-button>
             </a-tooltip>
-            <span v-else class="action-placeholder" aria-hidden="true" />
             <a-tooltip :content="t('编辑')">
               <a-button size="small" :title="t('编辑')" @click="emit('open-edit', account)">
                 <template #icon><icon-edit /></template>
+              </a-button>
+            </a-tooltip>
+            <a-tooltip v-if="isApiKeyAccount(account)" :content="t('获取模型列表')">
+              <a-button size="small" :title="t('获取模型列表')" @click="emit('open-models', account)">
+                <template #icon><icon-list /></template>
               </a-button>
             </a-tooltip>
             <a-tooltip :content="t('切换')">
@@ -920,7 +924,6 @@ function formatTime(value?: number | null): string {
                 <template #icon><icon-refresh /></template>
               </a-button>
             </a-tooltip>
-            <span v-else class="action-placeholder" aria-hidden="true" />
             <a-tooltip :content="t('导出')">
               <a-button
                 size="small"
@@ -1027,6 +1030,11 @@ function formatTime(value?: number | null): string {
         <a-tooltip :content="t('编辑')">
           <button class="compact-icon-action" type="button" @click="emit('open-edit', account)">
             <icon-file />
+          </button>
+        </a-tooltip>
+        <a-tooltip v-if="isApiKeyAccount(account)" :content="t('获取模型列表')">
+          <button class="compact-icon-action" type="button" @click="emit('open-models', account)">
+            <icon-list />
           </button>
         </a-tooltip>
         <a-tooltip :content="t('切换')">
@@ -1156,6 +1164,11 @@ function formatTime(value?: number | null): string {
                 <a-tooltip :content="t('编辑')">
                   <a-button size="mini" @click="emit('open-edit', account)">
                     <template #icon><icon-file /></template>
+                  </a-button>
+                </a-tooltip>
+                <a-tooltip v-if="isApiKeyAccount(account)" :content="t('获取模型列表')">
+                  <a-button size="mini" @click="emit('open-models', account)">
+                    <template #icon><icon-list /></template>
                   </a-button>
                 </a-tooltip>
                 <a-tooltip :content="t('切换')">

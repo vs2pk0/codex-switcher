@@ -19,6 +19,8 @@ export interface CodexAccount {
   apiProviderName?: string;
   api_official_url?: string;
   apiOfficialUrl?: string;
+  default_model?: string;
+  defaultModel?: string;
   plan_type?: string;
   auth_file_plan_type?: string;
   bound_oauth_account_id?: string | null;
