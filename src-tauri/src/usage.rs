@@ -1,5 +1,6 @@
 use chrono::{
-    DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Timelike,
+    DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime, TimeZone,
+    Timelike,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -164,15 +165,60 @@ impl DeltaTokens {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ParsedUsageLog {
     request_id: String,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    rollout_id: String,
     model: String,
     input_tokens: u64,
     output_tokens: u64,
     cache_read_tokens: u64,
     created_at: i64,
+    #[serde(default)]
+    source_kind: UsageLogSourceKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UsageLogSourceKind {
+    #[default]
+    Legacy,
+    Unknown,
+    Fork,
+    CanonicalRoot,
+}
+
+impl UsageLogSourceKind {
+    fn as_db_value(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Unknown => "unknown",
+            Self::Fork => "fork",
+            Self::CanonicalRoot => "canonical_root",
+        }
+    }
+
+    fn from_db_value(value: &str) -> Self {
+        match value {
+            "unknown" => Self::Unknown,
+            "fork" => Self::Fork,
+            "canonical_root" => Self::CanonicalRoot,
+            _ => Self::Legacy,
+        }
+    }
+
+    fn priority(self) -> u8 {
+        match self {
+            Self::Legacy => 0,
+            Self::Unknown => 1,
+            Self::Fork => 2,
+            Self::CanonicalRoot => 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,13 +241,37 @@ struct UsageCacheFile {
 
 #[derive(Debug, Clone)]
 struct FileParseState {
+    has_session_meta: bool,
     session_id: Option<String>,
+    rollout_id: Option<String>,
+    parent_rollout_id: Option<String>,
+    is_fork: bool,
+    is_canonical_root: bool,
+    session_started_at: Option<i64>,
+    last_valid_event_at: Option<i64>,
+    owned_task_started: bool,
     current_model: String,
     prev_total: Option<CumulativeTokens>,
     event_index: u32,
 }
 
-const USAGE_CACHE_VERSION: u32 = 2;
+#[derive(Debug, Clone)]
+struct ParsedUsageFile {
+    source_path: String,
+    rollout_id: String,
+    parent_rollout_id: Option<String>,
+    events: Vec<ParsedUsageEvent>,
+    is_fork: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedUsageEvent {
+    fingerprint: String,
+    log: Option<ParsedUsageLog>,
+    after_owned_task_start: bool,
+}
+
+const USAGE_CACHE_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy)]
 struct ModelPricing {
@@ -304,17 +374,26 @@ pub fn update_pricing_config(
     Ok(next)
 }
 
-fn parse_codex_usage_file(path: &Path) -> Result<Vec<ParsedUsageLog>, String> {
+fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
     let file = fs::File::open(path).map_err(|error| format!("打开会话文件失败: {}", error))?;
     let reader = BufReader::new(file);
-    let fallback_timestamp = file_modified_timestamp(path);
+    let filename_timestamp = rollout_filename_timestamp(path);
+    let path_rollout_id = rollout_identity_from_path(path);
     let mut state = FileParseState {
+        has_session_meta: false,
         session_id: None,
+        rollout_id: None,
+        parent_rollout_id: None,
+        is_fork: false,
+        is_canonical_root: false,
+        session_started_at: None,
+        last_valid_event_at: None,
+        owned_task_started: false,
         current_model: "unknown".to_string(),
         prev_total: None,
         event_index: 0,
     };
-    let mut logs = Vec::new();
+    let mut events = Vec::new();
 
     for line in reader.lines() {
         let line = match line {
@@ -330,7 +409,7 @@ fn parse_codex_usage_file(path: &Path) -> Result<Vec<ParsedUsageLog>, String> {
         if !is_event_msg && !is_turn_context && !is_session_meta {
             continue;
         }
-        if is_event_msg && !line.contains("\"token_count\"") {
+        if is_event_msg && !line.contains("\"token_count\"") && !line.contains("\"task_started\"") {
             continue;
         }
 
@@ -341,15 +420,42 @@ fn parse_codex_usage_file(path: &Path) -> Result<Vec<ParsedUsageLog>, String> {
         match value.get("type").and_then(Value::as_str) {
             Some("session_meta") if state.session_id.is_none() => {
                 let payload = value.get("payload");
-                state.session_id = payload
+                state.session_started_at = parse_event_timestamp(&value).or_else(|| {
+                    payload
+                        .and_then(|payload| payload.get("timestamp"))
+                        .and_then(Value::as_str)
+                        .and_then(parse_rfc3339_timestamp)
+                });
+                let raw_session_id = payload
                     .and_then(|payload| {
                         payload
                             .get("session_id")
                             .or_else(|| payload.get("sessionId"))
-                            .or_else(|| payload.get("id"))
                     })
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
+                state.rollout_id = payload
+                    .and_then(|payload| payload.get("id"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                state.parent_rollout_id = payload
+                    .and_then(|payload| payload.get("forked_from_id"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let has_fork_parent = state.parent_rollout_id.is_some();
+                let has_distinct_rollout_id = match (&raw_session_id, &state.rollout_id) {
+                    (Some(session_id), Some(rollout_id)) => session_id != rollout_id,
+                    _ => false,
+                };
+                state.is_fork = has_fork_parent || has_distinct_rollout_id;
+                let effective_session_id = raw_session_id.or_else(|| state.rollout_id.clone());
+                state.has_session_meta = effective_session_id.is_some();
+                state.is_canonical_root = !has_fork_parent
+                    && matches!(
+                        (&effective_session_id, &state.rollout_id),
+                        (Some(session_id), Some(rollout_id)) if session_id == rollout_id
+                    );
+                state.session_id = effective_session_id;
             }
             Some("turn_context") => {
                 if let Some(model) = value
@@ -368,6 +474,19 @@ fn parse_codex_usage_file(path: &Path) -> Result<Vec<ParsedUsageLog>, String> {
                 let Some(payload) = value.get("payload") else {
                     continue;
                 };
+                if payload.get("type").and_then(Value::as_str) == Some("task_started") {
+                    if state.is_fork
+                        && !state.owned_task_started
+                        && task_started_at(payload)
+                            .zip(state.session_started_at)
+                            .is_some_and(|(task_at, session_at)| {
+                                (session_at..=session_at.saturating_add(1)).contains(&task_at)
+                            })
+                    {
+                        state.owned_task_started = true;
+                    }
+                    continue;
+                }
                 if payload.get("type").and_then(Value::as_str) != Some("token_count") {
                     continue;
                 }
@@ -382,50 +501,93 @@ fn parse_codex_usage_file(path: &Path) -> Result<Vec<ParsedUsageLog>, String> {
                 {
                     state.current_model = normalize_codex_model(model);
                 }
-                let (current, cumulative) = if let Some(total) = info.get("total_token_usage") {
-                    (parse_cumulative_tokens(total), true)
-                } else if let Some(last) = info.get("last_token_usage") {
-                    (parse_cumulative_tokens(last), false)
-                } else {
-                    (None, false)
-                };
-                let Some(current) = current else {
-                    continue;
-                };
-                let delta = if cumulative {
-                    let delta = compute_delta(&state.prev_total, &current);
-                    state.prev_total = Some(current);
+                let total = info
+                    .get("total_token_usage")
+                    .and_then(parse_cumulative_tokens);
+                let last = info
+                    .get("last_token_usage")
+                    .and_then(parse_cumulative_tokens);
+                let event_timestamp = parse_event_timestamp(&value);
+                if let Some(timestamp) = event_timestamp {
+                    state.last_valid_event_at = Some(timestamp);
+                }
+                let fingerprint = token_usage_fingerprint(total.as_ref(), last.as_ref());
+                let delta = if let Some(total) = total {
+                    // Fork/replay rollouts start with the parent's cumulative total.  Only
+                    // those rollouts use last_token_usage for their first event; a canonical
+                    // root still owns its complete initial cumulative total.
+                    let delta = match state.prev_total.as_ref() {
+                        Some(_) => compute_delta(&state.prev_total, &total),
+                        None if state.is_fork => {
+                            compute_delta(&None, last.as_ref().unwrap_or(&total))
+                        }
+                        None => compute_delta(&None, &total),
+                    };
+                    state.prev_total = Some(total);
                     delta
+                } else if let Some(last) = last {
+                    compute_delta(&None, &last)
                 } else {
-                    DeltaTokens {
-                        input: current.input,
-                        cached_input: current.cached_input,
-                        output: current.output,
-                    }
+                    continue;
                 };
                 let delta = DeltaTokens {
                     cached_input: delta.cached_input.min(delta.input),
                     ..delta
                 };
-                if delta.is_zero() {
-                    continue;
-                }
                 state.event_index += 1;
                 let session_id = state.session_id.as_deref().unwrap_or("unknown");
-                logs.push(ParsedUsageLog {
-                    request_id: format!("codex_session:{}:{}", session_id, state.event_index),
+                let rollout_id = state
+                    .rollout_id
+                    .as_deref()
+                    .or(path_rollout_id.as_deref())
+                    .unwrap_or(session_id);
+                let source_kind = if state.is_canonical_root {
+                    UsageLogSourceKind::CanonicalRoot
+                } else if state.is_fork {
+                    UsageLogSourceKind::Fork
+                } else {
+                    UsageLogSourceKind::Unknown
+                };
+                let log = (!delta.is_zero()).then(|| ParsedUsageLog {
+                    request_id: format!("codex_rollout:{}:{}", rollout_id, state.event_index),
+                    session_id: session_id.to_string(),
+                    rollout_id: rollout_id.to_string(),
                     model: state.current_model.clone(),
                     input_tokens: delta.input,
                     output_tokens: delta.output,
                     cache_read_tokens: delta.cached_input,
-                    created_at: parse_event_timestamp(&value).unwrap_or(fallback_timestamp),
+                    created_at: event_timestamp
+                        .or(state.last_valid_event_at)
+                        .or(state.session_started_at)
+                        .or(filename_timestamp)
+                        .unwrap_or_default(),
+                    source_kind,
+                });
+                events.push(ParsedUsageEvent {
+                    fingerprint,
+                    log,
+                    after_owned_task_start: state.owned_task_started,
                 });
             }
             _ => {}
         }
     }
 
-    Ok(logs)
+    if !events.is_empty() && !state.has_session_meta {
+        return Err("会话文件包含用量事件但缺少有效 session_meta，已保留上次可信缓存".to_string());
+    }
+    let rollout_id = state
+        .rollout_id
+        .or(path_rollout_id)
+        .or_else(|| state.session_id.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(ParsedUsageFile {
+        source_path: path.to_string_lossy().to_string(),
+        rollout_id,
+        parent_rollout_id: state.parent_rollout_id,
+        events,
+        is_fork: state.is_fork,
+    })
 }
 
 fn collect_codex_session_files(codex_home: &Path) -> Vec<PathBuf> {
@@ -491,17 +653,22 @@ fn compute_delta(prev: &Option<CumulativeTokens>, current: &CumulativeTokens) ->
 fn ensure_usage_cache_db(force_refresh: bool) -> Result<(Connection, UsageCache), String> {
     let mut conn = open_usage_db()?;
     migrate_usage_json_cache_if_needed(&mut conn)?;
-    let previous_cache = read_usage_cache_meta_db(&conn)?;
-    if !force_refresh {
-        if let Some(cache) = previous_cache.as_ref() {
-            if cache.version == USAGE_CACHE_VERSION && cache.files == current_usage_cache_files() {
-                return Ok((conn, cache.clone()));
-            }
+    let previous_cache_meta = read_usage_cache_meta_db(&conn)?;
+    if let Some(cache) = previous_cache_meta.as_ref() {
+        let files_match = cache.files == current_usage_cache_files();
+        if !should_rebuild_usage_cache(force_refresh, cache.version, files_match) {
+            return Ok((conn, cache.clone()));
         }
     }
+    // A rebuild must retain records whose source JSONL has already rotated away.  Current
+    // files replace matching request IDs below, which also repairs v2 fork-overwrite rows.
     let previous_cache = read_usage_cache_db(&conn)?;
     let cache = rebuild_usage_cache_db(&mut conn, previous_cache)?;
     Ok((conn, cache))
+}
+
+fn should_rebuild_usage_cache(force_refresh: bool, cache_version: u32, files_match: bool) -> bool {
+    force_refresh || cache_version != USAGE_CACHE_VERSION || !files_match
 }
 
 fn current_usage_cache_files() -> Vec<UsageCacheFile> {
@@ -528,15 +695,15 @@ fn rebuild_usage_cache_db(
         .iter()
         .filter_map(|path| usage_cache_file(path))
         .collect();
-    let mut logs = Vec::new();
-    let mut errors = Vec::new();
-    for file in &files {
-        match parse_codex_usage_file(file) {
-            Ok(mut next) => logs.append(&mut next),
-            Err(error) => errors.push(format!("{}: {}", file.display(), error)),
-        }
-    }
-    logs = merge_usage_logs(previous_cache.map(|cache| cache.logs), logs);
+    let (current_logs, parsed_rollout_ids, errors) = parse_codex_usage_files(&files);
+    let previous_version = previous_cache.as_ref().map(|cache| cache.version);
+    let previous_logs = previous_cache.map(|cache| cache.logs);
+    let logs = merge_usage_logs(
+        previous_logs,
+        previous_version,
+        current_logs,
+        &parsed_rollout_ids,
+    );
     let cache = UsageCache {
         version: USAGE_CACHE_VERSION,
         updated_at: Local::now().timestamp(),
@@ -546,6 +713,115 @@ fn rebuild_usage_cache_db(
     };
     write_usage_cache_db(conn, &cache)?;
     Ok(cache)
+}
+
+fn parse_codex_usage_files(
+    files: &[PathBuf],
+) -> (Vec<ParsedUsageLog>, HashSet<String>, Vec<String>) {
+    let mut parsed_files = Vec::new();
+    let mut errors = Vec::new();
+    for file in files {
+        match parse_codex_usage_file(file) {
+            Ok(parsed) => parsed_files.push(parsed),
+            Err(error) => errors.push(format!("{}: {}", file.display(), error)),
+        }
+    }
+
+    let mut rollout_indexes = HashMap::<String, usize>::new();
+    for (index, file) in parsed_files.iter().enumerate() {
+        rollout_indexes
+            .entry(file.rollout_id.clone())
+            .and_modify(|current| {
+                let selected = &parsed_files[*current];
+                if selected.events.len() < file.events.len()
+                    || (selected.events.len() == file.events.len()
+                        && selected.source_path > file.source_path)
+                {
+                    *current = index;
+                }
+            })
+            .or_insert(index);
+    }
+
+    let mut selected_indexes = rollout_indexes.values().copied().collect::<Vec<_>>();
+    selected_indexes.sort_by(|left, right| {
+        parsed_files[*left]
+            .rollout_id
+            .cmp(&parsed_files[*right].rollout_id)
+    });
+    let mut parsed_rollout_ids = HashSet::new();
+    let mut logs = Vec::new();
+    for index in selected_indexes {
+        let file = &parsed_files[index];
+        if file.events.is_empty() {
+            // A newly-created or concurrently truncated JSONL is not proof that previously
+            // parsed owned events disappeared. Leave its trusted v4 cache untouched.
+            continue;
+        }
+        let explicit_boundary = file
+            .events
+            .iter()
+            .position(|event| event.after_owned_task_start);
+        let inherited_count = if !file.is_fork {
+            Some(0)
+        } else if let Some(boundary) = explicit_boundary {
+            // A task_started stamped at this rollout's own creation second is the strongest
+            // ownership signal. Forks can replay only a suffix of the parent (LCP = 0), and
+            // an owned call can coincidentally share the parent's next token fingerprint.
+            Some(boundary)
+        } else if let Some(parent) = file
+            .parent_rollout_id
+            .as_ref()
+            .and_then(|parent_id| rollout_indexes.get(parent_id))
+            .map(|index| &parsed_files[*index])
+            .filter(|parent| !parent.events.is_empty())
+        {
+            let lcp = common_event_prefix_len(&parent.events, &file.events);
+            if lcp > 0 {
+                Some(lcp)
+            } else {
+                errors.push(format!(
+                    "{}: fork 与父 rollout 无公共回放前缀且缺少可信自有事件边界，已保留上次可信缓存",
+                    file.rollout_id
+                ));
+                None
+            }
+        } else {
+            // If the parent JSONL has rotated away, only an explicit task_started whose
+            // started_at belongs to this rollout is a safe ownership boundary. Otherwise
+            // the copied history cannot be distinguished and is conservatively ignored.
+            errors.push(format!(
+                "{}: 缺少父 rollout 且无法确认 fork 自有事件边界，已保留上次可信缓存",
+                file.rollout_id
+            ));
+            None
+        };
+        let Some(inherited_count) = inherited_count else {
+            continue;
+        };
+        parsed_rollout_ids.insert(file.rollout_id.clone());
+        logs.extend(
+            file.events
+                .iter()
+                .skip(inherited_count)
+                .filter_map(|event| event.log.clone()),
+        );
+    }
+    (
+        dedupe_usage_logs_preferred(logs),
+        parsed_rollout_ids,
+        errors,
+    )
+}
+
+fn common_event_prefix_len(parent: &[ParsedUsageEvent], child: &[ParsedUsageEvent]) -> usize {
+    parent
+        .iter()
+        .zip(child)
+        .take_while(|(parent_event, child_event)| {
+            parent_event.fingerprint == child_event.fingerprint
+        })
+        .count()
 }
 
 fn open_usage_db() -> Result<Connection, String> {
@@ -576,18 +852,55 @@ fn init_usage_db(conn: &Connection) -> Result<(), String> {
         );
         CREATE TABLE IF NOT EXISTS usage_logs (
             request_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL DEFAULT '',
+            rollout_id TEXT NOT NULL DEFAULT '',
             model TEXT NOT NULL,
             input_tokens INTEGER NOT NULL,
             output_tokens INTEGER NOT NULL,
             cache_read_tokens INTEGER NOT NULL,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            source_kind TEXT NOT NULL DEFAULT 'legacy'
         );
         CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at ON usage_logs(created_at);
         CREATE INDEX IF NOT EXISTS idx_usage_logs_model ON usage_logs(model);
         "#,
     )
     .map_err(|error| format!("初始化统计数据库失败: {}", error))?;
+    let columns = usage_log_columns(conn)?;
+    for (name, statement) in [
+        (
+            "session_id",
+            "ALTER TABLE usage_logs ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "rollout_id",
+            "ALTER TABLE usage_logs ADD COLUMN rollout_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "source_kind",
+            "ALTER TABLE usage_logs ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'legacy'",
+        ),
+    ] {
+        if !columns.contains(name) {
+            conn.execute(statement, [])
+                .map_err(|error| format!("迁移统计数据库字段失败: {}", error))?;
+        }
+    }
     Ok(())
+}
+
+fn usage_log_columns(conn: &Connection) -> Result<HashSet<String>, String> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(usage_logs)")
+        .map_err(|error| format!("读取统计数据库字段失败: {}", error))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("读取统计数据库字段失败: {}", error))?;
+    let mut columns = HashSet::new();
+    for row in rows {
+        columns.insert(row.map_err(|error| format!("读取统计数据库字段失败: {}", error))?);
+    }
+    Ok(columns)
 }
 
 fn read_usage_cache_db(conn: &Connection) -> Result<Option<UsageCache>, String> {
@@ -647,19 +960,32 @@ fn read_usage_files_db(conn: &Connection) -> Result<Vec<UsageCacheFile>, String>
 fn read_usage_logs_db(conn: &Connection) -> Result<Vec<ParsedUsageLog>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT request_id, model, input_tokens, output_tokens, cache_read_tokens, created_at \
+            "SELECT request_id, session_id, rollout_id, model, input_tokens, output_tokens, \
+             cache_read_tokens, created_at, source_kind \
              FROM usage_logs ORDER BY created_at ASC, request_id ASC",
         )
         .map_err(|error| format!("读取统计日志失败: {}", error))?;
     let rows = stmt
         .query_map([], |row| {
+            let request_id = row.get::<_, String>(0)?;
+            let stored_session_id = row.get::<_, String>(1)?;
+            let session_id = if stored_session_id.is_empty() {
+                legacy_session_id_from_request_id(&request_id)
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                stored_session_id
+            };
             Ok(ParsedUsageLog {
-                request_id: row.get(0)?,
-                model: row.get(1)?,
-                input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
-                output_tokens: row.get::<_, i64>(3)?.max(0) as u64,
-                cache_read_tokens: row.get::<_, i64>(4)?.max(0) as u64,
-                created_at: row.get(5)?,
+                request_id,
+                session_id,
+                rollout_id: row.get(2)?,
+                model: row.get(3)?,
+                input_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                output_tokens: row.get::<_, i64>(5)?.max(0) as u64,
+                cache_read_tokens: row.get::<_, i64>(6)?.max(0) as u64,
+                created_at: row.get(7)?,
+                source_kind: UsageLogSourceKind::from_db_value(&row.get::<_, String>(8)?),
             })
         })
         .map_err(|error| format!("读取统计日志失败: {}", error))?;
@@ -673,20 +999,33 @@ fn read_usage_logs_db_range(
 ) -> Result<Vec<ParsedUsageLog>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT request_id, model, input_tokens, output_tokens, cache_read_tokens, created_at \
+            "SELECT request_id, session_id, rollout_id, model, input_tokens, output_tokens, \
+             cache_read_tokens, created_at, source_kind \
              FROM usage_logs WHERE created_at >= ?1 AND created_at <= ?2 \
              ORDER BY created_at ASC, request_id ASC",
         )
         .map_err(|error| format!("读取统计日志失败: {}", error))?;
     let rows = stmt
         .query_map(params![start, end], |row| {
+            let request_id = row.get::<_, String>(0)?;
+            let stored_session_id = row.get::<_, String>(1)?;
+            let session_id = if stored_session_id.is_empty() {
+                legacy_session_id_from_request_id(&request_id)
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                stored_session_id
+            };
             Ok(ParsedUsageLog {
-                request_id: row.get(0)?,
-                model: row.get(1)?,
-                input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
-                output_tokens: row.get::<_, i64>(3)?.max(0) as u64,
-                cache_read_tokens: row.get::<_, i64>(4)?.max(0) as u64,
-                created_at: row.get(5)?,
+                request_id,
+                session_id,
+                rollout_id: row.get(2)?,
+                model: row.get(3)?,
+                input_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                output_tokens: row.get::<_, i64>(5)?.max(0) as u64,
+                cache_read_tokens: row.get::<_, i64>(6)?.max(0) as u64,
+                created_at: row.get(7)?,
+                source_kind: UsageLogSourceKind::from_db_value(&row.get::<_, String>(8)?),
             })
         })
         .map_err(|error| format!("读取统计日志失败: {}", error))?;
@@ -760,19 +1099,23 @@ fn write_usage_cache_db(conn: &mut Connection, cache: &UsageCache) -> Result<(),
     {
         let mut stmt = tx
             .prepare(
-                "INSERT OR REPLACE INTO usage_logs \
-                 (request_id, model, input_tokens, output_tokens, cache_read_tokens, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT OR IGNORE INTO usage_logs \
+                 (request_id, session_id, rollout_id, model, input_tokens, output_tokens, \
+                  cache_read_tokens, created_at, source_kind) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )
             .map_err(|error| format!("写入统计日志失败: {}", error))?;
         for log in &cache.logs {
             stmt.execute(params![
                 log.request_id,
+                log.session_id,
+                log.rollout_id,
                 log.model,
                 log.input_tokens as i64,
                 log.output_tokens as i64,
                 log.cache_read_tokens as i64,
                 log.created_at,
+                log.source_kind.as_db_value(),
             ])
             .map_err(|error| format!("写入统计日志失败: {}", error))?;
         }
@@ -785,14 +1128,29 @@ fn write_usage_cache_db(conn: &mut Connection, cache: &UsageCache) -> Result<(),
 
 fn migrate_usage_json_cache_if_needed(conn: &mut Connection) -> Result<(), String> {
     let path = usage_cache_path();
-    let Some(marker) = usage_json_cache_marker(&path) else {
+    migrate_usage_json_cache_from_path_if_needed(conn, &path)
+}
+
+fn migrate_usage_json_cache_from_path_if_needed(
+    conn: &mut Connection,
+    path: &Path,
+) -> Result<(), String> {
+    let Some(marker) = usage_json_cache_marker(path) else {
         return Ok(());
     };
     if read_usage_meta(conn, "jsonMigrated")?.as_deref() == Some(marker.as_str()) {
         return Ok(());
     }
-    let has_existing_cache = read_usage_meta(conn, "version")?.is_some();
-    let cache = match read_usage_json_cache(&path) {
+    let existing_version =
+        read_usage_meta(conn, "version")?.and_then(|value| value.parse::<u32>().ok());
+    if existing_version.is_some_and(|version| version >= USAGE_CACHE_VERSION) {
+        // A v4 database already uses provenance-aware rollout IDs. Re-importing a changed
+        // legacy JSON cache would add non-conflicting codex_session IDs and double-count it.
+        write_usage_meta(conn, "jsonMigrated", &marker)?;
+        return Ok(());
+    }
+    let has_existing_cache = existing_version.is_some();
+    let cache = match read_usage_json_cache(path) {
         Ok(cache) => cache,
         Err(_) if has_existing_cache => return Ok(()),
         Err(error) => return Err(error),
@@ -871,18 +1229,22 @@ fn import_usage_cache_into_db(conn: &mut Connection, cache: &UsageCache) -> Resu
         let mut stmt = tx
             .prepare(
                 "INSERT OR IGNORE INTO usage_logs \
-                 (request_id, model, input_tokens, output_tokens, cache_read_tokens, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (request_id, session_id, rollout_id, model, input_tokens, output_tokens, \
+                  cache_read_tokens, created_at, source_kind) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )
             .map_err(|error| format!("迁移统计日志失败: {}", error))?;
         for log in &cache.logs {
             stmt.execute(params![
                 log.request_id,
+                log.session_id,
+                log.rollout_id,
                 log.model,
                 log.input_tokens as i64,
                 log.output_tokens as i64,
                 log.cache_read_tokens as i64,
                 log.created_at,
+                log.source_kind.as_db_value(),
             ])
             .map_err(|error| format!("迁移统计日志失败: {}", error))?;
         }
@@ -894,21 +1256,63 @@ fn import_usage_cache_into_db(conn: &mut Connection, cache: &UsageCache) -> Resu
 
 fn merge_usage_logs(
     previous_logs: Option<Vec<ParsedUsageLog>>,
+    previous_version: Option<u32>,
     current_logs: Vec<ParsedUsageLog>,
+    parsed_rollout_ids: &HashSet<String>,
 ) -> Vec<ParsedUsageLog> {
-    let Some(previous_logs) = previous_logs else {
+    let current_logs = dedupe_usage_logs_preferred(current_logs);
+    if previous_version != Some(USAGE_CACHE_VERSION) {
+        // Versions before v4 keyed every rollout by session_id:event_index and did not
+        // persist provenance. Previous-only rows therefore cannot be distinguished from
+        // fork replay pollution. Rebuild exclusively from source JSONL once during the
+        // migration instead of making unverifiable rows permanent.
         return current_logs;
-    };
-    let mut current_ids = HashSet::with_capacity(current_logs.len());
-    for log in &current_logs {
-        current_ids.insert(log.request_id.clone());
     }
 
-    let mut logs = previous_logs
+    let mut merged = dedupe_usage_logs_preferred(previous_logs.unwrap_or_default())
         .into_iter()
-        .filter(|log| !current_ids.contains(&log.request_id))
-        .collect::<Vec<_>>();
-    logs.extend(current_logs);
+        .filter(|log| log.rollout_id.is_empty() || !parsed_rollout_ids.contains(&log.rollout_id))
+        .map(|log| (log.request_id.clone(), log))
+        .collect::<HashMap<_, _>>();
+    for current in current_logs {
+        match merged.get(&current.request_id) {
+            Some(previous) if previous.source_kind.priority() > current.source_kind.priority() => {}
+            _ => {
+                merged.insert(current.request_id.clone(), current);
+            }
+        }
+    }
+    let mut logs = merged.into_values().collect::<Vec<_>>();
+    logs.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.request_id.cmp(&right.request_id))
+    });
+    logs
+}
+
+fn dedupe_usage_logs_preferred(mut logs: Vec<ParsedUsageLog>) -> Vec<ParsedUsageLog> {
+    logs.sort_by(|left, right| {
+        left.request_id
+            .cmp(&right.request_id)
+            .then_with(|| {
+                right
+                    .source_kind
+                    .priority()
+                    .cmp(&left.source_kind.priority())
+            })
+            .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left.model.cmp(&right.model))
+            .then_with(|| left.input_tokens.cmp(&right.input_tokens))
+            .then_with(|| left.output_tokens.cmp(&right.output_tokens))
+            .then_with(|| left.cache_read_tokens.cmp(&right.cache_read_tokens))
+    });
+    logs.dedup_by(|left, right| left.request_id == right.request_id);
+    logs.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.request_id.cmp(&right.request_id))
+    });
     logs
 }
 
@@ -981,9 +1385,9 @@ fn build_usage_activity(logs: &[ParsedUsageLog]) -> CodexUsageActivity {
             hour_entry.1 += 1;
         }
 
-        if let Some(session_id) = usage_log_session_id(&log.request_id) {
+        if !log.session_id.is_empty() {
             let range = session_ranges
-                .entry(session_id.to_string())
+                .entry(log.session_id.clone())
                 .or_insert((log.created_at, log.created_at));
             range.0 = range.0.min(log.created_at);
             range.1 = range.1.max(log.created_at);
@@ -1061,7 +1465,7 @@ fn local_day_start_timestamp(date: NaiveDate) -> i64 {
         .unwrap_or_else(|| Local::now().timestamp())
 }
 
-fn usage_log_session_id(request_id: &str) -> Option<&str> {
+fn legacy_session_id_from_request_id(request_id: &str) -> Option<&str> {
     request_id
         .strip_prefix("codex_session:")
         .and_then(|rest| rest.rsplit_once(':').map(|(session_id, _)| session_id))
@@ -1110,8 +1514,16 @@ fn build_trends(
     let now = Local::now().timestamp();
     let end = end_date.unwrap_or(now);
     let start = start_date.unwrap_or(end - 24 * 60 * 60);
-    let hourly = end.saturating_sub(start) <= 24 * 60 * 60;
-    let bucket_seconds = if hourly { 60 * 60 } else { 24 * 60 * 60 };
+    let same_local_day = Local
+        .timestamp_opt(start, 0)
+        .single()
+        .zip(Local.timestamp_opt(end, 0).single())
+        .is_some_and(|(start, end)| start.date_naive() == end.date_naive());
+    let hourly = same_local_day || end.saturating_sub(start) <= 24 * 60 * 60;
+    if !hourly {
+        return build_daily_trends(logs, start, end, pricing, cost_multiplier);
+    }
+    let bucket_seconds = 60 * 60;
     let bucket_count = (end.saturating_sub(start) / bucket_seconds + 1).clamp(1, 60) as usize;
     let mut buckets = Vec::with_capacity(bucket_count);
     for index in 0..bucket_count {
@@ -1133,6 +1545,70 @@ fn build_trends(
         }
         let index =
             ((log.created_at - start) / bucket_seconds).clamp(0, bucket_count as i64 - 1) as usize;
+        buckets[index].input_tokens += fresh_input_tokens(log);
+        buckets[index].output_tokens += log.output_tokens;
+        buckets[index].cache_read_tokens += log.cache_read_tokens;
+        costs[index] += calculate_cost(log, pricing, cost_multiplier);
+    }
+    for (bucket, cost) in buckets.iter_mut().zip(costs) {
+        bucket.total_cost = format_cost(cost);
+    }
+    buckets
+}
+
+fn build_daily_trends(
+    logs: &[ParsedUsageLog],
+    start: i64,
+    end: i64,
+    pricing: &[CodexUsagePricing],
+    cost_multiplier: f64,
+) -> Vec<CodexUsageTrendPoint> {
+    let start_day = Local
+        .timestamp_opt(start, 0)
+        .single()
+        .map(|datetime| datetime.date_naive())
+        .unwrap_or_else(|| Local::now().date_naive());
+    let end_day = Local
+        .timestamp_opt(end, 0)
+        .single()
+        .map(|datetime| datetime.date_naive())
+        .unwrap_or(start_day);
+    let bucket_count = (end_day
+        .signed_duration_since(start_day)
+        .num_days()
+        .saturating_add(1))
+    .clamp(1, 60) as usize;
+    let mut buckets = Vec::with_capacity(bucket_count);
+    for index in 0..bucket_count {
+        let date = start_day + ChronoDuration::days(index as i64);
+        let timestamp = local_day_start_timestamp(date);
+        buckets.push(CodexUsageTrendPoint {
+            timestamp,
+            label: date.format("%m/%d").to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            total_cost: "0.000000".to_string(),
+        });
+    }
+    let mut costs = vec![0.0; bucket_count];
+    for log in logs {
+        if log.created_at < start || log.created_at > end {
+            continue;
+        }
+        let Some(log_day) = Local
+            .timestamp_opt(log.created_at, 0)
+            .single()
+            .map(|datetime| datetime.date_naive())
+        else {
+            continue;
+        };
+        let index = log_day.signed_duration_since(start_day).num_days();
+        if index < 0 || index >= bucket_count as i64 {
+            continue;
+        }
+        let index = index as usize;
         buckets[index].input_tokens += fresh_input_tokens(log);
         buckets[index].output_tokens += log.output_tokens;
         buckets[index].cache_read_tokens += log.cache_read_tokens;
@@ -2404,17 +2880,54 @@ fn parse_event_timestamp(value: &Value) -> Option<i64> {
     value
         .get("timestamp")
         .and_then(Value::as_str)
-        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .and_then(parse_rfc3339_timestamp)
+}
+
+fn parse_rfc3339_timestamp(value: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
         .map(|datetime| datetime.timestamp())
 }
 
-fn file_modified_timestamp(path: &Path) -> i64 {
-    fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_else(|| Local::now().timestamp())
+fn task_started_at(payload: &Value) -> Option<i64> {
+    let value = payload.get("started_at")?;
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        .or_else(|| value.as_str().and_then(parse_rfc3339_timestamp))
+}
+
+fn token_usage_fingerprint(
+    total: Option<&CumulativeTokens>,
+    last: Option<&CumulativeTokens>,
+) -> String {
+    fn part(value: Option<&CumulativeTokens>) -> String {
+        value
+            .map(|value| format!("{}:{}:{}", value.input, value.cached_input, value.output))
+            .unwrap_or_else(|| "-".to_string())
+    }
+    format!("{}|{}", part(total), part(last))
+}
+
+fn rollout_identity_from_path(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn rollout_filename_timestamp(path: &Path) -> Option<i64> {
+    rollout_filename_timestamp_in_timezone(path, &Local)
+}
+
+fn rollout_filename_timestamp_in_timezone<Tz: TimeZone>(path: &Path, timezone: &Tz) -> Option<i64> {
+    let file_name = path.file_name()?.to_str()?;
+    let value = file_name.strip_prefix("rollout-")?.get(..19)?;
+    let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H-%M-%S").ok()?;
+    timezone
+        .from_local_datetime(&naive)
+        .earliest()
+        .map(|datetime| datetime.timestamp())
 }
 
 fn format_trend_label(timestamp: i64, hourly: bool) -> String {
@@ -2493,6 +3006,93 @@ mod tests {
         assert_eq!(delta.output, 25);
     }
 
+    fn file_logs(parsed: &ParsedUsageFile) -> Vec<ParsedUsageLog> {
+        parsed
+            .events
+            .iter()
+            .filter_map(|event| event.log.clone())
+            .collect()
+    }
+
+    fn sample_log(
+        request_id: &str,
+        session_id: &str,
+        rollout_id: &str,
+        source_kind: UsageLogSourceKind,
+        input_tokens: u64,
+    ) -> ParsedUsageLog {
+        ParsedUsageLog {
+            request_id: request_id.to_string(),
+            session_id: session_id.to_string(),
+            rollout_id: rollout_id.to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens,
+            output_tokens: 10,
+            cache_read_tokens: 20,
+            created_at: 1_782_662_400,
+            source_kind,
+        }
+    }
+
+    fn usage_meta(
+        timestamp: &str,
+        session_id: &str,
+        rollout_id: &str,
+        parent: Option<&str>,
+    ) -> String {
+        let mut payload = serde_json::json!({
+            "session_id": session_id,
+            "id": rollout_id,
+        });
+        if let Some(parent) = parent {
+            payload["forked_from_id"] = Value::String(parent.to_string());
+        }
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "session_meta",
+            "payload": payload,
+        })
+        .to_string()
+    }
+
+    fn token_event(
+        timestamp: Option<&str>,
+        total: (u64, u64, u64),
+        last: (u64, u64, u64),
+    ) -> String {
+        let mut value = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": total.0,
+                        "cached_input_tokens": total.1,
+                        "output_tokens": total.2,
+                    },
+                    "last_token_usage": {
+                        "input_tokens": last.0,
+                        "cached_input_tokens": last.1,
+                        "output_tokens": last.2,
+                    },
+                },
+            },
+        });
+        if let Some(timestamp) = timestamp {
+            value["timestamp"] = Value::String(timestamp.to_string());
+        }
+        value.to_string()
+    }
+
+    fn task_started(timestamp: &str, started_at: i64) -> String {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": { "type": "task_started", "started_at": started_at },
+        })
+        .to_string()
+    }
+
     #[test]
     fn parses_codex_token_count_file() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2508,9 +3108,13 @@ mod tests {
             .join("\n"),
         )
         .expect("write session");
-        let logs = parse_codex_usage_file(&file).expect("parse");
+        let parsed = parse_codex_usage_file(&file).expect("parse");
+        let logs = file_logs(&parsed);
         assert_eq!(logs.len(), 2);
-        assert_eq!(logs[0].request_id, "codex_session:s1:1");
+        assert_eq!(logs[0].request_id, "codex_rollout:s1:1");
+        assert_eq!(logs[0].session_id, "s1");
+        assert_eq!(logs[0].rollout_id, "s1");
+        assert_eq!(logs[0].source_kind, UsageLogSourceKind::CanonicalRoot);
         assert_eq!(logs[0].model, "gpt-5.5");
         assert_eq!(logs[0].input_tokens, 100);
         assert_eq!(logs[0].cache_read_tokens, 20);
@@ -2519,57 +3123,968 @@ mod tests {
     }
 
     #[test]
-    fn merge_usage_logs_keeps_deleted_session_history() {
-        let historical = ParsedUsageLog {
-            request_id: "codex_session:deleted:1".to_string(),
-            model: "gpt-5.5".to_string(),
-            input_tokens: 100,
-            output_tokens: 10,
-            cache_read_tokens: 20,
-            created_at: 1_782_662_400,
-        };
-        let updated = ParsedUsageLog {
-            request_id: "codex_session:active:1".to_string(),
-            model: "gpt-5.5".to_string(),
-            input_tokens: 200,
-            output_tokens: 20,
-            cache_read_tokens: 40,
-            created_at: 1_782_666_000,
-        };
+    fn parses_first_fork_event_from_last_usage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("fork.jsonl");
+        fs::write(
+            &file,
+            [
+                r#"{"type":"session_meta","payload":{"session_id":"shared","id":"fork"}}"#,
+                r#"{"type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-07-11T01:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":100},"last_token_usage":{"input_tokens":20,"cached_input_tokens":10,"output_tokens":5}}}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-07-11T01:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1030,"cached_input_tokens":815,"output_tokens":107},"last_token_usage":{"input_tokens":30,"cached_input_tokens":15,"output_tokens":7}}}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write fork");
 
-        let logs = merge_usage_logs(Some(vec![historical.clone()]), vec![updated.clone()]);
+        let parsed = parse_codex_usage_file(&file).expect("parse fork");
+        let logs = file_logs(&parsed);
 
         assert_eq!(logs.len(), 2);
-        assert!(logs
-            .iter()
-            .any(|log| log.request_id == historical.request_id));
-        assert!(logs.iter().any(|log| log.request_id == updated.request_id));
+        assert_eq!(logs[0].input_tokens, 20);
+        assert_eq!(logs[0].cache_read_tokens, 10);
+        assert_eq!(logs[0].output_tokens, 5);
+        assert_eq!(logs[1].input_tokens, 30);
+        assert_eq!(logs[1].cache_read_tokens, 15);
+        assert_eq!(logs[1].output_tokens, 7);
     }
 
     #[test]
-    fn merge_usage_logs_replaces_reparsed_current_entries() {
-        let stale = ParsedUsageLog {
-            request_id: "codex_session:active:1".to_string(),
-            model: "gpt-5.5".to_string(),
-            input_tokens: 100,
-            output_tokens: 10,
-            cache_read_tokens: 20,
-            created_at: 1_782_662_400,
-        };
-        let fresh = ParsedUsageLog {
-            request_id: stale.request_id.clone(),
-            model: "gpt-5.5".to_string(),
-            input_tokens: 200,
-            output_tokens: 20,
-            cache_read_tokens: 40,
-            created_at: 1_782_666_000,
-        };
+    fn root_first_event_uses_total_usage_even_when_last_is_present() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("root.jsonl");
+        fs::write(
+            &file,
+            [
+                r#"{"type":"session_meta","payload":{"session_id":"root","id":"root"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-07-11T01:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":10},"last_token_usage":{"input_tokens":20,"cached_input_tokens":5,"output_tokens":2}}}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write root");
 
-        let logs = merge_usage_logs(Some(vec![stale]), vec![fresh]);
+        let parsed = parse_codex_usage_file(&file).expect("parse root");
+
+        let logs = file_logs(&parsed);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].source_kind, UsageLogSourceKind::CanonicalRoot);
+        assert_eq!(logs[0].input_tokens, 100);
+        assert_eq!(logs[0].cache_read_tokens, 40);
+        assert_eq!(logs[0].output_tokens, 10);
+    }
+
+    #[test]
+    fn canonical_root_precedes_earlier_named_fork_and_fork_extends_coverage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fork_file = temp.path().join("rollout-01-fork.jsonl");
+        let root_file = temp.path().join("rollout-02-root.jsonl");
+        fs::write(
+            &root_file,
+            [
+                r#"{"type":"session_meta","payload":{"session_id":"shared","id":"shared"}}"#,
+                r#"{"type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-07-11T01:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":5},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":5}}}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-07-11T01:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":30,"output_tokens":10},"last_token_usage":{"input_tokens":50,"cached_input_tokens":10,"output_tokens":5}}}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write root");
+        fs::write(
+            &fork_file,
+            [
+                r#"{"timestamp":"2026-07-11T02:00:00Z","type":"session_meta","payload":{"session_id":"shared","id":"fork","forked_from_id":"shared"}}"#,
+                r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+                r#"{"timestamp":"2026-07-11T02:00:00Z","type":"event_msg","payload":{"type":"task_started","started_at":1783735200}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-07-11T02:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":100},"last_token_usage":{"input_tokens":25,"cached_input_tokens":15,"output_tokens":5}}}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-07-11T02:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1040,"cached_input_tokens":820,"output_tokens":108},"last_token_usage":{"input_tokens":40,"cached_input_tokens":20,"output_tokens":8}}}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-07-11T02:02:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1060,"cached_input_tokens":830,"output_tokens":112},"last_token_usage":{"input_tokens":20,"cached_input_tokens":10,"output_tokens":4}}}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write fork");
+
+        let files = vec![fork_file, root_file];
+        let (current, _, errors) = parse_codex_usage_files(&files);
+
+        assert!(errors.is_empty());
+        assert_eq!(current.len(), 5);
+        assert_eq!(current[0].request_id, "codex_rollout:shared:1");
+        assert_eq!(current[0].model, "gpt-5.5");
+        assert_eq!(current[0].input_tokens, 100);
+        assert_eq!(current[0].created_at, 1_783_731_600);
+        assert_eq!(current[1].input_tokens, 50);
+        assert_eq!(current[2].request_id, "codex_rollout:fork:1");
+        assert_eq!(current[2].model, "gpt-5.6-sol");
+        assert_eq!(current[2].input_tokens, 25);
+
+        let mut conn = Connection::open_in_memory().expect("open sqlite");
+        init_usage_db(&conn).expect("init sqlite");
+        let cache = UsageCache {
+            version: USAGE_CACHE_VERSION,
+            updated_at: 1_784_000_000,
+            files: Vec::new(),
+            logs: current,
+            errors: Vec::new(),
+        };
+        write_usage_cache_db(&mut conn, &cache).expect("write cache");
+        let stored = read_usage_logs_db(&conn).expect("read cache");
+        assert_eq!(stored.len(), 5);
+        assert_eq!(stored[0].model, "gpt-5.5");
+        assert_eq!(stored[0].input_tokens, 100);
+        assert_eq!(stored[1].input_tokens, 50);
+        assert_eq!(stored[2].model, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn id_only_root_precedes_earlier_named_fork() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fork_file = temp.path().join("rollout-01-fork.jsonl");
+        let root_file = temp.path().join("rollout-02-root.jsonl");
+        fs::write(
+            &fork_file,
+            [
+                r#"{"timestamp":"2026-07-11T02:00:00Z","type":"session_meta","payload":{"session_id":"legacy","id":"fork","forked_from_id":"legacy"}}"#,
+                r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+                r#"{"timestamp":"2026-07-11T02:00:00Z","type":"event_msg","payload":{"type":"task_started","started_at":1783735200}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-07-11T02:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":100},"last_token_usage":{"input_tokens":20,"cached_input_tokens":10,"output_tokens":5}}}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write fork");
+        fs::write(
+            &root_file,
+            [
+                r#"{"type":"session_meta","payload":{"id":"legacy"}}"#,
+                r#"{"type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-07-11T01:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":5}}}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("write root");
+
+        let (current, _, errors) = parse_codex_usage_files(&[fork_file, root_file]);
+
+        assert!(errors.is_empty());
+        assert_eq!(current.len(), 2);
+        assert_eq!(current[0].request_id, "codex_rollout:legacy:1");
+        assert_eq!(current[0].model, "gpt-5.5");
+        assert_eq!(current[0].input_tokens, 100);
+        assert_eq!(current[0].created_at, 1_783_731_600);
+    }
+
+    #[test]
+    fn legacy_migration_drops_unverifiable_previous_only_rows() {
+        let historical = sample_log(
+            "codex_session:deleted:1",
+            "deleted",
+            "",
+            UsageLogSourceKind::Legacy,
+            100,
+        );
+        let updated = sample_log(
+            "codex_rollout:active:1",
+            "active",
+            "active",
+            UsageLogSourceKind::CanonicalRoot,
+            200,
+        );
+
+        let logs = merge_usage_logs(
+            Some(vec![historical]),
+            Some(USAGE_CACHE_VERSION - 1),
+            vec![updated.clone()],
+            &HashSet::from(["active".to_string()]),
+        );
+
+        assert_eq!(logs, vec![updated]);
+    }
+
+    #[test]
+    fn v2_polluted_record_is_replaced_by_current_root() {
+        let stale = sample_log(
+            "codex_session:active:1",
+            "active",
+            "",
+            UsageLogSourceKind::Legacy,
+            100,
+        );
+        let fresh = sample_log(
+            "codex_rollout:active:1",
+            "active",
+            "active",
+            UsageLogSourceKind::CanonicalRoot,
+            200,
+        );
+
+        let logs = merge_usage_logs(
+            Some(vec![stale]),
+            Some(USAGE_CACHE_VERSION - 1),
+            vec![fresh],
+            &HashSet::from(["active".to_string()]),
+        );
 
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].input_tokens, 200);
-        assert_eq!(logs[0].cache_read_tokens, 40);
+        assert_eq!(logs[0].cache_read_tokens, 20);
+    }
+
+    #[test]
+    fn current_rollout_replaces_stale_v4_rows_but_missing_rollouts_survive() {
+        let stale = sample_log(
+            "codex_rollout:active:2",
+            "session",
+            "active",
+            UsageLogSourceKind::Fork,
+            25,
+        );
+        let missing = sample_log(
+            "codex_rollout:rotated:1",
+            "session",
+            "rotated",
+            UsageLogSourceKind::Fork,
+            50,
+        );
+        let current = sample_log(
+            "codex_rollout:active:1",
+            "session",
+            "active",
+            UsageLogSourceKind::CanonicalRoot,
+            100,
+        );
+
+        let logs = merge_usage_logs(
+            Some(vec![stale, missing.clone()]),
+            Some(USAGE_CACHE_VERSION),
+            vec![current.clone()],
+            &HashSet::from(["active".to_string()]),
+        );
+
+        assert_eq!(logs.len(), 2);
+        assert!(logs.contains(&current));
+        assert!(logs.contains(&missing));
+        assert!(!logs.iter().any(|log| log.request_id.ends_with(":2")));
+    }
+
+    #[test]
+    fn sibling_forks_preserve_distinct_tails_independent_of_file_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("root.jsonl");
+        let fork_a = temp.path().join("fork-a.jsonl");
+        let fork_b = temp.path().join("fork-b.jsonl");
+        let replay_one = token_event(Some("2026-07-11T01:00:00Z"), (100, 20, 5), (100, 20, 5));
+        let replay_two = token_event(Some("2026-07-11T01:01:00Z"), (150, 30, 10), (50, 10, 5));
+        fs::write(
+            &root,
+            [
+                usage_meta("2026-07-11T01:00:00Z", "session", "session", None),
+                replay_one.clone(),
+                replay_two.clone(),
+                token_event(Some("2026-07-11T01:02:00Z"), (190, 35, 14), (40, 5, 4)),
+            ]
+            .join("\n"),
+        )
+        .expect("write root");
+        fs::write(
+            &fork_a,
+            [
+                usage_meta("2026-07-11T02:00:00Z", "session", "fork-a", Some("session")),
+                replay_one.clone(),
+                replay_two.clone(),
+                token_event(Some("2026-07-11T02:01:00Z"), (230, 50, 22), (80, 20, 12)),
+            ]
+            .join("\n"),
+        )
+        .expect("write fork a");
+        fs::write(
+            &fork_b,
+            [
+                usage_meta("2026-07-11T03:00:00Z", "session", "fork-b", Some("session")),
+                replay_one,
+                replay_two,
+                // Same token tuple and raw index as fork-a is still an independent call.
+                token_event(Some("2026-07-11T03:01:00Z"), (230, 50, 22), (80, 20, 12)),
+                token_event(Some("2026-07-11T03:02:00Z"), (260, 55, 27), (30, 5, 5)),
+            ]
+            .join("\n"),
+        )
+        .expect("write fork b");
+
+        let (forward, _, forward_errors) =
+            parse_codex_usage_files(&[root.clone(), fork_a.clone(), fork_b.clone()]);
+        let (reverse, _, reverse_errors) = parse_codex_usage_files(&[fork_b, fork_a, root]);
+
+        assert!(forward_errors.is_empty());
+        assert!(reverse_errors.is_empty());
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.len(), 6);
+        let ids = forward
+            .iter()
+            .map(|log| log.request_id.as_str())
+            .collect::<HashSet<_>>();
+        assert!(ids.contains("codex_rollout:session:3"));
+        assert!(ids.contains("codex_rollout:fork-a:3"));
+        assert!(ids.contains("codex_rollout:fork-b:3"));
+        assert!(ids.contains("codex_rollout:fork-b:4"));
+    }
+
+    #[test]
+    fn fork_replaying_parent_suffix_uses_explicit_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent = temp.path().join("parent.jsonl");
+        let child = temp.path().join("child.jsonl");
+        let first = token_event(None, (100, 20, 5), (100, 20, 5));
+        let second = token_event(None, (150, 30, 10), (50, 10, 5));
+        let third = token_event(None, (190, 35, 14), (40, 5, 4));
+        let session_at = parse_rfc3339_timestamp("2026-07-11T02:00:00Z").unwrap();
+        fs::write(
+            &parent,
+            [
+                usage_meta("2026-07-11T01:00:00Z", "session", "session", None),
+                first,
+                second.clone(),
+                third.clone(),
+            ]
+            .join("\n"),
+        )
+        .expect("write parent");
+        fs::write(
+            &child,
+            [
+                usage_meta("2026-07-11T02:00:00Z", "session", "child", Some("session")),
+                second,
+                third,
+                task_started("2026-07-11T02:00:01Z", session_at),
+                token_event(None, (230, 40, 20), (40, 5, 6)),
+            ]
+            .join("\n"),
+        )
+        .expect("write child");
+
+        let (logs, _, errors) = parse_codex_usage_files(&[parent, child]);
+        assert!(errors.is_empty());
+        assert_eq!(logs.len(), 4);
+        assert!(logs
+            .iter()
+            .any(|log| log.request_id == "codex_rollout:child:3"));
+        assert!(!logs.iter().any(|log| {
+            log.request_id == "codex_rollout:child:1" || log.request_id == "codex_rollout:child:2"
+        }));
+    }
+
+    #[test]
+    fn explicit_boundary_wins_when_lcp_is_zero() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent = temp.path().join("parent.jsonl");
+        let child = temp.path().join("child.jsonl");
+        let session_at = parse_rfc3339_timestamp("2026-07-11T02:00:00Z").unwrap();
+        fs::write(
+            &parent,
+            [
+                usage_meta("2026-07-11T01:00:00Z", "session", "session", None),
+                token_event(None, (100, 20, 5), (100, 20, 5)),
+            ]
+            .join("\n"),
+        )
+        .expect("write parent");
+        fs::write(
+            &child,
+            [
+                usage_meta("2026-07-11T02:00:00Z", "session", "child", Some("session")),
+                token_event(None, (500, 400, 40), (50, 40, 4)),
+                task_started("2026-07-11T02:00:01Z", session_at),
+                token_event(None, (550, 440, 45), (50, 40, 5)),
+            ]
+            .join("\n"),
+        )
+        .expect("write child");
+
+        let (logs, replace_ids, errors) = parse_codex_usage_files(&[parent, child]);
+        assert!(errors.is_empty());
+        assert!(replace_ids.contains("child"));
+        assert!(logs
+            .iter()
+            .any(|log| log.request_id == "codex_rollout:child:2"));
+        assert!(!logs
+            .iter()
+            .any(|log| log.request_id == "codex_rollout:child:1"));
+    }
+
+    #[test]
+    fn explicit_boundary_wins_when_lcp_accidentally_extends_past_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent = temp.path().join("parent.jsonl");
+        let child = temp.path().join("child.jsonl");
+        let first = token_event(None, (100, 20, 5), (100, 20, 5));
+        let second = token_event(None, (150, 30, 10), (50, 10, 5));
+        let coincident = token_event(None, (190, 35, 14), (40, 5, 4));
+        let session_at = parse_rfc3339_timestamp("2026-07-11T02:00:00Z").unwrap();
+        fs::write(
+            &parent,
+            [
+                usage_meta("2026-07-11T01:00:00Z", "session", "session", None),
+                first.clone(),
+                second.clone(),
+                coincident.clone(),
+            ]
+            .join("\n"),
+        )
+        .expect("write parent");
+        fs::write(
+            &child,
+            [
+                usage_meta("2026-07-11T02:00:00Z", "session", "child", Some("session")),
+                first,
+                second,
+                task_started("2026-07-11T02:00:01Z", session_at),
+                coincident,
+            ]
+            .join("\n"),
+        )
+        .expect("write child");
+
+        let (logs, _, errors) = parse_codex_usage_files(&[parent, child]);
+        assert!(errors.is_empty());
+        assert!(logs
+            .iter()
+            .any(|log| log.request_id == "codex_rollout:child:3"));
+        assert!(!logs.iter().any(|log| {
+            log.request_id == "codex_rollout:child:1" || log.request_id == "codex_rollout:child:2"
+        }));
+    }
+
+    #[test]
+    fn no_marker_lcp_zero_preserves_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent = temp.path().join("parent.jsonl");
+        let child = temp.path().join("child.jsonl");
+        fs::write(
+            &parent,
+            [
+                usage_meta("2026-07-11T01:00:00Z", "session", "session", None),
+                token_event(None, (100, 20, 5), (100, 20, 5)),
+            ]
+            .join("\n"),
+        )
+        .expect("write parent");
+        fs::write(
+            &child,
+            [
+                usage_meta("2026-07-11T02:00:00Z", "session", "child", Some("session")),
+                token_event(None, (500, 400, 40), (50, 40, 4)),
+            ]
+            .join("\n"),
+        )
+        .expect("write child");
+
+        let (current, replace_ids, errors) = parse_codex_usage_files(&[parent, child]);
+        assert_eq!(errors.len(), 1);
+        assert!(!replace_ids.contains("child"));
+        assert!(!current.iter().any(|log| log.rollout_id.as_str() == "child"));
+        let previous = sample_log(
+            "codex_rollout:child:1",
+            "session",
+            "child",
+            UsageLogSourceKind::Fork,
+            75,
+        );
+        let merged = merge_usage_logs(
+            Some(vec![previous.clone()]),
+            Some(USAGE_CACHE_VERSION),
+            current,
+            &replace_ids,
+        );
+        assert!(merged.contains(&previous));
+    }
+
+    #[test]
+    fn equal_length_duplicate_parent_selection_is_order_independent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let preferred_parent = temp.path().join("a-parent.jsonl");
+        let other_parent = temp.path().join("z-parent.jsonl");
+        let child = temp.path().join("child.jsonl");
+        let preferred_event = token_event(None, (100, 20, 5), (100, 20, 5));
+        fs::write(
+            &preferred_parent,
+            [
+                usage_meta("2026-07-11T01:00:00Z", "session", "session", None),
+                preferred_event.clone(),
+            ]
+            .join("\n"),
+        )
+        .expect("write preferred parent");
+        fs::write(
+            &other_parent,
+            [
+                usage_meta("2026-07-11T01:00:00Z", "session", "session", None),
+                token_event(None, (999, 900, 90), (999, 900, 90)),
+            ]
+            .join("\n"),
+        )
+        .expect("write other parent");
+        fs::write(
+            &child,
+            [
+                usage_meta("2026-07-11T02:00:00Z", "session", "child", Some("session")),
+                preferred_event,
+                token_event(None, (150, 30, 10), (50, 10, 5)),
+            ]
+            .join("\n"),
+        )
+        .expect("write child");
+
+        let (forward, _, forward_errors) = parse_codex_usage_files(&[
+            preferred_parent.clone(),
+            other_parent.clone(),
+            child.clone(),
+        ]);
+        let (reverse, _, reverse_errors) =
+            parse_codex_usage_files(&[child, other_parent, preferred_parent]);
+        assert!(forward_errors.is_empty());
+        assert!(reverse_errors.is_empty());
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.len(), 2);
+        assert!(forward
+            .iter()
+            .any(|log| log.request_id == "codex_rollout:child:2"));
+    }
+
+    #[test]
+    fn nested_fork_replay_is_counted_once_per_rollout_tail() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("root.jsonl");
+        let parent = temp.path().join("parent.jsonl");
+        let child = temp.path().join("child.jsonl");
+        let first = token_event(None, (100, 20, 5), (100, 20, 5));
+        let second = token_event(None, (150, 30, 10), (50, 10, 5));
+        let parent_tail = token_event(None, (225, 45, 20), (75, 15, 10));
+        fs::write(
+            &root,
+            [
+                usage_meta("2026-07-11T01:00:00Z", "session", "session", None),
+                first.clone(),
+                second.clone(),
+            ]
+            .join("\n"),
+        )
+        .expect("write root");
+        fs::write(
+            &parent,
+            [
+                usage_meta("2026-07-11T02:00:00Z", "session", "parent", Some("session")),
+                first.clone(),
+                second.clone(),
+                parent_tail.clone(),
+            ]
+            .join("\n"),
+        )
+        .expect("write parent");
+        fs::write(
+            &child,
+            [
+                usage_meta("2026-07-11T03:00:00Z", "session", "child", Some("parent")),
+                first,
+                second,
+                parent_tail,
+                token_event(None, (260, 50, 26), (35, 5, 6)),
+            ]
+            .join("\n"),
+        )
+        .expect("write child");
+
+        let (logs, _, errors) = parse_codex_usage_files(&[child, root, parent]);
+        assert!(errors.is_empty());
+        assert_eq!(logs.len(), 4);
+        assert!(logs
+            .iter()
+            .any(|log| log.request_id == "codex_rollout:parent:3"));
+        assert!(logs
+            .iter()
+            .any(|log| log.request_id == "codex_rollout:child:4"));
+    }
+
+    #[test]
+    fn missing_parent_uses_owned_task_boundary_and_unresolved_cache_survives() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let resolved = temp.path().join("resolved.jsonl");
+        let unresolved = temp.path().join("unresolved.jsonl");
+        let session_at = parse_rfc3339_timestamp("2026-07-11T02:00:00Z").expect("timestamp");
+        fs::write(
+            &resolved,
+            [
+                usage_meta(
+                    "2026-07-11T02:00:00Z",
+                    "session",
+                    "resolved",
+                    Some("missing"),
+                ),
+                token_event(None, (100, 20, 5), (100, 20, 5)),
+                task_started("2026-07-11T02:00:01Z", session_at),
+                token_event(None, (150, 30, 10), (50, 10, 5)),
+            ]
+            .join("\n"),
+        )
+        .expect("write resolved");
+        fs::write(
+            &unresolved,
+            [
+                usage_meta(
+                    "2026-07-11T03:00:00Z",
+                    "session",
+                    "unresolved",
+                    Some("missing"),
+                ),
+                token_event(None, (100, 20, 5), (100, 20, 5)),
+            ]
+            .join("\n"),
+        )
+        .expect("write unresolved");
+
+        let (logs, replace_ids, errors) = parse_codex_usage_files(&[resolved, unresolved]);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].request_id, "codex_rollout:resolved:2");
+        assert!(replace_ids.contains("resolved"));
+        assert!(!replace_ids.contains("unresolved"));
+        assert_eq!(errors.len(), 1);
+
+        let previous = sample_log(
+            "codex_rollout:unresolved:1",
+            "session",
+            "unresolved",
+            UsageLogSourceKind::Fork,
+            75,
+        );
+        let merged = merge_usage_logs(
+            Some(vec![previous.clone()]),
+            Some(USAGE_CACHE_VERSION),
+            logs,
+            &replace_ids,
+        );
+        assert!(merged.contains(&previous));
+    }
+
+    #[test]
+    fn missing_event_timestamps_use_session_then_previous_event_not_file_mtime() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("rollout-2026-07-12T23-59-59-root.jsonl");
+        fs::write(
+            &file,
+            [
+                usage_meta("2026-07-10T01:00:00Z", "session", "root", None),
+                token_event(None, (100, 20, 5), (100, 20, 5)),
+                token_event(Some("2026-07-10T01:05:00Z"), (150, 30, 10), (50, 10, 5)),
+                token_event(None, (190, 35, 14), (40, 5, 4)),
+            ]
+            .join("\n"),
+        )
+        .expect("write root");
+
+        let logs = file_logs(&parse_codex_usage_file(&file).expect("parse"));
+        assert_eq!(
+            logs[0].created_at,
+            parse_rfc3339_timestamp("2026-07-10T01:00:00Z").unwrap()
+        );
+        assert_eq!(
+            logs[2].created_at,
+            parse_rfc3339_timestamp("2026-07-10T01:05:00Z").unwrap()
+        );
+    }
+
+    #[test]
+    fn rollout_filename_local_time_matches_session_meta_utc() {
+        let path = Path::new("rollout-2026-07-11T10-47-54-example.jsonl");
+        let utc8 = chrono::FixedOffset::east_opt(8 * 60 * 60).unwrap();
+        let timestamp = rollout_filename_timestamp_in_timezone(path, &utc8)
+            .expect("filename timestamp in UTC+8");
+        assert_eq!(
+            timestamp,
+            parse_rfc3339_timestamp("2026-07-11T02:47:54Z").unwrap()
+        );
+    }
+
+    #[test]
+    fn v3_cached_fork_is_discarded_when_current_root_rebuilds() {
+        let polluted = sample_log(
+            "codex_session:session:1",
+            "session",
+            "",
+            UsageLogSourceKind::Legacy,
+            25,
+        );
+        let root = sample_log(
+            "codex_rollout:root:1",
+            "session",
+            "root",
+            UsageLogSourceKind::CanonicalRoot,
+            100,
+        );
+        let logs = merge_usage_logs(
+            Some(vec![polluted]),
+            Some(USAGE_CACHE_VERSION - 1),
+            vec![root.clone()],
+            &HashSet::from(["root".to_string()]),
+        );
+        assert_eq!(logs, vec![root]);
+    }
+
+    #[test]
+    fn daily_trends_use_local_calendar_boundaries() {
+        let first_day = NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let second_day = first_day + ChronoDuration::days(1);
+        let start = local_day_start_timestamp(first_day);
+        let end = local_day_start_timestamp(second_day + ChronoDuration::days(1)) - 1;
+        let mut first = sample_log(
+            "codex_rollout:root:1",
+            "session",
+            "root",
+            UsageLogSourceKind::CanonicalRoot,
+            100,
+        );
+        first.created_at = start + 60;
+        let mut second = sample_log(
+            "codex_rollout:root:2",
+            "session",
+            "root",
+            UsageLogSourceKind::CanonicalRoot,
+            200,
+        );
+        second.created_at = local_day_start_timestamp(second_day) + 60;
+
+        let trends = build_trends(&[first, second], Some(start), Some(end), &[], 1.0);
+        assert_eq!(trends.len(), 2);
+        assert_eq!(trends[0].timestamp, local_day_start_timestamp(first_day));
+        assert_eq!(trends[1].timestamp, local_day_start_timestamp(second_day));
+        assert_eq!(trends[0].input_tokens, 80);
+        assert_eq!(trends[1].input_tokens, 180);
+    }
+
+    #[test]
+    fn explicit_boundary_prevents_truncated_parent_from_exposing_replay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent = temp.path().join("parent.jsonl");
+        let child = temp.path().join("child.jsonl");
+        let first = token_event(None, (100, 20, 5), (100, 20, 5));
+        let second = token_event(None, (150, 30, 10), (50, 10, 5));
+        let session_at = parse_rfc3339_timestamp("2026-07-11T02:00:00Z").unwrap();
+        fs::write(
+            &parent,
+            [
+                usage_meta("2026-07-11T01:00:00Z", "session", "session", None),
+                first.clone(),
+            ]
+            .join("\n"),
+        )
+        .expect("write truncated parent");
+        fs::write(
+            &child,
+            [
+                usage_meta("2026-07-11T02:00:00Z", "session", "child", Some("session")),
+                first,
+                second,
+                task_started("2026-07-11T02:00:01Z", session_at),
+                token_event(None, (190, 35, 14), (40, 5, 4)),
+            ]
+            .join("\n"),
+        )
+        .expect("write child");
+
+        let (logs, _, errors) = parse_codex_usage_files(&[parent, child]);
+        assert!(errors.is_empty());
+        assert_eq!(logs.len(), 2);
+        assert!(logs
+            .iter()
+            .any(|log| log.request_id == "codex_rollout:child:3"));
+        assert!(!logs
+            .iter()
+            .any(|log| log.request_id == "codex_rollout:child:2"));
+    }
+
+    #[test]
+    fn later_task_marker_is_not_mistaken_for_initial_fork_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent = temp.path().join("parent.jsonl");
+        let child = temp.path().join("child.jsonl");
+        let first = token_event(None, (100, 20, 5), (100, 20, 5));
+        let session_at = parse_rfc3339_timestamp("2026-07-11T02:00:00Z").unwrap();
+        fs::write(
+            &parent,
+            [
+                usage_meta("2026-07-11T01:00:00Z", "session", "session", None),
+                first.clone(),
+            ]
+            .join("\n"),
+        )
+        .expect("write parent");
+        fs::write(
+            &child,
+            [
+                usage_meta("2026-07-11T02:00:00Z", "session", "child", Some("session")),
+                first,
+                token_event(None, (150, 30, 10), (50, 10, 5)),
+                task_started("2026-07-11T02:01:00Z", session_at + 60),
+                token_event(None, (190, 35, 14), (40, 5, 4)),
+            ]
+            .join("\n"),
+        )
+        .expect("write child");
+
+        let (logs, _, errors) = parse_codex_usage_files(&[parent, child]);
+        assert!(errors.is_empty());
+        assert!(logs
+            .iter()
+            .any(|log| log.request_id == "codex_rollout:child:2"));
+        assert!(logs
+            .iter()
+            .any(|log| log.request_id == "codex_rollout:child:3"));
+    }
+
+    #[test]
+    fn empty_current_rollout_does_not_delete_trusted_v4_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("empty.jsonl");
+        fs::write(
+            &file,
+            usage_meta("2026-07-11T01:00:00Z", "session", "session", None),
+        )
+        .expect("write empty rollout");
+        let (current, replace_ids, errors) = parse_codex_usage_files(&[file]);
+        assert!(current.is_empty());
+        assert!(replace_ids.is_empty());
+        assert!(errors.is_empty());
+
+        let previous = sample_log(
+            "codex_rollout:session:1",
+            "session",
+            "session",
+            UsageLogSourceKind::CanonicalRoot,
+            100,
+        );
+        let merged = merge_usage_logs(
+            Some(vec![previous.clone()]),
+            Some(USAGE_CACHE_VERSION),
+            current,
+            &replace_ids,
+        );
+        assert_eq!(merged, vec![previous]);
+    }
+
+    #[test]
+    fn empty_parent_is_not_used_as_evidence_for_child_ownership() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent = temp.path().join("parent.jsonl");
+        let child = temp.path().join("child.jsonl");
+        fs::write(
+            &parent,
+            usage_meta("2026-07-11T01:00:00Z", "session", "session", None),
+        )
+        .expect("write empty parent");
+        fs::write(
+            &child,
+            [
+                usage_meta("2026-07-11T02:00:00Z", "session", "child", Some("session")),
+                token_event(None, (100, 20, 5), (100, 20, 5)),
+            ]
+            .join("\n"),
+        )
+        .expect("write child replay");
+
+        let (logs, replace_ids, errors) = parse_codex_usage_files(&[parent, child]);
+        assert!(logs.is_empty());
+        assert!(replace_ids.is_empty());
+        assert_eq!(errors.len(), 1);
+        let previous = sample_log(
+            "codex_rollout:child:2",
+            "session",
+            "child",
+            UsageLogSourceKind::Fork,
+            50,
+        );
+        let merged = merge_usage_logs(
+            Some(vec![previous.clone()]),
+            Some(USAGE_CACHE_VERSION),
+            logs,
+            &replace_ids,
+        );
+        assert_eq!(merged, vec![previous]);
+    }
+
+    #[test]
+    fn v4_database_never_reimports_changed_legacy_json_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let json_path = temp.path().join("usage_logs.json");
+        let mut conn = Connection::open_in_memory().expect("open sqlite");
+        init_usage_db(&conn).expect("init sqlite");
+        let current = sample_log(
+            "codex_rollout:session:1",
+            "session",
+            "session",
+            UsageLogSourceKind::CanonicalRoot,
+            100,
+        );
+        write_usage_cache_db(
+            &mut conn,
+            &UsageCache {
+                version: USAGE_CACHE_VERSION,
+                updated_at: 1,
+                files: Vec::new(),
+                logs: vec![current.clone()],
+                errors: Vec::new(),
+            },
+        )
+        .expect("write v4 cache");
+        let legacy = sample_log(
+            "codex_session:session:1",
+            "session",
+            "",
+            UsageLogSourceKind::Legacy,
+            25,
+        );
+        fs::write(
+            &json_path,
+            serde_json::to_string(&UsageCache {
+                version: USAGE_CACHE_VERSION - 1,
+                updated_at: 0,
+                files: Vec::new(),
+                logs: vec![legacy],
+                errors: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .expect("write legacy json");
+
+        migrate_usage_json_cache_from_path_if_needed(&mut conn, &json_path)
+            .expect("skip legacy import");
+        assert_eq!(read_usage_logs_db(&conn).unwrap(), vec![current]);
+        assert!(read_usage_meta(&conn, "jsonMigrated").unwrap().is_some());
+    }
+
+    #[test]
+    fn token_events_without_valid_session_meta_are_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("rollout-unknown.jsonl");
+        fs::write(&file, token_event(None, (100, 20, 5), (100, 20, 5)))
+            .expect("write malformed rollout");
+        assert!(parse_codex_usage_file(&file).is_err());
+    }
+
+    #[test]
+    fn force_version_or_file_changes_trigger_a_rebuild() {
+        assert!(!should_rebuild_usage_cache(
+            false,
+            USAGE_CACHE_VERSION,
+            true
+        ));
+        assert!(should_rebuild_usage_cache(true, USAGE_CACHE_VERSION, true));
+        assert!(should_rebuild_usage_cache(
+            false,
+            USAGE_CACHE_VERSION - 1,
+            true
+        ));
+        assert!(should_rebuild_usage_cache(
+            false,
+            USAGE_CACHE_VERSION,
+            false
+        ));
     }
 
     #[test]
@@ -2585,12 +4100,15 @@ mod tests {
                 size_bytes: 456,
             }],
             logs: vec![ParsedUsageLog {
-                request_id: "codex_session:imported:1".to_string(),
+                request_id: "codex_rollout:imported:1".to_string(),
+                session_id: "session".to_string(),
+                rollout_id: "imported".to_string(),
                 model: "gpt-5.5".to_string(),
                 input_tokens: 10,
                 output_tokens: 2,
                 cache_read_tokens: 4,
                 created_at: 1_782_880_001,
+                source_kind: UsageLogSourceKind::Fork,
             }],
             errors: vec!["sample error".to_string()],
         };
@@ -2603,7 +4121,10 @@ mod tests {
         assert_eq!(restored.version, USAGE_CACHE_VERSION);
         assert_eq!(restored.files, cache.files);
         assert_eq!(restored.logs.len(), 1);
-        assert_eq!(restored.logs[0].request_id, "codex_session:imported:1");
+        assert_eq!(restored.logs[0].request_id, "codex_rollout:imported:1");
+        assert_eq!(restored.logs[0].session_id, "session");
+        assert_eq!(restored.logs[0].rollout_id, "imported");
+        assert_eq!(restored.logs[0].source_kind, UsageLogSourceKind::Fork);
         assert_eq!(restored.errors, cache.errors);
     }
 
