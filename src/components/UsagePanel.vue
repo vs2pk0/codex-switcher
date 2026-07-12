@@ -273,7 +273,12 @@ let echartsApi: EChartsCoreApi | null = null;
 let echartsLoading: Promise<EChartsCoreApi> | null = null;
 let autoRefreshTimer: number | undefined;
 let activationRefreshTimer: number | undefined;
+let presetBoundaryTimer: number | undefined;
 let loadSerial = 0;
+let silentLoadInFlight = false;
+let presetBoundaryKey = localDayKey(new Date());
+let presetRefreshPending = false;
+let disposed = false;
 
 function readAutoRefreshInterval(): number {
   const fallback = 30_000;
@@ -298,6 +303,10 @@ function formatPickerValue(date: Date): string {
   return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
+function localDayKey(date: Date): string {
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
 function startOfDay(date: Date): Date {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0);
 }
@@ -312,13 +321,6 @@ function startOfMonth(date: Date): Date {
 
 function endOfMonth(date: Date): Date {
   return new Date(date.getFullYear(), date.getMonth() + 1, 0, 23, 59, 59, 999);
-}
-
-function nextWholeHour(date: Date): Date {
-  const next = new Date(date);
-  next.setMinutes(0, 0, 0);
-  next.setHours(next.getHours() + 1);
-  return next;
 }
 
 function seconds(date: Date): number {
@@ -344,7 +346,7 @@ function presetDates(preset: UsageRange): { start: Date; end: Date } {
     const date = new Date(now.getFullYear(), now.getMonth() - 1, 1);
     return { start: startOfMonth(date), end: endOfMonth(date) };
   }
-  return { start: startOfDay(now), end: nextWholeHour(now) };
+  return { start: startOfDay(now), end: now };
 }
 
 function syncPickerToPreset(preset: UsageRange): void {
@@ -353,13 +355,47 @@ function syncPickerToPreset(preset: UsageRange): void {
 }
 
 function parsePickerDate(value: unknown): Date | null {
-  if (value instanceof Date) return value;
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : new Date(value.getTime());
+  }
   if (typeof value === "number") {
-    return new Date(value > 10_000_000_000 ? value : value * 1000);
+    const parsed = new Date(value > 10_000_000_000 ? value : value * 1000);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
   }
   if (typeof value === "string" && value.trim()) {
-    const parsed = new Date(value.replace(/-/g, "/"));
-    return Number.isNaN(parsed.getTime()) ? null : parsed;
+    const match = value.trim().match(
+      /^(\d{4})[-/](\d{2})[-/](\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/,
+    );
+    if (!match) return null;
+    const [, yearText, monthText, dayText, hourText, minuteText, secondText] = match;
+    const year = Number(yearText);
+    const month = Number(monthText);
+    const day = Number(dayText);
+    const hour = Number(hourText);
+    const minute = Number(minuteText);
+    const second = Number(secondText);
+    if (
+      month < 1 || month > 12
+      || day < 1 || day > 31
+      || hour < 0 || hour > 23
+      || minute < 0 || minute > 59
+      || second < 0 || second > 59
+    ) {
+      return null;
+    }
+    const parsed = new Date(year, month - 1, day, hour, minute, second, 0);
+    // 组件以本地时间工作；回读所有字段可以同时拒绝 2 月 30 日和 DST gap 的自动归一化。
+    if (
+      parsed.getFullYear() !== year
+      || parsed.getMonth() !== month - 1
+      || parsed.getDate() !== day
+      || parsed.getHours() !== hour
+      || parsed.getMinutes() !== minute
+      || parsed.getSeconds() !== second
+    ) {
+      return null;
+    }
+    return parsed;
   }
   return null;
 }
@@ -368,7 +404,7 @@ function normalizePickerRange(value: unknown): [string, string] | null {
   if (!Array.isArray(value) || value.length < 2) return null;
   const start = parsePickerDate(value[0]);
   const end = parsePickerDate(value[1]);
-  if (!start || !end) return null;
+  if (!start || !end || start.getTime() > end.getTime()) return null;
   return [formatPickerValue(start), formatPickerValue(end)];
 }
 
@@ -381,6 +417,7 @@ function resolveRange(): { startDate: number; endDate: number } {
     }
   }
   const { start, end } = presetDates(range.value);
+  dateRange.value = [formatPickerValue(start), formatPickerValue(end)];
   return { startDate: seconds(start), endDate: seconds(end) };
 }
 
@@ -388,7 +425,11 @@ async function loadUsage(
   refresh = false,
   options: { silent?: boolean; notify?: boolean } = {},
 ): Promise<void> {
+  if (disposed) return;
   const silent = Boolean(options.silent);
+  if (silent && silentLoadInFlight) return;
+  presetRefreshPending = false;
+  if (silent) silentLoadInFlight = true;
   const notify = options.notify ?? refresh;
   const serial = ++loadSerial;
   if (!silent) loading.value = true;
@@ -399,11 +440,15 @@ async function loadUsage(
       pageSize,
       refresh,
     });
+    let activityError: unknown;
     const nextActivity = await getCodexUsageActivity({ refresh: false }).catch((error) => {
-      if (!silent) Message.warning(`加载年度活动失败：${errorText(error)}`);
+      activityError = error;
       return null;
     });
     if (serial !== loadSerial) return;
+    if (activityError && !silent) {
+      Message.warning(`加载年度活动失败：${errorText(activityError)}`);
+    }
     dashboard.value = nextDashboard;
     if (nextActivity) activity.value = nextActivity;
     lastLoadedAt.value = Date.now();
@@ -413,9 +458,22 @@ async function loadUsage(
     }
     if (refresh && notify && !silent) Message.success("消耗数据已刷新");
   } catch (error) {
+    if (serial !== loadSerial) return;
     if (!silent) Message.error(`加载消耗数据失败：${errorText(error)}`);
   } finally {
+    if (silent) silentLoadInFlight = false;
     if (serial === loadSerial && !silent) loading.value = false;
+    if (
+      presetRefreshPending
+      && !loading.value
+      && !silentLoadInFlight
+      && !disposed
+      && props.active
+      && document.visibilityState !== "hidden"
+    ) {
+      presetRefreshPending = false;
+      void loadUsage(false, { silent: true });
+    }
   }
 }
 
@@ -463,24 +521,22 @@ async function savePricingConfig(): Promise<void> {
 function changeRange(next: string | number | boolean): void {
   if (!rangeOptions.some((item) => item.value === next)) return;
   range.value = next as UsageRange;
+  presetBoundaryKey = localDayKey(new Date());
   page.value = 1;
   syncPickerToPreset(range.value);
-  void loadUsage(true, { notify: false });
+  void loadUsage(false, { notify: false });
 }
 
 function changeCustomRange(value: unknown): void {
   const normalized = normalizePickerRange(value);
   if (!normalized) {
-    range.value = "today";
-    page.value = 1;
-    syncPickerToPreset("today");
-    void loadUsage(true, { notify: false });
+    Message.warning("请选择有效的开始和结束时间，日期必须真实存在且开始时间不能晚于结束时间。");
     return;
   }
   range.value = "custom";
   dateRange.value = normalized;
   page.value = 1;
-  void loadUsage(true, { notify: false });
+  void loadUsage(false, { notify: false });
 }
 
 function refreshUsage(): void {
@@ -506,11 +562,11 @@ function changePage(next: number): void {
 }
 
 function shouldAutoRefresh(): boolean {
-  return props.active && range.value === "today" && !loading.value && !pricingModalVisible.value;
-}
-
-function refreshPresetRangeForNow(): void {
-  if (range.value === "today") syncPickerToPreset("today");
+  return props.active
+    && range.value === "today"
+    && !loading.value
+    && !silentLoadInFlight
+    && !pricingModalVisible.value;
 }
 
 function scheduleAutoRefresh(): void {
@@ -519,9 +575,46 @@ function scheduleAutoRefresh(): void {
   if (autoRefreshIntervalMs.value <= 0) return;
   autoRefreshTimer = window.setInterval(() => {
     if (!shouldAutoRefresh()) return;
-    refreshPresetRangeForNow();
     void loadUsage(false, { silent: true });
   }, autoRefreshIntervalMs.value);
+}
+
+function refreshPresetAtBoundary(): boolean {
+  const nextKey = localDayKey(new Date());
+  if (nextKey === presetBoundaryKey) return false;
+  presetBoundaryKey = nextKey;
+  if (range.value === "custom") return false;
+  page.value = 1;
+  syncPickerToPreset(range.value);
+  if (!props.active || document.visibilityState === "hidden") {
+    presetRefreshPending = true;
+  } else {
+    if (loading.value || silentLoadInFlight) {
+      presetRefreshPending = true;
+    } else {
+      void loadUsage(false, { silent: true });
+    }
+  }
+  return true;
+}
+
+function schedulePresetBoundaryRefresh(): void {
+  if (presetBoundaryTimer) window.clearTimeout(presetBoundaryTimer);
+  const now = new Date();
+  const nextMidnight = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate() + 1,
+    0,
+    0,
+    0,
+    150,
+  );
+  presetBoundaryTimer = window.setTimeout(() => {
+    presetBoundaryTimer = undefined;
+    refreshPresetAtBoundary();
+    schedulePresetBoundaryRefresh();
+  }, Math.max(250, nextMidnight.getTime() - now.getTime()));
 }
 
 function scheduleActivationRefresh(delay = 280): void {
@@ -533,11 +626,12 @@ function scheduleActivationRefresh(delay = 280): void {
 }
 
 function refreshWhenVisible(force = false): void {
-  if (loading.value) return;
+  const boundaryChanged = refreshPresetAtBoundary();
+  if (boundaryChanged && silentLoadInFlight) return;
+  if (loading.value || silentLoadInFlight) return;
   if (!props.active || document.visibilityState === "hidden") return;
   const stale = Date.now() - lastLoadedAt.value > 5_000;
-  if (!force && !stale) return;
-  refreshPresetRangeForNow();
+  if (!force && !stale && !presetRefreshPending) return;
   void loadUsage(false, { silent: true });
 }
 
@@ -946,12 +1040,14 @@ function renderUsageChart(): void {
 }
 
 onMounted(() => {
+  presetBoundaryKey = localDayKey(new Date());
   syncPickerToPreset("today");
   window.setTimeout(() => {
     void loadUsage(false);
     renderUsageChart();
   }, props.active ? 120 : 0);
   scheduleAutoRefresh();
+  schedulePresetBoundaryRefresh();
   window.addEventListener("focus", handleWindowFocus);
   document.addEventListener("visibilitychange", handleVisibilityChange);
 });
@@ -971,8 +1067,12 @@ watch(
 );
 
 onBeforeUnmount(() => {
+  disposed = true;
+  presetRefreshPending = false;
+  loadSerial += 1;
   if (autoRefreshTimer) window.clearInterval(autoRefreshTimer);
   if (activationRefreshTimer) window.clearTimeout(activationRefreshTimer);
+  if (presetBoundaryTimer) window.clearTimeout(presetBoundaryTimer);
   window.removeEventListener("focus", handleWindowFocus);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   chartResizeObserver?.disconnect();
@@ -999,6 +1099,7 @@ onBeforeUnmount(() => {
           :model-value="dateRange"
           show-time
           format="YYYY/MM/DD HH:mm:ss"
+          value-format="YYYY/MM/DD HH:mm:ss"
           class="usage-range-picker"
           @change="changeCustomRange"
         />
@@ -1045,7 +1146,7 @@ onBeforeUnmount(() => {
 
           <div class="usage-metrics">
             <article>
-              <span><icon-arrow-down /> {{ t("输入 Tokens") }}</span>
+              <span><icon-arrow-down /> {{ t("新增输入 Tokens") }}</span>
               <strong>{{ formatTokens(summary?.totalInputTokens) }}</strong>
             </article>
             <article>
