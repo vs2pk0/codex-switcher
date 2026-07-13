@@ -19,7 +19,7 @@ use session::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -49,6 +49,29 @@ struct CodexApiKeyModel {
 const MAX_API_MODEL_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_API_MODELS: usize = 500;
 const MAX_API_MODEL_ID_CHARS: usize = 256;
+const MAX_API_BALANCE_RESPONSE_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct CodexApiKeyBalance {
+    provider: String,
+    balance_kind: String,
+    available_amount: Option<f64>,
+    used_amount: Option<f64>,
+    total_amount: Option<f64>,
+    currency: String,
+    unlimited: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexRelayBalanceEndpoints {
+    new_api_status: reqwest::Url,
+    new_api_usage: reqwest::Url,
+    sub2api_usage: reqwest::Url,
+    insecure_http_origin: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -501,6 +524,319 @@ async fn fetch_codex_api_key_models(account_id: String) -> Result<Vec<CodexApiKe
         ));
     }
     parse_codex_api_key_models(&body)
+}
+
+fn relay_balance_url(root: &reqwest::Url, suffix: &str) -> reqwest::Url {
+    let mut url = root.clone();
+    let root_path = root.path().trim_end_matches('/');
+    let suffix = suffix.trim_start_matches('/');
+    let path = if root_path.is_empty() {
+        format!("/{}", suffix)
+    } else {
+        format!("{}/{}", root_path, suffix)
+    };
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    url
+}
+
+fn codex_relay_balance_endpoints(
+    base_url: Option<&str>,
+) -> Result<CodexRelayBalanceEndpoints, String> {
+    let base_url = base_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "API Key 账号未设置 Base URL，无法查询中转站余额".to_string())?;
+    let mut root =
+        reqwest::Url::parse(base_url).map_err(|error| format!("Base URL 无效: {}", error))?;
+    if !matches!(root.scheme(), "http" | "https") || root.host_str().is_none() {
+        return Err("Base URL 必须是有效的 http:// 或 https:// 地址".to_string());
+    }
+    let mut root_path = root.path().trim_end_matches('/').to_string();
+    if root_path == "/v1" {
+        root_path.clear();
+    } else if let Some(prefix) = root_path.strip_suffix("/v1") {
+        root_path = prefix.to_string();
+    }
+    root.set_path(if root_path.is_empty() {
+        "/"
+    } else {
+        &root_path
+    });
+    root.set_query(None);
+    root.set_fragment(None);
+
+    let insecure_http_origin = (root.scheme() == "http" && !balance_http_host_is_loopback(&root))
+        .then(|| root.origin().ascii_serialization());
+
+    Ok(CodexRelayBalanceEndpoints {
+        new_api_status: relay_balance_url(&root, "api/status"),
+        new_api_usage: relay_balance_url(&root, "api/usage/token/"),
+        sub2api_usage: relay_balance_url(&root, "v1/usage"),
+        insecure_http_origin,
+    })
+}
+
+fn balance_http_host_is_loopback(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
+fn ensure_balance_transport_allowed(
+    endpoints: &CodexRelayBalanceEndpoints,
+    approved_insecure_http_origin: Option<&str>,
+) -> Result<(), String> {
+    if let Some(required_origin) = endpoints.insecure_http_origin.as_deref() {
+        if approved_insecure_http_origin != Some(required_origin) {
+            return Err(
+                "INSECURE_HTTP_CONFIRM_REQUIRED: 远程 HTTP 中转站会以明文传输 API Key，请确认风险后重试"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn json_f64(value: Option<&Value>) -> Option<f64> {
+    let number = value.and_then(|value| {
+        value.as_f64().or_else(|| {
+            value
+                .as_str()
+                .and_then(|text| text.trim().parse::<f64>().ok())
+        })
+    })?;
+    number.is_finite().then_some(number)
+}
+
+fn json_trimmed_string(value: Option<&Value>) -> Option<String> {
+    let value = value?.as_str()?.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value.chars().take(120).collect())
+}
+
+fn parse_new_api_quota_per_unit(body: &str) -> Option<f64> {
+    let payload = serde_json::from_str::<Value>(body).ok()?;
+    if payload.get("success").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
+    let quota_per_unit = json_f64(payload.get("data")?.get("quota_per_unit"))?;
+    (quota_per_unit > 0.0).then_some(quota_per_unit)
+}
+
+fn parse_new_api_balance(body: &str, quota_per_unit: f64) -> Result<CodexApiKeyBalance, String> {
+    if !quota_per_unit.is_finite() || quota_per_unit <= 0.0 {
+        return Err("NewAPI 返回了无效的额度换算单位".to_string());
+    }
+    let payload = serde_json::from_str::<Value>(body)
+        .map_err(|error| format!("解析 NewAPI 余额响应失败: {}", error))?;
+    if payload.get("code").and_then(Value::as_bool) == Some(false) {
+        return Err("NewAPI 余额接口返回失败".to_string());
+    }
+    let data = payload
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "NewAPI 余额响应缺少 data".to_string())?;
+    if data.get("object").and_then(Value::as_str) != Some("token_usage") {
+        return Err("NewAPI 余额响应格式不受支持".to_string());
+    }
+    let unlimited = data
+        .get("unlimited_quota")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let convert = |key: &str| json_f64(data.get(key)).map(|value| value / quota_per_unit);
+    let available_amount = convert("total_available");
+    if !unlimited && available_amount.is_none() {
+        return Err("NewAPI 余额响应缺少 total_available".to_string());
+    }
+    Ok(CodexApiKeyBalance {
+        provider: "new_api".to_string(),
+        balance_kind: if unlimited { "unlimited" } else { "key_quota" }.to_string(),
+        available_amount: (!unlimited).then_some(available_amount).flatten(),
+        used_amount: convert("total_used"),
+        total_amount: convert("total_granted"),
+        currency: "USD".to_string(),
+        unlimited,
+        plan_name: json_trimmed_string(data.get("name")),
+    })
+}
+
+fn parse_sub2api_balance(body: &str) -> Result<CodexApiKeyBalance, String> {
+    let payload = serde_json::from_str::<Value>(body)
+        .map_err(|error| format!("解析 Sub2API 余额响应失败: {}", error))?;
+    let data = payload
+        .as_object()
+        .ok_or_else(|| "Sub2API 余额响应格式不受支持".to_string())?;
+    if data.get("isValid").and_then(Value::as_bool) == Some(false) {
+        return Err("Sub2API API Key 当前不可用".to_string());
+    }
+
+    let mode = data.get("mode").and_then(Value::as_str).unwrap_or_default();
+    let quota = data.get("quota").and_then(Value::as_object);
+    let wallet_balance = json_f64(data.get("balance"));
+    let remaining = json_f64(data.get("remaining"))
+        .or_else(|| quota.and_then(|value| json_f64(value.get("remaining"))));
+    let unlimited = mode == "unrestricted"
+        && wallet_balance.is_none()
+        && remaining.is_some_and(|value| value < 0.0);
+    let available_amount = if unlimited {
+        None
+    } else {
+        wallet_balance.or(remaining)
+    };
+    if available_amount.is_none() && !unlimited {
+        return Err("Sub2API 未返回可显示的余额或额度".to_string());
+    }
+
+    let balance_kind = if unlimited {
+        "unlimited"
+    } else if wallet_balance.is_some() {
+        "wallet"
+    } else if mode == "quota_limited" {
+        "key_quota"
+    } else {
+        "subscription"
+    };
+    let currency = json_trimmed_string(data.get("unit"))
+        .or_else(|| quota.and_then(|value| json_trimmed_string(value.get("unit"))))
+        .unwrap_or_else(|| "USD".to_string());
+
+    Ok(CodexApiKeyBalance {
+        provider: "sub2api".to_string(),
+        balance_kind: balance_kind.to_string(),
+        available_amount,
+        used_amount: quota.and_then(|value| json_f64(value.get("used"))),
+        total_amount: quota.and_then(|value| json_f64(value.get("limit"))),
+        currency,
+        unlimited,
+        plan_name: json_trimmed_string(data.get("planName")),
+    })
+}
+
+async fn read_balance_response(
+    mut response: reqwest::Response,
+    label: &str,
+) -> Result<(reqwest::StatusCode, String), String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_API_BALANCE_RESPONSE_BYTES as u64)
+    {
+        return Err(format!("{}响应超过 256 KiB 限制", label));
+    }
+    let status = response.status();
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("读取{}响应失败: {}", label, error))?
+    {
+        if body.len() + chunk.len() > MAX_API_BALANCE_RESPONSE_BYTES {
+            return Err(format!("{}响应超过 256 KiB 限制", label));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((status, String::from_utf8_lossy(&body).into_owned()))
+}
+
+fn balance_http_error(status: reqwest::StatusCode) -> String {
+    match status.as_u16() {
+        401 => "余额查询鉴权失败，请检查 API Key".to_string(),
+        403 => "余额查询被中转站拒绝，请检查账号或访问限制".to_string(),
+        404 | 405 => "当前中转站不支持 NewAPI/Sub2API 余额接口".to_string(),
+        _ => format!("余额接口返回 HTTP {}", status.as_u16()),
+    }
+}
+
+#[tauri::command]
+async fn fetch_codex_api_key_balance(
+    account_id: String,
+    approved_insecure_http_origin: Option<String>,
+) -> Result<CodexApiKeyBalance, String> {
+    let account = AccountStore::default()
+        .list_accounts()?
+        .into_iter()
+        .find(|account| account.id == account_id)
+        .ok_or_else(|| "账号不存在".to_string())?;
+    if account.auth_mode.as_deref() != Some("apikey") {
+        return Err("只有 API Key 账号可以查询中转站余额".to_string());
+    }
+    let api_key = account
+        .openai_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "API Key 账号缺少 OPENAI_API_KEY".to_string())?;
+    let endpoints = codex_relay_balance_endpoints(account.api_base_url.as_deref())?;
+    ensure_balance_transport_allowed(&endpoints, approved_insecure_http_origin.as_deref())?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let same_origin = attempt.previous().last().is_some_and(|previous| {
+                previous.scheme() == attempt.url().scheme()
+                    && previous.host_str() == attempt.url().host_str()
+                    && previous.port_or_known_default() == attempt.url().port_or_known_default()
+            });
+            if same_origin && attempt.previous().len() < 3 {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build()
+        .map_err(|error| format!("创建余额查询请求失败: {}", error))?;
+
+    let status_response = client
+        .get(endpoints.new_api_status.clone())
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await;
+    if let Ok(response) = status_response {
+        if let Ok((status, body)) = read_balance_response(response, "NewAPI 状态接口").await {
+            if status.is_success() {
+                if let Some(quota_per_unit) = parse_new_api_quota_per_unit(&body) {
+                    let response = client
+                        .get(endpoints.new_api_usage)
+                        .bearer_auth(api_key)
+                        .header(reqwest::header::ACCEPT, "application/json")
+                        .send()
+                        .await
+                        .map_err(|error| format!("请求 NewAPI 余额失败: {}", error))?;
+                    let (status, body) = read_balance_response(response, "NewAPI 余额接口").await?;
+                    if status.is_success() {
+                        if let Ok(balance) = parse_new_api_balance(&body, quota_per_unit) {
+                            return Ok(balance);
+                        }
+                    } else if !matches!(status.as_u16(), 404 | 405) {
+                        return Err(balance_http_error(status));
+                    }
+                }
+            }
+        }
+    }
+
+    let response = client
+        .get(endpoints.sub2api_usage)
+        .bearer_auth(api_key)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|error| format!("请求 Sub2API 余额失败: {}", error))?;
+    let (status, body) = read_balance_response(response, "Sub2API 余额接口").await?;
+    if !status.is_success() {
+        return Err(balance_http_error(status));
+    }
+    parse_sub2api_balance(&body)
 }
 
 #[tauri::command]
@@ -2743,6 +3079,146 @@ mod tests {
     }
 
     #[test]
+    fn relay_balance_endpoints_preserve_prefix_and_remove_v1_once() {
+        let endpoints = super::codex_relay_balance_endpoints(Some(
+            "https://relay.example/prefix/v1/?ignored=1#fragment",
+        ))
+        .expect("balance endpoints");
+        assert_eq!(
+            endpoints.new_api_status.as_str(),
+            "https://relay.example/prefix/api/status"
+        );
+        assert_eq!(
+            endpoints.new_api_usage.as_str(),
+            "https://relay.example/prefix/api/usage/token/"
+        );
+        assert_eq!(
+            endpoints.sub2api_usage.as_str(),
+            "https://relay.example/prefix/v1/usage"
+        );
+        assert!(endpoints.insecure_http_origin.is_none());
+        assert!(super::codex_relay_balance_endpoints(Some("file:///tmp/v1")).is_err());
+        assert!(super::codex_relay_balance_endpoints(Some("  ")).is_err());
+    }
+
+    #[test]
+    fn remote_http_balance_requires_explicit_confirmation_but_loopback_does_not() {
+        for base_url in [
+            "http://localhost:18787/v1",
+            "http://LOCALHOST:18787/v1",
+            "http://127.0.0.1:18787/v1",
+            "http://127.255.255.254:18787/v1",
+            "http://[::1]:18787/v1",
+        ] {
+            let endpoints = super::codex_relay_balance_endpoints(Some(base_url))
+                .expect("loopback balance endpoints");
+            assert!(endpoints.insecure_http_origin.is_none(), "{base_url}");
+            assert!(super::ensure_balance_transport_allowed(&endpoints, None).is_ok());
+        }
+
+        for (base_url, expected_origin) in [
+            ("http://RELAY.EXAMPLE:80/v1", "http://relay.example"),
+            (
+                "http://localhost.evil.example/v1",
+                "http://localhost.evil.example",
+            ),
+            ("http://192.168.1.8:18787/v1", "http://192.168.1.8:18787"),
+            ("http://126.255.255.255/v1", "http://126.255.255.255"),
+            ("http://128.0.0.1/v1", "http://128.0.0.1"),
+            ("http://[2001:db8::1]/v1", "http://[2001:db8::1]"),
+        ] {
+            let endpoints = super::codex_relay_balance_endpoints(Some(base_url))
+                .expect("remote HTTP balance endpoints");
+            let required_origin = endpoints
+                .insecure_http_origin
+                .as_deref()
+                .expect("remote HTTP origin");
+            assert_eq!(required_origin, expected_origin);
+            let error = super::ensure_balance_transport_allowed(&endpoints, None)
+                .expect_err("remote HTTP requires confirmation");
+            assert!(error.starts_with("INSECURE_HTTP_CONFIRM_REQUIRED:"));
+            assert!(super::ensure_balance_transport_allowed(
+                &endpoints,
+                Some("http://different.example")
+            )
+            .is_err());
+            assert!(
+                super::ensure_balance_transport_allowed(&endpoints, Some(required_origin)).is_ok()
+            );
+        }
+
+        let https = super::codex_relay_balance_endpoints(Some("https://relay.example/v1"))
+            .expect("HTTPS balance endpoints");
+        assert!(super::ensure_balance_transport_allowed(&https, None).is_ok());
+    }
+
+    #[test]
+    fn new_api_balance_parser_uses_dynamic_quota_unit_and_handles_unlimited() {
+        let status = r#"{"success":true,"data":{"quota_per_unit":"250000"}}"#;
+        assert_eq!(super::parse_new_api_quota_per_unit(status), Some(250_000.0));
+
+        let balance = super::parse_new_api_balance(
+            r#"{"code":true,"data":{"object":"token_usage","name":"Codex","total_granted":750000,"total_used":250000,"total_available":500000,"unlimited_quota":false}}"#,
+            250_000.0,
+        )
+        .expect("new api balance");
+        assert_eq!(balance.provider, "new_api");
+        assert_eq!(balance.balance_kind, "key_quota");
+        assert_eq!(balance.available_amount, Some(2.0));
+        assert_eq!(balance.used_amount, Some(1.0));
+        assert_eq!(balance.total_amount, Some(3.0));
+        assert_eq!(balance.plan_name.as_deref(), Some("Codex"));
+
+        let unlimited = super::parse_new_api_balance(
+            r#"{"data":{"object":"token_usage","unlimited_quota":true}}"#,
+            500_000.0,
+        )
+        .expect("unlimited new api balance");
+        assert!(unlimited.unlimited);
+        assert_eq!(unlimited.balance_kind, "unlimited");
+        assert_eq!(unlimited.available_amount, None);
+    }
+
+    #[test]
+    fn sub2api_balance_parser_distinguishes_wallet_quota_and_subscription() {
+        let wallet = super::parse_sub2api_balance(
+            r#"{"mode":"unrestricted","isValid":true,"planName":"钱包余额","balance":12.5,"remaining":12.5,"unit":"USD"}"#,
+        )
+        .expect("wallet balance");
+        assert_eq!(wallet.balance_kind, "wallet");
+        assert_eq!(wallet.available_amount, Some(12.5));
+
+        let quota = super::parse_sub2api_balance(
+            r#"{"mode":"quota_limited","isValid":true,"quota":{"limit":"20","used":7.5,"remaining":12.5,"unit":"USD"}}"#,
+        )
+        .expect("key quota");
+        assert_eq!(quota.balance_kind, "key_quota");
+        assert_eq!(quota.available_amount, Some(12.5));
+        assert_eq!(quota.used_amount, Some(7.5));
+        assert_eq!(quota.total_amount, Some(20.0));
+
+        let subscription = super::parse_sub2api_balance(
+            r#"{"mode":"unrestricted","isValid":true,"planName":"Pro","remaining":3.25,"unit":"USD","subscription":{}}"#,
+        )
+        .expect("subscription balance");
+        assert_eq!(subscription.balance_kind, "subscription");
+        assert_eq!(subscription.available_amount, Some(3.25));
+
+        let unlimited = super::parse_sub2api_balance(
+            r#"{"mode":"unrestricted","isValid":true,"planName":"Unlimited","remaining":-1,"unit":"USD"}"#,
+        )
+        .expect("unlimited subscription");
+        assert!(unlimited.unlimited);
+        assert_eq!(unlimited.balance_kind, "unlimited");
+        assert_eq!(unlimited.available_amount, None);
+
+        assert!(super::parse_sub2api_balance(
+            r#"{"mode":"quota_limited","isValid":true,"rate_limits":[]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn config_state_failure_restores_existing_or_missing_file_snapshot() {
         let codex = tempdir().expect("codex tempdir");
         let config_path = codex.path().join("config.toml");
@@ -2973,6 +3449,7 @@ pub fn run() {
             add_codex_account_with_api_key,
             update_codex_api_key_credentials,
             fetch_codex_api_key_models,
+            fetch_codex_api_key_balance,
             check_codex_api_key_model_access,
             set_codex_api_key_default_model,
             update_codex_account_profile,

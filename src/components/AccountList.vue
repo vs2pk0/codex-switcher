@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { Message } from "@arco-design/web-vue";
 import { computed, ref } from "vue";
-import type { CodexSwitcherSettings } from "../services/codex";
+import type { CodexApiKeyBalanceState, CodexSwitcherSettings } from "../services/codex";
 import type { CodexAccount, CodexResetCredit } from "../types/codex";
-import { formatLocalizedDuration, t } from "../i18n";
+import { currentLocale, formatLocalizedDuration, t } from "../i18n";
 import { hasAnyQuotaWindow, hasQuotaWindow } from "../quota";
 import PlanBadge from "./PlanBadge.vue";
 
@@ -19,6 +19,7 @@ const props = defineProps<{
   deletingId: string;
   exportingId: string;
   quotaRefreshingId: string;
+  apiKeyBalanceStates: Record<string, CodexApiKeyBalanceState>;
   privacyMasked: boolean;
 }>();
 
@@ -36,6 +37,7 @@ const emit = defineEmits<{
   (event: "open-models", account: CodexAccount): void;
   (event: "switch-account", account: CodexAccount): void;
   (event: "refresh-quota", account: CodexAccount): void;
+  (event: "refresh-api-balance", account: CodexAccount): void;
   (event: "open-export", account: CodexAccount): void;
   (event: "confirm-delete", account: CodexAccount): void;
   (event: "open-add", tab: string): void;
@@ -365,6 +367,112 @@ function apiOfficialHost(account: CodexAccount): string {
   }
 }
 
+function apiKeyBalanceState(account: CodexAccount): CodexApiKeyBalanceState | undefined {
+  return props.apiKeyBalanceStates[account.id];
+}
+
+function finiteAmount(value: number | null | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function apiKeyAvailableAmount(state?: CodexApiKeyBalanceState): number | undefined {
+  const balance = state?.balance;
+  if (!balance) return undefined;
+  const available = finiteAmount(balance.availableAmount);
+  if (available !== undefined) return available;
+  const total = finiteAmount(balance.totalAmount);
+  const used = finiteAmount(balance.usedAmount);
+  return total !== undefined && used !== undefined ? Math.max(0, total - used) : undefined;
+}
+
+function formatApiKeyBalance(account: CodexAccount): string {
+  const state = apiKeyBalanceState(account);
+  if (props.privacyMasked && state?.balance) return "••••";
+  if (state?.balance?.unlimited || state?.balance?.balanceKind === "unlimited") {
+    return "∞";
+  }
+  const amount = apiKeyAvailableAmount(state);
+  if (amount !== undefined) {
+    const currency = state?.balance?.currency.trim().toUpperCase() || "USD";
+    try {
+      return new Intl.NumberFormat(currentLocale(), {
+        style: "currency",
+        currency,
+        currencyDisplay: "narrowSymbol",
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 4,
+      }).format(amount);
+    } catch {
+      return `${currency} ${amount.toLocaleString(currentLocale(), {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 4,
+      })}`;
+    }
+  }
+  if (state?.status === "consent_required") return t("需确认");
+  if (state?.status === "loading") return "…";
+  if (state?.status === "error") return t("获取失败");
+  return "--";
+}
+
+function apiKeyBalanceKindLabel(account: CodexAccount): string {
+  const kind = apiKeyBalanceState(account)?.balance?.balanceKind;
+  if (kind === "key_quota") return t("密钥额度");
+  if (kind === "subscription") return t("套餐剩余");
+  if (kind === "unlimited") return t("不限量");
+  return t("余额");
+}
+
+function apiKeyBalanceProviderLabel(provider: string): string {
+  const normalized = provider.trim().toLowerCase().replace(/[\s_-]+/g, "");
+  if (normalized === "newapi") return "NewAPI";
+  if (normalized === "sub2api") return "Sub2API";
+  return provider.trim();
+}
+
+function apiKeyBalanceTooltip(account: CodexAccount): string {
+  const state = apiKeyBalanceState(account);
+  if (!state?.balance) {
+    if (state?.status === "consent_required") return t("HTTP 地址需点击确认后查询余额");
+    if (state?.status === "loading") return t("余额获取中");
+    if (state?.status === "error") return t("余额获取失败，点击重试");
+    return t("点击刷新余额");
+  }
+
+  const details = [
+    `${apiKeyBalanceKindLabel(account)} ${formatApiKeyBalance(account)}`,
+    apiKeyBalanceProviderLabel(state.balance.provider),
+    props.privacyMasked ? undefined : state.balance.planName,
+  ]
+    .map((value) => value?.trim())
+    .filter(Boolean);
+  if (state.fetchedAt > 0) {
+    const updatedAt = new Intl.DateTimeFormat(currentLocale(), {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(state.fetchedAt);
+    details.push(`${t("更新于")} ${updatedAt}`);
+  }
+  if (state.status === "consent_required") details.push(t("HTTP 地址需点击确认后查询余额"));
+  else if (state.status === "loading") details.push(t("余额获取中"));
+  else if (state.status === "error") details.push(t("余额获取失败，点击重试"));
+  else details.push(t("点击刷新余额"));
+  return details.join(" · ");
+}
+
+function apiKeyBalanceClass(account: CodexAccount): Record<string, boolean> {
+  const state = apiKeyBalanceState(account);
+  return {
+    loading: state?.status === "loading",
+    error: state?.status === "error",
+    consent: state?.status === "consent_required",
+    stale: state?.status === "error" && Boolean(state.balance),
+    unlimited: Boolean(state?.balance?.unlimited || state?.balance?.balanceKind === "unlimited"),
+  };
+}
+
 async function copyText(value: string, successLabel: string): Promise<void> {
   const text = value.trim();
   if (!text) {
@@ -691,6 +799,25 @@ function formatTime(value?: number | null): string {
           </div>
 
           <div class="api-key-info-card">
+            <div class="api-key-info-row api-balance-info-row" :class="apiKeyBalanceClass(account)">
+              <span class="api-key-info-icon api-key-info-icon-balance"><icon-safe /></span>
+              <span class="api-key-info-text">
+                <b>{{ apiKeyBalanceKindLabel(account) }}</b>
+                <em :title="apiKeyBalanceTooltip(account)">{{ formatApiKeyBalance(account) }}</em>
+              </span>
+              <a-tooltip :content="apiKeyBalanceTooltip(account)">
+                <a-button
+                  class="api-key-copy-btn api-key-balance-refresh-btn"
+                  size="small"
+                  :title="t('刷新余额')"
+                  :loading="apiKeyBalanceState(account)?.status === 'loading'"
+                  :aria-label="`${apiKeyBalanceKindLabel(account)} ${formatApiKeyBalance(account)} ${t('刷新余额')}`"
+                  @click.stop="emit('refresh-api-balance', account)"
+                >
+                  <template #icon><icon-refresh /></template>
+                </a-button>
+              </a-tooltip>
+            </div>
             <div class="api-key-info-row">
               <span class="api-key-info-icon api-key-info-icon-key"><icon-link /></span>
               <span class="api-key-info-text">
@@ -983,7 +1110,21 @@ function formatTime(value?: number | null): string {
           {{ displayAccountName(account) }}
         </button>
         <span v-if="account.id === currentId" class="current-account-pill compact-current">{{ t("当前") }}</span>
-        <span v-if="shouldShowQuota(account) && account.quota" class="compact-quota-pair">
+        <a-tooltip v-if="isApiKeyAccount(account)" :content="apiKeyBalanceTooltip(account)">
+          <button
+            class="compact-api-balance"
+            :class="apiKeyBalanceClass(account)"
+            type="button"
+            :aria-busy="apiKeyBalanceState(account)?.status === 'loading'"
+            :aria-label="`${apiKeyBalanceKindLabel(account)} ${formatApiKeyBalance(account)} ${t('刷新余额')}`"
+            @click.stop="emit('refresh-api-balance', account)"
+          >
+            <icon-safe />
+            <span>{{ apiKeyBalanceKindLabel(account) }} {{ formatApiKeyBalance(account) }}</span>
+            <icon-refresh class="api-balance-refresh-icon" />
+          </button>
+        </a-tooltip>
+        <span v-else-if="shouldShowQuota(account) && account.quota" class="compact-quota-pair">
           <span v-if="hasQuotaWindow(account.quota, 'hourly')">
             <i :style="quotaDotStyle(account.quota.hourly_percentage)" />
             {{ quotaPercentLabel(account.quota.hourly_percentage) }}
@@ -1059,7 +1200,7 @@ function formatTime(value?: number | null): string {
             <th>{{ t("邮箱") }}</th>
             <th>{{ t("订阅") }}</th>
             <th>{{ t("订阅信息") }}</th>
-            <th>{{ t("配额状态") }}</th>
+            <th>{{ t("配额 / 余额") }}</th>
             <th>{{ t("操作") }}</th>
           </tr>
         </thead>
@@ -1116,7 +1257,22 @@ function formatTime(value?: number | null): string {
               </div>
             </td>
             <td>
-              <div v-if="shouldShowQuota(account) && account.quota" class="table-quota-stack">
+              <a-tooltip v-if="isApiKeyAccount(account)" :content="apiKeyBalanceTooltip(account)">
+                <button
+                  class="table-api-balance"
+                  :class="apiKeyBalanceClass(account)"
+                  type="button"
+                  :aria-busy="apiKeyBalanceState(account)?.status === 'loading'"
+                  :aria-label="`${apiKeyBalanceKindLabel(account)} ${formatApiKeyBalance(account)} ${t('刷新余额')}`"
+                  @click.stop="emit('refresh-api-balance', account)"
+                >
+                  <icon-safe />
+                  <span>{{ apiKeyBalanceKindLabel(account) }}</span>
+                  <strong>{{ formatApiKeyBalance(account) }}</strong>
+                  <icon-refresh class="api-balance-refresh-icon" />
+                </button>
+              </a-tooltip>
+              <div v-else-if="shouldShowQuota(account) && account.quota" class="table-quota-stack">
                 <div v-if="hasQuotaWindow(account.quota, 'hourly')" class="table-quota-line">
                   <span>
                     {{ quotaWindowShortLabel(account.quota.hourly_window_minutes, isFreePlanAccount(account) ? 43200 : 300) }}

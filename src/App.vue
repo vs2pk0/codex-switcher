@@ -39,6 +39,7 @@ import {
   deleteCodexSwitcherBackup,
   detectCurrentCodexAccount,
   exportCodexAccounts,
+  fetchCodexApiKeyBalance,
   fetchCodexApiKeyModels,
   formatCodexConfigFile,
   getCodexSwitcherPaths,
@@ -71,6 +72,7 @@ import {
   updateCodexApiKeyBoundOAuthAccount,
   updateCodexApiKeyCredentials,
   type CodexExportFormat,
+  type CodexApiKeyBalanceState,
   type CodexApiKeyModel,
   type CodexConfigFileContent,
   type CodexConfigFileKind,
@@ -112,6 +114,19 @@ const accountSearchKeyword = ref("");
 const switchingId = ref("");
 const deletingId = ref("");
 const quotaRefreshingId = ref("");
+const apiKeyBalanceStates = reactive<Record<string, CodexApiKeyBalanceState>>({});
+const apiKeyBalanceRequestSequences = new Map<string, number>();
+let apiKeyBalanceRequestSequence = 0;
+const apiKeyBalanceLastAttemptAt = new Map<string, number>();
+const apiKeyBalanceInsecureHttpApprovals = new Map<string, string>();
+const apiKeyBalanceInsecureHttpConfirmationPending = new Set<string>();
+const INSECURE_HTTP_CONFIRM_REQUIRED = "INSECURE_HTTP_CONFIRM_REQUIRED:";
+const API_KEY_BALANCE_TTL_MS = 5 * 60_000;
+const API_KEY_BALANCE_PREFETCH_CONCURRENCY = 3;
+type ApiKeyBalancePrefetchTask = { account: CodexAccount; generation: number };
+const apiKeyBalancePrefetchQueue: ApiKeyBalancePrefetchTask[] = [];
+let apiKeyBalancePrefetchGeneration = 0;
+let apiKeyBalancePrefetchWorkers = 0;
 const selectedAccountIds = ref<Set<string>>(new Set());
 const draggingAccountId = ref("");
 const sortEditorVisible = ref(false);
@@ -123,6 +138,7 @@ let quotaTimer: number | undefined;
 let currentAccountQuotaTimer: number | undefined;
 let quotaCountdownTimer: number | undefined;
 let countdownSettingsPersistTimer: number | undefined;
+let apiKeyBalanceRefreshTimer: number | undefined;
 let scheduledQuotaRefreshRunning = false;
 let scheduledCurrentAccountRefreshRunning = false;
 const nextQuotaRefreshAt = ref(0);
@@ -548,6 +564,46 @@ function formatCountdown(remainingMs: number): string {
 
 function isApiKeyAccount(account: CodexAccount): boolean {
   return account.auth_mode === "apikey" || Boolean(account.openai_api_key || account.openaiApiKey);
+}
+
+function apiKeyAccountBaseUrl(account: CodexAccount): string {
+  return (account.api_base_url || account.apiBaseUrl || "").trim();
+}
+
+function remoteHttpBalanceOrigin(account: CodexAccount): string | undefined {
+  const baseUrl = apiKeyAccountBaseUrl(account);
+  if (!baseUrl) return undefined;
+  try {
+    const url = new URL(baseUrl);
+    if (url.protocol !== "http:") return undefined;
+    const hostname = url.hostname
+      .replace(/^\[/, "")
+      .replace(/\]$/, "")
+      .toLowerCase();
+    if (hostname === "localhost" || hostname === "::1") return undefined;
+    const ipv4 = hostname.split(".").map((part) => Number(part));
+    const isIpv4Loopback =
+      ipv4.length === 4 &&
+      ipv4.every((part) => Number.isInteger(part) && part >= 0 && part <= 255) &&
+      ipv4[0] === 127;
+    return isIpv4Loopback ? undefined : url.origin;
+  } catch {
+    return undefined;
+  }
+}
+
+function apiKeyBalanceCanAutoFetch(account: CodexAccount): boolean {
+  const origin = remoteHttpBalanceOrigin(account);
+  if (!origin || apiKeyBalanceInsecureHttpApprovals.get(account.id) === origin) return true;
+  const previous = apiKeyBalanceStates[account.id];
+  if (previous?.status !== "consent_required") {
+    apiKeyBalanceStates[account.id] = {
+      status: "consent_required",
+      balance: previous?.balance,
+      fetchedAt: previous?.fetchedAt || 0,
+    };
+  }
+  return false;
 }
 
 function displayName(account: CodexAccount): string {
@@ -1083,13 +1139,197 @@ async function loadAccounts(): Promise<void> {
       listCodexAccounts(),
       getCurrentCodexAccount(),
     ]);
+    let shouldPrefetchBalances = false;
+    const previousAccounts = new Map(accounts.value.map((account) => [account.id, account]));
+    const nextAccountIds = new Set(nextAccounts.map((account) => account.id));
+    for (const account of nextAccounts) {
+      const previous = previousAccounts.get(account.id);
+      if (previous && apiKeyCredentialsChanged(previous, account)) {
+        invalidateApiKeyBalance(account.id);
+        shouldPrefetchBalances = true;
+      }
+    }
+    const trackedBalanceAccountIds = new Set([
+      ...Object.keys(apiKeyBalanceStates),
+      ...apiKeyBalanceRequestSequences.keys(),
+    ]);
+    for (const accountId of trackedBalanceAccountIds) {
+      if (!nextAccountIds.has(accountId)) forgetApiKeyBalance(accountId);
+    }
     accounts.value = nextAccounts;
     currentAccount.value = nextCurrent;
+    if (shouldPrefetchBalances && activeView.value === "accounts") {
+      void nextTick(() => prefetchVisibleApiKeyBalances());
+    }
   } catch (error) {
     Message.error(`加载账号失败：${errorText(error)}`);
   } finally {
     loading.value = false;
   }
+}
+
+function apiKeyCredentialsChanged(previous: CodexAccount, next: CodexAccount): boolean {
+  return (
+    (previous.openai_api_key || previous.openaiApiKey || "") !==
+      (next.openai_api_key || next.openaiApiKey || "") ||
+    (previous.api_base_url || previous.apiBaseUrl || "") !==
+      (next.api_base_url || next.apiBaseUrl || "")
+  );
+}
+
+function invalidateApiKeyBalance(accountId: string): void {
+  apiKeyBalanceRequestSequences.set(accountId, ++apiKeyBalanceRequestSequence);
+  apiKeyBalanceLastAttemptAt.delete(accountId);
+  apiKeyBalanceInsecureHttpApprovals.delete(accountId);
+  delete apiKeyBalanceStates[accountId];
+}
+
+function forgetApiKeyBalance(accountId: string): void {
+  invalidateApiKeyBalance(accountId);
+  apiKeyBalanceInsecureHttpConfirmationPending.delete(accountId);
+  apiKeyBalanceRequestSequences.delete(accountId);
+}
+
+async function loadApiKeyBalance(
+  account: CodexAccount,
+  options: { force?: boolean; silent?: boolean } = {},
+): Promise<void> {
+  if (!isApiKeyAccount(account)) return;
+  if (!apiKeyBalanceCanAutoFetch(account)) return;
+  const previous = apiKeyBalanceStates[account.id];
+  if (previous?.status === "loading") return;
+  const lastAttemptAt = apiKeyBalanceLastAttemptAt.get(account.id) || 0;
+  if (!options.force && lastAttemptAt > 0 && Date.now() - lastAttemptAt < API_KEY_BALANCE_TTL_MS) {
+    return;
+  }
+
+  const requestSequence = ++apiKeyBalanceRequestSequence;
+  apiKeyBalanceRequestSequences.set(account.id, requestSequence);
+  apiKeyBalanceStates[account.id] = {
+    status: "loading",
+    balance: previous?.balance,
+    fetchedAt: previous?.fetchedAt || 0,
+  };
+  try {
+    const insecureHttpOrigin = remoteHttpBalanceOrigin(account);
+    const approvedInsecureHttpOrigin =
+      insecureHttpOrigin && apiKeyBalanceInsecureHttpApprovals.get(account.id) === insecureHttpOrigin
+        ? insecureHttpOrigin
+        : undefined;
+    const balance = await fetchCodexApiKeyBalance(account.id, approvedInsecureHttpOrigin);
+    if (apiKeyBalanceRequestSequences.get(account.id) !== requestSequence) return;
+    apiKeyBalanceStates[account.id] = {
+      status: "success",
+      balance,
+      fetchedAt: Date.now(),
+    };
+    apiKeyBalanceLastAttemptAt.set(account.id, Date.now());
+    if (!options.silent) Message.success(t("余额已刷新"));
+  } catch (error) {
+    if (apiKeyBalanceRequestSequences.get(account.id) !== requestSequence) return;
+    const message = errorText(error);
+    if (message.startsWith(INSECURE_HTTP_CONFIRM_REQUIRED)) {
+      apiKeyBalanceStates[account.id] = {
+        status: "consent_required",
+        balance: previous?.balance,
+        fetchedAt: previous?.fetchedAt || 0,
+      };
+      apiKeyBalanceLastAttemptAt.delete(account.id);
+      return;
+    }
+    apiKeyBalanceStates[account.id] = {
+      status: "error",
+      balance: previous?.balance,
+      error: message,
+      fetchedAt: previous?.fetchedAt || 0,
+    };
+    apiKeyBalanceLastAttemptAt.set(account.id, Date.now());
+    if (!options.silent) Message.warning(`${t("余额获取失败")}：${message}`);
+  }
+}
+
+function runApiKeyBalancePrefetchWorkers(): void {
+  while (
+    apiKeyBalancePrefetchWorkers < API_KEY_BALANCE_PREFETCH_CONCURRENCY &&
+    apiKeyBalancePrefetchQueue.length > 0
+  ) {
+    apiKeyBalancePrefetchWorkers += 1;
+    void (async () => {
+      try {
+        while (apiKeyBalancePrefetchQueue.length > 0) {
+          const task = apiKeyBalancePrefetchQueue.shift();
+          if (
+            !task ||
+            task.generation !== apiKeyBalancePrefetchGeneration ||
+            activeView.value !== "accounts"
+          ) {
+            continue;
+          }
+          await loadApiKeyBalance(task.account, { silent: true });
+        }
+      } finally {
+        apiKeyBalancePrefetchWorkers -= 1;
+        runApiKeyBalancePrefetchWorkers();
+      }
+    })();
+  }
+}
+
+function cancelApiKeyBalancePrefetch(): void {
+  apiKeyBalancePrefetchGeneration += 1;
+  apiKeyBalancePrefetchQueue.splice(0);
+}
+
+function prefetchVisibleApiKeyBalances(): void {
+  cancelApiKeyBalancePrefetch();
+  if (activeView.value !== "accounts") return;
+  const generation = apiKeyBalancePrefetchGeneration;
+  for (const account of pagedAccounts.value) {
+    if (isApiKeyAccount(account) && apiKeyBalanceCanAutoFetch(account)) {
+      apiKeyBalancePrefetchQueue.push({ account, generation });
+    }
+  }
+  runApiKeyBalancePrefetchWorkers();
+}
+
+async function handleRefreshApiKeyBalance(account: CodexAccount): Promise<void> {
+  const insecureHttpOrigin = remoteHttpBalanceOrigin(account);
+  if (
+    insecureHttpOrigin &&
+    apiKeyBalanceInsecureHttpApprovals.get(account.id) !== insecureHttpOrigin
+  ) {
+    if (apiKeyBalanceInsecureHttpConfirmationPending.has(account.id)) return;
+    apiKeyBalanceInsecureHttpConfirmationPending.add(account.id);
+    Modal.warning({
+      title: t("HTTP 连接安全提示"),
+      content: `${t("该中转站使用未加密的 HTTP 连接。查询余额时会通过此连接发送 API Key，同一网络中的设备或代理可能读取它。是否仅在本次运行期间允许？")}\n${insecureHttpOrigin}`,
+      okText: t("仅本次运行允许"),
+      cancelText: t("取消"),
+      hideCancel: false,
+      async onOk() {
+        try {
+          const current = accounts.value.find((item) => item.id === account.id);
+          if (
+            !current ||
+            remoteHttpBalanceOrigin(current) !== insecureHttpOrigin ||
+            apiKeyCredentialsChanged(account, current)
+          ) {
+            Message.warning(t("账号配置已变化，请重新点击余额并确认"));
+            return;
+          }
+          apiKeyBalanceInsecureHttpApprovals.set(account.id, insecureHttpOrigin);
+          await loadApiKeyBalance(current, { force: true, silent: false });
+        } finally {
+          apiKeyBalanceInsecureHttpConfirmationPending.delete(account.id);
+        }
+      },
+      onCancel() {
+        apiKeyBalanceInsecureHttpConfirmationPending.delete(account.id);
+      },
+    });
+    return;
+  }
+  await loadApiKeyBalance(account, { force: true, silent: false });
 }
 
 async function handleDetectCurrentAccount(): Promise<void> {
@@ -1551,6 +1791,8 @@ async function handleDelete(account: CodexAccount): Promise<void> {
   deletingId.value = account.id;
   try {
     await deleteCodexAccount(account.id);
+    cancelApiKeyBalancePrefetch();
+    forgetApiKeyBalance(account.id);
     await loadAccounts();
     Message.success(`已删除 ${displayName(account)}`);
   } catch (error) {
@@ -2972,6 +3214,21 @@ watch([sortedAccounts, () => settings.pageSize], () => {
   selectedAccountIds.value = new Set([...selectedAccountIds.value].filter((id) => visible.has(id)));
 });
 
+watch(
+  [
+    () => activeView.value,
+    () => pagedAccounts.value.map((account) => account.id).join("\u0000"),
+  ],
+  ([view]) => {
+    if (view === "accounts") {
+      prefetchVisibleApiKeyBalances();
+    } else {
+      cancelApiKeyBalancePrefetch();
+    }
+  },
+  { immediate: true },
+);
+
 watch(switchRepairVisible, (visible) => {
   if (!visible) clearSwitchRepairCloseTimer();
 });
@@ -2988,6 +3245,15 @@ onMounted(() => {
     nowMs.value = Date.now();
     refreshOverdueQuotaCountdowns();
   }, 1000);
+  apiKeyBalanceRefreshTimer = window.setInterval(() => {
+    if (
+      activeView.value === "accounts" &&
+      apiKeyBalancePrefetchWorkers === 0 &&
+      apiKeyBalancePrefetchQueue.length === 0
+    ) {
+      prefetchVisibleApiKeyBalances();
+    }
+  }, 60_000);
   void getVersion()
     .then((version) => {
       if (version) appVersion.value = version;
@@ -3029,7 +3295,11 @@ onUnmounted(() => {
   if (quotaTimer) window.clearTimeout(quotaTimer);
   if (currentAccountQuotaTimer) window.clearTimeout(currentAccountQuotaTimer);
   if (quotaCountdownTimer) window.clearInterval(quotaCountdownTimer);
+  if (apiKeyBalanceRefreshTimer) window.clearInterval(apiKeyBalanceRefreshTimer);
   if (countdownSettingsPersistTimer) window.clearTimeout(countdownSettingsPersistTimer);
+  cancelApiKeyBalancePrefetch();
+  apiKeyBalanceInsecureHttpApprovals.clear();
+  apiKeyBalanceInsecureHttpConfirmationPending.clear();
 });
 </script>
 
@@ -3094,6 +3364,7 @@ onUnmounted(() => {
         :deleting-id="deletingId"
         :exporting-id="exportingId"
         :quota-refreshing-id="quotaRefreshingId"
+        :api-key-balance-states="apiKeyBalanceStates"
         :privacy-masked="privacyMasked"
         @toggle-account="toggleAccount"
         @toggle-pin="toggleAccountPin"
@@ -3108,6 +3379,7 @@ onUnmounted(() => {
         @open-models="openApiModels"
         @switch-account="handleSwitch"
         @refresh-quota="handleRefreshQuota"
+        @refresh-api-balance="handleRefreshApiKeyBalance"
         @open-export="openExport"
         @confirm-delete="confirmDelete"
         @open-add="openAddModal"
