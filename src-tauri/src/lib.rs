@@ -2441,8 +2441,12 @@ async fn fetch_codex_reset_credits(
 
 fn parse_codex_quota(raw: Value) -> CodexQuota {
     let rate_limit = raw.get("rate_limit");
-    let primary = rate_limit.and_then(|value| value.get("primary_window"));
-    let secondary = rate_limit.and_then(|value| value.get("secondary_window"));
+    let primary = rate_limit
+        .and_then(|value| value.get("primary_window"))
+        .filter(|value| value.is_object());
+    let secondary = rate_limit
+        .and_then(|value| value.get("secondary_window"))
+        .filter(|value| value.is_object());
     let reset_credit_container = raw.get("rate_limit_reset_credits").or_else(|| {
         raw.get("data")
             .and_then(|data| data.get("rate_limit_reset_credits"))
@@ -2909,12 +2913,46 @@ mod tests {
         assert_eq!(quota.reset_credits[1].expires_at, Some(4_102_531_200));
         assert_eq!(quota.reset_credits_next_expires_at, Some(4_102_444_800));
     }
+
+    #[test]
+    fn parse_quota_treats_null_windows_as_absent() {
+        let quota = parse_codex_quota(json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 1,
+                    "limit_window_seconds": 604_800,
+                    "reset_at": 1_786_000_000
+                },
+                "secondary_window": null
+            }
+        }));
+
+        assert_eq!(quota.hourly_window_present, Some(true));
+        assert_eq!(quota.hourly_window_minutes, Some(10_080));
+        assert_eq!(quota.weekly_window_present, Some(false));
+        assert_eq!(quota.weekly_window_minutes, None);
+        assert_eq!(quota.weekly_reset_time, None);
+
+        let empty = parse_codex_quota(json!({
+            "rate_limit": {
+                "primary_window": null,
+                "secondary_window": null
+            }
+        }));
+        assert_eq!(empty.hourly_window_present, Some(false));
+        assert_eq!(empty.weekly_window_present, Some(false));
+    }
 }
 
 pub fn run() {
     tauri::Builder::default()
         .manage(api_service::ApiServiceProcessState::default())
         .manage(api_service::ApiServiceDownloadState::default())
+        .manage(api_service::ApiServiceOperationState::default())
+        .setup(|app| {
+            api_service::start_auto_update_scheduler(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             api_service::api_service_state,
             api_service::api_service_update_settings,
@@ -2990,7 +3028,9 @@ pub fn run() {
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {
                 let process = window.state::<api_service::ApiServiceProcessState>();
-                api_service::shutdown_api_service(process);
+                let download = window.state::<api_service::ApiServiceDownloadState>();
+                let operation = window.state::<api_service::ApiServiceOperationState>();
+                api_service::shutdown_api_service(process, download, operation);
             }
         })
         .run(tauri::generate_context!())

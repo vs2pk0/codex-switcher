@@ -1,18 +1,24 @@
-use crate::account::AccountStore;
+use crate::account::{write_bytes_atomic, AccountStore};
 use flate2::read::GzDecoder;
 use rand::{distributions::Alphanumeric, Rng};
+use semver::Version;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
     io::{self, Read, Write},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, MutexGuard, TryLockError,
+    },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tar::Archive;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -24,12 +30,32 @@ const CLIPROXYAPI_LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest";
 const GITHUB_USER_AGENT: &str = "Codex-Switcher-CPA-Service";
 const DOWNLOAD_PROGRESS_EVENT: &str = "codex-switcher-api-service-download-progress";
+const AUTO_UPDATE_EVENT: &str = "codex-switcher-api-service-auto-update";
+const AUTO_UPDATE_POLL_SECONDS: u64 = 15;
+const MAX_CHECKSUM_MANIFEST_BYTES: usize = 1024 * 1024;
+const MAX_RUNTIME_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_EXTRACTED_RUNTIME_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 4096;
 
 #[derive(Default)]
 pub struct ApiServiceProcessState(pub Mutex<Option<Child>>);
 
 #[derive(Default)]
 pub struct ApiServiceDownloadState(pub Mutex<DownloadControl>);
+
+pub struct ApiServiceOperationState {
+    lock: Mutex<()>,
+    shutting_down: AtomicBool,
+}
+
+impl Default for ApiServiceOperationState {
+    fn default() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            shutting_down: AtomicBool::new(false),
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct DownloadControl {
@@ -128,8 +154,17 @@ pub struct UpdateInfo {
     download_url: Option<String>,
     asset_name: Option<String>,
     has_update: bool,
+    can_apply: bool,
     latest_installed: bool,
     latest_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoUpdateEvent {
+    status: String,
+    update_info: Option<UpdateInfo>,
+    message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -180,12 +215,15 @@ pub fn api_service_state(
 #[tauri::command]
 pub fn api_service_update_settings(
     process: State<'_, ApiServiceProcessState>,
+    operation: State<'_, ApiServiceOperationState>,
     port: u16,
     management_key: String,
     api_keys: Vec<String>,
     auto_update: bool,
     auto_update_interval_hours: u64,
 ) -> Result<ApiServiceState, String> {
+    let _guard = lock_operation(&operation)?;
+    ensure_not_shutting_down(&operation)?;
     if service_pid_for_state(&process)?.is_some() {
         return Err("请先停止 API 服务，再修改端口或密钥".to_string());
     }
@@ -205,7 +243,7 @@ pub fn api_service_update_settings(
     settings.auto_update = auto_update;
     settings.auto_update_interval_hours = auto_update_interval_hours.clamp(1, 24 * 30);
     write_settings(&dirs, &settings)?;
-    if let Some(runtime) = active_runtime(&dirs).ok() {
+    if let Ok(runtime) = active_runtime(&dirs) {
         write_runtime_config(&dirs, &runtime, &settings)?;
     }
     build_state(&process)
@@ -216,14 +254,19 @@ pub fn api_service_start(
     app: AppHandle,
     process: State<'_, ApiServiceProcessState>,
     download: State<'_, ApiServiceDownloadState>,
+    operation: State<'_, ApiServiceOperationState>,
 ) -> Result<ApiServiceState, String> {
-    start_service_impl(&app, &process, &download)
+    let _guard = lock_operation(&operation)?;
+    ensure_not_shutting_down(&operation)?;
+    start_service_impl(&app, &process, &download, &operation)
 }
 
 #[tauri::command]
 pub fn api_service_stop(
     process: State<'_, ApiServiceProcessState>,
+    operation: State<'_, ApiServiceOperationState>,
 ) -> Result<ApiServiceState, String> {
+    let _guard = lock_operation(&operation)?;
     stop_service_impl(&process)?;
     build_state(&process)
 }
@@ -232,7 +275,10 @@ pub fn api_service_stop(
 pub fn api_service_reset(
     process: State<'_, ApiServiceProcessState>,
     download: State<'_, ApiServiceDownloadState>,
+    operation: State<'_, ApiServiceOperationState>,
 ) -> Result<ApiServiceState, String> {
+    let _guard = lock_operation(&operation)?;
+    ensure_not_shutting_down(&operation)?;
     let active_download = download
         .0
         .lock()
@@ -253,13 +299,27 @@ pub fn api_service_reset(
 }
 
 #[tauri::command]
-pub fn api_service_check_update() -> Result<UpdateInfo, String> {
+pub fn api_service_check_update(
+    operation: State<'_, ApiServiceOperationState>,
+) -> Result<UpdateInfo, String> {
+    let _guard = lock_operation(&operation)?;
+    ensure_not_shutting_down(&operation)?;
+    check_update_impl()
+}
+
+fn check_update_impl() -> Result<UpdateInfo, String> {
+    let (_, update) = check_update_with_release_impl()?;
+    Ok(update)
+}
+
+fn check_update_with_release_impl() -> Result<(GitHubRelease, UpdateInfo), String> {
     let dirs = ApiServiceDirs::new()?;
     let release = fetch_latest_release()?;
     let mut settings = read_settings(&dirs)?;
     settings.last_update_check_at = Some(unix_timestamp()?);
     write_settings(&dirs, &settings)?;
-    update_info_from_release(&dirs, &release)
+    let update = update_info_from_release(&dirs, &release)?;
+    Ok((release, update))
 }
 
 #[tauri::command]
@@ -267,30 +327,129 @@ pub fn api_service_download_update(
     app: AppHandle,
     process: State<'_, ApiServiceProcessState>,
     download: State<'_, ApiServiceDownloadState>,
+    operation: State<'_, ApiServiceOperationState>,
 ) -> Result<ApiServiceState, String> {
-    let was_running = service_pid_for_state(&process)?.is_some();
+    let _guard = lock_operation(&operation)?;
+    ensure_not_shutting_down(&operation)?;
+    download_update_impl(&app, &process, &download, &operation)
+}
+
+fn download_update_impl(
+    app: &AppHandle,
+    process: &State<'_, ApiServiceProcessState>,
+    download: &State<'_, ApiServiceDownloadState>,
+    operation: &ApiServiceOperationState,
+) -> Result<ApiServiceState, String> {
+    ensure_not_shutting_down(operation)?;
+    let dirs = ApiServiceDirs::new()?;
+    let release = fetch_latest_release()?;
+    let available = update_info_from_release(&dirs, &release)?;
+    download_update_from_release_impl(app, process, download, operation, &release, &available)
+}
+
+fn download_update_from_release_impl(
+    app: &AppHandle,
+    process: &State<'_, ApiServiceProcessState>,
+    download: &State<'_, ApiServiceDownloadState>,
+    operation: &ApiServiceOperationState,
+    release: &GitHubRelease,
+    available: &UpdateInfo,
+) -> Result<ApiServiceState, String> {
+    let dirs = ApiServiceDirs::new()?;
+    ensure_not_shutting_down(operation)?;
+    if !available.can_apply {
+        return Err(format!(
+            "已拒绝安装 {}：当前版本 {} 不低于该版本",
+            available.latest_version,
+            available.current_version.as_deref().unwrap_or("--")
+        ));
+    }
+    if available.latest_installed {
+        return activate_installed_latest_runtime(app, process, download, operation, available);
+    }
+    let previous_active_version = read_active_version(&dirs)?;
+    let was_running = service_pid_for_state(process)?.is_some();
+    let runtime = download_runtime_from_release(app, process, download, operation, release, false)?;
+    ensure_not_shutting_down(operation)?;
     if was_running {
         emit_download_progress(
-            &app,
+            app,
             "starting",
             "",
             0,
             None,
             Some("正在停止 API 服务以更新"),
         )?;
-        stop_service_impl(&process)?;
+        stop_service_impl(process)?;
     }
-    if let Err(error) = download_latest_runtime(&app, &process, &download, true) {
-        if was_running {
-            let _ = mark_update_check_attempted();
-            let _ = start_service_impl(&app, &process, &download);
-        }
-        return Err(error);
+    if let Err(error) = ensure_not_shutting_down(operation) {
+        return Err(rollback_runtime_switch(
+            app,
+            process,
+            download,
+            operation,
+            &dirs,
+            &previous_active_version,
+            was_running,
+            error,
+        ));
+    }
+    if let Err(error) = write_active_version(&dirs, Some(runtime.id)) {
+        return Err(rollback_runtime_switch(
+            app,
+            process,
+            download,
+            operation,
+            &dirs,
+            &previous_active_version,
+            was_running,
+            error,
+        ));
+    }
+    if operation.shutting_down.load(Ordering::SeqCst) {
+        return Err(rollback_runtime_switch(
+            app,
+            process,
+            download,
+            operation,
+            &dirs,
+            &previous_active_version,
+            was_running,
+            "应用退出期间已取消 API 服务版本切换".to_string(),
+        ));
     }
     let next = if was_running {
-        let next = start_service_impl(&app, &process, &download)?;
+        if let Err(error) = ensure_not_shutting_down(operation) {
+            return Err(rollback_runtime_switch(
+                app,
+                process,
+                download,
+                operation,
+                &dirs,
+                &previous_active_version,
+                was_running,
+                error,
+            ));
+        }
+        let next = match start_service_impl(app, process, download, operation) {
+            Ok(next) => next,
+            Err(start_error) => {
+                let message = rollback_runtime_switch(
+                    app,
+                    process,
+                    download,
+                    operation,
+                    &dirs,
+                    &previous_active_version,
+                    was_running,
+                    format!("新版 API 服务启动失败: {start_error}"),
+                );
+                let _ = emit_download_progress(app, "failed", "", 0, None, Some(&message));
+                return Err(message);
+            }
+        };
         emit_download_progress(
-            &app,
+            app,
             "done",
             "",
             1,
@@ -299,8 +458,8 @@ pub fn api_service_download_update(
         )?;
         next
     } else {
-        let next = build_state(&process)?;
-        emit_download_progress(&app, "done", "", 1, Some(1), Some("API 服务更新已安装"))?;
+        let next = build_state(process)?;
+        emit_download_progress(app, "done", "", 1, Some(1), Some("API 服务更新已安装"))?;
         next
     };
     Ok(next)
@@ -316,6 +475,122 @@ pub fn api_service_cancel_download(
         .map_err(|_| "下载状态锁已损坏".to_string())?;
     if guard.active_id.is_some() {
         guard.cancel_requested = true;
+    }
+    Ok(())
+}
+
+pub fn start_auto_update_scheduler(app: AppHandle) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(5));
+        loop {
+            if app
+                .state::<ApiServiceOperationState>()
+                .shutting_down
+                .load(Ordering::SeqCst)
+            {
+                break;
+            }
+            if let Err(error) = run_scheduled_auto_update(&app) {
+                eprintln!("API service auto update failed: {error}");
+            }
+            thread::sleep(Duration::from_secs(AUTO_UPDATE_POLL_SECONDS));
+        }
+    });
+}
+
+fn run_scheduled_auto_update(app: &AppHandle) -> Result<(), String> {
+    let operation = app.state::<ApiServiceOperationState>();
+    let Some(_guard) = try_lock_operation(&operation)? else {
+        return Ok(());
+    };
+    ensure_not_shutting_down(&operation)?;
+    let dirs = ApiServiceDirs::new()?;
+    let settings = read_settings(&dirs)?;
+    let has_runtimes = !list_runtimes(&dirs)?.is_empty();
+    if !auto_update_due(&settings, has_runtimes, unix_timestamp()?) {
+        return Ok(());
+    }
+
+    // Persist the attempt before the network request so an outage does not cause a tight retry loop.
+    mark_update_check_attempted()?;
+    let (release, update) = match check_update_with_release_impl() {
+        Ok(result) => result,
+        Err(error) => {
+            emit_auto_update_event(app, "failed", None, Some(error.clone()));
+            return Err(error);
+        }
+    };
+    ensure_not_shutting_down(&operation)?;
+    emit_auto_update_event(app, "checked", Some(update.clone()), None);
+
+    if update.latest_active {
+        return Ok(());
+    }
+
+    let should_apply = update.can_apply;
+    if !should_apply {
+        return Ok(());
+    }
+
+    let process = app.state::<ApiServiceProcessState>();
+    let download = app.state::<ApiServiceDownloadState>();
+    let result =
+        download_update_from_release_impl(app, &process, &download, &operation, &release, &update);
+
+    match result {
+        Ok(_) => {
+            let mut applied = update;
+            applied.current_version = Some(applied.latest_version.clone());
+            applied.has_update = false;
+            applied.can_apply = false;
+            applied.latest_installed = true;
+            applied.latest_active = true;
+            emit_auto_update_event(app, "updated", Some(applied), None);
+            Ok(())
+        }
+        Err(error) => {
+            emit_auto_update_event(app, "failed", Some(update), Some(error.clone()));
+            Err(error)
+        }
+    }
+}
+
+fn emit_auto_update_event(
+    app: &AppHandle,
+    status: &str,
+    update_info: Option<UpdateInfo>,
+    message: Option<String>,
+) {
+    let _ = app.emit(
+        AUTO_UPDATE_EVENT,
+        AutoUpdateEvent {
+            status: status.to_string(),
+            update_info,
+            message,
+        },
+    );
+}
+
+fn lock_operation(operation: &ApiServiceOperationState) -> Result<MutexGuard<'_, ()>, String> {
+    operation
+        .lock
+        .lock()
+        .map_err(|_| "API 服务操作锁已损坏".to_string())
+}
+
+fn try_lock_operation(
+    operation: &ApiServiceOperationState,
+) -> Result<Option<MutexGuard<'_, ()>>, String> {
+    match operation.lock.try_lock() {
+        Ok(guard) => Ok(Some(guard)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Poisoned(_)) => Err("API 服务操作锁已损坏".to_string()),
+    }
+}
+
+fn ensure_not_shutting_down(operation: &ApiServiceOperationState) -> Result<(), String> {
+    if operation.shutting_down.load(Ordering::SeqCst) {
+        return Err("应用正在退出，已取消 API 服务操作".to_string());
     }
     Ok(())
 }
@@ -416,15 +691,38 @@ pub fn api_service_delete_bound_accounts(
     })
 }
 
-pub fn shutdown_api_service(process: State<'_, ApiServiceProcessState>) {
-    let _ = stop_service_impl(&process);
+pub fn shutdown_api_service(
+    process: State<'_, ApiServiceProcessState>,
+    download: State<'_, ApiServiceDownloadState>,
+    operation: State<'_, ApiServiceOperationState>,
+) {
+    operation.shutting_down.store(true, Ordering::SeqCst);
+    if let Ok(mut control) = download.0.lock() {
+        control.cancel_requested = true;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match try_lock_operation(&operation) {
+            Ok(Some(_guard)) => {
+                let _ = stop_service_impl(&process);
+                return;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    // Network reads may still be unwinding. Avoid touching persisted state without the
+    // operation lock; the shutdown flag prevents the in-flight update from restarting.
+    let _ = stop_service_process_only(&process);
 }
 
 fn start_service_impl(
     app: &AppHandle,
     process: &State<'_, ApiServiceProcessState>,
     download: &State<'_, ApiServiceDownloadState>,
+    operation: &ApiServiceOperationState,
 ) -> Result<ApiServiceState, String> {
+    ensure_not_shutting_down(operation)?;
     if process_pid(process)?.is_some() {
         return build_state(process);
     }
@@ -432,18 +730,19 @@ fn start_service_impl(
     let dirs = ApiServiceDirs::new()?;
     let mut settings = read_settings(&dirs)?;
     if active_runtime(&dirs).is_err() {
-        download_latest_runtime(app, process, download, true)?;
-    } else if should_auto_update(&dirs, &settings)? {
-        if let Ok(update) = api_service_check_update() {
-            if update.has_update && update.download_url.is_some() {
-                download_latest_runtime(app, process, download, true)?;
-            }
+        let previous_active_version = read_active_version(&dirs)?;
+        let runtime = download_latest_runtime(app, process, download, operation, false)?;
+        ensure_not_shutting_down(operation)?;
+        write_active_version(&dirs, Some(runtime.id))?;
+        if operation.shutting_down.load(Ordering::SeqCst) {
+            write_active_version(&dirs, previous_active_version)?;
+            return Err("应用退出期间已取消 API 服务版本切换".to_string());
         }
     }
 
     let runtime = active_runtime(&dirs)?;
+    ensure_not_shutting_down(operation)?;
     settings.enabled = true;
-    write_settings(&dirs, &settings)?;
     let config_path = write_runtime_config(&dirs, &runtime, &settings)?;
     reject_unmanaged_port_listener(&dirs, settings.port)?;
 
@@ -458,61 +757,271 @@ fn start_service_impl(
         .env("MANAGEMENT_PASSWORD", &settings.management_key);
     hide_command_window(&mut command);
 
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|error| format!("启动 API 服务失败: {}", error))?;
     let pid = child.id();
-    let mut guard = process
-        .0
-        .lock()
-        .map_err(|_| "服务状态锁已损坏".to_string())?;
+    let mut guard = match process.0.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let cleanup = match child.kill() {
+                Ok(()) => child
+                    .wait()
+                    .map(|_| "已终止新进程".to_string())
+                    .unwrap_or_else(|error| format!("等待新进程退出失败: {error}")),
+                Err(error) => format!("终止新进程失败: {error}"),
+            };
+            return Err(format!("服务状态锁已损坏；{cleanup}"));
+        }
+    };
     *guard = Some(child);
     drop(guard);
-    write_managed_pid(&dirs, Some(pid))?;
-    build_state(process)
+    let startup_result = (|| {
+        write_managed_pid(&dirs, Some(pid))?;
+        wait_for_service_ready(process, operation, settings.port, Duration::from_secs(12))?;
+        write_settings(&dirs, &settings)?;
+        build_state(process)
+    })();
+    match startup_result {
+        Ok(state) => Ok(state),
+        Err(error) => {
+            let cleanup_error = stop_service_impl(process).err();
+            Err(match cleanup_error {
+                Some(cleanup_error) => format!("{error}; 启动失败清理异常: {cleanup_error}"),
+                None => error,
+            })
+        }
+    }
+}
+
+fn wait_for_service_ready(
+    process: &State<'_, ApiServiceProcessState>,
+    operation: &ApiServiceOperationState,
+    port: u16,
+    timeout: Duration,
+) -> Result<(), String> {
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let deadline = Instant::now() + timeout;
+    loop {
+        ensure_not_shutting_down(operation)?;
+        if process_pid(process)?.is_none() {
+            return Err("API 服务启动后立即退出".to_string());
+        }
+        if TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("API 服务启动超时，端口 {port} 未就绪"));
+        }
+        thread::sleep(Duration::from_millis(120));
+    }
 }
 
 fn stop_service_impl(process: &State<'_, ApiServiceProcessState>) -> Result<(), String> {
+    let mut failures = Vec::new();
+    if let Err(error) = stop_service_process_only(process) {
+        failures.push(error);
+    }
+    let dirs = match ApiServiceDirs::new() {
+        Ok(dirs) => dirs,
+        Err(error) => {
+            failures.push(error);
+            return Err(failures.join("; "));
+        }
+    };
+    if let Err(error) = write_managed_pid(&dirs, None) {
+        failures.push(error);
+    }
+    match read_settings(&dirs) {
+        Ok(mut settings) => {
+            settings.enabled = false;
+            if let Err(error) = write_settings(&dirs, &settings) {
+                failures.push(error);
+            }
+        }
+        Err(error) => failures.push(error),
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn stop_service_process_only(process: &State<'_, ApiServiceProcessState>) -> Result<(), String> {
+    let mut failures = Vec::new();
     let mut guard = process
         .0
         .lock()
         .map_err(|_| "服务状态锁已损坏".to_string())?;
-    if let Some(child) = guard.as_mut() {
-        child
-            .kill()
-            .map_err(|error| format!("停止 API 服务失败: {}", error))?;
-        child
-            .wait()
-            .map_err(|error| format!("等待 API 服务退出失败: {}", error))?;
+    if let Some(mut child) = guard.take() {
+        match child.kill() {
+            Ok(()) => {
+                if let Err(error) = child.wait() {
+                    failures.push(format!("等待 API 服务退出失败: {error}"));
+                }
+            }
+            Err(error) => failures.push(format!("停止 API 服务失败: {error}")),
+        }
     }
-    *guard = None;
     drop(guard);
 
-    let dirs = ApiServiceDirs::new()?;
-    let managed_pid = read_managed_pid(&dirs)?;
-    if let Some(pid) = managed_pid {
-        terminate_managed_pid(&dirs, pid)?;
+    match ApiServiceDirs::new() {
+        Ok(dirs) => match read_managed_pid(&dirs) {
+            Ok(Some(pid)) => {
+                if let Err(error) = terminate_managed_pid(&dirs, pid) {
+                    failures.push(error);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => failures.push(error),
+        },
+        Err(error) => failures.push(error),
     }
-    write_managed_pid(&dirs, None)?;
-    let mut settings = read_settings(&dirs)?;
-    settings.enabled = false;
-    write_settings(&dirs, &settings)?;
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
-fn should_auto_update(
-    dirs: &ApiServiceDirs,
-    settings: &ApiServiceSettings,
-) -> Result<bool, String> {
-    if !settings.auto_update {
-        return Ok(false);
+fn auto_update_due(settings: &ApiServiceSettings, has_runtimes: bool, now: u64) -> bool {
+    if !settings.auto_update || !has_runtimes {
+        return false;
     }
     let Some(last) = settings.last_update_check_at else {
-        return Ok(true);
+        return true;
     };
-    let now = unix_timestamp()?;
     let interval = settings.auto_update_interval_hours.clamp(1, 24 * 30) * 3600;
-    Ok(now.saturating_sub(last) >= interval && !list_runtimes(dirs)?.is_empty())
+    now.saturating_sub(last) >= interval
+}
+
+fn should_apply_latest_version(current: Option<&str>, latest: &str) -> Result<bool, String> {
+    let latest = parse_semantic_version(latest)?;
+    match current {
+        Some(current) => Ok(latest > parse_semantic_version(current)?),
+        None => Ok(true),
+    }
+}
+
+fn activate_installed_latest_runtime(
+    app: &AppHandle,
+    process: &State<'_, ApiServiceProcessState>,
+    download: &State<'_, ApiServiceDownloadState>,
+    operation: &ApiServiceOperationState,
+    update: &UpdateInfo,
+) -> Result<ApiServiceState, String> {
+    let dirs = ApiServiceDirs::new()?;
+    let targets = current_package_target_aliases();
+    let runtime = list_runtimes(&dirs)?
+        .into_iter()
+        .find(|runtime| {
+            versions_equal(&runtime.version, &update.latest_version)
+                && targets.iter().any(|target| target == &runtime.target)
+        })
+        .ok_or_else(|| "已安装的最新运行时不存在或平台不匹配".to_string())?;
+    let previous_active_version = read_active_version(&dirs)?;
+    let was_running = service_pid_for_state(process)?.is_some();
+    if was_running {
+        stop_service_impl(process)?;
+    }
+    if let Err(error) = ensure_not_shutting_down(operation) {
+        return Err(rollback_runtime_switch(
+            app,
+            process,
+            download,
+            operation,
+            &dirs,
+            &previous_active_version,
+            was_running,
+            error,
+        ));
+    }
+    if let Err(error) = write_active_version(&dirs, Some(runtime.id)) {
+        return Err(rollback_runtime_switch(
+            app,
+            process,
+            download,
+            operation,
+            &dirs,
+            &previous_active_version,
+            was_running,
+            error,
+        ));
+    }
+    if operation.shutting_down.load(Ordering::SeqCst) {
+        return Err(rollback_runtime_switch(
+            app,
+            process,
+            download,
+            operation,
+            &dirs,
+            &previous_active_version,
+            was_running,
+            "应用退出期间已取消 API 服务版本切换".to_string(),
+        ));
+    }
+    if !was_running {
+        return build_state(process);
+    }
+    if let Err(error) = ensure_not_shutting_down(operation) {
+        return Err(rollback_runtime_switch(
+            app,
+            process,
+            download,
+            operation,
+            &dirs,
+            &previous_active_version,
+            was_running,
+            error,
+        ));
+    }
+    match start_service_impl(app, process, download, operation) {
+        Ok(state) => Ok(state),
+        Err(start_error) => Err(rollback_runtime_switch(
+            app,
+            process,
+            download,
+            operation,
+            &dirs,
+            &previous_active_version,
+            was_running,
+            format!("新版 API 服务启动失败: {start_error}"),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rollback_runtime_switch(
+    app: &AppHandle,
+    process: &State<'_, ApiServiceProcessState>,
+    download: &State<'_, ApiServiceDownloadState>,
+    operation: &ApiServiceOperationState,
+    dirs: &ApiServiceDirs,
+    previous_active_version: &Option<String>,
+    was_running: bool,
+    reason: String,
+) -> String {
+    let mut failures = Vec::new();
+    if let Err(error) = stop_service_impl(process) {
+        failures.push(format!("停止失败版本进程异常: {error}"));
+    }
+    if let Err(error) = write_active_version(dirs, previous_active_version.clone()) {
+        failures.push(format!("恢复旧 active 失败: {error}"));
+    } else if was_running && !operation.shutting_down.load(Ordering::SeqCst) {
+        if let Err(error) = start_service_impl(app, process, download, operation) {
+            failures.push(format!("重启旧版本失败: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        if was_running && !operation.shutting_down.load(Ordering::SeqCst) {
+            format!("{reason}，已恢复旧版本")
+        } else {
+            reason
+        }
+    } else {
+        format!("{reason}; {}", failures.join("; "))
+    }
 }
 
 fn mark_update_check_attempted() -> Result<(), String> {
@@ -526,14 +1035,28 @@ fn download_latest_runtime(
     app: &AppHandle,
     process: &State<'_, ApiServiceProcessState>,
     download: &State<'_, ApiServiceDownloadState>,
+    operation: &ApiServiceOperationState,
+    activate: bool,
+) -> Result<RuntimeInfo, String> {
+    let release = fetch_latest_release()?;
+    ensure_not_shutting_down(operation)?;
+    download_runtime_from_release(app, process, download, operation, &release, activate)
+}
+
+fn download_runtime_from_release(
+    app: &AppHandle,
+    process: &State<'_, ApiServiceProcessState>,
+    download: &State<'_, ApiServiceDownloadState>,
+    operation: &ApiServiceOperationState,
+    release: &GitHubRelease,
     activate: bool,
 ) -> Result<RuntimeInfo, String> {
     let _ = process;
-    let download_id = begin_download(download)?;
+    ensure_not_shutting_down(operation)?;
+    let download_id = begin_download(download, operation)?;
     let result = (|| {
         let dirs = ApiServiceDirs::new()?;
-        let release = fetch_latest_release()?;
-        let update = update_info_from_release(&dirs, &release)?;
+        let update = update_info_from_release(&dirs, release)?;
         let asset_name = update
             .asset_name
             .ok_or_else(|| format!("最新版本没有匹配 {} 的安装包", update.target))?;
@@ -548,6 +1071,16 @@ fn download_latest_runtime(
             &asset_name,
             &download_url,
         )?;
+        ensure_not_shutting_down(operation)?;
+        if let Err(error) = verify_release_asset_checksum(release, &asset_name, &package_path) {
+            let _ = fs::remove_file(&package_path);
+            return Err(error);
+        }
+        if let Err(error) = ensure_package_matches_release(&package_path, release) {
+            let _ = fs::remove_file(&package_path);
+            return Err(error);
+        }
+        ensure_not_shutting_down(operation)?;
         emit_download_progress(
             app,
             "installing",
@@ -645,7 +1178,10 @@ fn install_runtime_package(
         .staging_dir
         .join(format!("{}-{}", package.id, unix_timestamp()?));
     fs::create_dir_all(&staging_dir).map_err(|error| format!("创建解包目录失败: {}", error))?;
-    unpack_archive(package_path, &staging_dir)?;
+    if let Err(error) = unpack_archive(package_path, &staging_dir) {
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(error);
+    }
     let staging_binary = runtime_binary_path(&staging_dir);
     if !staging_binary.exists() {
         let _ = fs::remove_dir_all(&staging_dir);
@@ -701,7 +1237,7 @@ fn update_info_from_release(
     dirs: &ApiServiceDirs,
     release: &GitHubRelease,
 ) -> Result<UpdateInfo, String> {
-    let latest_version = normalize_release_version(&release.tag_name);
+    let latest_version = parse_semantic_version(&release.tag_name)?.to_string();
     let targets = current_package_target_aliases();
     let runtimes = list_runtimes(dirs)?;
     let active_version = read_active_version(dirs)?;
@@ -710,19 +1246,18 @@ fn update_info_from_release(
         .and_then(|id| runtimes.iter().find(|runtime| runtime.id == id));
     let current_version = active_runtime.map(|runtime| runtime.version.clone());
     let latest_installed = runtimes.iter().any(|runtime| {
-        normalize_release_version(&runtime.version) == latest_version
+        versions_equal(&runtime.version, &latest_version)
             && targets.iter().any(|target| target == &runtime.target)
     });
     let latest_active = active_runtime.is_some_and(|runtime| {
-        normalize_release_version(&runtime.version) == latest_version
+        versions_equal(&runtime.version, &latest_version)
             && targets.iter().any(|target| target == &runtime.target)
     });
     let asset = release_asset_for_target(release, &latest_version, &targets);
-    let has_update = current_version
-        .as_deref()
-        .map_or(asset.is_some(), |version| {
-            asset.is_some() && !latest_installed && is_newer_version(&latest_version, version)
-        });
+    let can_apply = asset.is_some()
+        && !latest_active
+        && should_apply_latest_version(current_version.as_deref(), &latest_version)?;
+    let has_update = can_apply && !latest_installed;
     Ok(UpdateInfo {
         current_version,
         latest_version,
@@ -731,6 +1266,7 @@ fn update_info_from_release(
         download_url: asset.map(|asset| asset.browser_download_url.clone()),
         asset_name: asset.map(|asset| asset.name.clone()),
         has_update,
+        can_apply,
         latest_installed,
         latest_active,
     })
@@ -755,15 +1291,6 @@ fn release_asset_for_target<'a>(
         .assets
         .iter()
         .find(|asset| exact_names.iter().any(|name| name == &asset.name))
-        .or_else(|| {
-            release.assets.iter().find(|asset| {
-                let name = asset.name.as_str();
-                is_runtime_archive_name(name)
-                    && name.contains("CLIProxyAPI")
-                    && name.contains(version)
-                    && targets.iter().any(|target| name.contains(target))
-            })
-        })
 }
 
 fn download_release_asset(
@@ -806,6 +1333,12 @@ fn download_release_asset(
             ));
         }
         let total_bytes = response.content_length();
+        if total_bytes.is_some_and(|size| size > MAX_RUNTIME_ARCHIVE_BYTES) {
+            return Err(format!(
+                "CLIProxyAPI 安装包超过安全大小限制（最大 {} MiB）",
+                MAX_RUNTIME_ARCHIVE_BYTES / 1024 / 1024
+            ));
+        }
         emit_download_progress(app, "downloading", asset_name, 0, total_bytes, None)?;
         let mut file =
             File::create(&temp_path).map_err(|error| format!("创建下载临时文件失败: {}", error))?;
@@ -830,9 +1363,16 @@ fn download_release_asset(
             if read == 0 {
                 break;
             }
+            let next_downloaded = downloaded_bytes.saturating_add(read as u64);
+            if next_downloaded > MAX_RUNTIME_ARCHIVE_BYTES {
+                return Err(format!(
+                    "CLIProxyAPI 安装包超过安全大小限制（最大 {} MiB）",
+                    MAX_RUNTIME_ARCHIVE_BYTES / 1024 / 1024
+                ));
+            }
             file.write_all(&buffer[..read])
                 .map_err(|error| format!("写入安装包失败: {}", error))?;
-            downloaded_bytes += read as u64;
+            downloaded_bytes = next_downloaded;
             if downloaded_bytes == total_bytes.unwrap_or(0)
                 || downloaded_bytes.saturating_sub(last_emit_bytes) >= 512 * 1024
             {
@@ -857,6 +1397,81 @@ fn download_release_asset(
         let _ = fs::remove_file(&temp_path);
     }
     result
+}
+
+fn verify_release_asset_checksum(
+    release: &GitHubRelease,
+    asset_name: &str,
+    package_path: &Path,
+) -> Result<(), String> {
+    let manifest_asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name.eq_ignore_ascii_case("checksums.txt"))
+        .ok_or_else(|| "最新版本未提供 checksums.txt，已拒绝安装".to_string())?;
+    let response = reqwest::blocking::Client::builder()
+        .user_agent(GITHUB_USER_AGENT)
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|error| format!("初始化校验文件客户端失败: {error}"))?
+        .get(&manifest_asset.browser_download_url)
+        .header("Accept", "text/plain")
+        .send()
+        .map_err(|error| format!("下载 checksums.txt 失败: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("下载 checksums.txt 失败: HTTP {status}"));
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_CHECKSUM_MANIFEST_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("读取 checksums.txt 失败: {error}"))?;
+    if bytes.len() > MAX_CHECKSUM_MANIFEST_BYTES {
+        return Err("checksums.txt 超过安全大小限制".to_string());
+    }
+    let manifest = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("checksums.txt 不是有效 UTF-8: {error}"))?;
+    let expected = checksum_for_asset(manifest, asset_name)
+        .ok_or_else(|| format!("checksums.txt 中缺少 {asset_name} 的 SHA-256"))?;
+
+    let mut file = File::open(package_path).map_err(|error| format!("读取安装包失败: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("计算安装包 SHA-256 失败: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(&expected) {
+        return Err(format!(
+            "安装包 SHA-256 校验失败: 期望 {expected}，实际 {actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn checksum_for_asset(manifest: &str, asset_name: &str) -> Option<String> {
+    manifest.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let checksum = fields.next()?;
+        let file_name = fields.next()?.trim_start_matches('*');
+        if file_name == asset_name
+            && checksum.len() == 64
+            && checksum
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        {
+            Some(checksum.to_ascii_lowercase())
+        } else {
+            None
+        }
+    })
 }
 
 fn cleanup_downloads_dir(dirs: &ApiServiceDirs) -> Result<(), String> {
@@ -973,7 +1588,7 @@ fn emit_download_progress(
     total_bytes: Option<u64>,
     message: Option<&str>,
 ) -> Result<(), String> {
-    app.emit(
+    let _ = app.emit(
         DOWNLOAD_PROGRESS_EVENT,
         DownloadProgressEvent {
             status: status.to_string(),
@@ -982,16 +1597,20 @@ fn emit_download_progress(
             total_bytes,
             message: message.map(ToString::to_string),
         },
-    )
-    .map_err(|error| format!("发送下载进度失败: {}", error))
+    );
+    Ok(())
 }
 
-fn begin_download(download: &State<'_, ApiServiceDownloadState>) -> Result<String, String> {
+fn begin_download(
+    download: &State<'_, ApiServiceDownloadState>,
+    operation: &ApiServiceOperationState,
+) -> Result<String, String> {
     let id = format!("{}-{}", std::process::id(), unix_timestamp()?);
     let mut guard = download
         .0
         .lock()
         .map_err(|_| "下载状态锁已损坏".to_string())?;
+    ensure_not_shutting_down(operation)?;
     if guard.active_id.is_some() {
         return Err("已有下载任务正在进行".to_string());
     }
@@ -1066,10 +1685,18 @@ fn unpack_tar_gz_archive(package_path: &Path, target_dir: &Path) -> Result<(), S
     let file = File::open(package_path).map_err(|error| format!("打开版本包失败: {}", error))?;
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
+    let mut entry_count = 0_usize;
+    let mut extracted_bytes = 0_u64;
     for entry in archive
         .entries()
         .map_err(|error| format!("读取版本包失败: {}", error))?
     {
+        entry_count += 1;
+        if entry_count > MAX_ARCHIVE_ENTRIES {
+            return Err(format!(
+                "版本包条目数量超过安全限制（最大 {MAX_ARCHIVE_ENTRIES}）"
+            ));
+        }
         let mut entry = entry.map_err(|error| format!("读取版本包条目失败: {}", error))?;
         let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
@@ -1085,6 +1712,7 @@ fn unpack_tar_gz_archive(package_path: &Path, target_dir: &Path) -> Result<(), S
         if entry_type.is_dir() {
             fs::create_dir_all(&output_path).map_err(|error| format!("创建目录失败: {}", error))?;
         } else {
+            extracted_bytes = checked_extracted_total(extracted_bytes, entry.size())?;
             if let Some(parent) = output_path.parent() {
                 fs::create_dir_all(parent).map_err(|error| format!("创建目录失败: {}", error))?;
             }
@@ -1100,6 +1728,12 @@ fn unpack_zip_archive(package_path: &Path, target_dir: &Path) -> Result<(), Stri
     let file = File::open(package_path).map_err(|error| format!("打开版本包失败: {}", error))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|error| format!("读取 zip 版本包失败: {}", error))?;
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(format!(
+            "版本包条目数量超过安全限制（最大 {MAX_ARCHIVE_ENTRIES}）"
+        ));
+    }
+    let mut extracted_bytes = 0_u64;
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
@@ -1118,6 +1752,7 @@ fn unpack_zip_archive(package_path: &Path, target_dir: &Path) -> Result<(), Stri
         if !entry.is_file() {
             continue;
         }
+        extracted_bytes = checked_extracted_total(extracted_bytes, entry.size())?;
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent).map_err(|error| format!("创建目录失败: {}", error))?;
         }
@@ -1127,6 +1762,19 @@ fn unpack_zip_archive(package_path: &Path, target_dir: &Path) -> Result<(), Stri
             .map_err(|error| format!("解包 zip 文件失败: {}", error))?;
     }
     Ok(())
+}
+
+fn checked_extracted_total(current: u64, next: u64) -> Result<u64, String> {
+    let total = current
+        .checked_add(next)
+        .ok_or_else(|| "版本包解压大小溢出".to_string())?;
+    if total > MAX_EXTRACTED_RUNTIME_BYTES {
+        return Err(format!(
+            "版本包解压后超过安全大小限制（最大 {} MiB）",
+            MAX_EXTRACTED_RUNTIME_BYTES / 1024 / 1024
+        ));
+    }
+    Ok(total)
 }
 
 fn safe_relative_path(path: &Path) -> Result<PathBuf, String> {
@@ -1181,7 +1829,7 @@ fn list_runtimes(dirs: &ApiServiceDirs) -> Result<Vec<RuntimeInfo>, String> {
             runtimes.push(runtime);
         }
     }
-    runtimes.sort_by(|left, right| right.installed_at.cmp(&left.installed_at));
+    runtimes.sort_by_key(|runtime| std::cmp::Reverse(runtime.installed_at));
     Ok(runtimes)
 }
 
@@ -1327,7 +1975,7 @@ fn write_managed_pid(dirs: &ApiServiceDirs, managed_pid: Option<u32>) -> Result<
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let content = serde_json::to_string_pretty(value)
         .map_err(|error| format!("序列化 JSON 失败: {}", error))?;
-    fs::write(path, content).map_err(|error| format!("写入文件失败: {}", error))
+    write_bytes_atomic(path, content.as_bytes())
 }
 
 fn reject_unmanaged_port_listener(dirs: &ApiServiceDirs, port: u16) -> Result<(), String> {
@@ -1636,11 +2284,24 @@ fn parse_package_info(path: &Path) -> Result<PackageInfo, String> {
     if parts.len() != 3 {
         return Err("版本包命名需匹配 CLIProxyAPI_<version>_<os>_<arch>".to_string());
     }
+    let version = parse_semantic_version(parts[0])?.to_string();
     Ok(PackageInfo {
-        id: format!("{}_{}_{}", parts[0], parts[1], parts[2]),
-        version: parts[0].to_string(),
+        id: format!("{}_{}_{}", version, parts[1], parts[2]),
+        version,
         target: format!("{}_{}", parts[1], parts[2]),
     })
+}
+
+fn ensure_package_matches_release(path: &Path, release: &GitHubRelease) -> Result<(), String> {
+    let package = parse_package_info(path)?;
+    let expected = parse_semantic_version(&release.tag_name)?;
+    let actual = parse_semantic_version(&package.version)?;
+    if actual != expected {
+        return Err(format!(
+            "版本包版本与发布标签不匹配: 发布版本 {expected}，安装包版本 {actual}"
+        ));
+    }
+    Ok(())
 }
 
 fn runtime_binary_path(runtime_path: &Path) -> PathBuf {
@@ -1653,10 +2314,6 @@ fn binary_name() -> &'static str {
     } else {
         BINARY_BASENAME
     }
-}
-
-fn is_runtime_archive_name(name: &str) -> bool {
-    name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".zip")
 }
 
 fn safe_download_file_name(name: &str) -> Result<String, String> {
@@ -1701,43 +2358,19 @@ fn current_package_target_aliases() -> Vec<String> {
 }
 
 fn normalize_release_version(tag: &str) -> String {
-    let trimmed = tag.trim().trim_start_matches(['v', 'V']);
-    if trimmed
-        .chars()
-        .next()
-        .is_some_and(|value| value.is_ascii_digit())
-    {
-        return trimmed.to_string();
-    }
-    trimmed
-        .find(|value: char| value.is_ascii_digit())
-        .map(|index| trimmed[index..].to_string())
-        .unwrap_or_else(|| trimmed.to_string())
+    tag.trim().trim_start_matches(['v', 'V']).to_string()
 }
 
-fn is_newer_version(latest: &str, current: &str) -> bool {
-    let latest_parts = version_number_parts(latest);
-    let current_parts = version_number_parts(current);
-    if latest_parts.is_empty() || current_parts.is_empty() {
-        return normalize_release_version(latest) != normalize_release_version(current);
-    }
-    let length = latest_parts.len().max(current_parts.len());
-    for index in 0..length {
-        let left = latest_parts.get(index).copied().unwrap_or(0);
-        let right = current_parts.get(index).copied().unwrap_or(0);
-        if left != right {
-            return left > right;
-        }
-    }
-    false
+fn parse_semantic_version(value: &str) -> Result<Version, String> {
+    let normalized = normalize_release_version(value);
+    Version::parse(&normalized).map_err(|error| format!("无效的语义化版本 {value:?}: {error}"))
 }
 
-fn version_number_parts(value: &str) -> Vec<u64> {
-    value
-        .split(|part: char| !part.is_ascii_digit())
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| part.parse::<u64>().ok())
-        .collect()
+fn versions_equal(left: &str, right: &str) -> bool {
+    match (parse_semantic_version(left), parse_semantic_version(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn upsert_top_level_scalar(content: &str, key: &str, value: &str) -> String {
@@ -2080,4 +2713,113 @@ impl ApiServiceDirs {
 struct RuntimeInfoInternal {
     path: PathBuf,
     binary_path: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_update_due_requires_enabled_installed_runtime_and_elapsed_interval() {
+        let mut settings = ApiServiceSettings::default();
+        let now = 10_000;
+        assert!(!auto_update_due(&settings, true, now));
+
+        settings.auto_update = true;
+        assert!(!auto_update_due(&settings, false, now));
+        assert!(auto_update_due(&settings, true, now));
+
+        settings.auto_update_interval_hours = 2;
+        settings.last_update_check_at = Some(now - 7_199);
+        assert!(!auto_update_due(&settings, true, now));
+        settings.last_update_check_at = Some(now - 7_200);
+        assert!(auto_update_due(&settings, true, now));
+    }
+
+    #[test]
+    fn auto_update_due_clamps_interval_to_supported_range() {
+        let mut settings = ApiServiceSettings {
+            auto_update: true,
+            auto_update_interval_hours: 0,
+            last_update_check_at: Some(1_000),
+            ..ApiServiceSettings::default()
+        };
+        assert!(!auto_update_due(&settings, true, 4_599));
+        assert!(auto_update_due(&settings, true, 4_600));
+
+        settings.auto_update_interval_hours = 10_000;
+        let max_interval = 24 * 30 * 3600;
+        assert!(!auto_update_due(&settings, true, 1_000 + max_interval - 1));
+        assert!(auto_update_due(&settings, true, 1_000 + max_interval));
+    }
+
+    #[test]
+    fn latest_version_is_only_applied_when_it_is_newer_or_current_is_missing() {
+        assert!(should_apply_latest_version(None, "7.2.71").unwrap());
+        assert!(should_apply_latest_version(Some("7.2.70"), "7.2.71").unwrap());
+        assert!(!should_apply_latest_version(Some("7.2.71"), "7.2.71").unwrap());
+        assert!(!should_apply_latest_version(Some("7.3.0"), "7.2.71").unwrap());
+        assert!(should_apply_latest_version(Some("7.2.71-rc.1"), "7.2.71").unwrap());
+        assert!(should_apply_latest_version(Some("7.2.71"), "7.2.72-rc.1").unwrap());
+        assert!(!should_apply_latest_version(Some("7.2.72"), "7.2.72-rc.1").unwrap());
+        assert!(should_apply_latest_version(Some("not-a-version"), "7.2.71").is_err());
+        assert!(should_apply_latest_version(Some("7.2.71"), "release-latest").is_err());
+    }
+
+    #[test]
+    fn release_asset_matching_requires_the_exact_version_and_target() {
+        let mismatched = GitHubRelease {
+            tag_name: "v7.2.71".to_string(),
+            html_url: String::new(),
+            assets: vec![GitHubAsset {
+                name: "CLIProxyAPI_17.2.710_darwin_aarch64.tar.gz".to_string(),
+                browser_download_url: "https://example.invalid/mismatch".to_string(),
+            }],
+        };
+        assert!(
+            release_asset_for_target(&mismatched, "7.2.71", &["darwin_aarch64".to_string()])
+                .is_none()
+        );
+
+        let matching = GitHubRelease {
+            tag_name: "v7.2.71".to_string(),
+            html_url: String::new(),
+            assets: vec![GitHubAsset {
+                name: "CLIProxyAPI_7.2.71_darwin_aarch64.tar.gz".to_string(),
+                browser_download_url: "https://example.invalid/match".to_string(),
+            }],
+        };
+        assert!(
+            release_asset_for_target(&matching, "7.2.71", &["darwin_aarch64".to_string()])
+                .is_some()
+        );
+        assert!(ensure_package_matches_release(
+            Path::new("CLIProxyAPI_17.2.710_darwin_aarch64.tar.gz"),
+            &matching
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn extracted_runtime_size_is_bounded() {
+        assert_eq!(
+            checked_extracted_total(MAX_EXTRACTED_RUNTIME_BYTES - 1, 1).unwrap(),
+            MAX_EXTRACTED_RUNTIME_BYTES
+        );
+        assert!(checked_extracted_total(MAX_EXTRACTED_RUNTIME_BYTES, 1).is_err());
+        assert!(checked_extracted_total(u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn checksum_manifest_matches_only_the_exact_asset_name() {
+        let manifest = concat!(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  CLIProxyAPI_7.2.71_darwin_aarch64.tar.gz\n",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  CLIProxyAPI_7.2.71_windows_amd64.zip\n",
+        );
+        assert_eq!(
+            checksum_for_asset(manifest, "CLIProxyAPI_7.2.71_windows_amd64.zip").as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(checksum_for_asset(manifest, "CLIProxyAPI_7.2.71.zip"), None);
+    }
 }

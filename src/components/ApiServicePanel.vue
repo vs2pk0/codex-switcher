@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { addCodexAccountWithApiKey, openExternalUrl, type CodexSwitcherSettings } from "../services/codex";
 import { t } from "../i18n";
+import { hasAnyQuotaWindow, hasQuotaWindow } from "../quota";
 import type { CodexAccount } from "../types/codex";
 import PlanBadge from "./PlanBadge.vue";
 import {
+  API_SERVICE_AUTO_UPDATE_EVENT,
   API_SERVICE_DOWNLOAD_PROGRESS_EVENT,
   bindApiServiceAccounts,
   cancelApiServiceDownload,
@@ -19,6 +21,7 @@ import {
   startApiService,
   stopApiService,
   updateApiServiceSettings,
+  type ApiServiceAutoUpdateEvent,
   type ApiServiceBoundAccount,
   type ApiServiceDownloadProgress,
   type ApiServiceState,
@@ -28,6 +31,7 @@ import {
 const props = defineProps<{
   accounts: CodexAccount[];
   settings: CodexSwitcherSettings;
+  active: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -53,8 +57,10 @@ const selectedDeleteEmails = ref<Set<string>>(new Set());
 const boundAccounts = ref<ApiServiceBoundAccount[]>([]);
 const progress = ref<ApiServiceDownloadProgress | null>(null);
 let unlistenProgress: UnlistenFn | null = null;
-let autoUpdateTimer: number | undefined;
+let unlistenAutoUpdate: UnlistenFn | null = null;
+let countdownTimer: number | undefined;
 let progressClearTimer: number | undefined;
+const countdownNow = ref(Date.now());
 
 const form = reactive({
   port: 17877,
@@ -71,7 +77,7 @@ const currentRuntime = computed(() =>
   state.value?.runtimes.find((runtime) => runtime.id === state.value?.activeVersion) || null,
 );
 const canDownloadUpdate = computed(() =>
-  Boolean(updateInfo.value?.downloadUrl && (updateInfo.value.hasUpdate || !updateInfo.value.latestInstalled)),
+  Boolean(updateInfo.value?.downloadUrl && updateInfo.value.canApply),
 );
 const progressPercent = computed(() => {
   const status = progress.value?.status;
@@ -92,6 +98,27 @@ const progressStatus = computed(() => {
   if (progress.value?.status === "failed") return "danger";
   if (progress.value?.status === "done") return "success";
   return "normal";
+});
+const savedAutoUpdateEnabled = computed(() => Boolean(state.value?.installed && state.value.settings.autoUpdate));
+const autoUpdateFormChanged = computed(() =>
+  Boolean(state.value) &&
+  (form.autoUpdate !== Boolean(state.value?.settings.autoUpdate) ||
+    Math.max(1, Math.trunc(Number(form.autoUpdateIntervalHours) || 24)) !==
+      Math.max(1, Number(state.value?.settings.autoUpdateIntervalHours || 24))),
+);
+const autoUpdateToggleChanged = computed(() =>
+  Boolean(state.value) && form.autoUpdate !== Boolean(state.value?.settings.autoUpdate),
+);
+const autoUpdateCountdown = computed(() => {
+  if (autoUpdateToggleChanged.value) return form.autoUpdate ? t("保存后生效") : t("保存后关闭");
+  if (autoUpdateFormChanged.value) return t("保存后生效");
+  if (!savedAutoUpdateEnabled.value) return t("已关闭");
+  const lastCheck = Number(state.value?.settings.lastUpdateCheckAt || 0);
+  if (!lastCheck) return t("即将检测");
+  const intervalSeconds = Math.max(1, Number(state.value?.settings.autoUpdateIntervalHours || 24)) * 3600;
+  const remainingSeconds = Math.max(0, Math.ceil(lastCheck + intervalSeconds - countdownNow.value / 1000));
+  if (remainingSeconds <= 0) return t("等待后台检测");
+  return `${t("距下次检测")} ${formatCountdown(remainingSeconds)}`;
 });
 const progressDetail = computed(() => {
   if (!progress.value) return "";
@@ -140,53 +167,16 @@ function syncForm(next: ApiServiceState): void {
   form.autoUpdateIntervalHours = Math.max(1, Number(next.settings.autoUpdateIntervalHours || 24));
 }
 
-async function refreshState(silent = false): Promise<void> {
+async function refreshState(silent = false, syncSettings = true): Promise<void> {
   loading.value = !silent;
   try {
     const next = await getApiServiceState();
     state.value = next;
-    syncForm(next);
-    scheduleAutoUpdate();
+    if (syncSettings) syncForm(next);
   } catch (error) {
     if (!silent) Message.error(`加载 API 服务失败：${errorText(error)}`);
   } finally {
     loading.value = false;
-  }
-}
-
-function scheduleAutoUpdate(): void {
-  if (autoUpdateTimer) {
-    window.clearTimeout(autoUpdateTimer);
-    autoUpdateTimer = undefined;
-  }
-  const current = state.value;
-  if (!current?.installed || !current.settings.autoUpdate) return;
-  const intervalMs = Math.max(1, current.settings.autoUpdateIntervalHours || 24) * 60 * 60 * 1000;
-  const last = (current.settings.lastUpdateCheckAt || 0) * 1000;
-  const nextAt = last ? last + intervalMs : Date.now() + 5000;
-  const delay = Math.max(5000, nextAt - Date.now());
-  autoUpdateTimer = window.setTimeout(() => {
-    void runAutoUpdate();
-  }, delay);
-}
-
-async function runAutoUpdate(): Promise<void> {
-  if (!state.value?.installed || !state.value.settings.autoUpdate || checking.value || downloading.value) {
-    scheduleAutoUpdate();
-    return;
-  }
-  checking.value = true;
-  try {
-    const nextUpdate = await checkApiServiceUpdate();
-    updateInfo.value = nextUpdate;
-    await refreshState(true);
-    if (nextUpdate.downloadUrl && (nextUpdate.hasUpdate || !nextUpdate.latestInstalled)) {
-      await downloadUpdate();
-    }
-  } catch {
-    scheduleAutoUpdate();
-  } finally {
-    checking.value = false;
   }
 }
 
@@ -202,7 +192,6 @@ async function saveSettings(): Promise<void> {
     });
     state.value = next;
     syncForm(next);
-    scheduleAutoUpdate();
     Message.success(t("API 服务配置已保存"));
   } catch (error) {
     Message.error(`保存失败：${errorText(error)}`);
@@ -246,7 +235,6 @@ async function start(): Promise<void> {
     const next = await startApiService();
     state.value = next;
     syncForm(next);
-    scheduleAutoUpdate();
     progress.value = null;
     Message.success(t("API 服务已开启"));
   } catch (error) {
@@ -263,7 +251,6 @@ async function stop(): Promise<void> {
     const next = await stopApiService();
     state.value = next;
     syncForm(next);
-    scheduleAutoUpdate();
     Message.success(t("API 服务已停止"));
   } catch (error) {
     Message.error(`停止失败：${errorText(error)}`);
@@ -528,7 +515,6 @@ function resetService(): void {
         progress.value = null;
         downloading.value = false;
         syncForm(next);
-        scheduleAutoUpdate();
         Message.success("API 服务已重置");
       } catch (error) {
         Message.error(`重置失败：${errorText(error)}`);
@@ -543,12 +529,13 @@ async function checkUpdate(): Promise<void> {
   checking.value = true;
   try {
     updateInfo.value = await checkApiServiceUpdate();
+    if (progress.value?.status === "failed") progress.value = null;
     if (updateInfo.value.hasUpdate) {
       Message.info(`发现新版本 ${updateInfo.value.latestVersion}`);
     } else {
       Message.success(`当前已是最新版本 ${updateInfo.value.latestVersion}`);
     }
-    await refreshState(true);
+    await refreshState(true, false);
   } catch (error) {
     Message.error(`检测更新失败：${errorText(error)}`);
   } finally {
@@ -572,7 +559,6 @@ async function downloadUpdate(): Promise<void> {
     const next = await downloadApiServiceUpdate();
     state.value = next;
     syncForm(next);
-    scheduleAutoUpdate();
     updateInfo.value = await checkApiServiceUpdate().catch(() => updateInfo.value);
     if (progress.value?.status !== "done") {
       progress.value = {
@@ -696,6 +682,16 @@ function formatTime(seconds?: number | null): string {
   }).format(new Date(seconds * 1000));
 }
 
+function formatCountdown(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.trunc(totalSeconds));
+  const days = Math.floor(seconds / 86_400);
+  const hours = Math.floor((seconds % 86_400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainingSeconds = seconds % 60;
+  const clock = [hours, minutes, remainingSeconds].map((value) => String(value).padStart(2, "0")).join(":");
+  return days > 0 ? `${days} ${t("天")} ${clock}` : clock;
+}
+
 function errorText(error: unknown): string {
   return String(error instanceof Error ? error.message : error).replace(/^Error:\s*/, "");
 }
@@ -715,12 +711,48 @@ onMounted(async () => {
       }
     },
   );
+  unlistenAutoUpdate = await listen<ApiServiceAutoUpdateEvent>(
+    API_SERVICE_AUTO_UPDATE_EVENT,
+    (event) => {
+      if (event.payload.updateInfo) updateInfo.value = event.payload.updateInfo;
+      if (event.payload.status === "failed") {
+        downloading.value = false;
+        progress.value = {
+          status: "failed",
+          assetName: event.payload.updateInfo?.assetName || "CLIProxyAPI",
+          downloadedBytes: progress.value?.downloadedBytes || 0,
+          totalBytes: progress.value?.totalBytes || null,
+          message: event.payload.message || t("自动更新失败"),
+        };
+        Message.warning(`${t("自动更新失败")}：${event.payload.message || t("请稍后手动检测更新")}`);
+      } else if (event.payload.status === "checked") {
+        if (progress.value?.status === "failed") progress.value = null;
+      } else if (event.payload.status === "updated") {
+        downloading.value = false;
+        clearProgressLater();
+      }
+      void refreshState(true, false);
+    },
+  );
+  countdownTimer = window.setInterval(() => {
+    countdownNow.value = Date.now();
+  }, 1000);
   await refreshState();
 });
 
+watch(
+  () => props.active,
+  (active, previous) => {
+    if (active && previous === false) {
+      void refreshState(true, false);
+    }
+  },
+);
+
 onUnmounted(() => {
   unlistenProgress?.();
-  if (autoUpdateTimer) window.clearTimeout(autoUpdateTimer);
+  unlistenAutoUpdate?.();
+  if (countdownTimer) window.clearInterval(countdownTimer);
   if (progressClearTimer) window.clearTimeout(progressClearTimer);
 });
 </script>
@@ -846,7 +878,13 @@ onUnmounted(() => {
                   <a-input-password v-model="form.managementKey" allow-clear />
                 </a-form-item>
                 <a-form-item :label="t('自动更新')">
-                  <a-switch v-model="form.autoUpdate" />
+                  <div class="api-service-auto-update-control">
+                    <a-switch v-model="form.autoUpdate" />
+                    <span :class="{ pending: autoUpdateFormChanged }">
+                      <icon-clock-circle />
+                      {{ autoUpdateCountdown }}
+                    </span>
+                  </div>
                 </a-form-item>
                 <a-form-item :label="t('检测间隔')">
                   <a-input-number
@@ -986,8 +1024,8 @@ onUnmounted(() => {
             <div class="api-service-account-main">
               <strong>{{ accountDisplayName(account) }}</strong>
               <span>OAuth · {{ account.email || account.id }}</span>
-              <div v-if="account.quota" class="api-service-account-quota">
-                <div v-if="account.quota.hourly_window_present !== false" class="api-service-quota-line">
+              <div v-if="account.quota && hasAnyQuotaWindow(account.quota)" class="api-service-account-quota">
+                <div v-if="hasQuotaWindow(account.quota, 'hourly')" class="api-service-quota-line">
                   <span>
                     <icon-calendar v-if="isFreePlanAccount(account)" />
                     <icon-clock-circle v-else />
@@ -1000,7 +1038,7 @@ onUnmounted(() => {
                   <em>{{ quotaResetLeftLabel(account.quota.hourly_reset_time) }}</em>
                 </div>
                 <div
-                  v-if="!isFreePlanAccount(account) && account.quota.weekly_window_present !== false"
+                  v-if="!isFreePlanAccount(account) && hasQuotaWindow(account.quota, 'weekly')"
                   class="api-service-quota-line"
                 >
                   <span><icon-calendar /> {{ t("长周期") }}</span>
@@ -1055,10 +1093,10 @@ onUnmounted(() => {
             <div class="api-service-account-main">
               <strong>{{ account.email }}</strong>
               <span>{{ t("CPA 认证账号") }}</span>
-              <template v-if="boundSourceAccount(account)?.quota">
+              <template v-if="boundSourceAccount(account)?.quota && hasAnyQuotaWindow(boundSourceAccount(account)?.quota)">
                 <div class="api-service-account-quota">
                   <div
-                    v-if="boundSourceAccount(account)!.quota!.hourly_window_present !== false"
+                    v-if="hasQuotaWindow(boundSourceAccount(account)?.quota, 'hourly')"
                     class="api-service-quota-line"
                   >
                     <span>
@@ -1073,7 +1111,7 @@ onUnmounted(() => {
                     <em>{{ quotaResetLeftLabel(boundSourceAccount(account)!.quota!.hourly_reset_time) }}</em>
                   </div>
                   <div
-                    v-if="!isFreePlanAccount(boundSourceAccount(account)!) && boundSourceAccount(account)!.quota!.weekly_window_present !== false"
+                    v-if="!isFreePlanAccount(boundSourceAccount(account)!) && hasQuotaWindow(boundSourceAccount(account)?.quota, 'weekly')"
                     class="api-service-quota-line"
                   >
                     <span><icon-calendar /> {{ t("长周期") }}</span>

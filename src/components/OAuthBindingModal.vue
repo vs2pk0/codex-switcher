@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { t } from "../i18n";
+import { hasAnyQuotaWindow, hasQuotaWindow } from "../quota";
 import type { CodexAccount } from "../types/codex";
 import PlanBadge from "./PlanBadge.vue";
 
@@ -70,8 +71,8 @@ defineEmits<{
               </div>
               <PlanBadge :label="planLabel(oauth)" :badge-class="planClass(oauth)" />
             </div>
-            <div v-if="oauth.quota" class="oauth-bind-quota">
-              <div v-if="oauth.quota.hourly_window_present !== false">
+            <div v-if="oauth.quota && hasAnyQuotaWindow(oauth.quota)" class="oauth-bind-quota">
+              <div v-if="hasQuotaWindow(oauth.quota, 'hourly')">
                 <span>
                   <icon-calendar v-if="isFreePlanAccount(oauth)" />
                   <icon-clock-circle v-else />
@@ -84,7 +85,7 @@ defineEmits<{
                 <em>{{ quotaResetLabel(oauth.quota.hourly_reset_time) }}</em>
               </div>
               <div
-                v-if="!isFreePlanAccount(oauth) && oauth.quota.weekly_window_present !== false"
+                v-if="!isFreePlanAccount(oauth) && hasQuotaWindow(oauth.quota, 'weekly')"
               >
                 <span><icon-calendar /> {{ t("长周期") }}</span>
                 <strong :style="{ color: quotaColor(oauth.quota.weekly_percentage) }">
