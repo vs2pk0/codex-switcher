@@ -4,6 +4,7 @@ import { computed, ref } from "vue";
 import type { CodexSwitcherSettings } from "../services/codex";
 import type { CodexAccount, CodexResetCredit } from "../types/codex";
 import { formatLocalizedDuration, t } from "../i18n";
+import { hasAnyQuotaWindow, hasQuotaWindow } from "../quota";
 import PlanBadge from "./PlanBadge.vue";
 
 const props = defineProps<{
@@ -178,7 +179,7 @@ function canShowQuota(account: CodexAccount): boolean {
 }
 
 function shouldShowQuota(account: CodexAccount): boolean {
-  return canShowQuota(account) && Boolean(account.quota);
+  return canShowQuota(account) && hasAnyQuotaWindow(account.quota);
 }
 
 function shouldShowQuotaError(account: CodexAccount): boolean {
@@ -386,7 +387,7 @@ function maskSecret(value?: string): string {
 }
 
 function canUseResetCredit(account: CodexAccount): boolean {
-  return shouldShowQuota(account) && resetCreditCount(account) > 0;
+  return canShowQuota(account) && Boolean(account.quota) && resetCreditCount(account) > 0;
 }
 
 function resetCreditCount(account: CodexAccount): number {
@@ -749,7 +750,7 @@ function formatTime(value?: number | null): string {
                 <small>{{ t("自动同步") }}</small>
               </div>
               <div class="quota-metrics" :class="{ single: isFreePlanAccount(account) }">
-                <div v-if="account.quota.hourly_window_present !== false" class="quota-metric">
+                <div v-if="hasQuotaWindow(account.quota, 'hourly')" class="quota-metric">
                   <div class="quota-metric-main">
                     <span class="quota-window-label">
                       <icon-calendar v-if="isFreePlanAccount(account)" />
@@ -773,7 +774,7 @@ function formatTime(value?: number | null): string {
                 </div>
 
                 <div
-                  v-if="!isFreePlanAccount(account) && account.quota.weekly_window_present !== false"
+                  v-if="!isFreePlanAccount(account) && hasQuotaWindow(account.quota, 'weekly')"
                   class="quota-metric"
                 >
                   <div class="quota-metric-main">
@@ -798,7 +799,7 @@ function formatTime(value?: number | null): string {
                 </div>
 
                 <div
-                  v-if="isFreePlanAccount(account) && account.quota.hourly_window_present !== false"
+                  v-if="isFreePlanAccount(account) && hasQuotaWindow(account.quota, 'hourly')"
                   class="quota-metric quota-placeholder"
                   aria-hidden="true"
                 />
@@ -983,13 +984,13 @@ function formatTime(value?: number | null): string {
         </button>
         <span v-if="account.id === currentId" class="current-account-pill compact-current">{{ t("当前") }}</span>
         <span v-if="shouldShowQuota(account) && account.quota" class="compact-quota-pair">
-          <span>
+          <span v-if="hasQuotaWindow(account.quota, 'hourly')">
             <i :style="quotaDotStyle(account.quota.hourly_percentage)" />
             {{ quotaPercentLabel(account.quota.hourly_percentage) }}
           </span>
-          <span>
+          <span v-if="!isFreePlanAccount(account) && hasQuotaWindow(account.quota, 'weekly')">
             <i :style="quotaDotStyle(account.quota.weekly_percentage)" />
-            {{ isFreePlanAccount(account) ? "--" : quotaPercentLabel(account.quota.weekly_percentage) }}
+            {{ quotaPercentLabel(account.quota.weekly_percentage) }}
           </span>
         </span>
         <span v-else-if="shouldShowQuotaError(account)" class="compact-quota-error">
@@ -1116,15 +1117,20 @@ function formatTime(value?: number | null): string {
             </td>
             <td>
               <div v-if="shouldShowQuota(account) && account.quota" class="table-quota-stack">
-                <div class="table-quota-line">
-                  <span>{{ isFreePlanAccount(account) ? t("长周期") : "5h" }}</span>
+                <div v-if="hasQuotaWindow(account.quota, 'hourly')" class="table-quota-line">
+                  <span>
+                    {{ quotaWindowShortLabel(account.quota.hourly_window_minutes, isFreePlanAccount(account) ? 43200 : 300) }}
+                  </span>
                   <div><i :style="quotaProgressStyle(account.quota.hourly_percentage)" /></div>
                   <strong :style="{ color: quotaColor(account.quota.hourly_percentage) }">
                     {{ quotaPercentLabel(account.quota.hourly_percentage) }}
                   </strong>
                   <small>{{ quotaResetLeftLabel(account.quota.hourly_reset_time) }}</small>
                 </div>
-                <div v-if="!isFreePlanAccount(account)" class="table-quota-line">
+                <div
+                  v-if="!isFreePlanAccount(account) && hasQuotaWindow(account.quota, 'weekly')"
+                  class="table-quota-line"
+                >
                   <span>{{ t("周配额") }}</span>
                   <div><i :style="quotaProgressStyle(account.quota.weekly_percentage)" /></div>
                   <strong :style="{ color: quotaColor(account.quota.weekly_percentage) }">

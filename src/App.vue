@@ -28,6 +28,7 @@ import SwitchRepairModal from "./components/SwitchRepairModal.vue";
 import UsagePanel from "./components/UsagePanel.vue";
 import { defaultBadgeStyles } from "./constants/badgeStyles";
 import { currentLanguage, formatLocalizedDuration, setLanguage, t } from "./i18n";
+import { quotaWindowForMinutes } from "./quota";
 import {
   addCodexAccountWithApiKey,
   cancelCodexOAuthLogin,
@@ -320,13 +321,17 @@ const sortedAccounts = computed(() => {
   const sortValue = (account: CodexAccount): number => {
     switch (settings.sortMode) {
       case "weekly_quota":
-        return account.quota?.weekly_percentage ?? Number.NEGATIVE_INFINITY;
+        return quotaWindowForMinutes(account.quota, 10_080)?.percentage
+          ?? Number.NEGATIVE_INFINITY;
       case "hourly_quota":
-        return account.quota?.hourly_percentage ?? Number.NEGATIVE_INFINITY;
+        return quotaWindowForMinutes(account.quota, 300)?.percentage
+          ?? Number.NEGATIVE_INFINITY;
       case "weekly_reset":
-        return account.quota?.weekly_reset_time ?? Number.NEGATIVE_INFINITY;
+        return quotaWindowForMinutes(account.quota, 10_080)?.resetTime
+          ?? Number.NEGATIVE_INFINITY;
       case "hourly_reset":
-        return account.quota?.hourly_reset_time ?? Number.NEGATIVE_INFINITY;
+        return quotaWindowForMinutes(account.quota, 300)?.resetTime
+          ?? Number.NEGATIVE_INFINITY;
       case "subscription":
         return dateSortValue(accountSubscriptionUntil(account));
       case "custom":
@@ -3029,7 +3034,13 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <main class="app-shell" :class="{ 'sidebar-disabled': !settings.sidebarEnabled }">
+  <main
+    class="app-shell"
+    :class="{
+      'sidebar-disabled': !settings.sidebarEnabled,
+      'accounts-view': activeView === 'accounts',
+    }"
+  >
     <AppHeader
       :active-view="activeView"
       :sidebar-enabled="settings.sidebarEnabled"
@@ -3070,72 +3081,73 @@ onUnmounted(() => {
       @open-add="openAddModal"
     />
 
-    <AccountList
-      v-if="activeView === 'accounts'"
-      :accounts="pagedAccounts"
-      :has-any-account="accounts.length > 0"
-      :current-id="currentId"
-      :selected-account-ids="selectedAccountIds"
-      :settings="settings"
-      :expanded-layout="expandedLayout"
-      :loading="loading"
-      :switching-id="switchingId"
-      :deleting-id="deletingId"
-      :exporting-id="exportingId"
-      :quota-refreshing-id="quotaRefreshingId"
-      :privacy-masked="privacyMasked"
-      @toggle-account="toggleAccount"
-      @toggle-pin="toggleAccountPin"
-      @drag-start="handleDragStart"
-      @drag-end="handleDragEnd"
-      @drop-account="handleDropAccount"
-      @open-phone="openPhone"
-      @reset-credit="confirmResetCredit"
-      @open-binding="openBinding"
-      @open-official-url="openOfficialUrl"
-      @open-edit="openEdit"
-      @open-models="openApiModels"
-      @switch-account="handleSwitch"
-      @refresh-quota="handleRefreshQuota"
-      @open-export="openExport"
-      @confirm-delete="confirmDelete"
-      @open-add="openAddModal"
-      @copy-email="copyAccountEmail"
-      @reauthorize="openReauthorizeModal"
-    />
-
-    <div v-if="activeView === 'accounts' && sortedAccounts.length" class="pagination-bar">
-      <div class="pagination-selection">
-        <span>{{ t("已选择") }} {{ selectedAccountIdList.length }} {{ t("个账号") }}</span>
-        <a-button
-          v-if="selectedAccountIdList.length"
-          size="mini"
-          type="text"
-          @click="clearSelectedAccounts"
-        >
-          {{ t("清空选择") }}
-        </a-button>
-      </div>
-      <a-pagination
-        v-model:current="currentPage"
-        :total="sortedAccounts.length"
-        :page-size="settings.pageSize"
+    <section v-if="activeView === 'accounts'" class="accounts-page-content">
+      <AccountList
+        :accounts="pagedAccounts"
+        :has-any-account="accounts.length > 0"
+        :current-id="currentId"
+        :selected-account-ids="selectedAccountIds"
+        :settings="settings"
+        :expanded-layout="expandedLayout"
+        :loading="loading"
+        :switching-id="switchingId"
+        :deleting-id="deletingId"
+        :exporting-id="exportingId"
+        :quota-refreshing-id="quotaRefreshingId"
+        :privacy-masked="privacyMasked"
+        @toggle-account="toggleAccount"
+        @toggle-pin="toggleAccountPin"
+        @drag-start="handleDragStart"
+        @drag-end="handleDragEnd"
+        @drop-account="handleDropAccount"
+        @open-phone="openPhone"
+        @reset-credit="confirmResetCredit"
+        @open-binding="openBinding"
+        @open-official-url="openOfficialUrl"
+        @open-edit="openEdit"
+        @open-models="openApiModels"
+        @switch-account="handleSwitch"
+        @refresh-quota="handleRefreshQuota"
+        @open-export="openExport"
+        @confirm-delete="confirmDelete"
+        @open-add="openAddModal"
+        @copy-email="copyAccountEmail"
+        @reauthorize="openReauthorizeModal"
       />
-      <div class="pagination-summary">
-        <span>{{ t("共") }} {{ sortedAccounts.length }} {{ t("条") }}</span>
-        <a-select
-          v-model="settings.pageSize"
-          size="small"
-          class="pagination-page-size"
-          @change="() => { currentPage = 1; saveSettings(); }"
-        >
-          <a-option :value="20">20 {{ t("条/页") }}</a-option>
-          <a-option :value="50">50 {{ t("条/页") }}</a-option>
-          <a-option :value="100">100 {{ t("条/页") }}</a-option>
-          <a-option :value="200">200 {{ t("条/页") }}</a-option>
-        </a-select>
+
+      <div v-if="totalPages > 1" class="pagination-bar">
+        <div class="pagination-selection">
+          <span>{{ t("已选择") }} {{ selectedAccountIdList.length }} {{ t("个账号") }}</span>
+          <a-button
+            v-if="selectedAccountIdList.length"
+            size="mini"
+            type="text"
+            @click="clearSelectedAccounts"
+          >
+            {{ t("清空选择") }}
+          </a-button>
+        </div>
+        <a-pagination
+          v-model:current="currentPage"
+          :total="sortedAccounts.length"
+          :page-size="settings.pageSize"
+        />
+        <div class="pagination-summary">
+          <span>{{ t("共") }} {{ sortedAccounts.length }} {{ t("条") }}</span>
+          <a-select
+            v-model="settings.pageSize"
+            size="small"
+            class="pagination-page-size"
+            @change="() => { currentPage = 1; saveSettings(); }"
+          >
+            <a-option :value="20">20 {{ t("条/页") }}</a-option>
+            <a-option :value="50">50 {{ t("条/页") }}</a-option>
+            <a-option :value="100">100 {{ t("条/页") }}</a-option>
+            <a-option :value="200">200 {{ t("条/页") }}</a-option>
+          </a-select>
+        </div>
       </div>
-    </div>
+    </section>
 
     <SortEditorModal
       v-model:visible="sortEditorVisible"
@@ -3202,7 +3214,8 @@ onUnmounted(() => {
     />
 
     <ApiServicePanel
-      v-if="activeView === 'apiService'"
+      v-show="activeView === 'apiService'"
+      :active="activeView === 'apiService'"
       :accounts="accounts"
       :settings="settings"
       @account-added="loadAccounts"

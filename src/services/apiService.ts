@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export const API_SERVICE_DOWNLOAD_PROGRESS_EVENT = "codex-switcher-api-service-download-progress";
+export const API_SERVICE_AUTO_UPDATE_EVENT = "codex-switcher-api-service-auto-update";
 
 export interface ApiServiceSettings {
   enabled: boolean;
@@ -51,8 +52,15 @@ export interface ApiServiceUpdateInfo {
   downloadUrl?: string | null;
   assetName?: string | null;
   hasUpdate: boolean;
+  canApply: boolean;
   latestInstalled: boolean;
   latestActive: boolean;
+}
+
+export interface ApiServiceAutoUpdateEvent {
+  status: "checked" | "updated" | "failed" | string;
+  updateInfo?: ApiServiceUpdateInfo | null;
+  message?: string | null;
 }
 
 export type ApiServiceDownloadStatus =
