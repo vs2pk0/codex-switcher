@@ -56,6 +56,26 @@ export interface CodexApiKeyModel {
   ownedBy?: string;
 }
 
+export interface CodexApiKeyBalance {
+  provider: string;
+  balanceKind: "wallet" | "key_quota" | "subscription" | "unlimited";
+  availableAmount?: number | null;
+  usedAmount?: number | null;
+  totalAmount?: number | null;
+  currency: string;
+  unlimited: boolean;
+  planName?: string | null;
+}
+
+export type CodexApiKeyBalanceStatus = "loading" | "success" | "error" | "consent_required";
+
+export interface CodexApiKeyBalanceState {
+  status: CodexApiKeyBalanceStatus;
+  balance?: CodexApiKeyBalance;
+  error?: string;
+  fetchedAt: number;
+}
+
 export interface CodexSwitcherBackupFile {
   name: string;
   path: string;
@@ -159,6 +179,16 @@ export function updateCodexApiKeyCredentials(input: {
 
 export function fetchCodexApiKeyModels(accountId: string): Promise<CodexApiKeyModel[]> {
   return invoke("fetch_codex_api_key_models", { accountId });
+}
+
+export function fetchCodexApiKeyBalance(
+  accountId: string,
+  approvedInsecureHttpOrigin?: string,
+): Promise<CodexApiKeyBalance> {
+  return invoke("fetch_codex_api_key_balance", {
+    accountId,
+    approvedInsecureHttpOrigin: approvedInsecureHttpOrigin || null,
+  });
 }
 
 export function checkCodexApiKeyModelAccess(accountId: string): Promise<boolean> {
