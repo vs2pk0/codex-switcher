@@ -2484,8 +2484,12 @@ fn restart_command_targets_codex_app_on_current_platform() {
 
     #[cfg(target_os = "macos")]
     {
+        assert_eq!(_stop_program, "killall");
+        assert!(_stop_args.contains(&"ChatGPT"));
+        assert!(_stop_args.contains(&"Codex"));
         assert_eq!(start_program, "open");
-        assert_eq!(start_args, vec!["-n", "-a", "Codex"]);
+        assert_eq!(start_args, vec!["-b", "com.openai.codex"]);
+        assert!(!start_args.contains(&"-n"));
         assert!(codex_restart_delay_ms() >= 1000);
     }
 

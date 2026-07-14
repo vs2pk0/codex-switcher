@@ -1300,10 +1300,10 @@ pub fn codex_restart_commands() -> (
     #[cfg(target_os = "macos")]
     {
         (
-            "pkill",
-            vec!["-x", "Codex"],
+            "killall",
+            vec!["-q", "ChatGPT", "Codex"],
             "open",
-            vec!["-n", "-a", "Codex"],
+            vec!["-b", "com.openai.codex"],
         )
     }
 
@@ -1458,13 +1458,13 @@ fn restart_codex_app() -> Result<String, String> {
     hide_command_window(&mut start_command);
     let status = start_command
         .status()
-        .map_err(|error| format!("启动 Codex 失败: {}", error))?;
+        .map_err(|error| format!("启动 ChatGPT/Codex 失败: {}", error))?;
     if !status.success() {
         return Err(
-            "启动 Codex 失败：未找到 Codex 桌面应用，请确认已安装并可从开始菜单打开".to_string(),
+            "启动 ChatGPT/Codex 失败：未找到桌面应用，请确认已安装并可正常打开".to_string(),
         );
     }
-    Ok("已尝试重启 Codex".to_string())
+    Ok("已请求重启 ChatGPT/Codex".to_string())
 }
 
 #[cfg(windows)]

@@ -3422,10 +3422,14 @@ mod tests {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(api_service::ApiServiceProcessState::default())
         .manage(api_service::ApiServiceDownloadState::default())
         .manage(api_service::ApiServiceOperationState::default())
         .setup(|app| {
+            if let Err(error) = api_service::prune_api_service_runtimes_on_startup() {
+                eprintln!("API service runtime maintenance failed during startup: {error}");
+            }
             api_service::start_auto_update_scheduler(app.handle().clone());
             Ok(())
         })
@@ -3437,6 +3441,9 @@ pub fn run() {
             api_service::api_service_reset,
             api_service::api_service_check_update,
             api_service::api_service_download_update,
+            api_service::api_service_import_runtime,
+            api_service::api_service_activate_runtime,
+            api_service::api_service_delete_runtime,
             api_service::api_service_cancel_download,
             api_service::api_service_bind_accounts,
             api_service::api_service_list_bound_accounts,

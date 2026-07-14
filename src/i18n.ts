@@ -388,6 +388,49 @@ const en: Record<string, string> = {
   "停止服务": "Stop Service",
   "检测更新": "Check Updates",
   "下载更新": "Download Update",
+  "版本管理": "Version Manager",
+  "API 服务版本管理": "API Service Version Manager",
+  "本地版本": "Local Versions",
+  "更新或导入成功后默认切换到本机最高版本，并保留当前版本和最多 2 个旧版本。":
+    "After an update or import, the highest local version becomes current. The current version and up to two older versions are retained.",
+  "导入本地包": "Import Local Package",
+  "GitHub 更新接口当前限流，可打开“版本管理”导入本地安装包":
+    "GitHub update requests are currently rate-limited. Open Version Manager to import a local package.",
+  "CLIProxyAPI 安装包": "CLIProxyAPI Package",
+  "导入本地版本包": "Import Local Version Package",
+  "手动导入用于 GitHub 限流或网络不可用的情况，不会通过 GitHub checksums 在线校验。请只导入可信的 CLIProxyAPI 官方安装包。导入成功后会自动使用本机最高版本，并仅保留当前版本和 2 个旧版本。":
+    "Manual import is intended for GitHub rate limits or unavailable networks and does not verify GitHub checksums online. Only import trusted official CLIProxyAPI packages. After import, the highest local version becomes current and only the current version plus two older versions are retained.",
+  "确认导入": "Confirm Import",
+  "版本包已导入，已切换到本机最新版本":
+    "The package was imported and the newest local version is now current.",
+  "导入失败：{error}": "Import failed: {error}",
+  "选择版本包失败：{error}": "Could not select the version package: {error}",
+  "切换到 v{version}": "Switch to v{version}",
+  "API 服务正在运行，切换时会自动重启；如果新版本启动失败，将恢复当前版本。是否继续？":
+    "The API service is running and will restart during the switch. If the selected version fails to start, the current version will be restored. Continue?",
+  "切换后，该版本会成为下次启动 API 服务时使用的版本。是否继续？":
+    "This version will be used the next time the API service starts. Continue?",
+  "已切换到 v{version}": "Switched to v{version}",
+  "切换失败：{error}": "Switch failed: {error}",
+  "删除 v{version}": "Delete v{version}",
+  "将删除这个本地运行时版本，当前使用的版本不会受影响。是否继续？":
+    "This local runtime version will be deleted. The current version will not be affected. Continue?",
+  "已删除 v{version}": "Deleted v{version}",
+  "删除失败：{error}": "Delete failed: {error}",
+  "旧版本清理尚未完成：当前有 {count} 个旧版本，最多应保留 {limit} 个。请稍后重试删除。":
+    "Old-version cleanup is incomplete: {count} old versions remain, but at most {limit} should be kept. Please retry deletion later.",
+  "版本": "Version",
+  "平台": "Platform",
+  "导入时间": "Imported At",
+  "包文件": "Package",
+  "状态与操作": "Status & Actions",
+  "设为当前": "Set as Current",
+  "平台不兼容": "Incompatible Platform",
+  "不可删除": "Cannot Delete",
+  "暂无本地版本，可导入 CLIProxyAPI 官方安装包":
+    "No local versions. Import an official CLIProxyAPI package to continue.",
+  "手动导入不会联网校验 GitHub checksums，请只选择可信的官方安装包。":
+    "Manual imports do not verify GitHub checksums online. Only select trusted official packages.",
   "重置服务": "Reset Service",
   "绑定账号": "Bind Accounts",
   "删除账号": "Delete Accounts",
@@ -960,6 +1003,49 @@ const ru: Record<string, string> = {
   "停止服务": "Остановить",
   "检测更新": "Проверить обновления",
   "下载更新": "Скачать обновление",
+  "版本管理": "Управление версиями",
+  "API 服务版本管理": "Версии API-сервиса",
+  "本地版本": "Локальные версии",
+  "更新或导入成功后默认切换到本机最高版本，并保留当前版本和最多 2 个旧版本。":
+    "После обновления или импорта самой новой локальной версии назначается статус текущей; сохраняются текущая и до двух старых версий.",
+  "导入本地包": "Импортировать пакет",
+  "GitHub 更新接口当前限流，可打开“版本管理”导入本地安装包":
+    "Запросы обновлений GitHub временно ограничены. Откройте управление версиями и импортируйте локальный пакет.",
+  "CLIProxyAPI 安装包": "Пакет CLIProxyAPI",
+  "导入本地版本包": "Импорт локальной версии",
+  "手动导入用于 GitHub 限流或网络不可用的情况，不会通过 GitHub checksums 在线校验。请只导入可信的 CLIProxyAPI 官方安装包。导入成功后会自动使用本机最高版本，并仅保留当前版本和 2 个旧版本。":
+    "Ручной импорт предназначен для случаев ограничения GitHub или отсутствия сети и не проверяет GitHub checksums онлайн. Импортируйте только доверенные официальные пакеты CLIProxyAPI. После импорта самой новой локальной версии назначается статус текущей; сохраняются текущая и две старые версии.",
+  "确认导入": "Подтвердить импорт",
+  "版本包已导入，已切换到本机最新版本":
+    "Пакет импортирован, выбрана самая новая локальная версия.",
+  "导入失败：{error}": "Ошибка импорта: {error}",
+  "选择版本包失败：{error}": "Не удалось выбрать пакет версии: {error}",
+  "切换到 v{version}": "Переключиться на v{version}",
+  "API 服务正在运行，切换时会自动重启；如果新版本启动失败，将恢复当前版本。是否继续？":
+    "API-сервис работает и будет перезапущен при переключении. Если выбранная версия не запустится, будет восстановлена текущая версия. Продолжить?",
+  "切换后，该版本会成为下次启动 API 服务时使用的版本。是否继续？":
+    "Эта версия будет использована при следующем запуске API-сервиса. Продолжить?",
+  "已切换到 v{version}": "Выполнено переключение на v{version}",
+  "切换失败：{error}": "Ошибка переключения: {error}",
+  "删除 v{version}": "Удалить v{version}",
+  "将删除这个本地运行时版本，当前使用的版本不会受影响。是否继续？":
+    "Эта локальная версия среды выполнения будет удалена. Текущая версия не изменится. Продолжить?",
+  "已删除 v{version}": "Удалена v{version}",
+  "删除失败：{error}": "Ошибка удаления: {error}",
+  "旧版本清理尚未完成：当前有 {count} 个旧版本，最多应保留 {limit} 个。请稍后重试删除。":
+    "Очистка старых версий не завершена: осталось {count}, допустимо не более {limit}. Повторите удаление позже.",
+  "版本": "Версия",
+  "平台": "Платформа",
+  "导入时间": "Время импорта",
+  "包文件": "Файл пакета",
+  "状态与操作": "Статус и действия",
+  "设为当前": "Сделать текущей",
+  "平台不兼容": "Несовместимая платформа",
+  "不可删除": "Удаление запрещено",
+  "暂无本地版本，可导入 CLIProxyAPI 官方安装包":
+    "Локальных версий нет. Импортируйте официальный пакет CLIProxyAPI.",
+  "手动导入不会联网校验 GitHub checksums，请只选择可信的官方安装包。":
+    "При ручном импорте GitHub checksums не проверяются. Используйте только доверенные официальные пакеты.",
   "重置服务": "Сброс сервиса",
   "绑定账号": "Привязать аккаунты",
   "删除账号": "Удалить аккаунты",

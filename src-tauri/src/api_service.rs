@@ -5,6 +5,8 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    cmp::Ordering as CmpOrdering,
+    collections::HashSet,
     fs::{self, File},
     io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
@@ -36,6 +38,7 @@ const MAX_CHECKSUM_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_RUNTIME_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_EXTRACTED_RUNTIME_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
+const MAX_OLD_RUNTIMES: usize = 2;
 
 #[derive(Default)]
 pub struct ApiServiceProcessState(pub Mutex<Option<Child>>);
@@ -70,6 +73,12 @@ struct PackageInfo {
     target: String,
 }
 
+#[derive(Debug)]
+struct LocalPackageSnapshot {
+    path: PathBuf,
+    directory: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RuntimeMetadata {
@@ -86,6 +95,7 @@ pub struct RuntimeInfo {
     id: String,
     version: String,
     target: String,
+    compatible: bool,
     path: String,
     binary_path: String,
     installed_at: u64,
@@ -142,6 +152,7 @@ pub struct ApiServiceState {
     service: ApiServiceInfo,
     config_path: String,
     installed: bool,
+    maintenance_old_runtime_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -334,6 +345,67 @@ pub fn api_service_download_update(
     download_update_impl(&app, &process, &download, &operation)
 }
 
+#[tauri::command]
+pub fn api_service_import_runtime(
+    app: AppHandle,
+    process: State<'_, ApiServiceProcessState>,
+    download: State<'_, ApiServiceDownloadState>,
+    operation: State<'_, ApiServiceOperationState>,
+    package_path: String,
+) -> Result<ApiServiceState, String> {
+    let _guard = lock_operation(&operation)?;
+    ensure_not_shutting_down(&operation)?;
+    let dirs = ApiServiceDirs::new()?;
+    let snapshot = snapshot_local_runtime_package(&dirs, Path::new(&package_path))?;
+    let install_result = install_runtime_package(&dirs, &snapshot.path, false);
+    if let Err(error) = fs::remove_dir_all(&snapshot.directory) {
+        eprintln!(
+            "failed to clean imported API service package snapshot {}: {error}",
+            display_path(&snapshot.directory)
+        );
+    }
+    install_result?;
+    let latest = latest_compatible_runtime(&dirs)?
+        .ok_or_else(|| "导入后未找到与当前平台兼容的 API 服务版本".to_string())?;
+    switch_active_runtime(&app, &process, &download, &operation, &dirs, &latest.id)
+}
+
+#[tauri::command]
+pub fn api_service_activate_runtime(
+    app: AppHandle,
+    process: State<'_, ApiServiceProcessState>,
+    download: State<'_, ApiServiceDownloadState>,
+    operation: State<'_, ApiServiceOperationState>,
+    runtime_id: String,
+) -> Result<ApiServiceState, String> {
+    let _guard = lock_operation(&operation)?;
+    ensure_not_shutting_down(&operation)?;
+    let dirs = ApiServiceDirs::new()?;
+    switch_active_runtime(
+        &app,
+        &process,
+        &download,
+        &operation,
+        &dirs,
+        runtime_id.trim(),
+    )
+}
+
+#[tauri::command]
+pub fn api_service_delete_runtime(
+    process: State<'_, ApiServiceProcessState>,
+    operation: State<'_, ApiServiceOperationState>,
+    runtime_id: String,
+) -> Result<ApiServiceState, String> {
+    let _guard = lock_operation(&operation)?;
+    ensure_not_shutting_down(&operation)?;
+    let dirs = ApiServiceDirs::new()?;
+    let runtime = installed_runtime_by_id(&dirs, runtime_id.trim())?;
+    ensure_runtime_can_be_deleted(&dirs, &runtime)?;
+    remove_runtime_directory(&dirs, &runtime)?;
+    build_state(&process)
+}
+
 fn download_update_impl(
     app: &AppHandle,
     process: &State<'_, ApiServiceProcessState>,
@@ -364,90 +436,21 @@ fn download_update_from_release_impl(
             available.current_version.as_deref().unwrap_or("--")
         ));
     }
-    if available.latest_installed {
-        return activate_installed_latest_runtime(app, process, download, operation, available);
-    }
-    let previous_active_version = read_active_version(&dirs)?;
     let was_running = service_pid_for_state(process)?.is_some();
-    let runtime = download_runtime_from_release(app, process, download, operation, release, false)?;
+    if !available.latest_installed {
+        download_runtime_from_release(app, process, download, operation, release, false)?;
+    }
     ensure_not_shutting_down(operation)?;
-    if was_running {
-        emit_download_progress(
-            app,
-            "starting",
-            "",
-            0,
-            None,
-            Some("正在停止 API 服务以更新"),
-        )?;
-        stop_service_impl(process)?;
-    }
-    if let Err(error) = ensure_not_shutting_down(operation) {
-        return Err(rollback_runtime_switch(
-            app,
-            process,
-            download,
-            operation,
-            &dirs,
-            &previous_active_version,
-            was_running,
-            error,
-        ));
-    }
-    if let Err(error) = write_active_version(&dirs, Some(runtime.id)) {
-        return Err(rollback_runtime_switch(
-            app,
-            process,
-            download,
-            operation,
-            &dirs,
-            &previous_active_version,
-            was_running,
-            error,
-        ));
-    }
-    if operation.shutting_down.load(Ordering::SeqCst) {
-        return Err(rollback_runtime_switch(
-            app,
-            process,
-            download,
-            operation,
-            &dirs,
-            &previous_active_version,
-            was_running,
-            "应用退出期间已取消 API 服务版本切换".to_string(),
-        ));
-    }
-    let next = if was_running {
-        if let Err(error) = ensure_not_shutting_down(operation) {
-            return Err(rollback_runtime_switch(
-                app,
-                process,
-                download,
-                operation,
-                &dirs,
-                &previous_active_version,
-                was_running,
-                error,
-            ));
+    let latest = latest_compatible_runtime(&dirs)?
+        .ok_or_else(|| "更新后未找到与当前平台兼容的 API 服务版本".to_string())?;
+    let next = match switch_active_runtime(app, process, download, operation, &dirs, &latest.id) {
+        Ok(next) => next,
+        Err(message) => {
+            let _ = emit_download_progress(app, "failed", "", 0, None, Some(&message));
+            return Err(message);
         }
-        let next = match start_service_impl(app, process, download, operation) {
-            Ok(next) => next,
-            Err(start_error) => {
-                let message = rollback_runtime_switch(
-                    app,
-                    process,
-                    download,
-                    operation,
-                    &dirs,
-                    &previous_active_version,
-                    was_running,
-                    format!("新版 API 服务启动失败: {start_error}"),
-                );
-                let _ = emit_download_progress(app, "failed", "", 0, None, Some(&message));
-                return Err(message);
-            }
-        };
+    };
+    if was_running {
         emit_download_progress(
             app,
             "done",
@@ -456,12 +459,9 @@ fn download_update_from_release_impl(
             Some(1),
             Some("API 服务已更新并重新启动"),
         )?;
-        next
     } else {
-        let next = build_state(process)?;
         emit_download_progress(app, "done", "", 1, Some(1), Some("API 服务更新已安装"))?;
-        next
-    };
+    }
     Ok(next)
 }
 
@@ -716,6 +716,16 @@ pub fn shutdown_api_service(
     let _ = stop_service_process_only(&process);
 }
 
+pub fn prune_api_service_runtimes_on_startup() -> Result<(), String> {
+    let dirs = ApiServiceDirs::new()?;
+    if active_runtime(&dirs).is_err() {
+        if let Some(runtime) = latest_compatible_runtime(&dirs)? {
+            write_active_version(&dirs, Some(runtime.id))?;
+        }
+    }
+    prune_old_runtimes(&dirs)
+}
+
 fn start_service_impl(
     app: &AppHandle,
     process: &State<'_, ApiServiceProcessState>,
@@ -731,7 +741,10 @@ fn start_service_impl(
     let mut settings = read_settings(&dirs)?;
     if active_runtime(&dirs).is_err() {
         let previous_active_version = read_active_version(&dirs)?;
-        let runtime = download_latest_runtime(app, process, download, operation, false)?;
+        let runtime = match latest_compatible_runtime(&dirs)? {
+            Some(runtime) => runtime,
+            None => download_latest_runtime(app, process, download, operation, false)?,
+        };
         ensure_not_shutting_down(operation)?;
         write_active_version(&dirs, Some(runtime.id))?;
         if operation.shutting_down.load(Ordering::SeqCst) {
@@ -904,26 +917,37 @@ fn should_apply_latest_version(current: Option<&str>, latest: &str) -> Result<bo
     }
 }
 
-fn activate_installed_latest_runtime(
+fn switch_active_runtime(
     app: &AppHandle,
     process: &State<'_, ApiServiceProcessState>,
     download: &State<'_, ApiServiceDownloadState>,
     operation: &ApiServiceOperationState,
-    update: &UpdateInfo,
+    dirs: &ApiServiceDirs,
+    runtime_id: &str,
 ) -> Result<ApiServiceState, String> {
-    let dirs = ApiServiceDirs::new()?;
-    let targets = current_package_target_aliases();
-    let runtime = list_runtimes(&dirs)?
-        .into_iter()
-        .find(|runtime| {
-            versions_equal(&runtime.version, &update.latest_version)
-                && targets.iter().any(|target| target == &runtime.target)
-        })
-        .ok_or_else(|| "已安装的最新运行时不存在或平台不匹配".to_string())?;
-    let previous_active_version = read_active_version(&dirs)?;
+    ensure_not_shutting_down(operation)?;
+    let runtime = compatible_runtime_by_id(dirs, runtime_id)?;
+    let previous_active_version = read_active_version(dirs)?;
+    if previous_active_version.as_deref() == Some(runtime.id.as_str()) {
+        if let Err(error) = prune_old_runtimes(dirs) {
+            eprintln!("failed to prune old API service runtimes: {error}");
+        }
+        return build_state(process);
+    }
     let was_running = service_pid_for_state(process)?.is_some();
     if was_running {
-        stop_service_impl(process)?;
+        if let Err(error) = stop_service_impl(process) {
+            return Err(rollback_runtime_switch(
+                app,
+                process,
+                download,
+                operation,
+                dirs,
+                &previous_active_version,
+                was_running,
+                format!("停止当前 API 服务失败: {error}"),
+            ));
+        }
     }
     if let Err(error) = ensure_not_shutting_down(operation) {
         return Err(rollback_runtime_switch(
@@ -931,19 +955,19 @@ fn activate_installed_latest_runtime(
             process,
             download,
             operation,
-            &dirs,
+            dirs,
             &previous_active_version,
             was_running,
             error,
         ));
     }
-    if let Err(error) = write_active_version(&dirs, Some(runtime.id)) {
+    if let Err(error) = write_active_version(dirs, Some(runtime.id.clone())) {
         return Err(rollback_runtime_switch(
             app,
             process,
             download,
             operation,
-            &dirs,
+            dirs,
             &previous_active_version,
             was_running,
             error,
@@ -955,13 +979,16 @@ fn activate_installed_latest_runtime(
             process,
             download,
             operation,
-            &dirs,
+            dirs,
             &previous_active_version,
             was_running,
             "应用退出期间已取消 API 服务版本切换".to_string(),
         ));
     }
     if !was_running {
+        if let Err(error) = prune_old_runtimes(dirs) {
+            eprintln!("failed to prune old API service runtimes: {error}");
+        }
         return build_state(process);
     }
     if let Err(error) = ensure_not_shutting_down(operation) {
@@ -970,20 +997,25 @@ fn activate_installed_latest_runtime(
             process,
             download,
             operation,
-            &dirs,
+            dirs,
             &previous_active_version,
             was_running,
             error,
         ));
     }
     match start_service_impl(app, process, download, operation) {
-        Ok(state) => Ok(state),
+        Ok(_) => {
+            if let Err(error) = prune_old_runtimes(dirs) {
+                eprintln!("failed to prune old API service runtimes: {error}");
+            }
+            build_state(process)
+        }
         Err(start_error) => Err(rollback_runtime_switch(
             app,
             process,
             download,
             operation,
-            &dirs,
+            dirs,
             &previous_active_version,
             was_running,
             format!("新版 API 服务启动失败: {start_error}"),
@@ -1111,6 +1143,10 @@ fn build_state(process: &State<'_, ApiServiceProcessState>) -> Result<ApiService
     let settings = read_effective_settings(&dirs)?;
     let runtimes = list_runtimes(&dirs)?;
     let active_version = read_active_version(&dirs)?;
+    let old_runtime_count = runtimes
+        .iter()
+        .filter(|runtime| Some(runtime.id.as_str()) != active_version.as_deref())
+        .count();
     let pid = service_pid_for_state(process)?;
     Ok(ApiServiceState {
         base_dir: display_path(&dirs.base_dir),
@@ -1120,6 +1156,8 @@ fn build_state(process: &State<'_, ApiServiceProcessState>) -> Result<ApiService
         auth_dir: display_path(&api_auth_dir(&dirs)),
         config_path: display_path(&dirs.workspace_dir.join("config.yaml")),
         installed: !runtimes.is_empty(),
+        maintenance_old_runtime_count: (old_runtime_count > MAX_OLD_RUNTIMES)
+            .then_some(old_runtime_count),
         service: ApiServiceInfo {
             running: pid.is_some(),
             pid,
@@ -1132,6 +1170,88 @@ fn build_state(process: &State<'_, ApiServiceProcessState>) -> Result<ApiService
     })
 }
 
+fn snapshot_local_runtime_package(
+    dirs: &ApiServiceDirs,
+    source_path: &Path,
+) -> Result<LocalPackageSnapshot, String> {
+    if source_path.as_os_str().is_empty() {
+        return Err("请选择要导入的 API 服务版本包".to_string());
+    }
+    let source_metadata = fs::symlink_metadata(source_path)
+        .map_err(|error| format!("读取导入版本包失败: {error}"))?;
+    if source_metadata.file_type().is_symlink() {
+        return Err("导入版本包不能是符号链接".to_string());
+    }
+    if !source_metadata.is_file() {
+        return Err("导入版本包必须是普通文件".to_string());
+    }
+    if source_metadata.len() > MAX_RUNTIME_ARCHIVE_BYTES {
+        return Err(format!(
+            "CLIProxyAPI 安装包超过安全大小限制（最大 {} MiB）",
+            MAX_RUNTIME_ARCHIVE_BYTES / 1024 / 1024
+        ));
+    }
+
+    let canonical_source = source_path
+        .canonicalize()
+        .map_err(|error| format!("解析导入版本包路径失败: {error}"))?;
+    let package = parse_package_info(&canonical_source)?;
+    ensure_package_target_matches_current(&package)?;
+    let file_name = canonical_source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "版本包文件名无效".to_string())?;
+    let file_name = safe_download_file_name(file_name)?;
+
+    fs::create_dir_all(&dirs.staging_dir)
+        .map_err(|error| format!("创建导入临时目录失败: {error}"))?;
+    let snapshot_directory = dirs.staging_dir.join(format!(
+        "import-{}-{}",
+        unix_timestamp()?,
+        random_suffix(10)
+    ));
+    fs::create_dir(&snapshot_directory)
+        .map_err(|error| format!("创建导入快照目录失败: {error}"))?;
+    let snapshot_path = snapshot_directory.join(file_name);
+
+    let copy_result = (|| {
+        let mut source = File::open(&canonical_source)
+            .map_err(|error| format!("打开导入版本包失败: {error}"))?;
+        let opened_metadata = source
+            .metadata()
+            .map_err(|error| format!("读取导入版本包元数据失败: {error}"))?;
+        if !opened_metadata.is_file() {
+            return Err("导入版本包必须是普通文件".to_string());
+        }
+        let mut target = File::create(&snapshot_path)
+            .map_err(|error| format!("创建导入版本包快照失败: {error}"))?;
+        let copied = io::copy(
+            &mut Read::by_ref(&mut source).take(MAX_RUNTIME_ARCHIVE_BYTES + 1),
+            &mut target,
+        )
+        .map_err(|error| format!("复制导入版本包失败: {error}"))?;
+        if copied > MAX_RUNTIME_ARCHIVE_BYTES {
+            return Err(format!(
+                "CLIProxyAPI 安装包超过安全大小限制（最大 {} MiB）",
+                MAX_RUNTIME_ARCHIVE_BYTES / 1024 / 1024
+            ));
+        }
+        target
+            .sync_all()
+            .map_err(|error| format!("刷新导入版本包快照失败: {error}"))?;
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        let _ = fs::remove_dir_all(&snapshot_directory);
+        return Err(error);
+    }
+
+    Ok(LocalPackageSnapshot {
+        path: snapshot_path,
+        directory: snapshot_directory,
+    })
+}
+
 fn install_runtime_package(
     dirs: &ApiServiceDirs,
     package_path: &Path,
@@ -1141,17 +1261,7 @@ fn install_runtime_package(
         return Err(format!("版本包不存在: {}", display_path(package_path)));
     }
     let package = parse_package_info(package_path)?;
-    let expected_targets = current_package_target_aliases();
-    if !expected_targets
-        .iter()
-        .any(|target| target == &package.target)
-    {
-        return Err(format!(
-            "版本包平台不匹配: 当前平台需要 {}, 但包是 {}",
-            expected_targets.join(" 或 "),
-            package.target
-        ));
-    }
+    ensure_package_target_matches_current(&package)?;
 
     fs::create_dir_all(&dirs.runtime_dir)
         .map_err(|error| format!("创建运行时目录失败: {}", error))?;
@@ -1174,36 +1284,48 @@ fn install_runtime_package(
         ));
     }
 
-    let staging_dir = dirs
-        .staging_dir
-        .join(format!("{}-{}", package.id, unix_timestamp()?));
+    let staging_dir = dirs.staging_dir.join(format!(
+        "{}-{}-{}",
+        package.id,
+        unix_timestamp()?,
+        random_suffix(8)
+    ));
     fs::create_dir_all(&staging_dir).map_err(|error| format!("创建解包目录失败: {}", error))?;
-    if let Err(error) = unpack_archive(package_path, &staging_dir) {
+    let prepare_result = (|| {
+        unpack_archive(package_path, &staging_dir)?;
+        let staging_binary = runtime_binary_path(&staging_dir);
+        ensure_runtime_binary_is_regular_file(&staging_binary)?;
+        set_executable(&staging_binary)?;
+        ensure_default_config_cache(&staging_dir)?;
+        let package_file = package_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("CLIProxyAPI.tar.gz")
+            .to_string();
+        let metadata = RuntimeMetadata {
+            id: package.id.clone(),
+            version: package.version.clone(),
+            target: package.target.clone(),
+            installed_at: unix_timestamp()?,
+            package_file,
+        };
+        write_json(&staging_dir.join("metadata.json"), &metadata)
+    })();
+    if let Err(error) = prepare_result {
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(error);
     }
-    let staging_binary = runtime_binary_path(&staging_dir);
-    if !staging_binary.exists() {
+    if let Err(error) = fs::rename(&staging_dir, &install_dir) {
         let _ = fs::remove_dir_all(&staging_dir);
-        return Err("版本包中缺少 cli-proxy-api 可执行文件".to_string());
+        return Err(format!("安装运行时失败: {}", error));
     }
-    set_executable(&staging_binary)?;
-    ensure_default_config_cache(&staging_dir)?;
-    let package_file = package_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("CLIProxyAPI.tar.gz")
-        .to_string();
-    let metadata = RuntimeMetadata {
-        id: package.id.clone(),
-        version: package.version,
-        target: package.target,
-        installed_at: unix_timestamp()?,
-        package_file,
+    let runtime = match runtime_from_metadata(&install_dir) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&install_dir);
+            return Err(error);
+        }
     };
-    write_json(&staging_dir.join("metadata.json"), &metadata)?;
-    fs::rename(&staging_dir, &install_dir).map_err(|error| format!("安装运行时失败: {}", error))?;
-    let runtime = runtime_from_metadata(&install_dir)?;
     if activate {
         write_active_version(dirs, Some(runtime.id.clone()))?;
     }
@@ -1799,16 +1921,40 @@ fn active_runtime(dirs: &ApiServiceDirs) -> Result<RuntimeInfoInternal, String> 
 }
 
 fn runtime_by_id(dirs: &ApiServiceDirs, id: &str) -> Result<RuntimeInfoInternal, String> {
-    let path = dirs.runtime_dir.join(id);
-    runtime_metadata(&path)?;
+    let runtime = compatible_runtime_by_id(dirs, id)?;
+    let path = dirs.runtime_dir.join(&runtime.id);
     let binary_path = runtime_binary_path(&path);
-    if !binary_path.exists() {
+    Ok(RuntimeInfoInternal { path, binary_path })
+}
+
+fn compatible_runtime_by_id(dirs: &ApiServiceDirs, id: &str) -> Result<RuntimeInfo, String> {
+    let runtime = installed_runtime_by_id(dirs, id)?;
+    if !runtime_target_is_compatible(&runtime.target) {
         return Err(format!(
-            "运行时缺少可执行文件: {}",
-            display_path(&binary_path)
+            "API 服务版本平台不匹配: 当前平台需要 {}, 但版本是 {}",
+            current_package_target_aliases().join(" 或 "),
+            runtime.target
         ));
     }
-    Ok(RuntimeInfoInternal { path, binary_path })
+    Ok(runtime)
+}
+
+fn installed_runtime_by_id(dirs: &ApiServiceDirs, id: &str) -> Result<RuntimeInfo, String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("API 服务版本 ID 不能为空".to_string());
+    }
+    let runtime = list_runtimes(dirs)?
+        .into_iter()
+        .find(|runtime| runtime.id == id)
+        .ok_or_else(|| format!("API 服务版本不存在: {id}"))?;
+    Ok(runtime)
+}
+
+fn latest_compatible_runtime(dirs: &ApiServiceDirs) -> Result<Option<RuntimeInfo>, String> {
+    Ok(list_runtimes(dirs)?
+        .into_iter()
+        .find(|runtime| runtime_target_is_compatible(&runtime.target)))
 }
 
 fn list_runtimes(dirs: &ApiServiceDirs) -> Result<Vec<RuntimeInfo>, String> {
@@ -1819,38 +1965,163 @@ fn list_runtimes(dirs: &ApiServiceDirs) -> Result<Vec<RuntimeInfo>, String> {
     for entry in
         fs::read_dir(&dirs.runtime_dir).map_err(|error| format!("读取运行时目录失败: {}", error))?
     {
-        let path = entry
-            .map_err(|error| format!("读取运行时条目失败: {}", error))?
-            .path();
-        if !path.is_dir() {
+        let entry = entry.map_err(|error| format!("读取运行时条目失败: {}", error))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("读取运行时条目类型失败: {error}"))?;
+        if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
+        let path = entry.path();
         if let Ok(runtime) = runtime_from_metadata(&path) {
             runtimes.push(runtime);
         }
     }
-    runtimes.sort_by_key(|runtime| std::cmp::Reverse(runtime.installed_at));
+    runtimes.sort_by(compare_runtimes_newest_first);
     Ok(runtimes)
+}
+
+fn compare_runtimes_newest_first(left: &RuntimeInfo, right: &RuntimeInfo) -> CmpOrdering {
+    match (
+        parse_semantic_version(&left.version),
+        parse_semantic_version(&right.version),
+    ) {
+        (Ok(left_version), Ok(right_version)) => right_version
+            .cmp(&left_version)
+            .then_with(|| right.installed_at.cmp(&left.installed_at))
+            .then_with(|| left.id.cmp(&right.id)),
+        (Ok(_), Err(_)) => CmpOrdering::Less,
+        (Err(_), Ok(_)) => CmpOrdering::Greater,
+        (Err(_), Err(_)) => right
+            .installed_at
+            .cmp(&left.installed_at)
+            .then_with(|| left.id.cmp(&right.id)),
+    }
+}
+
+fn retained_runtime_ids(
+    runtimes: &[RuntimeInfo],
+    active_id: &str,
+    max_old_runtimes: usize,
+) -> HashSet<String> {
+    let mut sorted = runtimes.to_vec();
+    sorted.sort_by(compare_runtimes_newest_first);
+    let mut retained = HashSet::new();
+    if sorted.iter().any(|runtime| runtime.id == active_id) {
+        retained.insert(active_id.to_string());
+    }
+    for runtime in sorted
+        .into_iter()
+        .filter(|runtime| runtime.id != active_id)
+        .take(max_old_runtimes)
+    {
+        retained.insert(runtime.id);
+    }
+    retained
+}
+
+fn prune_old_runtimes(dirs: &ApiServiceDirs) -> Result<(), String> {
+    let runtimes = list_runtimes(dirs)?;
+    if runtimes.is_empty() {
+        return Ok(());
+    }
+    let active_id = read_active_version(dirs)?
+        .ok_or_else(|| "当前 API 服务版本为空，已拒绝清理旧版本".to_string())?;
+    compatible_runtime_by_id(dirs, &active_id)?;
+    let compatible = runtimes
+        .iter()
+        .filter(|runtime| runtime_target_is_compatible(&runtime.target))
+        .cloned()
+        .collect::<Vec<_>>();
+    let retained = retained_runtime_ids(&compatible, &active_id, MAX_OLD_RUNTIMES);
+    for runtime in runtimes {
+        if !retained.contains(&runtime.id) {
+            remove_runtime_directory(dirs, &runtime)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_runtime_directory(dirs: &ApiServiceDirs, runtime: &RuntimeInfo) -> Result<(), String> {
+    let runtime_path = dirs.runtime_dir.join(&runtime.id);
+    let metadata = fs::symlink_metadata(&runtime_path)
+        .map_err(|error| format!("读取 API 服务版本目录失败: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("API 服务版本目录不能是符号链接".to_string());
+    }
+    if !metadata.is_dir() {
+        return Err("API 服务版本路径不是目录".to_string());
+    }
+    let runtime_root = dirs
+        .runtime_dir
+        .canonicalize()
+        .map_err(|error| format!("解析 API 服务运行时根目录失败: {error}"))?;
+    let canonical_runtime = runtime_path
+        .canonicalize()
+        .map_err(|error| format!("解析 API 服务版本目录失败: {error}"))?;
+    if canonical_runtime.parent() != Some(runtime_root.as_path()) {
+        return Err("API 服务版本目录不在运行时根目录内，已拒绝删除".to_string());
+    }
+    let verified = runtime_from_metadata(&canonical_runtime)?;
+    if verified.id != runtime.id {
+        return Err("运行时目录校验失败，已拒绝删除".to_string());
+    }
+    fs::remove_dir_all(&canonical_runtime)
+        .map_err(|error| format!("删除 API 服务版本 {} 失败: {error}", runtime.version))
+}
+
+fn ensure_runtime_can_be_deleted(
+    dirs: &ApiServiceDirs,
+    runtime: &RuntimeInfo,
+) -> Result<(), String> {
+    if read_active_version(dirs)?.as_deref() == Some(runtime.id.as_str()) {
+        Err("当前使用中的 API 服务版本不能删除".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn runtime_from_metadata(path: &Path) -> Result<RuntimeInfo, String> {
     let metadata = runtime_metadata(path)?;
-    let binary_path = runtime_binary_path(path);
-    if !binary_path.exists() {
+    let directory_id = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "运行时目录名称无效".to_string())?;
+    if metadata.id != directory_id {
         return Err(format!(
-            "运行时缺少可执行文件: {}",
-            display_path(&binary_path)
+            "运行时元数据 ID 与目录不一致: {} != {}",
+            metadata.id, directory_id
         ));
     }
+    parse_semantic_version(&metadata.version)?;
+    if metadata.id != format!("{}_{}", metadata.version, metadata.target) {
+        return Err("运行时元数据 ID、版本和平台不一致".to_string());
+    }
+    let binary_path = runtime_binary_path(path);
+    ensure_runtime_binary_is_regular_file(&binary_path)?;
     Ok(RuntimeInfo {
         id: metadata.id,
         version: metadata.version,
+        compatible: runtime_target_is_compatible(&metadata.target),
         target: metadata.target,
         path: display_path(path),
         binary_path: display_path(&binary_path),
         installed_at: metadata.installed_at,
         package_file: metadata.package_file,
     })
+}
+
+fn ensure_runtime_binary_is_regular_file(binary_path: &Path) -> Result<(), String> {
+    ensure_regular_file(binary_path, "运行时可执行文件")
+}
+
+fn ensure_regular_file(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("{label}不存在或无法读取 {}: {error}", display_path(path)))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!("{label}必须是普通文件: {}", display_path(path)));
+    }
+    Ok(())
 }
 
 fn runtime_metadata(path: &Path) -> Result<RuntimeMetadata, String> {
@@ -1862,11 +2133,17 @@ fn runtime_metadata(path: &Path) -> Result<RuntimeMetadata, String> {
 
 fn ensure_default_config_cache(runtime_path: &Path) -> Result<PathBuf, String> {
     let cache_path = runtime_path.join(DEFAULT_CONFIG_CACHE);
-    if cache_path.exists() {
-        return Ok(cache_path);
+    match fs::symlink_metadata(&cache_path) {
+        Ok(_) => {
+            ensure_regular_file(&cache_path, "默认配置缓存")?;
+            return Ok(cache_path);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("读取默认配置缓存失败: {error}")),
     }
     let source = packaged_default_config_path(runtime_path)?;
     fs::copy(&source, &cache_path).map_err(|error| format!("缓存默认配置失败: {}", error))?;
+    ensure_regular_file(&cache_path, "默认配置缓存")?;
     Ok(cache_path)
 }
 
@@ -1875,13 +2152,16 @@ fn default_config_path(runtime: &RuntimeInfoInternal) -> Result<PathBuf, String>
 }
 
 fn packaged_default_config_path(runtime_path: &Path) -> Result<PathBuf, String> {
-    let config_path = runtime_path.join("config.yaml");
-    if config_path.exists() {
-        return Ok(config_path);
-    }
-    let example_path = runtime_path.join("config.example.yaml");
-    if example_path.exists() {
-        return Ok(example_path);
+    for name in ["config.yaml", "config.example.yaml"] {
+        let path = runtime_path.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                ensure_regular_file(&path, "打包的默认配置文件")?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("读取打包的默认配置文件失败: {error}")),
+        }
     }
     Err("当前版本缺少默认配置文件".to_string())
 }
@@ -2292,6 +2572,17 @@ fn parse_package_info(path: &Path) -> Result<PackageInfo, String> {
     })
 }
 
+fn ensure_package_target_matches_current(package: &PackageInfo) -> Result<(), String> {
+    if runtime_target_is_compatible(&package.target) {
+        return Ok(());
+    }
+    Err(format!(
+        "版本包平台不匹配: 当前平台需要 {}, 但包是 {}",
+        current_package_target_aliases().join(" 或 "),
+        package.target
+    ))
+}
+
 fn ensure_package_matches_release(path: &Path, release: &GitHubRelease) -> Result<(), String> {
     let package = parse_package_info(path)?;
     let expected = parse_semantic_version(&release.tag_name)?;
@@ -2355,6 +2646,12 @@ fn current_package_target_aliases() -> Vec<String> {
         }
     }
     targets
+}
+
+fn runtime_target_is_compatible(target: &str) -> bool {
+    current_package_target_aliases()
+        .iter()
+        .any(|expected| expected == target)
 }
 
 fn normalize_release_version(tag: &str) -> String {
@@ -2635,9 +2932,13 @@ fn finish_lines(lines: Vec<String>, trailing_newline: bool) -> String {
 }
 
 fn generate_management_key() -> String {
+    random_suffix(32)
+}
+
+fn random_suffix(length: usize) -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
-        .take(32)
+        .take(length)
         .map(char::from)
         .collect()
 }
@@ -2647,11 +2948,7 @@ fn default_api_keys() -> Vec<String> {
 }
 
 fn generate_api_key() -> String {
-    let suffix = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(40)
-        .map(char::from)
-        .collect::<String>();
+    let suffix = random_suffix(40);
     format!("sk-cpa-{suffix}")
 }
 
@@ -2697,8 +2994,13 @@ impl ApiServiceDirs {
         let home = dirs::home_dir()
             .or_else(|| std::env::current_dir().ok())
             .ok_or_else(|| "无法定位用户主目录".to_string())?;
-        let base_dir = home.join(".codex_switcher").join("api-service");
-        Ok(Self {
+        Ok(Self::from_base_dir(
+            home.join(".codex_switcher").join("api-service"),
+        ))
+    }
+
+    fn from_base_dir(base_dir: PathBuf) -> Self {
+        Self {
             runtime_dir: base_dir.join("runtimes"),
             staging_dir: base_dir.join("staging"),
             workspace_dir: base_dir.join("workspace"),
@@ -2706,7 +3008,7 @@ impl ApiServiceDirs {
             settings_path: base_dir.join("settings.json"),
             state_path: base_dir.join("state.json"),
             base_dir,
-        })
+        }
     }
 }
 
@@ -2718,6 +3020,289 @@ struct RuntimeInfoInternal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_runtime(version: &str, target: &str, installed_at: u64) -> RuntimeInfo {
+        let id = format!("{version}_{target}");
+        RuntimeInfo {
+            id: id.clone(),
+            version: version.to_string(),
+            target: target.to_string(),
+            compatible: runtime_target_is_compatible(target),
+            path: format!("/tmp/{id}"),
+            binary_path: format!("/tmp/{id}/{}", binary_name()),
+            installed_at,
+            package_file: format!("CLIProxyAPI_{version}_{target}.zip"),
+        }
+    }
+
+    fn write_test_runtime(
+        dirs: &ApiServiceDirs,
+        version: &str,
+        target: &str,
+        installed_at: u64,
+    ) -> RuntimeInfo {
+        let runtime = test_runtime(version, target, installed_at);
+        let runtime_path = dirs.runtime_dir.join(&runtime.id);
+        fs::create_dir_all(&runtime_path).unwrap();
+        fs::write(runtime_binary_path(&runtime_path), b"test binary").unwrap();
+        fs::write(runtime_path.join("config.example.yaml"), b"port: 8317\n").unwrap();
+        write_json(
+            &runtime_path.join("metadata.json"),
+            &RuntimeMetadata {
+                id: runtime.id.clone(),
+                version: runtime.version.clone(),
+                target: runtime.target.clone(),
+                installed_at,
+                package_file: runtime.package_file.clone(),
+            },
+        )
+        .unwrap();
+        runtime_from_metadata(&runtime_path).unwrap()
+    }
+
+    fn test_dirs() -> (tempfile::TempDir, ApiServiceDirs) {
+        let temporary = tempfile::tempdir().unwrap();
+        let dirs = ApiServiceDirs::from_base_dir(temporary.path().join("api-service"));
+        (temporary, dirs)
+    }
+
+    fn write_test_zip_package(path: &Path) {
+        let file = File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default();
+        archive.start_file(binary_name(), options).unwrap();
+        archive.write_all(b"test binary").unwrap();
+        archive.start_file("config.example.yaml", options).unwrap();
+        archive.write_all(b"port: 8317\n").unwrap();
+        archive.finish().unwrap();
+    }
+
+    fn write_test_zip_with_binary_directory(path: &Path) {
+        let file = File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default();
+        archive
+            .add_directory(format!("{}/", binary_name()), options)
+            .unwrap();
+        archive.start_file("config.example.yaml", options).unwrap();
+        archive.write_all(b"port: 8317\n").unwrap();
+        archive.finish().unwrap();
+    }
+
+    fn write_test_zip_without_config(path: &Path) {
+        let file = File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default();
+        archive.start_file(binary_name(), options).unwrap();
+        archive.write_all(b"test binary").unwrap();
+        archive.finish().unwrap();
+    }
+
+    fn write_test_zip_with_config_cache_directory(path: &Path) {
+        let file = File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default();
+        archive.start_file(binary_name(), options).unwrap();
+        archive.write_all(b"test binary").unwrap();
+        archive
+            .add_directory(format!("{DEFAULT_CONFIG_CACHE}/"), options)
+            .unwrap();
+        archive.finish().unwrap();
+    }
+
+    #[test]
+    fn runtimes_are_sorted_by_semver_not_lexicographically() {
+        let target = current_package_target();
+        let mut runtimes = vec![
+            test_runtime("7.2.9", &target, 30),
+            test_runtime("7.2.10", &target, 10),
+            test_runtime("7.2.10-rc.1", &target, 40),
+        ];
+        runtimes.sort_by(compare_runtimes_newest_first);
+        assert_eq!(
+            runtimes
+                .iter()
+                .map(|runtime| runtime.version.as_str())
+                .collect::<Vec<_>>(),
+            vec!["7.2.10", "7.2.10-rc.1", "7.2.9"]
+        );
+    }
+
+    #[test]
+    fn retention_keeps_active_and_two_newest_other_versions() {
+        let (_temporary, dirs) = test_dirs();
+        let target = current_package_target();
+        let active = write_test_runtime(&dirs, "7.2.60", &target, 1);
+        write_test_runtime(&dirs, "7.2.71", &target, 2);
+        let previous = write_test_runtime(&dirs, "7.2.72", &target, 3);
+        let latest = write_test_runtime(&dirs, "7.2.73", &target, 4);
+        write_active_version(&dirs, Some(active.id.clone())).unwrap();
+
+        prune_old_runtimes(&dirs).unwrap();
+
+        let retained = list_runtimes(&dirs)
+            .unwrap()
+            .into_iter()
+            .map(|runtime| runtime.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(retained.len(), 3);
+        assert!(retained.contains(&active.id));
+        assert!(retained.contains(&previous.id));
+        assert!(retained.contains(&latest.id));
+    }
+
+    #[test]
+    fn latest_compatible_runtime_uses_semver_and_ignores_other_platforms() {
+        let (_temporary, dirs) = test_dirs();
+        let target = current_package_target();
+        write_test_runtime(&dirs, "7.2.9", &target, 20);
+        let latest = write_test_runtime(&dirs, "7.2.10", &target, 10);
+        write_test_runtime(&dirs, "99.0.0", "unsupported_arch", 30);
+
+        assert_eq!(
+            latest_compatible_runtime(&dirs).unwrap().unwrap().id,
+            latest.id
+        );
+    }
+
+    #[test]
+    fn local_package_is_snapshotted_before_installing() {
+        let (temporary, dirs) = test_dirs();
+        let target = current_package_target();
+        let source = temporary
+            .path()
+            .join(format!("CLIProxyAPI_8.0.0_{target}.zip"));
+        write_test_zip_package(&source);
+
+        let snapshot = snapshot_local_runtime_package(&dirs, &source).unwrap();
+        assert!(snapshot.path.starts_with(&dirs.staging_dir));
+        assert_ne!(snapshot.path, source);
+        let installed = install_runtime_package(&dirs, &snapshot.path, false).unwrap();
+        assert_eq!(installed.version, "8.0.0");
+        assert!(Path::new(&installed.binary_path).exists());
+    }
+
+    #[test]
+    fn runtime_package_rejects_a_directory_in_place_of_the_binary() {
+        let (temporary, dirs) = test_dirs();
+        let target = current_package_target();
+        let source = temporary
+            .path()
+            .join(format!("CLIProxyAPI_8.0.0_{target}.zip"));
+        write_test_zip_with_binary_directory(&source);
+
+        let error = install_runtime_package(&dirs, &source, false).unwrap_err();
+        assert!(error.contains("必须是普通文件"));
+        assert!(list_runtimes(&dirs).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_runtime_install_removes_staging_directory() {
+        let (temporary, dirs) = test_dirs();
+        let target = current_package_target();
+        let source = temporary
+            .path()
+            .join(format!("CLIProxyAPI_8.0.0_{target}.zip"));
+        write_test_zip_without_config(&source);
+
+        let error = install_runtime_package(&dirs, &source, false).unwrap_err();
+        assert!(error.contains("缺少默认配置文件"));
+        assert_eq!(fs::read_dir(&dirs.staging_dir).unwrap().count(), 0);
+        assert!(list_runtimes(&dirs).unwrap().is_empty());
+    }
+
+    #[test]
+    fn runtime_package_rejects_a_directory_in_place_of_default_config() {
+        let (temporary, dirs) = test_dirs();
+        let target = current_package_target();
+        let source = temporary
+            .path()
+            .join(format!("CLIProxyAPI_8.0.0_{target}.zip"));
+        write_test_zip_with_config_cache_directory(&source);
+
+        let error = install_runtime_package(&dirs, &source, false).unwrap_err();
+        assert!(error.contains("默认配置缓存必须是普通文件"));
+        assert_eq!(fs::read_dir(&dirs.staging_dir).unwrap().count(), 0);
+        assert!(list_runtimes(&dirs).unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_package_snapshot_rejects_oversized_files() {
+        let (temporary, dirs) = test_dirs();
+        let target = current_package_target();
+        let source = temporary
+            .path()
+            .join(format!("CLIProxyAPI_8.0.0_{target}.zip"));
+        File::create(&source)
+            .unwrap()
+            .set_len(MAX_RUNTIME_ARCHIVE_BYTES + 1)
+            .unwrap();
+
+        let error = snapshot_local_runtime_package(&dirs, &source).unwrap_err();
+        assert!(error.contains("超过安全大小限制"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_package_snapshot_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let (temporary, dirs) = test_dirs();
+        let target = current_package_target();
+        let actual = temporary.path().join("actual.zip");
+        fs::write(&actual, b"not important").unwrap();
+        let link = temporary
+            .path()
+            .join(format!("CLIProxyAPI_8.0.0_{target}.zip"));
+        symlink(&actual, &link).unwrap();
+
+        let error = snapshot_local_runtime_package(&dirs, &link).unwrap_err();
+        assert!(error.contains("不能是符号链接"));
+    }
+
+    #[test]
+    fn runtime_delete_rejects_paths_outside_runtime_root() {
+        let (_temporary, dirs) = test_dirs();
+        fs::create_dir_all(&dirs.runtime_dir).unwrap();
+        let outside = dirs.base_dir.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let malicious = RuntimeInfo {
+            id: "../outside".to_string(),
+            version: "8.0.0".to_string(),
+            target: current_package_target(),
+            compatible: true,
+            path: display_path(&outside),
+            binary_path: display_path(&runtime_binary_path(&outside)),
+            installed_at: 1,
+            package_file: "CLIProxyAPI_8.0.0_test.zip".to_string(),
+        };
+
+        let error = remove_runtime_directory(&dirs, &malicious).unwrap_err();
+        assert!(error.contains("不在运行时根目录内"));
+        assert!(outside.exists());
+    }
+
+    #[test]
+    fn active_runtime_cannot_be_deleted() {
+        let (_temporary, dirs) = test_dirs();
+        let runtime = write_test_runtime(&dirs, "8.0.0", &current_package_target(), 1);
+        write_active_version(&dirs, Some(runtime.id.clone())).unwrap();
+
+        let error = ensure_runtime_can_be_deleted(&dirs, &runtime).unwrap_err();
+        assert!(error.contains("不能删除"));
+    }
+
+    #[test]
+    fn incompatible_runtime_can_still_be_selected_for_deletion() {
+        let (_temporary, dirs) = test_dirs();
+        let runtime = write_test_runtime(&dirs, "8.0.0", "unsupported_arch", 1);
+
+        assert!(compatible_runtime_by_id(&dirs, &runtime.id).is_err());
+        let selected = installed_runtime_by_id(&dirs, &runtime.id).unwrap();
+        ensure_runtime_can_be_deleted(&dirs, &selected).unwrap();
+        remove_runtime_directory(&dirs, &selected).unwrap();
+        assert!(!dirs.runtime_dir.join(runtime.id).exists());
+    }
 
     #[test]
     fn auto_update_due_requires_enabled_installed_runtime_and_elapsed_interval() {
