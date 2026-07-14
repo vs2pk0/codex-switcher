@@ -17,6 +17,7 @@ use session::{
     CodexSessionVisibilityRepairInstanceList, CodexSessionVisibilityRepairProviderList,
     CodexSessionVisibilityRepairSummary, CodexTrashedSessionRecord, SessionStore,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener};
@@ -1543,7 +1544,11 @@ fn write_codex_config_file_to(
         .map_err(|error| format!("创建 Codex 目录失败: {}", error))?;
     let path = codex_config_file_path(codex_home, kind);
     let backup_path = if path.is_file() {
-        let backup_path = path.with_file_name(format!("{}.codex-switcher.bak", kind.file_name()));
+        let backup_path = codex_config_backup_path(codex_home, kind);
+        if let Some(parent) = backup_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("创建 Codex 配置备份目录失败: {}", error))?;
+        }
         std::fs::copy(&path, &backup_path).map_err(|error| {
             format!(
                 "备份 Codex {} 失败 ({}): {}",
@@ -2110,9 +2115,37 @@ fn codex_list_session_visibility_repair_providers(
 }
 
 fn switcher_data_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("CODEX_SWITCHER_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        return path;
+    }
+    default_switcher_data_dir()
+}
+
+#[cfg(test)]
+fn default_switcher_data_dir() -> PathBuf {
+    test_switcher_data_dir()
+}
+
+#[cfg(not(test))]
+fn default_switcher_data_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .join(".codex_switcher")
+}
+
+#[cfg(test)]
+fn test_switcher_data_dir() -> PathBuf {
+    let thread_id = format!("{:?}", std::thread::current().id())
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric())
+        .collect::<String>();
+    std::env::temp_dir()
+        .join("codex-switcher-tests")
+        .join(format!("{}-{}", std::process::id(), thread_id))
 }
 
 fn switcher_account_dir() -> PathBuf {
@@ -2123,6 +2156,14 @@ fn switcher_session_dir() -> PathBuf {
     switcher_data_dir().join("session")
 }
 
+fn switcher_session_trash_dir() -> PathBuf {
+    switcher_data_dir().join("session-trash")
+}
+
+fn codex_session_trash_dir(codex_home: &Path) -> PathBuf {
+    switcher_session_trash_dir().join(short_hash(&codex_home.to_string_lossy()))
+}
+
 fn switcher_statistics_dir() -> PathBuf {
     switcher_data_dir().join("statistics")
 }
@@ -2131,8 +2172,27 @@ fn switcher_config_data_dir() -> PathBuf {
     switcher_data_dir().join("data")
 }
 
+fn switcher_config_backup_dir() -> PathBuf {
+    switcher_data_dir().join("config-backups")
+}
+
+fn codex_config_backup_path(codex_home: &Path, kind: CodexConfigFileKind) -> PathBuf {
+    switcher_config_backup_dir()
+        .join(short_hash(&codex_home.to_string_lossy()))
+        .join(format!("{}.codex-switcher.bak", kind.file_name()))
+}
+
 fn switcher_backup_dir() -> PathBuf {
     switcher_data_dir().join("backup")
+}
+
+fn short_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    digest
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .take(12)
+        .collect()
 }
 
 fn ensure_switcher_data_dirs() -> Result<(), String> {
@@ -2250,6 +2310,50 @@ fn add_directory_to_backup_zip(
     Ok(())
 }
 
+fn add_directory_to_backup_zip_skipping_shadow(
+    zip: &mut zip::ZipWriter<std::fs::File>,
+    root: &Path,
+    current: &Path,
+    shadow_root: &Path,
+    archive_prefix: &str,
+    options: zip::write::FileOptions,
+) -> Result<(), String> {
+    if !current.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(current)
+        .map_err(|error| format!("读取备份数据目录失败 ({}): {}", current.display(), error))?
+    {
+        let path = entry
+            .map_err(|error| format!("读取备份数据文件失败: {}", error))?
+            .path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| format!("计算备份相对路径失败: {}", error))?;
+        if path.is_dir() {
+            add_directory_to_backup_zip_skipping_shadow(
+                zip,
+                root,
+                &path,
+                shadow_root,
+                archive_prefix,
+                options,
+            )?;
+            continue;
+        }
+        if shadow_root.join(relative).exists() {
+            continue;
+        }
+        let name = format!(
+            "{}/{}",
+            archive_prefix.trim_matches('/'),
+            relative.to_string_lossy().replace('\\', "/")
+        );
+        add_file_to_backup_zip(zip, &path, &name, options)?;
+    }
+    Ok(())
+}
+
 fn add_file_to_backup_zip(
     zip: &mut zip::ZipWriter<std::fs::File>,
     path: &Path,
@@ -2273,6 +2377,7 @@ fn add_codex_sessions_to_backup_zip(
     progress: &mut impl FnMut(u8, &str),
 ) -> Result<(), String> {
     let codex_home = default_codex_home();
+    migrate_legacy_session_trash(&codex_home);
     progress(55, "正在备份会话文件...");
     add_directory_to_backup_zip(
         zip,
@@ -2283,12 +2388,21 @@ fn add_codex_sessions_to_backup_zip(
         options,
     )?;
     progress(82, "正在备份会话回收站...");
+    let session_trash_dir = codex_session_trash_dir(&codex_home);
     add_directory_to_backup_zip(
         zip,
-        &codex_home.join(".codex-switcher").join("session-trash"),
-        &codex_home.join(".codex-switcher").join("session-trash"),
+        &session_trash_dir,
+        &session_trash_dir,
         "codex/session-trash",
         &[],
+        options,
+    )?;
+    add_directory_to_backup_zip_skipping_shadow(
+        zip,
+        &legacy_session_trash_dir(&codex_home),
+        &legacy_session_trash_dir(&codex_home),
+        &session_trash_dir,
+        "codex/session-trash",
         options,
     )?;
     progress(88, "正在备份会话索引...");
@@ -2304,12 +2418,58 @@ fn add_codex_sessions_to_backup_zip(
 }
 
 fn codex_session_backup_summary(codex_home: &Path) -> Value {
+    migrate_legacy_session_trash(codex_home);
     serde_json::json!({
         "sessionsDir": codex_home.join("sessions").to_string_lossy().to_string(),
         "sessionFiles": count_files_under(&codex_home.join("sessions")),
-        "trashedSessionFiles": count_files_under(&codex_home.join(".codex-switcher").join("session-trash")),
+        "trashedSessionFiles": count_session_trash_backup_files(codex_home),
         "includesSessionIndex": codex_home.join("session_index.jsonl").is_file(),
     })
+}
+
+fn legacy_session_trash_dir(codex_home: &Path) -> PathBuf {
+    codex_home.join(".codex-switcher").join("session-trash")
+}
+
+fn migrate_legacy_session_trash(codex_home: &Path) {
+    migrate_directory_files(
+        &legacy_session_trash_dir(codex_home),
+        &codex_session_trash_dir(codex_home),
+    );
+}
+
+fn migrate_directory_files(from: &Path, to: &Path) {
+    if !from.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return;
+    };
+    if std::fs::create_dir_all(to).is_err() {
+        return;
+    }
+    for entry in entries.flatten() {
+        let source = entry.path();
+        if !source.is_file() {
+            continue;
+        }
+        let Some(file_name) = source.file_name() else {
+            continue;
+        };
+        let target = to.join(file_name);
+        if target.exists() {
+            continue;
+        }
+        if std::fs::rename(&source, &target).is_err() && std::fs::copy(&source, &target).is_ok() {
+            let _ = std::fs::remove_file(&source);
+        }
+    }
+}
+
+fn count_session_trash_backup_files(codex_home: &Path) -> usize {
+    let primary = codex_session_trash_dir(codex_home);
+    let legacy = legacy_session_trash_dir(codex_home);
+    count_files_under(&primary) + count_files_under_skipping_shadow(&legacy, &legacy, &primary)
 }
 
 fn switcher_statistics_backup_summary() -> Value {
@@ -2344,6 +2504,35 @@ fn count_files_under(path: &Path) -> usize {
                 1
             } else {
                 0
+            }
+        })
+        .sum()
+}
+
+fn count_files_under_skipping_shadow(root: &Path, current: &Path, shadow_root: &Path) -> usize {
+    if !current.exists() {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(current) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                return count_files_under_skipping_shadow(root, &path, shadow_root);
+            }
+            if !path.is_file() {
+                return 0;
+            }
+            let Ok(relative) = path.strip_prefix(root) else {
+                return 0;
+            };
+            if shadow_root.join(relative).exists() {
+                0
+            } else {
+                1
             }
         })
         .sum()
@@ -2408,12 +2597,7 @@ fn backup_session_entry_restore_target(name: &str) -> Option<PathBuf> {
         .or_else(|| {
             normalized
                 .strip_prefix("codex/session-trash/")
-                .map(|relative| {
-                    codex_home
-                        .join(".codex-switcher")
-                        .join("session-trash")
-                        .join(relative)
-                })
+                .map(|relative| codex_session_trash_dir(&codex_home).join(relative))
         })
         .or_else(|| {
             ["session_index.jsonl", "session_index.jsonl.bak"]
@@ -3015,10 +3199,10 @@ fn compact_http_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_entry_restore_target, default_codex_home, format_codex_config_content,
-        parse_codex_api_key_models, parse_codex_quota, read_codex_config_file_from,
-        rollback_file_on_error, switcher_data_dir, write_codex_config_file_to, CodexApiKeyModel,
-        CodexConfigFileKind,
+        backup_entry_restore_target, codex_config_backup_path, codex_session_trash_dir,
+        default_codex_home, format_codex_config_content, parse_codex_api_key_models,
+        parse_codex_quota, read_codex_config_file_from, rollback_file_on_error, switcher_data_dir,
+        write_codex_config_file_to, CodexApiKeyModel, CodexConfigFileKind,
     };
     use serde_json::json;
     use tempfile::tempdir;
@@ -3261,8 +3445,11 @@ mod tests {
         write_codex_config_file_to(codex.path(), CodexConfigFileKind::AuthJson, second_auth)
             .expect("replace auth");
         assert_eq!(
-            std::fs::read_to_string(codex.path().join("auth.json.codex-switcher.bak"))
-                .expect("read auth backup"),
+            std::fs::read_to_string(codex_config_backup_path(
+                codex.path(),
+                CodexConfigFileKind::AuthJson
+            ))
+            .expect("read auth backup"),
             first_auth
         );
 
@@ -3318,6 +3505,10 @@ mod tests {
             Some(default_codex_home().join("session_index.jsonl"))
         );
         assert_eq!(
+            backup_entry_restore_target("codex/session-trash/session.jsonl"),
+            Some(codex_session_trash_dir(&default_codex_home()).join("session.jsonl"))
+        );
+        assert_eq!(
             backup_entry_restore_target("data/accounts.json"),
             Some(switcher_data_dir().join("accounts.json"))
         );
@@ -3342,6 +3533,77 @@ mod tests {
         ] {
             assert_eq!(backup_entry_restore_target(name), None);
         }
+    }
+
+    #[test]
+    fn legacy_session_trash_backup_skips_shadowed_files_only() {
+        let temp = tempdir().expect("backup tempdir");
+        let legacy = temp.path().join("legacy-trash");
+        let shadow = temp.path().join("new-trash");
+        std::fs::create_dir_all(legacy.join("nested")).expect("legacy nested dir");
+        std::fs::create_dir_all(shadow.join("nested")).expect("shadow nested dir");
+        std::fs::write(legacy.join("nested").join("keep.jsonl"), "{}").expect("legacy keep");
+        std::fs::write(legacy.join("nested").join("duplicate.jsonl"), "legacy")
+            .expect("legacy duplicate");
+        std::fs::write(shadow.join("nested").join("duplicate.jsonl"), "new")
+            .expect("shadow duplicate");
+
+        let zip_path = temp.path().join("backup.zip");
+        let file = std::fs::File::create(&zip_path).expect("create zip");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        super::add_directory_to_backup_zip_skipping_shadow(
+            &mut zip,
+            &legacy,
+            &legacy,
+            &shadow,
+            "codex/session-trash",
+            options,
+        )
+        .expect("write legacy trash");
+        zip.finish().expect("finish zip");
+
+        let file = std::fs::File::open(zip_path).expect("open zip");
+        let mut archive = zip::ZipArchive::new(file).expect("read zip");
+        let mut names = (0..archive.len())
+            .map(|index| {
+                archive
+                    .by_index(index)
+                    .expect("zip entry")
+                    .name()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["codex/session-trash/nested/keep.jsonl"]);
+    }
+
+    #[test]
+    fn codex_session_backup_summary_counts_legacy_trash_fallback_files() {
+        let codex = tempdir().expect("codex tempdir");
+        let primary = codex_session_trash_dir(codex.path());
+        let legacy = codex.path().join(".codex-switcher").join("session-trash");
+        std::fs::create_dir_all(primary.join("nested")).expect("primary nested dir");
+        std::fs::create_dir_all(legacy.join("nested")).expect("legacy nested dir");
+        std::fs::write(primary.join("primary.jsonl"), "{}").expect("primary file");
+        std::fs::write(primary.join("nested").join("duplicate.jsonl"), "new")
+            .expect("primary duplicate");
+        std::fs::write(legacy.join("moved.jsonl"), "{}").expect("legacy moved file");
+        std::fs::write(legacy.join("nested").join("keep.jsonl"), "{}").expect("legacy keep");
+        std::fs::write(legacy.join("nested").join("duplicate.jsonl"), "legacy")
+            .expect("legacy duplicate");
+
+        let summary = super::codex_session_backup_summary(codex.path());
+
+        assert_eq!(
+            summary
+                .get("trashedSessionFiles")
+                .and_then(serde_json::Value::as_u64),
+            Some(4)
+        );
+        assert!(primary.join("moved.jsonl").is_file());
     }
 
     #[test]
