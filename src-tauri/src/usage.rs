@@ -2030,6 +2030,16 @@ fn default_pricing() -> Vec<CodexUsagePricing> {
         ("gpt-5.5-high", "GPT-5.5", "5", "30", "0.50", "0"),
         ("gpt-5.5-xhigh", "GPT-5.5", "5", "30", "0.50", "0"),
         ("gpt-5.5-minimal", "GPT-5.5", "5", "30", "0.50", "0"),
+        ("gpt-5.6-sol", "GPT-5.6 Sol", "5", "30", "0.50", "6.25"),
+        (
+            "gpt-5.6-terra",
+            "GPT-5.6 Terra",
+            "2.50",
+            "15",
+            "0.25",
+            "3.125",
+        ),
+        ("gpt-5.6-luna", "GPT-5.6 Luna", "1", "6", "0.10", "1.25"),
         ("gpt-5.4", "GPT-5.4", "2.50", "15", "0.25", "0"),
         ("gpt-5.4-mini", "GPT-5.4 Mini", "0.75", "4.50", "0.075", "0"),
         ("gpt-5.4-nano", "GPT-5.4 Nano", "0.20", "1.25", "0.02", "0"),
@@ -2745,15 +2755,17 @@ fn model_pricing_candidates(model_id: &str) -> Vec<String> {
 }
 
 fn clean_model_id_for_pricing(model_id: &str) -> String {
-    model_id
+    let cleaned = model_id
         .rsplit_once('/')
         .map_or(model_id, |(_, rest)| rest)
         .split(':')
         .next()
         .unwrap_or(model_id)
         .trim()
+        .replace([' ', '_'], "-")
         .replace('@', "-")
-        .to_ascii_lowercase()
+        .to_ascii_lowercase();
+    normalize_gpt_56_display_model(&cleaned).unwrap_or(cleaned)
 }
 
 fn strip_known_model_namespace(model_id: &str) -> Option<String> {
@@ -2873,7 +2885,17 @@ fn normalize_codex_model(raw: &str) -> String {
             name = parts[1].to_string();
         }
     }
-    name.replace('@', "-")
+    let name = name.replace([' ', '_'], "-").replace('@', "-");
+    normalize_gpt_56_display_model(&name).unwrap_or(name)
+}
+
+fn normalize_gpt_56_display_model(model_id: &str) -> Option<String> {
+    match model_id.trim().to_ascii_lowercase().as_str() {
+        "5.6-sol" | "gpt-5.6-sol" => Some("gpt-5.6-sol".to_string()),
+        "5.6-terra" | "gpt-5.6-terra" => Some("gpt-5.6-terra".to_string()),
+        "5.6-luna" | "gpt-5.6-luna" => Some("gpt-5.6-luna".to_string()),
+        _ => None,
+    }
 }
 
 fn parse_event_timestamp(value: &Value) -> Option<i64> {
@@ -4145,6 +4167,9 @@ mod tests {
             .iter()
             .all(|item| is_supported_pricing_model(&item.model_id)));
         assert!(pricing.iter().any(|item| item.model_id == "gpt-5.5"));
+        assert!(pricing.iter().any(|item| item.model_id == "gpt-5.6-sol"));
+        assert!(pricing.iter().any(|item| item.model_id == "gpt-5.6-terra"));
+        assert!(pricing.iter().any(|item| item.model_id == "gpt-5.6-luna"));
         assert!(!pricing
             .iter()
             .any(|item| item.model_id.starts_with("claude-")));
@@ -4154,6 +4179,25 @@ mod tests {
         assert!(!pricing
             .iter()
             .any(|item| item.model_id.starts_with("doubao-")));
+    }
+
+    #[test]
+    fn gpt_56_display_names_use_default_pricing() {
+        let pricing = default_pricing();
+        let log = ParsedUsageLog {
+            request_id: "codex_rollout:gpt56:1".to_string(),
+            session_id: "session".to_string(),
+            rollout_id: "gpt56".to_string(),
+            model: normalize_codex_model("5.6 Terra"),
+            input_tokens: 1_200_000,
+            output_tokens: 100_000,
+            cache_read_tokens: 200_000,
+            created_at: 1_782_880_001,
+            source_kind: UsageLogSourceKind::CanonicalRoot,
+        };
+
+        assert_eq!(log.model, "gpt-5.6-terra");
+        assert_eq!(format_cost(calculate_cost(&log, &pricing, 1.0)), "4.050000");
     }
 
     #[test]
