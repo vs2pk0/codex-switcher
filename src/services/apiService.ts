@@ -17,6 +17,7 @@ export interface ApiServiceRuntime {
   id: string;
   version: string;
   target: string;
+  compatible: boolean;
   path: string;
   binaryPath: string;
   installedAt: number;
@@ -42,6 +43,7 @@ export interface ApiServiceState {
   service: ApiServiceInfo;
   configPath: string;
   installed: boolean;
+  maintenanceOldRuntimeCount?: number | null;
 }
 
 export interface ApiServiceUpdateInfo {
@@ -122,6 +124,18 @@ export function checkApiServiceUpdate(): Promise<ApiServiceUpdateInfo> {
 
 export function downloadApiServiceUpdate(): Promise<ApiServiceState> {
   return invoke("api_service_download_update");
+}
+
+export function importApiServiceRuntime(packagePath: string): Promise<ApiServiceState> {
+  return invoke("api_service_import_runtime", { packagePath });
+}
+
+export function activateApiServiceRuntime(runtimeId: string): Promise<ApiServiceState> {
+  return invoke("api_service_activate_runtime", { runtimeId });
+}
+
+export function deleteApiServiceRuntime(runtimeId: string): Promise<ApiServiceState> {
+  return invoke("api_service_delete_runtime", { runtimeId });
 }
 
 export function cancelApiServiceDownload(): Promise<void> {

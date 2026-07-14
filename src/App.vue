@@ -24,7 +24,6 @@ import SessionRepairModal from "./components/SessionRepairModal.vue";
 import SessionRestoreModal from "./components/SessionRestoreModal.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
 import SortEditorModal from "./components/SortEditorModal.vue";
-import SwitchRepairModal from "./components/SwitchRepairModal.vue";
 import UsagePanel from "./components/UsagePanel.vue";
 import { defaultBadgeStyles } from "./constants/badgeStyles";
 import { currentLanguage, formatLocalizedDuration, setLanguage, t } from "./i18n";
@@ -290,12 +289,6 @@ const expandedSessionGroups = ref<Set<string>>(new Set());
 const sessionLoading = ref(false);
 const sessionRepairing = ref(false);
 const repairVisible = ref(false);
-const switchRepairVisible = ref(false);
-const switchRepairProgress = ref(0);
-const switchRepairResult = ref<CodexSessionVisibilityRepairSummary | null>(null);
-const switchRepairError = ref("");
-const switchRepairTargetName = ref("");
-let switchRepairCloseTimer: number | undefined;
 const repairMode = ref<CodexSessionVisibilityRepairMode>("quick");
 const repairInstanceScope = ref<"target" | "all">("target");
 const repairSessionScope = ref<"all" | "selected">("all");
@@ -1725,45 +1718,16 @@ async function handleRefreshEveryQuota(): Promise<void> {
   }
 }
 
-async function runSwitchSessionRepair(account: CodexAccount): Promise<void> {
-  clearSwitchRepairCloseTimer();
-  switchRepairTargetName.value = displayName(account);
-  switchRepairVisible.value = true;
-  switchRepairProgress.value = 12;
-  switchRepairResult.value = null;
-  switchRepairError.value = "";
-  try {
-    switchRepairProgress.value = 48;
-    const summary = await repairSessionVisibilityAcrossInstances({
-      mode: "quick",
-      targetProvider: null,
-      targetInstanceId: "__default__",
-      repairInstanceIds: ["__default__"],
-    });
-    switchRepairResult.value = summary;
-    switchRepairProgress.value = 100;
-    scheduleSwitchRepairAutoClose();
-  } catch (error) {
-    switchRepairError.value = errorText(error);
-    switchRepairProgress.value = 100;
-    throw error;
-  }
-}
-
 async function handleSwitch(account: CodexAccount): Promise<void> {
+  if (switchingId.value) return;
   switchingId.value = account.id;
   try {
     currentAccount.value = await switchCodexAccount(account.id);
-    try {
-      await runSwitchSessionRepair(account);
-    } catch (repairError) {
-      Message.warning(`账号已切换，会话修复失败：${errorText(repairError)}`);
-    }
-    let restartMessage = "已尝试重启 Codex";
+    let restartMessage = "已请求重启 ChatGPT/Codex";
     try {
       restartMessage = await restartCodexApp();
     } catch (restartError) {
-      Message.warning(`账号已切换，但启动 Codex 失败：${errorText(restartError)}`);
+      Message.warning(`账号已切换，但启动 ChatGPT/Codex 失败：${errorText(restartError)}`);
       await loadAccounts();
       return;
     }
@@ -2694,25 +2658,6 @@ function sessionApproxTokens(sessionId: string): string {
     : "-- tokens";
 }
 
-function clearSwitchRepairCloseTimer(): void {
-  if (!switchRepairCloseTimer) return;
-  window.clearTimeout(switchRepairCloseTimer);
-  switchRepairCloseTimer = undefined;
-}
-
-function closeSwitchRepairModal(): void {
-  clearSwitchRepairCloseTimer();
-  switchRepairVisible.value = false;
-}
-
-function scheduleSwitchRepairAutoClose(): void {
-  clearSwitchRepairCloseTimer();
-  switchRepairCloseTimer = window.setTimeout(() => {
-    switchRepairVisible.value = false;
-    switchRepairCloseTimer = undefined;
-  }, 3000);
-}
-
 async function openSessionFolder(path: string): Promise<void> {
   try {
     await openPathInFileManager(path);
@@ -3229,10 +3174,6 @@ watch(
   { immediate: true },
 );
 
-watch(switchRepairVisible, (visible) => {
-  if (!visible) clearSwitchRepairCloseTimer();
-});
-
 watch(
   () => currentAccount.value?.id,
   () => {
@@ -3291,7 +3232,6 @@ onUnmounted(() => {
   if (initialPrewarmTimer) window.clearTimeout(initialPrewarmTimer);
   window.removeEventListener("pointerup", handleSortDraftPointerEnd);
   window.removeEventListener("pointercancel", handleSortDraftPointerEnd);
-  clearSwitchRepairCloseTimer();
   if (quotaTimer) window.clearTimeout(quotaTimer);
   if (currentAccountQuotaTimer) window.clearTimeout(currentAccountQuotaTimer);
   if (quotaCountdownTimer) window.clearInterval(quotaCountdownTimer);
@@ -3551,15 +3491,6 @@ onUnmounted(() => {
       :progress="backupProgress"
       :status="backupProgressStatus"
       :message="backupProgressMessage"
-    />
-
-    <SwitchRepairModal
-      v-model:visible="switchRepairVisible"
-      :target-name="switchRepairTargetName"
-      :progress="switchRepairProgress"
-      :result="switchRepairResult"
-      :error="switchRepairError"
-      @close="closeSwitchRepairModal"
     />
 
     <AddAccountModal

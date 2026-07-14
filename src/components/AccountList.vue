@@ -1037,6 +1037,7 @@ function formatTime(value?: number | null): string {
                 size="small"
                 :title="t('切换')"
                 :loading="switchingId === account.id"
+                :disabled="switchingId !== ''"
                 @click="emit('switch-account', account)"
               >
                 <template #icon><icon-play-arrow /></template>
@@ -1183,7 +1184,7 @@ function formatTime(value?: number | null): string {
           <button
             class="compact-icon-action primary"
             type="button"
-            :disabled="switchingId === account.id"
+            :disabled="switchingId !== ''"
             @click="emit('switch-account', account)"
           >
             <icon-play-arrow />
@@ -1337,6 +1338,7 @@ function formatTime(value?: number | null): string {
                   <a-button
                     size="mini"
                     :loading="switchingId === account.id"
+                    :disabled="switchingId !== ''"
                     @click="emit('switch-account', account)"
                   >
                     <template #icon><icon-play-arrow /></template>

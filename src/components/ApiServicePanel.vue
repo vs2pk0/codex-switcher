@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import { addCodexAccountWithApiKey, openExternalUrl, type CodexSwitcherSettings } from "../services/codex";
 import { t } from "../i18n";
 import { hasAnyQuotaWindow, hasQuotaWindow } from "../quota";
@@ -10,12 +11,15 @@ import PlanBadge from "./PlanBadge.vue";
 import {
   API_SERVICE_AUTO_UPDATE_EVENT,
   API_SERVICE_DOWNLOAD_PROGRESS_EVENT,
+  activateApiServiceRuntime,
   bindApiServiceAccounts,
   cancelApiServiceDownload,
   checkApiServiceUpdate,
   deleteApiServiceBoundAccounts,
+  deleteApiServiceRuntime,
   downloadApiServiceUpdate,
   getApiServiceState,
+  importApiServiceRuntime,
   listApiServiceBoundAccounts,
   resetApiService,
   startApiService,
@@ -52,6 +56,10 @@ const checking = ref(false);
 const downloading = ref(false);
 const bindVisible = ref(false);
 const deleteVisible = ref(false);
+const versionVisible = ref(false);
+const importingRuntime = ref(false);
+const activatingRuntimeId = ref("");
+const deletingRuntimeId = ref("");
 const selectedBindIds = ref<Set<string>>(new Set());
 const selectedDeleteEmails = ref<Set<string>>(new Set());
 const boundAccounts = ref<ApiServiceBoundAccount[]>([]);
@@ -75,6 +83,9 @@ const serviceReady = computed(() => Boolean(state.value?.installed));
 const running = computed(() => Boolean(state.value?.service.running));
 const currentRuntime = computed(() =>
   state.value?.runtimes.find((runtime) => runtime.id === state.value?.activeVersion) || null,
+);
+const runtimeOperationBusy = computed(() =>
+  Boolean(importingRuntime.value || activatingRuntimeId.value || deletingRuntimeId.value),
 );
 const canDownloadUpdate = computed(() =>
   Boolean(updateInfo.value?.downloadUrl && updateInfo.value.canApply),
@@ -167,14 +178,37 @@ function syncForm(next: ApiServiceState): void {
   form.autoUpdateIntervalHours = Math.max(1, Number(next.settings.autoUpdateIntervalHours || 24));
 }
 
-async function refreshState(silent = false, syncSettings = true): Promise<void> {
+function translatedTemplate(template: string, values: Record<string, string | number>): string {
+  return Object.entries(values).reduce(
+    (message, [key, value]) => message.replaceAll(`{${key}}`, String(value)),
+    t(template),
+  );
+}
+
+function runtimeMaintenanceMessage(next: ApiServiceState | null): string {
+  const count = Number(next?.maintenanceOldRuntimeCount || 0);
+  if (count <= 2) return "";
+  return translatedTemplate(
+    "旧版本清理尚未完成：当前有 {count} 个旧版本，最多应保留 {limit} 个。请稍后重试删除。",
+    { count, limit: 2 },
+  );
+}
+
+function warnRuntimeMaintenance(next: ApiServiceState): void {
+  const warning = runtimeMaintenanceMessage(next);
+  if (warning) Message.warning(warning);
+}
+
+async function refreshState(silent = false, syncSettings = true): Promise<boolean> {
   loading.value = !silent;
   try {
     const next = await getApiServiceState();
     state.value = next;
     if (syncSettings) syncForm(next);
+    return true;
   } catch (error) {
     if (!silent) Message.error(`加载 API 服务失败：${errorText(error)}`);
+    return false;
   } finally {
     loading.value = false;
   }
@@ -537,10 +571,124 @@ async function checkUpdate(): Promise<void> {
     }
     await refreshState(true, false);
   } catch (error) {
-    Message.error(`检测更新失败：${errorText(error)}`);
+    const detail = errorText(error);
+    if (detail.includes("403") || detail.toLowerCase().includes("rate limit")) {
+      Message.warning(t("GitHub 更新接口当前限流，可打开“版本管理”导入本地安装包"));
+    } else {
+      Message.error(`检测更新失败：${detail}`);
+    }
   } finally {
     checking.value = false;
   }
+}
+
+async function openVersionManager(): Promise<void> {
+  if (!(await refreshState(false, false))) return;
+  versionVisible.value = true;
+}
+
+async function chooseRuntimePackage(): Promise<void> {
+  try {
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [
+        {
+          name: t("CLIProxyAPI 安装包"),
+          extensions: ["gz", "tgz", "zip"],
+        },
+      ],
+    });
+    if (typeof selected !== "string" || !selected) return;
+    Modal.warning({
+      title: t("导入本地版本包"),
+      content: t(
+        "手动导入用于 GitHub 限流或网络不可用的情况，不会通过 GitHub checksums 在线校验。请只导入可信的 CLIProxyAPI 官方安装包。导入成功后会自动使用本机最高版本，并仅保留当前版本和 2 个旧版本。",
+      ),
+      okText: t("确认导入"),
+      cancelText: t("取消"),
+      hideCancel: false,
+      async onOk() {
+        importingRuntime.value = true;
+        try {
+          const next = await importApiServiceRuntime(selected);
+          state.value = next;
+          updateInfo.value = null;
+          Message.success(t("版本包已导入，已切换到本机最新版本"));
+          warnRuntimeMaintenance(next);
+        } catch (error) {
+          Message.error(
+            translatedTemplate("导入失败：{error}", { error: errorText(error) }),
+          );
+          await refreshState(true, false);
+        } finally {
+          importingRuntime.value = false;
+        }
+      },
+    });
+  } catch (error) {
+    Message.error(
+      translatedTemplate("选择版本包失败：{error}", { error: errorText(error) }),
+    );
+  }
+}
+
+function activateRuntime(runtimeId: string, version: string): void {
+  if (runtimeId === state.value?.activeVersion) return;
+  Modal.warning({
+    title: translatedTemplate("切换到 v{version}", { version }),
+    content: running.value
+      ? t("API 服务正在运行，切换时会自动重启；如果新版本启动失败，将恢复当前版本。是否继续？")
+      : t("切换后，该版本会成为下次启动 API 服务时使用的版本。是否继续？"),
+    okText: t("设为当前"),
+    cancelText: t("取消"),
+    hideCancel: false,
+    async onOk() {
+      activatingRuntimeId.value = runtimeId;
+      try {
+        const next = await activateApiServiceRuntime(runtimeId);
+        state.value = next;
+        updateInfo.value = null;
+        Message.success(translatedTemplate("已切换到 v{version}", { version }));
+        warnRuntimeMaintenance(next);
+      } catch (error) {
+        Message.error(
+          translatedTemplate("切换失败：{error}", { error: errorText(error) }),
+        );
+        await refreshState(true, false);
+      } finally {
+        activatingRuntimeId.value = "";
+      }
+    },
+  });
+}
+
+function deleteRuntime(runtimeId: string, version: string): void {
+  if (runtimeId === state.value?.activeVersion) return;
+  Modal.warning({
+    title: translatedTemplate("删除 v{version}", { version }),
+    content: t("将删除这个本地运行时版本，当前使用的版本不会受影响。是否继续？"),
+    okText: t("确认删除"),
+    cancelText: t("取消"),
+    hideCancel: false,
+    async onOk() {
+      deletingRuntimeId.value = runtimeId;
+      try {
+        const next = await deleteApiServiceRuntime(runtimeId);
+        state.value = next;
+        updateInfo.value = null;
+        Message.success(translatedTemplate("已删除 v{version}", { version }));
+        warnRuntimeMaintenance(next);
+      } catch (error) {
+        Message.error(
+          translatedTemplate("删除失败：{error}", { error: errorText(error) }),
+        );
+        await refreshState(true, false);
+      } finally {
+        deletingRuntimeId.value = "";
+      }
+    },
+  });
 }
 
 async function downloadUpdate(): Promise<void> {
@@ -558,8 +706,21 @@ async function downloadUpdate(): Promise<void> {
   try {
     const next = await downloadApiServiceUpdate();
     state.value = next;
-    syncForm(next);
-    updateInfo.value = await checkApiServiceUpdate().catch(() => updateInfo.value);
+    if (updateInfo.value) {
+      const completedUpdate = updateInfo.value;
+      const activeRuntime = next.runtimes.find((runtime) => runtime.id === next.activeVersion);
+      const latestInstalled = next.runtimes.some(
+        (runtime) => runtime.version === completedUpdate.latestVersion,
+      );
+      updateInfo.value = {
+        ...completedUpdate,
+        currentVersion: activeRuntime?.version || completedUpdate.latestVersion,
+        hasUpdate: false,
+        canApply: false,
+        latestInstalled,
+        latestActive: activeRuntime?.version === completedUpdate.latestVersion,
+      };
+    }
     if (progress.value?.status !== "done") {
       progress.value = {
         status: "done",
@@ -570,6 +731,7 @@ async function downloadUpdate(): Promise<void> {
       };
     }
     Message.success(t("API 服务更新已安装"));
+    warnRuntimeMaintenance(next);
   } catch (error) {
     progress.value = {
       status: errorText(error).includes("下载已取消") ? "cancelled" : "failed",
@@ -583,6 +745,7 @@ async function downloadUpdate(): Promise<void> {
     } else {
       Message.error(`下载更新失败：${errorText(error)}`);
     }
+    await refreshState(true, false);
   } finally {
     downloading.value = false;
     if (progress.value?.status === "done" || progress.value?.status === "cancelled") {
@@ -848,6 +1011,13 @@ onUnmounted(() => {
                 {{ t("下载更新") }}
               </a-button>
               <a-button
+                :disabled="downloading || starting || stopping || runtimeOperationBusy"
+                @click="openVersionManager"
+              >
+                <template #icon><icon-list /></template>
+                {{ t("版本管理") }}
+              </a-button>
+              <a-button
                 html-type="button"
                 status="danger"
                 :loading="resetting"
@@ -996,6 +1166,103 @@ onUnmounted(() => {
         </aside>
       </div>
     </a-spin>
+
+    <a-modal
+      v-model:visible="versionVisible"
+      :title="t('API 服务版本管理')"
+      width="980px"
+      :footer="false"
+      :mask-closable="!runtimeOperationBusy"
+      :closable="!runtimeOperationBusy"
+      :esc-to-close="!runtimeOperationBusy"
+    >
+      <div class="api-service-version-manager">
+        <div class="api-service-version-toolbar">
+          <div>
+            <strong>{{ t("本地版本") }}</strong>
+            <p>
+              {{ t("更新或导入成功后默认切换到本机最高版本，并保留当前版本和最多 2 个旧版本。") }}
+            </p>
+          </div>
+          <a-button
+            type="primary"
+            :loading="importingRuntime"
+            :disabled="Boolean(activatingRuntimeId || deletingRuntimeId || downloading)"
+            @click="chooseRuntimePackage"
+          >
+            <template #icon><icon-upload /></template>
+            {{ t("导入本地包") }}
+          </a-button>
+        </div>
+
+        <a-alert v-if="runtimeMaintenanceMessage(state)" type="warning" show-icon>
+          {{ runtimeMaintenanceMessage(state) }}
+        </a-alert>
+
+        <div v-if="state?.runtimes.length" class="api-service-version-table">
+          <div class="api-service-version-row api-service-version-header" aria-hidden="true">
+            <span>{{ t("版本") }}</span>
+            <span>{{ t("平台") }}</span>
+            <span>{{ t("导入时间") }}</span>
+            <span>{{ t("包文件") }}</span>
+            <span>{{ t("状态与操作") }}</span>
+          </div>
+          <div
+            v-for="runtime in state.runtimes"
+            :key="runtime.id"
+            class="api-service-version-row"
+            :class="{ current: runtime.id === state.activeVersion }"
+          >
+            <div :data-label="t('版本')">
+              <strong>v{{ runtime.version }}</strong>
+            </div>
+            <div :data-label="t('平台')">
+              <code>{{ runtime.target }}</code>
+            </div>
+            <div :data-label="t('导入时间')">
+              <span>{{ formatTime(runtime.installedAt) }}</span>
+            </div>
+            <div :data-label="t('包文件')" class="api-service-version-package" :title="runtime.packageFile">
+              <span>{{ runtime.packageFile }}</span>
+            </div>
+            <div :data-label="t('状态与操作')" class="api-service-version-operations">
+              <a-tag v-if="runtime.id === state.activeVersion" color="green">
+                <template #icon><icon-check-circle /></template>
+                {{ t("当前") }}
+              </a-tag>
+              <a-tag v-else-if="!runtime.compatible" color="gray">
+                {{ t("平台不兼容") }}
+              </a-tag>
+              <a-button
+                v-else
+                size="small"
+                :loading="activatingRuntimeId === runtime.id"
+                :disabled="runtimeOperationBusy || downloading"
+                @click="activateRuntime(runtime.id, runtime.version)"
+              >
+                {{ t("设为当前") }}
+              </a-button>
+              <a-button
+                size="small"
+                status="danger"
+                :loading="deletingRuntimeId === runtime.id"
+                :disabled="runtime.id === state.activeVersion || runtimeOperationBusy || downloading"
+                @click="deleteRuntime(runtime.id, runtime.version)"
+              >
+                <template #icon><icon-delete /></template>
+                {{ runtime.id === state.activeVersion ? t("不可删除") : t("删除") }}
+              </a-button>
+            </div>
+          </div>
+        </div>
+        <a-empty v-else :description="t('暂无本地版本，可导入 CLIProxyAPI 官方安装包')" />
+
+        <div class="api-service-import-warning">
+          <icon-info-circle />
+          <span>{{ t("手动导入不会联网校验 GitHub checksums，请只选择可信的官方安装包。") }}</span>
+        </div>
+      </div>
+    </a-modal>
 
     <a-modal
       v-model:visible="bindVisible"
