@@ -198,6 +198,7 @@ impl SessionStore {
         &self,
         session_ids: &[String],
     ) -> Result<CodexSessionTrashSummary, String> {
+        self.migrate_legacy_trash();
         let sessions = self.list_sessions(None, None)?;
         fs::create_dir_all(self.trash_dir())
             .map_err(|error| format!("创建回收站失败: {}", error))?;
@@ -237,22 +238,37 @@ impl SessionStore {
     }
 
     pub fn list_trashed(&self) -> Result<Vec<CodexTrashedSessionRecord>, String> {
+        self.migrate_legacy_trash();
         let mut records = Vec::new();
-        for path in collect_json_files(&self.trash_dir())? {
-            let content = fs::read_to_string(&path)
-                .map_err(|error| format!("读取回收站失败 {}: {}", path.display(), error))?;
-            let value: Value = serde_json::from_str(&content)
-                .map_err(|error| format!("解析回收站失败 {}: {}", path.display(), error))?;
-            records.push(CodexTrashedSessionRecord {
-                id: read_string(&value, "id").unwrap_or_else(|| file_stem(&path)),
-                title: read_string(&value, "title").unwrap_or_else(|| "未命名会话".to_string()),
-                original_path: read_string(&value, "originalPath").unwrap_or_default(),
-                trash_path: read_string(&value, "trashPath").unwrap_or_default(),
-                deleted_at: value
-                    .get("deletedAt")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default(),
-            });
+        let mut seen = HashSet::new();
+        for dir in self.trash_dirs() {
+            for path in collect_json_files(&dir)? {
+                let content = fs::read_to_string(&path)
+                    .map_err(|error| format!("读取回收站失败 {}: {}", path.display(), error))?;
+                let value: Value = serde_json::from_str(&content)
+                    .map_err(|error| format!("解析回收站失败 {}: {}", path.display(), error))?;
+                let id = read_string(&value, "id").unwrap_or_else(|| file_stem(&path));
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                let stored_trash_path = read_string(&value, "trashPath").unwrap_or_default();
+                let trash_path =
+                    if stored_trash_path.is_empty() || !Path::new(&stored_trash_path).exists() {
+                        path.with_extension("jsonl").to_string_lossy().to_string()
+                    } else {
+                        stored_trash_path
+                    };
+                records.push(CodexTrashedSessionRecord {
+                    id,
+                    title: read_string(&value, "title").unwrap_or_else(|| "未命名会话".to_string()),
+                    original_path: read_string(&value, "originalPath").unwrap_or_default(),
+                    trash_path,
+                    deleted_at: value
+                        .get("deletedAt")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default(),
+                });
+            }
         }
         records.sort_by_key(|record| std::cmp::Reverse(record.deleted_at));
         Ok(records)
@@ -278,7 +294,7 @@ impl SessionStore {
             }
             match fs::rename(&trash_path, &original_path) {
                 Ok(()) => {
-                    let _ = fs::remove_file(self.trash_dir().join(format!("{}.json", session_id)));
+                    let _ = fs::remove_file(trash_path.with_extension("json"));
                     restored += 1;
                 }
                 Err(error) => failed.push(format!("恢复失败 {}: {}", session_id, error)),
@@ -356,11 +372,13 @@ impl SessionStore {
         all_backup_dirs.extend(backup_dirs);
         all_backup_dirs.sort();
         all_backup_dirs.dedup();
-        fs::create_dir_all(self.codex_home.join(".codex-switcher"))
-            .map_err(|error| format!("创建修复标记目录失败: {}", error))?;
+        let repair_marker_path = visibility_repair_marker_path();
+        if let Some(parent) = repair_marker_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("创建修复标记目录失败: {}", error))?;
+        }
         fs::write(
-            self.codex_home
-                .join(".codex-switcher/session-visibility-repair.json"),
+            repair_marker_path,
             serde_json::to_string_pretty(&serde_json::json!({
                 "scanned": sessions.len(),
                 "repaired": repaired,
@@ -465,9 +483,27 @@ impl SessionStore {
     }
 
     fn trash_dir(&self) -> PathBuf {
+        session_trash_dir(&self.codex_home)
+    }
+
+    fn legacy_trash_dir(&self) -> PathBuf {
         self.codex_home
             .join(".codex-switcher")
             .join("session-trash")
+    }
+
+    fn trash_dirs(&self) -> Vec<PathBuf> {
+        let primary = self.trash_dir();
+        let legacy = self.legacy_trash_dir();
+        if legacy == primary {
+            vec![primary]
+        } else {
+            vec![primary, legacy]
+        }
+    }
+
+    fn migrate_legacy_trash(&self) {
+        migrate_directory_files(&self.legacy_trash_dir(), &self.trash_dir());
     }
 
     fn read_target_provider(&self) -> Result<String, String> {
@@ -509,7 +545,7 @@ impl SessionStore {
         let mut repaired = 0usize;
         let mut backup_dirs = Vec::new();
         for db_path in self.sqlite_candidate_paths() {
-            let backup_dir = backup_sqlite_file(&self.codex_home, &db_path)?;
+            let backup_dir = backup_sqlite_file(&db_path)?;
             let changed = repair_sqlite_db(&db_path, target_provider, sessions)?;
             if changed > 0 {
                 backup_dirs.push(backup_dir);
@@ -528,11 +564,7 @@ impl SessionStore {
         if sessions.is_empty() {
             return Ok((0, Vec::new()));
         }
-        let backup_dir = self
-            .codex_home
-            .join(".codex-switcher")
-            .join("visibility-backups")
-            .join(chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string());
+        let backup_dir = visibility_backup_dir();
         let mut changed = 0usize;
         let mut backup_created = false;
         for session in sessions {
@@ -639,11 +671,7 @@ impl SessionStore {
         if additions.is_empty() {
             return Ok(0);
         }
-        let backup_dir = self
-            .codex_home
-            .join(".codex-switcher")
-            .join("visibility-backups")
-            .join(chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string());
+        let backup_dir = visibility_backup_dir();
         fs::create_dir_all(&backup_dir)
             .map_err(|error| format!("创建会话索引备份失败: {}", error))?;
         if path.exists() {
@@ -1051,11 +1079,8 @@ fn sqlite_provider_ids(db_path: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn backup_sqlite_file(codex_home: &Path, db_path: &Path) -> Result<String, String> {
-    let backup_dir = codex_home
-        .join(".codex-switcher")
-        .join("visibility-backups")
-        .join(chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string());
+fn backup_sqlite_file(db_path: &Path) -> Result<String, String> {
+    let backup_dir = visibility_backup_dir();
     fs::create_dir_all(&backup_dir)
         .map_err(|error| format!("创建 SQLite 备份目录失败: {}", error))?;
     let filename = db_path
@@ -1065,6 +1090,84 @@ fn backup_sqlite_file(codex_home: &Path, db_path: &Path) -> Result<String, Strin
     fs::copy(db_path, backup_dir.join(filename))
         .map_err(|error| format!("备份 SQLite 失败 ({}): {}", db_path.display(), error))?;
     Ok(backup_dir.to_string_lossy().to_string())
+}
+
+fn visibility_backup_dir() -> PathBuf {
+    switcher_root_dir()
+        .join("visibility-backups")
+        .join(chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string())
+}
+
+fn visibility_repair_marker_path() -> PathBuf {
+    switcher_root_dir().join("session-visibility-repair.json")
+}
+
+fn session_trash_dir(codex_home: &Path) -> PathBuf {
+    switcher_root_dir()
+        .join("session-trash")
+        .join(short_hash(&codex_home.to_string_lossy()))
+}
+
+fn switcher_root_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("CODEX_SWITCHER_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        return path;
+    }
+    default_switcher_root_dir()
+}
+
+#[cfg(test)]
+fn default_switcher_root_dir() -> PathBuf {
+    test_switcher_root_dir()
+}
+
+#[cfg(not(test))]
+fn default_switcher_root_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .join(".codex_switcher")
+}
+
+#[cfg(test)]
+fn test_switcher_root_dir() -> PathBuf {
+    let thread_id = format!("{:?}", std::thread::current().id())
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric())
+        .collect::<String>();
+    std::env::temp_dir()
+        .join("codex-switcher-tests")
+        .join(format!("{}-{}", std::process::id(), thread_id))
+}
+
+fn migrate_directory_files(from: &Path, to: &Path) {
+    if !from.is_dir() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(from) else {
+        return;
+    };
+    if fs::create_dir_all(to).is_err() {
+        return;
+    }
+    for entry in entries.flatten() {
+        let source = entry.path();
+        if !source.is_file() {
+            continue;
+        }
+        let Some(file_name) = source.file_name() else {
+            continue;
+        };
+        let target = to.join(file_name);
+        if target.exists() {
+            continue;
+        }
+        if fs::rename(&source, &target).is_err() && fs::copy(&source, &target).is_ok() {
+            let _ = fs::remove_file(&source);
+        }
+    }
 }
 
 fn normalized_id_set(values: Option<Vec<String>>) -> Option<HashSet<String>> {
@@ -1518,6 +1621,42 @@ mod tests {
         let restored = store
             .restore_from_trash(&[sessions[0].id.clone()])
             .expect("restore");
+        assert_eq!(restored.restored, 1);
+        assert!(session_path.exists());
+    }
+
+    #[test]
+    fn lists_and_restores_legacy_trashed_sessions() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions").join("2026").join("06");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("legacy-session.jsonl");
+        let legacy_trash = codex.path().join(".codex-switcher").join("session-trash");
+        fs::create_dir_all(&legacy_trash).expect("legacy trash dir");
+        let legacy_trash_file = legacy_trash.join("legacy-session.jsonl");
+        fs::write(&legacy_trash_file, "{}").expect("write legacy trash");
+        fs::write(
+            legacy_trash.join("legacy-session.json"),
+            serde_json::json!({
+                "id": "legacy-session",
+                "title": "Legacy",
+                "originalPath": session_path.to_string_lossy(),
+                "trashPath": legacy_trash_file.to_string_lossy(),
+                "deletedAt": 1
+            })
+            .to_string(),
+        )
+        .expect("write legacy metadata");
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let trashed = store.list_trashed().expect("list legacy trash");
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].id, "legacy-session");
+        assert!(trashed[0].trash_path.ends_with("legacy-session.jsonl"));
+
+        let restored = store
+            .restore_from_trash(&["legacy-session".to_string()])
+            .expect("restore legacy trash");
         assert_eq!(restored.restored, 1);
         assert!(session_path.exists());
     }
