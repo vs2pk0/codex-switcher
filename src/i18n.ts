@@ -478,8 +478,12 @@ const en: Record<string, string> = {
   "请先下载并开启 API 服务": "Download and start the API service first",
   "本地 API 服务": "Local API Service",
   "请选择要绑定的 OAuth 账号": "Select OAuth accounts to bind",
+  "请选择要绑定的账号": "Select accounts to bind",
   "请选择要删除的 API 服务账号": "Select API service accounts to delete",
   "认证目录里暂无账号": "No accounts in the auth directory",
+  "暂无可绑定账号": "No accounts available to bind",
+  "没有匹配的账号": "No matching accounts",
+  "自定义服务": "Custom Service",
   "API 服务已更新并重新启动": "API service updated and restarted",
   "API 服务更新已安装": "API service update installed",
   "下载已取消": "Download cancelled",
@@ -488,11 +492,15 @@ const en: Record<string, string> = {
   "绑定账号到 API 服务": "Bind Accounts to API Service",
   "选择 OAuth 账号后会转换为 CPA 格式，并写入 API 服务的认证目录。":
     "Selected OAuth accounts are converted to CPA format and written to the API service auth directory.",
+  "OAuth 账号会写入认证目录，API Key 账号会写入 CLIProxyAPI 上游配置。":
+    "OAuth accounts are written to the auth directory, while API Key accounts are written to the CLIProxyAPI upstream config.",
   "已选": "Selected",
   "确认绑定": "Confirm Bind",
   "删除 API 服务账号": "Delete API Service Accounts",
   "这里从认证目录 JSON 内容解析邮箱匹配账号，删除会移除对应 CPA 认证文件。":
     "Accounts are matched by email parsed from auth-directory JSON. Deleting removes the matching CPA auth file.",
+  "删除会移除对应 OAuth 认证文件或由本应用管理的 API Key 上游配置。":
+    "Deleting removes the matching OAuth auth file or the API Key upstream config managed by this app.",
   "CPA 认证账号": "CPA Auth Account",
   "确认删除": "Confirm Delete",
   "编辑账号顺序": "Edit Account Order",
@@ -1093,8 +1101,12 @@ const ru: Record<string, string> = {
   "请先下载并开启 API 服务": "Сначала скачайте и запустите API-сервис",
   "本地 API 服务": "Локальный API-сервис",
   "请选择要绑定的 OAuth 账号": "Выберите OAuth-аккаунты для привязки",
+  "请选择要绑定的账号": "Выберите аккаунты для привязки",
   "请选择要删除的 API 服务账号": "Выберите аккаунты API-сервиса для удаления",
   "认证目录里暂无账号": "В каталоге авторизации пока нет аккаунтов",
+  "暂无可绑定账号": "Нет доступных аккаунтов для привязки",
+  "没有匹配的账号": "Совпадающих аккаунтов нет",
+  "自定义服务": "Пользовательский сервис",
   "API 服务已更新并重新启动": "API-сервис обновлен и перезапущен",
   "API 服务更新已安装": "Обновление API-сервиса установлено",
   "下载已取消": "Загрузка отменена",
@@ -1103,11 +1115,15 @@ const ru: Record<string, string> = {
   "绑定账号到 API 服务": "Привязать аккаунты к API-сервису",
   "选择 OAuth 账号后会转换为 CPA 格式，并写入 API 服务的认证目录。":
     "Выбранные OAuth-аккаунты будут преобразованы в формат CPA и записаны в каталог авторизации API-сервиса.",
+  "OAuth 账号会写入认证目录，API Key 账号会写入 CLIProxyAPI 上游配置。":
+    "OAuth-аккаунты записываются в каталог авторизации, а API Key — в конфигурацию upstream CLIProxyAPI.",
   "已选": "Выбрано",
   "确认绑定": "Подтвердить привязку",
   "删除 API 服务账号": "Удалить аккаунты API-сервиса",
   "这里从认证目录 JSON 内容解析邮箱匹配账号，删除会移除对应 CPA 认证文件。":
     "Аккаунты сопоставляются по email из JSON в каталоге авторизации. Удаление уберет соответствующий CPA-файл.",
+  "删除会移除对应 OAuth 认证文件或由本应用管理的 API Key 上游配置。":
+    "Удаление уберет соответствующий OAuth-файл или конфигурацию upstream API Key, управляемую приложением.",
   "CPA 认证账号": "CPA-аккаунт авторизации",
   "确认删除": "Подтвердить удаление",
   "编辑账号顺序": "Изменить порядок аккаунтов",

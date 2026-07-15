@@ -41,10 +41,10 @@ struct CodexOAuthCallbackEvent {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-struct CodexApiKeyModel {
-    id: String,
+pub(crate) struct CodexApiKeyModel {
+    pub(crate) id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    owned_by: Option<String>,
+    pub(crate) owned_by: Option<String>,
 }
 
 const MAX_API_MODEL_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -70,6 +70,8 @@ struct CodexApiKeyBalance {
 struct CodexRelayBalanceEndpoints {
     new_api_status: reqwest::Url,
     new_api_usage: reqwest::Url,
+    new_api_billing_subscription: reqwest::Url,
+    new_api_billing_usage: reqwest::Url,
     sub2api_usage: reqwest::Url,
     insecure_http_origin: Option<String>,
 }
@@ -471,6 +473,12 @@ async fn fetch_codex_api_key_models(account_id: String) -> Result<Vec<CodexApiKe
         .into_iter()
         .find(|account| account.id == account_id)
         .ok_or_else(|| "账号不存在".to_string())?;
+    fetch_codex_api_key_models_for_account(&account).await
+}
+
+pub(crate) async fn fetch_codex_api_key_models_for_account(
+    account: &CodexAccount,
+) -> Result<Vec<CodexApiKeyModel>, String> {
     if account.auth_mode.as_deref() != Some("apikey") {
         return Err("只有 API Key 账号可以获取模型列表".to_string());
     }
@@ -574,6 +582,8 @@ fn codex_relay_balance_endpoints(
     Ok(CodexRelayBalanceEndpoints {
         new_api_status: relay_balance_url(&root, "api/status"),
         new_api_usage: relay_balance_url(&root, "api/usage/token/"),
+        new_api_billing_subscription: relay_balance_url(&root, "dashboard/billing/subscription"),
+        new_api_billing_usage: relay_balance_url(&root, "dashboard/billing/usage"),
         sub2api_usage: relay_balance_url(&root, "v1/usage"),
         insecure_http_origin,
     })
@@ -626,19 +636,71 @@ fn json_trimmed_string(value: Option<&Value>) -> Option<String> {
     Some(value.chars().take(120).collect())
 }
 
-fn parse_new_api_quota_per_unit(body: &str) -> Option<f64> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewApiQuotaDisplayType {
+    Usd,
+    Cny,
+    Tokens,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NewApiQuotaSettings {
+    quota_per_unit: f64,
+    usd_exchange_rate: f64,
+    display_type: NewApiQuotaDisplayType,
+}
+
+impl NewApiQuotaSettings {
+    fn convert_quota(self, quota: f64) -> Option<f64> {
+        let amount = match self.display_type {
+            NewApiQuotaDisplayType::Usd => quota / self.quota_per_unit,
+            NewApiQuotaDisplayType::Cny => quota / self.quota_per_unit * self.usd_exchange_rate,
+            NewApiQuotaDisplayType::Tokens => quota,
+        };
+        amount.is_finite().then_some(amount)
+    }
+
+    fn unit(self) -> &'static str {
+        match self.display_type {
+            NewApiQuotaDisplayType::Usd => "USD",
+            NewApiQuotaDisplayType::Cny => "CNY",
+            NewApiQuotaDisplayType::Tokens => "TOKENS",
+        }
+    }
+}
+
+fn parse_new_api_quota_settings(body: &str) -> Option<NewApiQuotaSettings> {
     let payload = serde_json::from_str::<Value>(body).ok()?;
     if payload.get("success").and_then(Value::as_bool) == Some(false) {
         return None;
     }
-    let quota_per_unit = json_f64(payload.get("data")?.get("quota_per_unit"))?;
-    (quota_per_unit > 0.0).then_some(quota_per_unit)
+    let data = payload.get("data")?;
+    let quota_per_unit = json_f64(data.get("quota_per_unit")).filter(|value| *value > 0.0)?;
+    let usd_exchange_rate = json_f64(data.get("usd_exchange_rate"))
+        .filter(|value| *value > 0.0)
+        .unwrap_or(1.0);
+    let display_type = match data
+        .get("quota_display_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(str::to_ascii_uppercase)
+        .as_deref()
+    {
+        Some("CNY") => NewApiQuotaDisplayType::Cny,
+        Some("TOKENS") => NewApiQuotaDisplayType::Tokens,
+        _ => NewApiQuotaDisplayType::Usd,
+    };
+    Some(NewApiQuotaSettings {
+        quota_per_unit,
+        usd_exchange_rate,
+        display_type,
+    })
 }
 
-fn parse_new_api_balance(body: &str, quota_per_unit: f64) -> Result<CodexApiKeyBalance, String> {
-    if !quota_per_unit.is_finite() || quota_per_unit <= 0.0 {
-        return Err("NewAPI 返回了无效的额度换算单位".to_string());
-    }
+fn parse_new_api_balance(
+    body: &str,
+    settings: NewApiQuotaSettings,
+) -> Result<CodexApiKeyBalance, String> {
     let payload = serde_json::from_str::<Value>(body)
         .map_err(|error| format!("解析 NewAPI 余额响应失败: {}", error))?;
     if payload.get("code").and_then(Value::as_bool) == Some(false) {
@@ -655,7 +717,8 @@ fn parse_new_api_balance(body: &str, quota_per_unit: f64) -> Result<CodexApiKeyB
         .get("unlimited_quota")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let convert = |key: &str| json_f64(data.get(key)).map(|value| value / quota_per_unit);
+    let convert =
+        |key: &str| json_f64(data.get(key)).and_then(|value| settings.convert_quota(value));
     let available_amount = convert("total_available");
     if !unlimited && available_amount.is_none() {
         return Err("NewAPI 余额响应缺少 total_available".to_string());
@@ -666,9 +729,41 @@ fn parse_new_api_balance(body: &str, quota_per_unit: f64) -> Result<CodexApiKeyB
         available_amount: (!unlimited).then_some(available_amount).flatten(),
         used_amount: convert("total_used"),
         total_amount: convert("total_granted"),
-        currency: "USD".to_string(),
+        currency: settings.unit().to_string(),
         unlimited,
         plan_name: json_trimmed_string(data.get("name")),
+    })
+}
+
+fn parse_new_api_account_balance(
+    subscription_body: &str,
+    usage_body: &str,
+    settings: NewApiQuotaSettings,
+) -> Result<CodexApiKeyBalance, String> {
+    let subscription = serde_json::from_str::<Value>(subscription_body)
+        .map_err(|error| format!("解析 NewAPI 账户总额响应失败: {error}"))?;
+    let usage = serde_json::from_str::<Value>(usage_body)
+        .map_err(|error| format!("解析 NewAPI 账户用量响应失败: {error}"))?;
+    let total_amount = json_f64(subscription.get("hard_limit_usd"))
+        .ok_or_else(|| "NewAPI 账户总额响应缺少 hard_limit_usd".to_string())?;
+    let used_amount = json_f64(usage.get("total_usage"))
+        .map(|value| value / 100.0)
+        .ok_or_else(|| "NewAPI 账户用量响应缺少 total_usage".to_string())?;
+    let unlimited_sentinel = settings.display_type != NewApiQuotaDisplayType::Tokens
+        && (total_amount - 100_000_000.0).abs() < 0.000_001;
+    if total_amount < 0.0 || used_amount < 0.0 || unlimited_sentinel {
+        return Err("NewAPI 账户账单响应不包含可显示的真实余额".to_string());
+    }
+
+    Ok(CodexApiKeyBalance {
+        provider: "new_api".to_string(),
+        balance_kind: "wallet".to_string(),
+        available_amount: Some((total_amount - used_amount).max(0.0)),
+        used_amount: Some(used_amount),
+        total_amount: Some(total_amount),
+        currency: settings.unit().to_string(),
+        unlimited: false,
+        plan_name: None,
     })
 }
 
@@ -749,6 +844,40 @@ async fn read_balance_response(
     Ok((status, String::from_utf8_lossy(&body).into_owned()))
 }
 
+async fn fetch_new_api_account_balance(
+    client: &reqwest::Client,
+    endpoints: &CodexRelayBalanceEndpoints,
+    api_key: &str,
+    settings: NewApiQuotaSettings,
+) -> Result<CodexApiKeyBalance, String> {
+    let subscription = client
+        .get(endpoints.new_api_billing_subscription.clone())
+        .bearer_auth(api_key)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|error| format!("请求 NewAPI 账户总额失败: {error}"))?;
+    let (subscription_status, subscription_body) =
+        read_balance_response(subscription, "NewAPI 账户总额接口").await?;
+    if !subscription_status.is_success() {
+        return Err(balance_http_error(subscription_status));
+    }
+
+    let usage = client
+        .get(endpoints.new_api_billing_usage.clone())
+        .bearer_auth(api_key)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|error| format!("请求 NewAPI 账户用量失败: {error}"))?;
+    let (usage_status, usage_body) = read_balance_response(usage, "NewAPI 账户用量接口").await?;
+    if !usage_status.is_success() {
+        return Err(balance_http_error(usage_status));
+    }
+
+    parse_new_api_account_balance(&subscription_body, &usage_body, settings)
+}
+
 fn balance_http_error(status: reqwest::StatusCode) -> String {
     match status.as_u16() {
         401 => "余额查询鉴权失败，请检查 API Key".to_string(),
@@ -805,9 +934,9 @@ async fn fetch_codex_api_key_balance(
     if let Ok(response) = status_response {
         if let Ok((status, body)) = read_balance_response(response, "NewAPI 状态接口").await {
             if status.is_success() {
-                if let Some(quota_per_unit) = parse_new_api_quota_per_unit(&body) {
+                if let Some(quota_settings) = parse_new_api_quota_settings(&body) {
                     let response = client
-                        .get(endpoints.new_api_usage)
+                        .get(endpoints.new_api_usage.clone())
                         .bearer_auth(api_key)
                         .header(reqwest::header::ACCEPT, "application/json")
                         .send()
@@ -815,7 +944,19 @@ async fn fetch_codex_api_key_balance(
                         .map_err(|error| format!("请求 NewAPI 余额失败: {}", error))?;
                     let (status, body) = read_balance_response(response, "NewAPI 余额接口").await?;
                     if status.is_success() {
-                        if let Ok(balance) = parse_new_api_balance(&body, quota_per_unit) {
+                        if let Ok(balance) = parse_new_api_balance(&body, quota_settings) {
+                            if balance.unlimited {
+                                if let Ok(account_balance) = fetch_new_api_account_balance(
+                                    &client,
+                                    &endpoints,
+                                    api_key,
+                                    quota_settings,
+                                )
+                                .await
+                                {
+                                    return Ok(account_balance);
+                                }
+                            }
                             return Ok(balance);
                         }
                     } else if !matches!(status.as_u16(), 404 | 405) {
@@ -3277,6 +3418,14 @@ mod tests {
             "https://relay.example/prefix/api/usage/token/"
         );
         assert_eq!(
+            endpoints.new_api_billing_subscription.as_str(),
+            "https://relay.example/prefix/dashboard/billing/subscription"
+        );
+        assert_eq!(
+            endpoints.new_api_billing_usage.as_str(),
+            "https://relay.example/prefix/dashboard/billing/usage"
+        );
+        assert_eq!(
             endpoints.sub2api_usage.as_str(),
             "https://relay.example/prefix/v1/usage"
         );
@@ -3338,12 +3487,14 @@ mod tests {
 
     #[test]
     fn new_api_balance_parser_uses_dynamic_quota_unit_and_handles_unlimited() {
-        let status = r#"{"success":true,"data":{"quota_per_unit":"250000"}}"#;
-        assert_eq!(super::parse_new_api_quota_per_unit(status), Some(250_000.0));
+        let status = r#"{"success":true,"data":{"quota_per_unit":"250000","quota_display_type":"USD","usd_exchange_rate":7.3}}"#;
+        let settings = super::parse_new_api_quota_settings(status).expect("quota settings");
+        assert_eq!(settings.quota_per_unit, 250_000.0);
+        assert_eq!(settings.display_type, super::NewApiQuotaDisplayType::Usd);
 
         let balance = super::parse_new_api_balance(
             r#"{"code":true,"data":{"object":"token_usage","name":"Codex","total_granted":750000,"total_used":250000,"total_available":500000,"unlimited_quota":false}}"#,
-            250_000.0,
+            settings,
         )
         .expect("new api balance");
         assert_eq!(balance.provider, "new_api");
@@ -3355,12 +3506,79 @@ mod tests {
 
         let unlimited = super::parse_new_api_balance(
             r#"{"data":{"object":"token_usage","unlimited_quota":true}}"#,
-            500_000.0,
+            settings,
         )
         .expect("unlimited new api balance");
         assert!(unlimited.unlimited);
         assert_eq!(unlimited.balance_kind, "unlimited");
         assert_eq!(unlimited.available_amount, None);
+    }
+
+    #[test]
+    fn new_api_balance_parser_honors_cny_and_token_display_modes() {
+        let cny_settings = super::parse_new_api_quota_settings(
+            r#"{"data":{"quota_per_unit":500000,"quota_display_type":"CNY","usd_exchange_rate":7.3}}"#,
+        )
+        .expect("CNY settings");
+        let cny = super::parse_new_api_balance(
+            r#"{"data":{"object":"token_usage","total_granted":1000000,"total_used":0,"total_available":1000000}}"#,
+            cny_settings,
+        )
+        .expect("CNY balance");
+        assert_eq!(cny.currency, "CNY");
+        assert!((cny.available_amount.expect("CNY amount") - 14.6).abs() < 1e-9);
+
+        let token_settings = super::parse_new_api_quota_settings(
+            r#"{"data":{"quota_per_unit":500000,"quota_display_type":"TOKENS"}}"#,
+        )
+        .expect("token settings");
+        let tokens = super::parse_new_api_balance(
+            r#"{"data":{"object":"token_usage","total_granted":1000000,"total_used":250000,"total_available":750000}}"#,
+            token_settings,
+        )
+        .expect("token balance");
+        assert_eq!(tokens.currency, "TOKENS");
+        assert_eq!(tokens.available_amount, Some(750_000.0));
+    }
+
+    #[test]
+    fn new_api_account_balance_parser_subtracts_historical_usage() {
+        let usd_settings = super::parse_new_api_quota_settings(
+            r#"{"data":{"quota_per_unit":500000,"quota_display_type":"USD"}}"#,
+        )
+        .expect("USD settings");
+        let balance = super::parse_new_api_account_balance(
+            r#"{"object":"billing_subscription","hard_limit_usd":300}"#,
+            r#"{"object":"list","total_usage":17441}"#,
+            usd_settings,
+        )
+        .expect("new api account balance");
+        assert_eq!(balance.provider, "new_api");
+        assert_eq!(balance.balance_kind, "wallet");
+        assert!((balance.available_amount.expect("available") - 125.59).abs() < 1e-9);
+        assert!((balance.used_amount.expect("used") - 174.41).abs() < 1e-9);
+        assert_eq!(balance.total_amount, Some(300.0));
+        assert!(!balance.unlimited);
+
+        assert!(super::parse_new_api_account_balance(
+            r#"{"hard_limit_usd":100000000}"#,
+            r#"{"total_usage":0}"#,
+            usd_settings,
+        )
+        .is_err());
+
+        let token_settings = super::parse_new_api_quota_settings(
+            r#"{"data":{"quota_per_unit":500000,"quota_display_type":"TOKENS"}}"#,
+        )
+        .expect("token settings");
+        let tokens = super::parse_new_api_account_balance(
+            r#"{"hard_limit_usd":100000000}"#,
+            r#"{"total_usage":2500000000}"#,
+            token_settings,
+        )
+        .expect("legitimate token balance");
+        assert_eq!(tokens.currency, "TOKENS");
+        assert_eq!(tokens.available_amount, Some(75_000_000.0));
     }
 
     #[test]

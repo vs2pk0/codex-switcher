@@ -272,6 +272,8 @@ struct ParsedUsageEvent {
 }
 
 const USAGE_CACHE_VERSION: u32 = 4;
+const PRICING_DEFAULTS_VERSION: u32 = 1;
+const GPT_56_DEFAULT_MODEL_IDS: [&str; 3] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 
 #[derive(Debug, Clone, Copy)]
 struct ModelPricing {
@@ -1745,14 +1747,61 @@ fn load_pricing() -> Result<Vec<CodexUsagePricing>, String> {
             fs::read_to_string(&path).map_err(|error| format!("读取成本定价失败: {}", error))?;
         let pricing: Vec<CodexUsagePricing> = serde_json::from_str(&content)
             .map_err(|error| format!("解析成本定价失败: {}", error))?;
+        let applied_version = read_pricing_defaults_version()?;
+        let (pricing, migrated) = migrate_pricing_defaults(pricing, applied_version);
         let mut pricing = filter_supported_pricing(pricing);
         pricing.sort_by(|left, right| left.model_id.cmp(&right.model_id));
         write_pricing(&pricing)?;
+        if migrated {
+            write_pricing_defaults_version()?;
+        }
         return Ok(pricing);
     }
     let pricing = default_pricing();
     write_pricing(&pricing)?;
+    write_pricing_defaults_version()?;
     Ok(pricing)
+}
+
+fn migrate_pricing_defaults(
+    mut pricing: Vec<CodexUsagePricing>,
+    applied_version: u32,
+) -> (Vec<CodexUsagePricing>, bool) {
+    if applied_version >= PRICING_DEFAULTS_VERSION {
+        return (pricing, false);
+    }
+
+    for default in default_pricing()
+        .into_iter()
+        .filter(|item| GPT_56_DEFAULT_MODEL_IDS.contains(&item.model_id.as_str()))
+    {
+        if !pricing.iter().any(|item| item.model_id == default.model_id) {
+            pricing.push(default);
+        }
+    }
+    (pricing, true)
+}
+
+fn read_pricing_defaults_version() -> Result<u32, String> {
+    let path = pricing_defaults_version_path();
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("读取默认定价版本失败: {error}")),
+    };
+    content
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| format!("解析默认定价版本失败: {error}"))
+}
+
+fn write_pricing_defaults_version() -> Result<(), String> {
+    fs::create_dir_all(statistics_dir()).map_err(|error| format!("创建统计目录失败: {error}"))?;
+    fs::write(
+        pricing_defaults_version_path(),
+        PRICING_DEFAULTS_VERSION.to_string(),
+    )
+    .map_err(|error| format!("写入默认定价版本失败: {error}"))
 }
 
 fn write_pricing(pricing: &[CodexUsagePricing]) -> Result<(), String> {
@@ -3006,6 +3055,10 @@ fn pricing_config_path() -> PathBuf {
     statistics_dir().join("pricing_config.json")
 }
 
+fn pricing_defaults_version_path() -> PathBuf {
+    statistics_dir().join("pricing-defaults.version")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4198,6 +4251,60 @@ mod tests {
 
         assert_eq!(log.model, "gpt-5.6-terra");
         assert_eq!(format_cost(calculate_cost(&log, &pricing, 1.0)), "4.050000");
+    }
+
+    #[test]
+    fn pricing_defaults_migration_adds_gpt_56_once_and_preserves_custom_prices() {
+        let custom_sol = CodexUsagePricing {
+            model_id: "gpt-5.6-sol".to_string(),
+            display_name: "Custom Sol".to_string(),
+            input_cost_per_million: "99".to_string(),
+            output_cost_per_million: "98".to_string(),
+            cache_read_cost_per_million: "97".to_string(),
+            cache_creation_cost_per_million: "96".to_string(),
+        };
+        let existing = vec![
+            CodexUsagePricing {
+                model_id: "gpt-5.5".to_string(),
+                display_name: "GPT-5.5".to_string(),
+                input_cost_per_million: "5".to_string(),
+                output_cost_per_million: "30".to_string(),
+                cache_read_cost_per_million: "0.50".to_string(),
+                cache_creation_cost_per_million: "0".to_string(),
+            },
+            custom_sol.clone(),
+        ];
+
+        let (migrated, changed) = migrate_pricing_defaults(existing, 0);
+        assert!(changed);
+        assert_eq!(
+            migrated
+                .iter()
+                .filter(|item| item.model_id == "gpt-5.6-sol")
+                .count(),
+            1
+        );
+        assert_eq!(
+            migrated
+                .iter()
+                .find(|item| item.model_id == "gpt-5.6-sol")
+                .expect("custom Sol pricing")
+                .input_cost_per_million,
+            custom_sol.input_cost_per_million
+        );
+        assert!(migrated.iter().any(|item| item.model_id == "gpt-5.6-terra"));
+        assert!(migrated.iter().any(|item| item.model_id == "gpt-5.6-luna"));
+
+        let without_luna = migrated
+            .into_iter()
+            .filter(|item| item.model_id != "gpt-5.6-luna")
+            .collect::<Vec<_>>();
+        let (after_current_version, changed) =
+            migrate_pricing_defaults(without_luna, PRICING_DEFAULTS_VERSION);
+        assert!(!changed);
+        assert!(!after_current_version
+            .iter()
+            .any(|item| item.model_id == "gpt-5.6-luna"));
     }
 
     #[test]
