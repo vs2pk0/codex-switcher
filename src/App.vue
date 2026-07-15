@@ -80,7 +80,11 @@ import {
   type CodexSwitcherPaths,
   type CodexSwitcherSettings,
 } from "./services/codex";
-import { bindApiServiceAccounts } from "./services/apiService";
+import {
+  bindApiServiceAccounts,
+  getApiServiceState,
+  isCurrentApiServiceAccount,
+} from "./services/apiService";
 import { getCodexUsageDashboard } from "./services/usage";
 import {
   listSessionVisibilityRepairInstances,
@@ -323,7 +327,7 @@ const filteredAccounts = computed(() => {
       .some((value) => (value || "").toLocaleLowerCase().includes(keyword));
   });
 });
-const sortedAccounts = computed(() => {
+function sortAccountsForDisplay(source: CodexAccount[]): CodexAccount[] {
   const order = new Map(settings.customOrder.map((id, index) => [id, index]));
   const pinned = new Map((settings.pinnedAccountIds || []).map((id, index) => [id, index]));
   const sortDirection = settings.sortDirection === "asc" ? 1 : -1;
@@ -350,7 +354,7 @@ const sortedAccounts = computed(() => {
         return account.created_at;
     }
   };
-  return [...filteredAccounts.value].sort((a, b) => {
+  return [...source].sort((a, b) => {
     const aPinned = pinned.get(a.id);
     const bPinned = pinned.get(b.id);
     if (aPinned !== undefined || bPinned !== undefined) {
@@ -369,7 +373,9 @@ const sortedAccounts = computed(() => {
     }
     return b.last_used - a.last_used;
   });
-});
+}
+const sortedAccounts = computed(() => sortAccountsForDisplay(filteredAccounts.value));
+const apiServiceAccounts = computed(() => sortAccountsForDisplay(accounts.value));
 const totalPages = computed(() =>
   Math.max(1, Math.ceil(sortedAccounts.value.length / Math.max(1, settings.pageSize || 50))),
 );
@@ -1806,29 +1812,40 @@ async function openBatchExport(): Promise<void> {
   }
 }
 
-function confirmBindSelectedToApiService(): void {
+async function confirmBindSelectedToApiService(): Promise<void> {
+  if (!selectedAccountIdList.value.length) {
+    Message.warning("请先勾选要绑定到 API 服务的账号");
+    return;
+  }
+  let serviceState;
+  try {
+    serviceState = await getApiServiceState();
+  } catch (error) {
+    Message.error(`读取 API 服务配置失败：${errorText(error)}`);
+    return;
+  }
   const selected = selectedAccountIdList.value
     .map((id) => accounts.value.find((account) => account.id === id))
     .filter((account): account is CodexAccount => Boolean(account))
-    .filter((account) => !isApiKeyAccount(account));
-  if (!selectedAccountIdList.value.length) {
-    Message.warning("请先勾选要绑定到 API 服务的 OAuth 账号");
-    return;
-  }
+    .filter((account) => !isCurrentApiServiceAccount(account, serviceState));
   if (!selected.length) {
-    Message.warning("API Key 账号不需要绑定到 API 服务，请选择 OAuth 账号");
+    Message.warning("所选账号指向当前 API 服务，不能绑定服务自身");
     return;
   }
+  const oauthCount = selected.filter((account) => !isApiKeyAccount(account)).length;
+  const apiKeyCount = selected.length - oauthCount;
   Modal.warning({
     title: "绑定到 API 服务",
-    content: `将 ${selected.length} 个 OAuth 账号转换为 CPA 格式，并写入 API 服务认证目录。是否继续？`,
+    content: `将绑定 ${selected.length} 个账号（OAuth ${oauthCount}，API Key ${apiKeyCount}）到 API 服务。是否继续？`,
     okText: "确认绑定",
     cancelText: "取消",
     hideCancel: false,
     async onOk() {
       try {
         const summary = await bindApiServiceAccounts(selected.map((account) => account.id));
-        Message.success(`已绑定 ${summary.count} 个账号到 API 服务`);
+        Message.success(
+          `已绑定 ${summary.count} 个账号到 API 服务（OAuth ${summary.oauthCount}，API Key ${summary.apiKeyCount}）`,
+        );
       } catch (error) {
         Message.error(`绑定失败：${errorText(error)}`);
       }
@@ -3066,6 +3083,7 @@ function handleAddTabChange(key: string | number): void {
 }
 
 function switchView(view: ActiveView): void {
+  window.scrollTo({ top: 0, left: 0, behavior: "auto" });
   activeView.value = view;
   if (view === "usage") {
     usagePanelMounted.value = true;
@@ -3428,7 +3446,7 @@ onUnmounted(() => {
     <ApiServicePanel
       v-show="activeView === 'apiService'"
       :active="activeView === 'apiService'"
-      :accounts="accounts"
+      :accounts="apiServiceAccounts"
       :settings="settings"
       @account-added="loadAccounts"
     />

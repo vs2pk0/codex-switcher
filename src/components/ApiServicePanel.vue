@@ -20,6 +20,7 @@ import {
   downloadApiServiceUpdate,
   getApiServiceState,
   importApiServiceRuntime,
+  isCurrentApiServiceAccount,
   listApiServiceBoundAccounts,
   resetApiService,
   startApiService,
@@ -61,7 +62,8 @@ const importingRuntime = ref(false);
 const activatingRuntimeId = ref("");
 const deletingRuntimeId = ref("");
 const selectedBindIds = ref<Set<string>>(new Set());
-const selectedDeleteEmails = ref<Set<string>>(new Set());
+const selectedDeleteIds = ref<Set<string>>(new Set());
+const bindSearchKeyword = ref("");
 const boundAccounts = ref<ApiServiceBoundAccount[]>([]);
 const progress = ref<ApiServiceDownloadProgress | null>(null);
 let unlistenProgress: UnlistenFn | null = null;
@@ -149,18 +151,35 @@ const serviceStatusText = computed(() => {
 });
 const apiBaseUrl = computed(() => `http://127.0.0.1:${form.port || 17877}/v1`);
 const firstApiKey = computed(() => form.apiKeys.find((key) => key.trim())?.trim() || "");
-const oauthAccounts = computed(() => props.accounts.filter((account) => !isApiKeyAccount(account)));
+const bindableAccounts = computed(() =>
+  props.accounts.filter((account) => !isCurrentApiServiceAccount(account, state.value)),
+);
+const filteredBindableAccounts = computed(() => {
+  const keyword = bindSearchKeyword.value.trim().toLocaleLowerCase();
+  if (!keyword) return bindableAccounts.value;
+  return bindableAccounts.value.filter((account) =>
+    [account.account_name, account.email]
+      .some((value) => (value || "").toLocaleLowerCase().includes(keyword)),
+  );
+});
 const selectedBindCount = computed(
-  () => oauthAccounts.value.filter((account) => selectedBindIds.value.has(account.id)).length,
+  () => bindableAccounts.value.filter((account) => selectedBindIds.value.has(account.id)).length,
+);
+const selectedVisibleBindCount = computed(
+  () => filteredBindableAccounts.value.filter((account) => selectedBindIds.value.has(account.id)).length,
 );
 const allBindSelected = computed(
-  () => oauthAccounts.value.length > 0 && selectedBindCount.value === oauthAccounts.value.length,
+  () =>
+    filteredBindableAccounts.value.length > 0 &&
+    selectedVisibleBindCount.value === filteredBindableAccounts.value.length,
 );
 const bindSelectionIndeterminate = computed(
-  () => selectedBindCount.value > 0 && selectedBindCount.value < oauthAccounts.value.length,
+  () =>
+    selectedVisibleBindCount.value > 0 &&
+    selectedVisibleBindCount.value < filteredBindableAccounts.value.length,
 );
 const selectedDeleteCount = computed(
-  () => boundAccounts.value.filter((account) => selectedDeleteEmails.value.has(account.email)).length,
+  () => boundAccounts.value.filter((account) => selectedDeleteIds.value.has(account.id)).length,
 );
 const allDeleteSelected = computed(
   () => boundAccounts.value.length > 0 && selectedDeleteCount.value === boundAccounts.value.length,
@@ -377,11 +396,15 @@ function planClass(account: CodexAccount): string {
   return `${key} ${style}`;
 }
 
-function normalizedEmail(value?: string): string {
+function normalizedEmail(value?: string | null): string {
   return (value || "").trim().toLowerCase();
 }
 
 function boundSourceAccount(account: ApiServiceBoundAccount): CodexAccount | undefined {
+  if (account.accountId) {
+    const matched = props.accounts.find((item) => item.id === account.accountId);
+    if (matched) return matched;
+  }
   const email = normalizedEmail(account.email);
   if (!email) return undefined;
   return props.accounts.find((item) => normalizedEmail(item.email) === email);
@@ -449,22 +472,35 @@ function quotaResetDateLabel(value?: string | number): string {
   )}:${pad(date.getMinutes())}`);
 }
 
-function openBindAccounts(): void {
-  selectedBindIds.value = new Set(oauthAccounts.value.map((account) => account.id));
+async function openBindAccounts(): Promise<void> {
+  if (!(await loadBoundAccounts())) return;
+  const boundAccountIds = new Set(
+    boundAccounts.value
+      .map((account) => account.accountId || boundSourceAccount(account)?.id)
+      .filter((accountId): accountId is string => Boolean(accountId)),
+  );
+  selectedBindIds.value = new Set(
+    bindableAccounts.value
+      .filter((account) => boundAccountIds.has(account.id))
+      .map((account) => account.id),
+  );
+  bindSearchKeyword.value = "";
   bindVisible.value = true;
 }
 
 async function bindSelectedAccounts(): Promise<void> {
   const ids = [...selectedBindIds.value];
   if (!ids.length) {
-    Message.warning(t("请选择要绑定的 OAuth 账号"));
+    Message.warning(t("请选择要绑定的账号"));
     return;
   }
   bindingAccounts.value = true;
   try {
     const summary = await bindApiServiceAccounts(ids);
     bindVisible.value = false;
-    Message.success(`已绑定 ${summary.count} 个账号到 API 服务`);
+    Message.success(
+      `已绑定 ${summary.count} 个账号到 API 服务（OAuth ${summary.oauthCount}，API Key ${summary.apiKeyCount}）`,
+    );
     await loadBoundAccounts();
   } catch (error) {
     Message.error(`绑定失败：${errorText(error)}`);
@@ -474,30 +510,33 @@ async function bindSelectedAccounts(): Promise<void> {
 }
 
 async function openDeleteAccounts(): Promise<void> {
-  await loadBoundAccounts();
-  selectedDeleteEmails.value = new Set(boundAccounts.value.map((account) => account.email));
+  if (!(await loadBoundAccounts())) return;
+  selectedDeleteIds.value = new Set(boundAccounts.value.map((account) => account.id));
   deleteVisible.value = true;
 }
 
-async function loadBoundAccounts(): Promise<void> {
+async function loadBoundAccounts(): Promise<boolean> {
   try {
     boundAccounts.value = await listApiServiceBoundAccounts();
+    return true;
   } catch (error) {
+    boundAccounts.value = [];
     Message.error(`读取 API 服务账号失败：${errorText(error)}`);
+    return false;
   }
 }
 
 async function deleteSelectedBoundAccounts(): Promise<void> {
-  const emails = [...selectedDeleteEmails.value];
-  if (!emails.length) {
+  const ids = [...selectedDeleteIds.value];
+  if (!ids.length) {
     Message.warning(t("请选择要删除的 API 服务账号"));
     return;
   }
   deletingBoundAccounts.value = true;
   try {
-    const summary = await deleteApiServiceBoundAccounts(emails);
+    const summary = await deleteApiServiceBoundAccounts(ids);
     await loadBoundAccounts();
-    selectedDeleteEmails.value = new Set();
+    selectedDeleteIds.value = new Set();
     deleteVisible.value = false;
     Message.success(`已删除 ${summary.count} 个 API 服务账号`);
   } catch (error) {
@@ -515,21 +554,24 @@ function toggleBindAccount(accountId: string, checked: boolean): void {
 }
 
 function toggleAllBindAccounts(checked: boolean): void {
-  selectedBindIds.value = checked
-    ? new Set(oauthAccounts.value.map((account) => account.id))
-    : new Set();
+  const next = new Set(selectedBindIds.value);
+  for (const account of filteredBindableAccounts.value) {
+    if (checked) next.add(account.id);
+    else next.delete(account.id);
+  }
+  selectedBindIds.value = next;
 }
 
-function toggleDeleteAccount(email: string, checked: boolean): void {
-  const next = new Set(selectedDeleteEmails.value);
-  if (checked) next.add(email);
-  else next.delete(email);
-  selectedDeleteEmails.value = next;
+function toggleDeleteAccount(id: string, checked: boolean): void {
+  const next = new Set(selectedDeleteIds.value);
+  if (checked) next.add(id);
+  else next.delete(id);
+  selectedDeleteIds.value = next;
 }
 
 function toggleAllDeleteAccounts(checked: boolean): void {
-  selectedDeleteEmails.value = checked
-    ? new Set(boundAccounts.value.map((account) => account.email))
+  selectedDeleteIds.value = checked
+    ? new Set(boundAccounts.value.map((account) => account.id))
     : new Set();
 }
 
@@ -1271,8 +1313,15 @@ onUnmounted(() => {
       :footer="false"
     >
       <div class="api-service-account-modal">
-        <p>{{ t("选择 OAuth 账号后会转换为 CPA 格式，并写入 API 服务的认证目录。") }}</p>
-        <div v-if="oauthAccounts.length" class="api-service-account-select-all">
+        <p>{{ t("OAuth 账号会写入认证目录，API Key 账号会写入 CLIProxyAPI 上游配置。") }}</p>
+        <a-input
+          v-model="bindSearchKeyword"
+          allow-clear
+          :placeholder="t('筛选邮箱 / 昵称')"
+        >
+          <template #prefix><icon-search /></template>
+        </a-input>
+        <div v-if="bindableAccounts.length" class="api-service-account-select-all">
           <a-checkbox
             :model-value="allBindSelected"
             :indeterminate="bindSelectionIndeterminate"
@@ -1280,17 +1329,24 @@ onUnmounted(() => {
           >
             {{ t("全选") }}
           </a-checkbox>
-          <span>{{ t("已选") }} {{ selectedBindCount }} / {{ oauthAccounts.length }}</span>
+          <span>
+            {{ t("已选") }} {{ selectedBindCount }} / {{ bindableAccounts.length }}
+            <template v-if="bindSearchKeyword.trim()">· {{ filteredBindableAccounts.length }} {{ t("条") }}</template>
+          </span>
         </div>
         <div class="api-service-account-list">
-          <label v-for="account in oauthAccounts" :key="account.id" class="api-service-account-row">
+          <label v-for="account in filteredBindableAccounts" :key="account.id" class="api-service-account-row">
             <a-checkbox
               :model-value="selectedBindIds.has(account.id)"
               @change="(checked) => toggleBindAccount(account.id, Boolean(checked))"
             />
             <div class="api-service-account-main">
               <strong>{{ accountDisplayName(account) }}</strong>
-              <span>OAuth · {{ account.email || account.id }}</span>
+              <span v-if="isApiKeyAccount(account)">
+                API Key · {{ account.api_provider_name || account.apiProviderName || t("自定义服务") }} ·
+                {{ account.api_base_url || account.apiBaseUrl || "https://api.openai.com/v1" }}
+              </span>
+              <span v-else>OAuth · {{ account.email || account.id }}</span>
               <div v-if="account.quota && hasAnyQuotaWindow(account.quota)" class="api-service-account-quota">
                 <div v-if="hasQuotaWindow(account.quota, 'hourly')" class="api-service-quota-line">
                   <span>
@@ -1322,7 +1378,10 @@ onUnmounted(() => {
             </div>
             <PlanBadge :label="planLabel(account)" :badge-class="planClass(account)" />
           </label>
-          <a-empty v-if="!oauthAccounts.length" :description="t('暂无可绑定的 OAuth 账号')" />
+          <a-empty
+            v-if="!filteredBindableAccounts.length"
+            :description="t(bindableAccounts.length ? '没有匹配的账号' : '暂无可绑定账号')"
+          />
         </div>
         <div class="api-service-modal-actions">
           <a-button @click="bindVisible = false">{{ t("取消") }}</a-button>
@@ -1340,7 +1399,7 @@ onUnmounted(() => {
       :footer="false"
     >
       <div class="api-service-account-modal">
-        <p>{{ t("这里从认证目录 JSON 内容解析邮箱匹配账号，删除会移除对应 CPA 认证文件。") }}</p>
+        <p>{{ t("删除会移除对应 OAuth 认证文件或由本应用管理的 API Key 上游配置。") }}</p>
         <div v-if="boundAccounts.length" class="api-service-account-select-all">
           <a-checkbox
             :model-value="allDeleteSelected"
@@ -1352,14 +1411,15 @@ onUnmounted(() => {
           <span>{{ t("已选") }} {{ selectedDeleteCount }} / {{ boundAccounts.length }}</span>
         </div>
         <div class="api-service-account-list">
-          <label v-for="account in boundAccounts" :key="account.path" class="api-service-account-row">
+          <label v-for="account in boundAccounts" :key="account.id" class="api-service-account-row">
             <a-checkbox
-              :model-value="selectedDeleteEmails.has(account.email)"
-              @change="(checked) => toggleDeleteAccount(account.email, Boolean(checked))"
+              :model-value="selectedDeleteIds.has(account.id)"
+              @change="(checked) => toggleDeleteAccount(account.id, Boolean(checked))"
             />
             <div class="api-service-account-main">
-              <strong>{{ account.email }}</strong>
-              <span>{{ t("CPA 认证账号") }}</span>
+              <strong>{{ account.label }}</strong>
+              <span v-if="account.kind === 'apikey'">API Key · {{ account.baseUrl }}</span>
+              <span v-else>{{ t("CPA 认证账号") }} · {{ account.email }}</span>
               <template v-if="boundSourceAccount(account)?.quota && hasAnyQuotaWindow(boundSourceAccount(account)?.quota)">
                 <div class="api-service-account-quota">
                   <div

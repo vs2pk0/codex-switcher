@@ -1,4 +1,7 @@
-use crate::account::{write_bytes_atomic, AccountStore};
+use crate::{
+    account::{write_bytes_atomic, AccountStore, CodexAccount},
+    fetch_codex_api_key_models_for_account,
+};
 use flate2::read::GzDecoder;
 use rand::{distributions::Alphanumeric, Rng};
 use semver::Version;
@@ -6,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering as CmpOrdering,
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs::{self, File},
     io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
@@ -39,6 +42,7 @@ const MAX_RUNTIME_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_EXTRACTED_RUNTIME_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
 const MAX_OLD_RUNTIMES: usize = 2;
+const API_KEY_BINDINGS_FILE: &str = "api-key-bindings.json";
 
 #[derive(Default)]
 pub struct ApiServiceProcessState(pub Mutex<Option<Child>>);
@@ -193,14 +197,63 @@ pub struct DownloadProgressEvent {
 pub struct ApiServiceAccountSyncSummary {
     count: usize,
     auth_dir: String,
+    oauth_count: usize,
+    api_key_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiServiceBoundAccount {
-    email: String,
+    id: String,
+    account_id: Option<String>,
+    kind: String,
+    label: String,
+    email: Option<String>,
+    base_url: Option<String>,
     path: String,
     modified_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ManagedApiKeyBindings {
+    #[serde(default)]
+    bindings: Vec<ManagedApiKeyBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedApiKeyBinding {
+    account_id: String,
+    api_key_hash: String,
+    base_url: String,
+    label: String,
+    #[serde(default = "default_true")]
+    owns_config_entry: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+struct CodexApiKeyConfigEntry {
+    api_key: String,
+    base_url: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    models: Vec<CodexApiKeyConfigModel>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexApiKeyConfigModel {
+    name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    alias: String,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -596,98 +649,163 @@ fn ensure_not_shutting_down(operation: &ApiServiceOperationState) -> Result<(), 
 }
 
 #[tauri::command]
-pub fn api_service_bind_accounts(
+pub async fn api_service_bind_accounts(
+    operation: State<'_, ApiServiceOperationState>,
     account_ids: Vec<String>,
 ) -> Result<ApiServiceAccountSyncSummary, String> {
+    let mut seen = HashSet::new();
     let ids = account_ids
         .into_iter()
         .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
+        .filter(|id| !id.is_empty() && seen.insert(id.clone()))
         .collect::<Vec<_>>();
     if ids.is_empty() {
-        return Err("请选择要绑定到 API 服务的 OAuth 账号".to_string());
+        return Err("请选择要绑定到 API 服务的账号".to_string());
     }
     let dirs = ApiServiceDirs::new()?;
-    ensure_auth_dir_config(&dirs)?;
-    let auth_dir = api_auth_dir(&dirs);
-    fs::create_dir_all(&auth_dir)
-        .map_err(|error| format!("创建 API 服务认证目录失败: {}", error))?;
+    let initial_settings = read_effective_settings(&dirs)?;
 
     let store = AccountStore::default();
     let accounts = store.list_accounts()?;
-    let oauth_ids = ids
-        .into_iter()
-        .filter(|id| {
-            accounts
-                .iter()
-                .find(|account| account.id == *id)
-                .is_some_and(|account| account.auth_mode.as_deref() != Some("apikey"))
-        })
-        .collect::<Vec<_>>();
-    if oauth_ids.is_empty() {
-        return Err("请选择 OAuth 账号，API Key 账号不需要写入 CPA 认证目录".to_string());
+    let mut selected = Vec::with_capacity(ids.len());
+    for id in ids {
+        let account = accounts
+            .iter()
+            .find(|account| account.id == id)
+            .cloned()
+            .ok_or_else(|| format!("账号不存在: {id}"))?;
+        selected.push(account);
     }
 
-    let mut count = 0;
-    for account_id in oauth_ids {
-        let content = store.export_accounts(std::slice::from_ref(&account_id), Some("cpa"))?;
+    let mut api_key_bindings = Vec::new();
+    for account in selected
+        .iter()
+        .filter(|account| is_api_key_account(account))
+    {
+        if is_current_api_service_account(account, &initial_settings)? {
+            return Err(format!(
+                "账号“{}”指向当前 API 服务端口，不能绑定服务自身",
+                api_service_account_label(account)
+            ));
+        }
+        let models = match fetch_codex_api_key_models_for_account(account).await {
+            Ok(models) if !models.is_empty() => models
+                .into_iter()
+                .map(|model| CodexApiKeyConfigModel {
+                    name: model.id,
+                    alias: String::new(),
+                    extra: BTreeMap::new(),
+                })
+                .collect(),
+            _ => account
+                .default_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(|model| {
+                    vec![CodexApiKeyConfigModel {
+                        name: model.to_string(),
+                        alias: String::new(),
+                        extra: BTreeMap::new(),
+                    }]
+                })
+                .unwrap_or_default(),
+        };
+        api_key_bindings.push((account.clone(), models));
+    }
+
+    let mut oauth_bindings = Vec::new();
+    for account in selected
+        .iter()
+        .filter(|account| !is_api_key_account(account))
+    {
+        let content = store.export_accounts(std::slice::from_ref(&account.id), Some("cpa"))?;
         let value: serde_json::Value = serde_json::from_str(&content)
             .map_err(|error| format!("解析 CPA 导出数据失败: {}", error))?;
-        let email = cpa_email_from_value(&value)
-            .or_else(|| {
-                accounts
-                    .iter()
-                    .find(|account| account.id == account_id)
-                    .map(|account| account.email.clone())
-            })
-            .unwrap_or_else(|| account_id.clone());
+        let email = cpa_email_from_value(&value).unwrap_or_else(|| account.email.clone());
         let file_name = format!("codex-switcher-{}.json", safe_auth_file_stem(&email));
-        fs::write(auth_dir.join(file_name), content)
-            .map_err(|error| format!("写入 API 服务认证文件失败: {}", error))?;
-        count += 1;
+        oauth_bindings.push((file_name, content));
     }
 
+    let _guard = lock_operation(&operation)?;
+    ensure_not_shutting_down(&operation)?;
+    ensure_auth_dir_config(&dirs)?;
+    let settings = read_effective_settings(&dirs)?;
+    for (account, _) in &api_key_bindings {
+        if is_current_api_service_account(account, &settings)? {
+            return Err(format!(
+                "账号“{}”指向当前 API 服务端口，不能绑定服务自身",
+                api_service_account_label(account)
+            ));
+        }
+    }
+
+    let auth_dir = api_auth_dir(&dirs);
+    fs::create_dir_all(&auth_dir)
+        .map_err(|error| format!("创建 API 服务认证目录失败: {}", error))?;
+    if !api_key_bindings.is_empty() {
+        bind_managed_api_key_accounts(&dirs, &api_key_bindings)?;
+    }
+
+    for (file_name, content) in &oauth_bindings {
+        write_bytes_atomic(&auth_dir.join(file_name), content.as_bytes())
+            .map_err(|error| format!("写入 API 服务认证文件失败: {error}"))?;
+    }
+
+    let oauth_count = oauth_bindings.len();
+    let api_key_count = api_key_bindings.len();
     Ok(ApiServiceAccountSyncSummary {
-        count,
+        count: oauth_count + api_key_count,
         auth_dir: display_path(&auth_dir),
+        oauth_count,
+        api_key_count,
     })
 }
 
 #[tauri::command]
-pub fn api_service_list_bound_accounts() -> Result<Vec<ApiServiceBoundAccount>, String> {
+pub fn api_service_list_bound_accounts(
+    operation: State<'_, ApiServiceOperationState>,
+) -> Result<Vec<ApiServiceBoundAccount>, String> {
+    let _guard = lock_operation(&operation)?;
+    ensure_not_shutting_down(&operation)?;
     let dirs = ApiServiceDirs::new()?;
     ensure_auth_dir_config(&dirs)?;
-    let auth_dir = api_auth_dir(&dirs);
-    list_bound_auth_accounts(&auth_dir)
+    list_all_bound_accounts(&dirs)
 }
 
 #[tauri::command]
 pub fn api_service_delete_bound_accounts(
-    emails: Vec<String>,
+    operation: State<'_, ApiServiceOperationState>,
+    bound_ids: Vec<String>,
 ) -> Result<ApiServiceAccountSyncSummary, String> {
-    let targets = emails
+    let targets = bound_ids
         .into_iter()
-        .map(|email| email.trim().to_ascii_lowercase())
-        .filter(|email| !email.is_empty())
-        .collect::<std::collections::HashSet<_>>();
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect::<HashSet<_>>();
     if targets.is_empty() {
         return Err("请选择要删除的 API 服务账号".to_string());
     }
+    let _guard = lock_operation(&operation)?;
+    ensure_not_shutting_down(&operation)?;
     let dirs = ApiServiceDirs::new()?;
     ensure_auth_dir_config(&dirs)?;
     let auth_dir = api_auth_dir(&dirs);
     let accounts = list_bound_auth_accounts(&auth_dir)?;
-    let mut count = 0;
+    let mut oauth_count = 0;
     for account in accounts {
-        if targets.contains(&account.email.to_ascii_lowercase()) {
+        if targets.contains(&account.id) {
             fs::remove_file(&account.path)
                 .map_err(|error| format!("删除认证文件失败: {}", error))?;
-            count += 1;
+            oauth_count += 1;
         }
     }
+    let api_key_count = delete_managed_api_key_bindings(&dirs, &targets)?;
     Ok(ApiServiceAccountSyncSummary {
-        count,
+        count: oauth_count + api_key_count,
         auth_dir: display_path(&auth_dir),
+        oauth_count,
+        api_key_count,
     })
 }
 
@@ -1628,6 +1746,350 @@ fn ensure_auth_dir_config(dirs: &ApiServiceDirs) -> Result<(), String> {
     Ok(())
 }
 
+fn api_service_account_label(account: &CodexAccount) -> String {
+    account
+        .account_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(account.email.as_str())
+        .to_string()
+}
+
+fn is_api_key_account(account: &CodexAccount) -> bool {
+    account.auth_mode.as_deref() == Some("apikey")
+        || account
+            .openai_api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+}
+
+fn normalized_api_base_url(account: &CodexAccount) -> Result<String, String> {
+    let raw = account
+        .api_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("https://api.openai.com/v1");
+    let mut url = reqwest::Url::parse(raw).map_err(|error| format!("Base URL 无效: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+        return Err("Base URL 必须是有效的 http:// 或 https:// 地址".to_string());
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    let normalized = url.to_string();
+    Ok(normalized.trim_end_matches('/').to_string())
+}
+
+fn is_current_api_service_account(
+    account: &CodexAccount,
+    settings: &ApiServiceSettings,
+) -> Result<bool, String> {
+    let base_url = normalized_api_base_url(account)?;
+    Ok(is_current_api_service_endpoint(
+        &base_url,
+        account.openai_api_key.as_deref(),
+        settings,
+    ))
+}
+
+fn is_current_api_service_endpoint(
+    base_url: &str,
+    api_key: Option<&str>,
+    settings: &ApiServiceSettings,
+) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    if url.port_or_known_default() != Some(settings.port) {
+        return false;
+    }
+    let local_host = match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback() || address.is_unspecified(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback() || address.is_unspecified(),
+        None => false,
+    };
+    let key_is_local = api_key
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .is_some_and(|key| {
+            settings
+                .api_keys
+                .iter()
+                .any(|candidate| candidate.trim() == key)
+        });
+    local_host || key_is_local
+}
+
+fn api_service_short_hash(value: &str) -> String {
+    api_service_hash(value)[..16].to_string()
+}
+
+fn api_service_hash(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn managed_api_key_bindings_path(dirs: &ApiServiceDirs) -> PathBuf {
+    dirs.base_dir.join(API_KEY_BINDINGS_FILE)
+}
+
+fn read_managed_api_key_bindings(dirs: &ApiServiceDirs) -> Result<ManagedApiKeyBindings, String> {
+    let path = managed_api_key_bindings_path(dirs);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ManagedApiKeyBindings::default())
+        }
+        Err(error) => return Err(format!("读取 API Key 绑定清单失败: {error}")),
+    };
+    serde_json::from_str(&content).map_err(|error| format!("解析 API Key 绑定清单失败: {error}"))
+}
+
+fn read_codex_api_key_entries(config_path: &Path) -> Result<Vec<CodexApiKeyConfigEntry>, String> {
+    let content = fs::read_to_string(config_path)
+        .map_err(|error| format!("读取 API 服务配置失败: {error}"))?;
+    let root: serde_yaml::Value = serde_yaml::from_str(&content)
+        .map_err(|error| format!("解析 API 服务 YAML 配置失败: {error}"))?;
+    let Some(mapping) = root.as_mapping() else {
+        return Err("API 服务 YAML 配置根节点必须是对象".to_string());
+    };
+    let key = serde_yaml::Value::String("codex-api-key".to_string());
+    let Some(value) = mapping.get(&key) else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    serde_yaml::from_value(value.clone())
+        .map_err(|error| format!("解析 codex-api-key 配置失败: {error}"))
+}
+
+fn entry_matches_binding(entry: &CodexApiKeyConfigEntry, binding: &ManagedApiKeyBinding) -> bool {
+    api_service_hash(entry.api_key.trim()) == binding.api_key_hash
+        && entry.base_url.trim().trim_end_matches('/') == binding.base_url.trim_end_matches('/')
+}
+
+fn codex_api_key_yaml_lines(entries: &[CodexApiKeyConfigEntry]) -> Result<Vec<String>, String> {
+    if entries.is_empty() {
+        return Ok(vec!["codex-api-key: []".to_string()]);
+    }
+    let serialized = serde_yaml::to_string(entries)
+        .map_err(|error| format!("序列化 codex-api-key 配置失败: {error}"))?;
+    let mut lines = vec!["codex-api-key:".to_string()];
+    lines.extend(
+        serialized
+            .trim_end()
+            .lines()
+            .map(|line| format!("  {line}")),
+    );
+    Ok(lines)
+}
+
+fn upsert_top_level_block(content: &str, key: &str, replacement: Vec<String>) -> String {
+    let trailing_newline = content.ends_with('\n');
+    let mut lines = content
+        .replace("\r\n", "\n")
+        .split('\n')
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if trailing_newline && lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+
+    for index in 0..lines.len() {
+        let Some((indent, line_key)) = yaml_key_line(&lines[index]) else {
+            continue;
+        };
+        if indent != 0 || line_key != key {
+            continue;
+        }
+        let mut end = index + 1;
+        while end < lines.len() {
+            let line = &lines[end];
+            if line.starts_with('#') {
+                break;
+            }
+            if line.trim().is_empty() {
+                end += 1;
+                continue;
+            }
+            if line.len() == line.trim_start().len() {
+                break;
+            }
+            end += 1;
+        }
+        lines.splice(index..end, replacement);
+        return finish_lines(lines, trailing_newline);
+    }
+
+    if !lines.is_empty() && !lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.push(String::new());
+    }
+    lines.extend(replacement);
+    finish_lines(lines, trailing_newline)
+}
+
+fn persist_managed_api_key_config(
+    dirs: &ApiServiceDirs,
+    entries: &[CodexApiKeyConfigEntry],
+    bindings: &ManagedApiKeyBindings,
+) -> Result<(), String> {
+    let config_path = dirs.workspace_dir.join("config.yaml");
+    let original = fs::read_to_string(&config_path)
+        .map_err(|error| format!("读取 API 服务配置失败: {error}"))?;
+    let updated = upsert_top_level_block(
+        &original,
+        "codex-api-key",
+        codex_api_key_yaml_lines(entries)?,
+    );
+    write_bytes_atomic(&config_path, updated.as_bytes())
+        .map_err(|error| format!("写入 API Key 上游配置失败: {error}"))?;
+    if let Err(error) = write_json(&managed_api_key_bindings_path(dirs), bindings) {
+        let _ = write_bytes_atomic(&config_path, original.as_bytes());
+        return Err(format!("写入 API Key 绑定清单失败: {error}"));
+    }
+    Ok(())
+}
+
+fn bind_managed_api_key_accounts(
+    dirs: &ApiServiceDirs,
+    selected: &[(CodexAccount, Vec<CodexApiKeyConfigModel>)],
+) -> Result<(), String> {
+    let config_path = dirs.workspace_dir.join("config.yaml");
+    let mut entries = read_codex_api_key_entries(&config_path)?;
+    let mut managed = read_managed_api_key_bindings(dirs)?;
+
+    for (account, models) in selected {
+        let api_key = account
+            .openai_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| format!("账号“{}”缺少 API Key", api_service_account_label(account)))?;
+        let base_url = normalized_api_base_url(account)?;
+        if let Some(previous) = managed
+            .bindings
+            .iter()
+            .find(|binding| binding.account_id == account.id)
+            .cloned()
+        {
+            if previous.owns_config_entry {
+                entries.retain(|entry| !entry_matches_binding(entry, &previous));
+            }
+        }
+        let api_key_hash = api_service_hash(api_key);
+        let existing_entry = entries.iter().any(|entry| {
+            api_service_hash(entry.api_key.trim()) == api_key_hash
+                && entry.base_url.trim().trim_end_matches('/') == base_url.trim_end_matches('/')
+        });
+        if !existing_entry {
+            entries.push(CodexApiKeyConfigEntry {
+                api_key: api_key.to_string(),
+                base_url: base_url.clone(),
+                models: models.clone(),
+                extra: BTreeMap::new(),
+            });
+        }
+        managed
+            .bindings
+            .retain(|binding| binding.account_id != account.id);
+        managed.bindings.push(ManagedApiKeyBinding {
+            account_id: account.id.clone(),
+            api_key_hash,
+            base_url,
+            label: api_service_account_label(account),
+            owns_config_entry: !existing_entry,
+        });
+    }
+
+    persist_managed_api_key_config(dirs, &entries, &managed)
+}
+
+fn list_all_bound_accounts(dirs: &ApiServiceDirs) -> Result<Vec<ApiServiceBoundAccount>, String> {
+    let auth_dir = api_auth_dir(dirs);
+    let local_accounts = AccountStore::default().list_accounts()?;
+    let mut bound = list_bound_auth_accounts(&auth_dir)?;
+    for item in &mut bound {
+        item.account_id = item.email.as_deref().and_then(|email| {
+            local_accounts
+                .iter()
+                .find(|account| account.email.eq_ignore_ascii_case(email))
+                .map(|account| account.id.clone())
+        });
+    }
+
+    let config_path = dirs.workspace_dir.join("config.yaml");
+    let entries = read_codex_api_key_entries(&config_path)?;
+    let managed = read_managed_api_key_bindings(dirs)?;
+    let modified_at = fs::metadata(&config_path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs());
+    for binding in managed.bindings {
+        if !entries
+            .iter()
+            .any(|entry| entry_matches_binding(entry, &binding))
+        {
+            continue;
+        }
+        let source = local_accounts
+            .iter()
+            .find(|account| account.id == binding.account_id);
+        bound.push(ApiServiceBoundAccount {
+            id: format!("apikey:{}", binding.account_id),
+            account_id: Some(binding.account_id.clone()),
+            kind: "apikey".to_string(),
+            label: source
+                .map(api_service_account_label)
+                .unwrap_or(binding.label),
+            email: source.map(|account| account.email.clone()),
+            base_url: Some(binding.base_url),
+            path: display_path(&config_path),
+            modified_at,
+        });
+    }
+    bound.sort_by(|left, right| {
+        left.kind.cmp(&right.kind).then_with(|| {
+            left.label
+                .to_ascii_lowercase()
+                .cmp(&right.label.to_ascii_lowercase())
+        })
+    });
+    Ok(bound)
+}
+
+fn delete_managed_api_key_bindings(
+    dirs: &ApiServiceDirs,
+    targets: &HashSet<String>,
+) -> Result<usize, String> {
+    let config_path = dirs.workspace_dir.join("config.yaml");
+    let mut entries = read_codex_api_key_entries(&config_path)?;
+    let mut managed = read_managed_api_key_bindings(dirs)?;
+    let removed = managed
+        .bindings
+        .iter()
+        .filter(|binding| targets.contains(&format!("apikey:{}", binding.account_id)))
+        .cloned()
+        .collect::<Vec<_>>();
+    if removed.is_empty() {
+        return Ok(0);
+    }
+    entries.retain(|entry| {
+        !removed
+            .iter()
+            .any(|binding| binding.owns_config_entry && entry_matches_binding(entry, binding))
+    });
+    managed
+        .bindings
+        .retain(|binding| !targets.contains(&format!("apikey:{}", binding.account_id)));
+    persist_managed_api_key_config(dirs, &entries, &managed)?;
+    Ok(removed.len())
+}
+
 fn list_bound_auth_accounts(auth_dir: &Path) -> Result<Vec<ApiServiceBoundAccount>, String> {
     if !auth_dir.exists() {
         return Ok(Vec::new());
@@ -1659,15 +2121,20 @@ fn list_bound_auth_accounts(auth_dir: &Path) -> Result<Vec<ApiServiceBoundAccoun
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs());
         accounts.push(ApiServiceBoundAccount {
-            email,
+            id: format!("oauth:{}", api_service_short_hash(&display_path(&path))),
+            account_id: None,
+            kind: "oauth".to_string(),
+            label: email.clone(),
+            email: Some(email),
+            base_url: None,
             path: display_path(&path),
             modified_at,
         });
     }
     accounts.sort_by(|left, right| {
-        left.email
+        left.label
             .to_ascii_lowercase()
-            .cmp(&right.email.to_ascii_lowercase())
+            .cmp(&right.label.to_ascii_lowercase())
     });
     Ok(accounts)
 }
@@ -3406,5 +3873,186 @@ mod tests {
             Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         );
         assert_eq!(checksum_for_asset(manifest, "CLIProxyAPI_7.2.71.zip"), None);
+    }
+
+    #[test]
+    fn current_api_service_endpoint_detects_loopback_and_local_keys_on_the_active_port() {
+        let settings = ApiServiceSettings {
+            port: 17877,
+            api_keys: vec!["local-client-key".to_string()],
+            ..ApiServiceSettings::default()
+        };
+
+        assert!(is_current_api_service_endpoint(
+            "http://localhost:17877/v1",
+            Some("other-key"),
+            &settings
+        ));
+        assert!(is_current_api_service_endpoint(
+            "http://127.12.34.56:17877/v1",
+            None,
+            &settings
+        ));
+        assert!(is_current_api_service_endpoint(
+            "http://[::1]:17877/v1",
+            None,
+            &settings
+        ));
+        assert!(is_current_api_service_endpoint(
+            "http://192.0.2.10:17877/v1",
+            Some("local-client-key"),
+            &settings
+        ));
+        assert!(!is_current_api_service_endpoint(
+            "http://192.0.2.10:17877/v1",
+            Some("other-key"),
+            &settings
+        ));
+        assert!(!is_current_api_service_endpoint(
+            "http://localhost:8317/v1",
+            Some("local-client-key"),
+            &settings
+        ));
+    }
+
+    #[test]
+    fn managed_api_key_config_preserves_manual_entries_and_surrounding_yaml() {
+        let (_temporary, dirs) = test_dirs();
+        fs::create_dir_all(&dirs.workspace_dir).unwrap();
+        let config_path = dirs.workspace_dir.join("config.yaml");
+        fs::write(
+            &config_path,
+            concat!(
+                "port: 17877\n",
+                "codex-api-key:\n",
+                "  - api-key: manual-key\n",
+                "    base-url: https://manual.example/v1\n",
+                "    prefix: manual\n",
+                "    models:\n",
+                "      - name: manual-model\n",
+                "        display-name: Manual Model\n",
+                "        force-mapping: true\n",
+                "\n",
+                "# Keep this provider section comment.\n",
+                "openai-compatibility: []\n",
+            ),
+        )
+        .unwrap();
+        let mut entries = read_codex_api_key_entries(&config_path).unwrap();
+        entries.push(CodexApiKeyConfigEntry {
+            api_key: "managed-secret-key".to_string(),
+            base_url: "https://managed.example/v1".to_string(),
+            models: vec![CodexApiKeyConfigModel {
+                name: "gpt-5.6-sol".to_string(),
+                alias: String::new(),
+                extra: BTreeMap::new(),
+            }],
+            extra: BTreeMap::new(),
+        });
+        let bindings = ManagedApiKeyBindings {
+            bindings: vec![ManagedApiKeyBinding {
+                account_id: "api_managed".to_string(),
+                api_key_hash: api_service_hash("managed-secret-key"),
+                base_url: "https://managed.example/v1".to_string(),
+                label: "Managed Provider".to_string(),
+                owns_config_entry: true,
+            }],
+        };
+
+        persist_managed_api_key_config(&dirs, &entries, &bindings).unwrap();
+
+        let updated = fs::read_to_string(&config_path).unwrap();
+        assert!(updated.contains("# Keep this provider section comment."));
+        assert!(updated.contains("openai-compatibility: []"));
+        let parsed = read_codex_api_key_entries(&config_path).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().any(|entry| {
+            entry.api_key == "manual-key"
+                && entry
+                    .extra
+                    .get("prefix")
+                    .and_then(serde_yaml::Value::as_str)
+                    == Some("manual")
+        }));
+        let manual_model = &parsed
+            .iter()
+            .find(|entry| entry.api_key == "manual-key")
+            .unwrap()
+            .models[0];
+        assert_eq!(
+            manual_model
+                .extra
+                .get("display-name")
+                .and_then(serde_yaml::Value::as_str),
+            Some("Manual Model")
+        );
+        assert_eq!(
+            manual_model
+                .extra
+                .get("force-mapping")
+                .and_then(serde_yaml::Value::as_bool),
+            Some(true)
+        );
+        let manifest = fs::read_to_string(managed_api_key_bindings_path(&dirs)).unwrap();
+        assert!(!manifest.contains("managed-secret-key"));
+    }
+
+    #[test]
+    fn deleting_managed_api_key_binding_does_not_remove_manual_entries() {
+        let (_temporary, dirs) = test_dirs();
+        fs::create_dir_all(&dirs.workspace_dir).unwrap();
+        let config_path = dirs.workspace_dir.join("config.yaml");
+        fs::write(
+            &config_path,
+            concat!(
+                "port: 17877\n",
+                "codex-api-key:\n",
+                "  - api-key: manual-key\n",
+                "    base-url: https://manual.example/v1\n",
+                "  - api-key: managed-key\n",
+                "    base-url: https://managed.example/v1\n",
+            ),
+        )
+        .unwrap();
+        write_json(
+            &managed_api_key_bindings_path(&dirs),
+            &ManagedApiKeyBindings {
+                bindings: vec![
+                    ManagedApiKeyBinding {
+                        account_id: "api_managed".to_string(),
+                        api_key_hash: api_service_hash("managed-key"),
+                        base_url: "https://managed.example/v1".to_string(),
+                        label: "Managed Provider".to_string(),
+                        owns_config_entry: true,
+                    },
+                    ManagedApiKeyBinding {
+                        account_id: "api_manual".to_string(),
+                        api_key_hash: api_service_hash("manual-key"),
+                        base_url: "https://manual.example/v1".to_string(),
+                        label: "Manual Provider".to_string(),
+                        owns_config_entry: false,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        let removed = delete_managed_api_key_bindings(
+            &dirs,
+            &HashSet::from([
+                "apikey:api_managed".to_string(),
+                "apikey:api_manual".to_string(),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(removed, 2);
+        let entries = read_codex_api_key_entries(&config_path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].api_key, "manual-key");
+        assert!(read_managed_api_key_bindings(&dirs)
+            .unwrap()
+            .bindings
+            .is_empty());
     }
 }

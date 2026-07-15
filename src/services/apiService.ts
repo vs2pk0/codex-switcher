@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { CodexAccount } from "../types/codex";
 
 export const API_SERVICE_DOWNLOAD_PROGRESS_EVENT = "codex-switcher-api-service-download-progress";
 export const API_SERVICE_AUTO_UPDATE_EVENT = "codex-switcher-api-service-auto-update";
@@ -84,12 +85,46 @@ export interface ApiServiceDownloadProgress {
 export interface ApiServiceAccountSyncSummary {
   count: number;
   authDir: string;
+  oauthCount: number;
+  apiKeyCount: number;
 }
 
 export interface ApiServiceBoundAccount {
-  email: string;
+  id: string;
+  accountId?: string | null;
+  kind: "oauth" | "apikey" | string;
+  label: string;
+  email?: string | null;
+  baseUrl?: string | null;
   path: string;
   modifiedAt?: number | null;
+}
+
+export function isCurrentApiServiceAccount(
+  account: CodexAccount,
+  serviceState: Pick<ApiServiceState, "settings"> | null | undefined,
+): boolean {
+  const apiKey = (account.openai_api_key || account.openaiApiKey || "").trim();
+  const isApiKey = account.auth_mode === "apikey" || Boolean(apiKey);
+  if (!isApiKey || !serviceState) return false;
+  const baseUrl = (account.api_base_url || account.apiBaseUrl || "https://api.openai.com/v1").trim();
+  try {
+    const parsed = new URL(baseUrl);
+    const servicePort = Number(serviceState.settings.port);
+    const accountPort = Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80));
+    if (!servicePort || accountPort !== servicePort) return false;
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const localHost =
+      hostname === "localhost" ||
+      hostname === "::1" ||
+      hostname === "::" ||
+      hostname === "0.0.0.0" ||
+      hostname.startsWith("127.");
+    const localKey = Boolean(apiKey && serviceState.settings.apiKeys.some((key) => key.trim() === apiKey));
+    return localHost || localKey;
+  } catch {
+    return false;
+  }
 }
 
 export function getApiServiceState(): Promise<ApiServiceState> {
@@ -150,6 +185,6 @@ export function listApiServiceBoundAccounts(): Promise<ApiServiceBoundAccount[]>
   return invoke("api_service_list_bound_accounts");
 }
 
-export function deleteApiServiceBoundAccounts(emails: string[]): Promise<ApiServiceAccountSyncSummary> {
-  return invoke("api_service_delete_bound_accounts", { emails });
+export function deleteApiServiceBoundAccounts(boundIds: string[]): Promise<ApiServiceAccountSyncSummary> {
+  return invoke("api_service_delete_bound_accounts", { boundIds });
 }
