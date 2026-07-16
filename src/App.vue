@@ -187,7 +187,7 @@ let viewLoadTimer: number | undefined;
 let initialPrewarmTimer: number | undefined;
 const EXPANDED_LAYOUT_WIDTH_DELTA = 80;
 const settings = reactive<CodexSwitcherSettings>({
-  monitorQuota: false,
+  monitorQuota: true,
   quotaRefreshMinutes: 10,
   currentAccountRefreshMinutes: 10,
   quotaNextRefreshAt: 0,
@@ -201,6 +201,7 @@ const settings = reactive<CodexSwitcherSettings>({
   accountViewMode: "card",
   sidebarEnabled: true,
   showQuotaCountdowns: true,
+  showAdditionalQuotaWindows: true,
   badgeStyle: "classic",
   badgeStyles: defaultBadgeStyles(),
   maxColumns: 3,
@@ -528,6 +529,7 @@ function scheduleCountdownSettingsPersist(): void {
         ? Math.floor(settings.currentAccountNextRefreshAt || 0)
         : 0,
       showQuotaCountdowns: settings.showQuotaCountdowns ?? true,
+      showAdditionalQuotaWindows: settings.showAdditionalQuotaWindows ?? true,
       maxColumns: [3, 4, 5].includes(settings.maxColumns) ? settings.maxColumns : 3,
       language: settings.language || "zh-CN",
     }).catch(() => {
@@ -1361,6 +1363,7 @@ async function loadSettings(): Promise<void> {
     ]);
     Object.assign(settings, {
       ...nextSettings,
+      monitorQuota: true,
       badgeStyles: {
         ...defaultBadgeStyles(),
         ...(nextSettings.badgeStyles || {}),
@@ -1376,6 +1379,7 @@ async function loadSettings(): Promise<void> {
       quotaNextRefreshAt: Number(nextSettings.quotaNextRefreshAt || 0),
       currentAccountNextRefreshAt: Number(nextSettings.currentAccountNextRefreshAt || 0),
       showQuotaCountdowns: nextSettings.showQuotaCountdowns ?? true,
+      showAdditionalQuotaWindows: nextSettings.showAdditionalQuotaWindows ?? true,
       maxColumns: [3, 4, 5].includes(nextSettings.maxColumns) ? nextSettings.maxColumns : 3,
       language: nextSettings.language || "zh-CN",
     });
@@ -1418,6 +1422,7 @@ async function saveSettings(): Promise<void> {
   try {
     const saved = await updateCodexSwitcherSettings({
       ...settings,
+      monitorQuota: true,
       badgeStyles: {
         ...defaultBadgeStyles(),
         ...settings.badgeStyles,
@@ -1435,6 +1440,7 @@ async function saveSettings(): Promise<void> {
         ? Math.floor(settings.currentAccountNextRefreshAt || 0)
         : 0,
       showQuotaCountdowns: settings.showQuotaCountdowns ?? true,
+      showAdditionalQuotaWindows: settings.showAdditionalQuotaWindows ?? true,
       maxColumns: [3, 4, 5].includes(settings.maxColumns) ? settings.maxColumns : 3,
       language: settings.language || "zh-CN",
     });
@@ -1600,6 +1606,51 @@ async function handleRefreshQuota(account: CodexAccount): Promise<void> {
   } finally {
     quotaRefreshingId.value = "";
   }
+}
+
+async function refreshAccountsAfterMutation(changedAccounts: CodexAccount[]): Promise<number> {
+  const uniqueAccounts = changedAccounts.filter(
+    (account, index, items) => items.findIndex((item) => item.id === account.id) === index,
+  );
+  let quotaFailures = 0;
+  try {
+    for (const account of uniqueAccounts) {
+      const latest = accounts.value.find((item) => item.id === account.id) ?? account;
+      if (isApiKeyAccount(latest)) {
+        invalidateApiKeyBalance(latest.id);
+        await loadApiKeyBalance(latest, { force: true, silent: true });
+        continue;
+      }
+      quotaRefreshingId.value = latest.id;
+      try {
+        const refreshed = await refreshCodexQuota(latest.id);
+        accounts.value = accounts.value.map((item) =>
+          item.id === refreshed.id ? refreshed : item,
+        );
+        if (currentAccount.value?.id === refreshed.id) {
+          currentAccount.value = refreshed;
+        }
+      } catch {
+        quotaFailures += 1;
+      }
+    }
+  } finally {
+    quotaRefreshingId.value = "";
+  }
+  if (quotaFailures > 0) await loadAccounts();
+  return quotaFailures;
+}
+
+function warnQuotaRefreshFailures(count: number): void {
+  if (count > 0) {
+    Message.warning(`${count} 个账号已保存，但额度刷新失败，可稍后点击刷新重试`);
+  }
+}
+
+async function handleApiServiceAccountAdded(account: CodexAccount): Promise<void> {
+  await loadAccounts();
+  const quotaFailures = await refreshAccountsAfterMutation([account]);
+  warnQuotaRefreshFailures(quotaFailures);
 }
 
 async function confirmResetCredit(account: CodexAccount): Promise<void> {
@@ -2033,7 +2084,9 @@ async function handleTokenImport(): Promise<void> {
     tokenInput.value = "";
     addModalVisible.value = false;
     await loadAccounts();
+    const quotaFailures = await refreshAccountsAfterMutation(imported);
     Message.success(`成功导入 ${imported.length} 个账号`);
+    warnQuotaRefreshFailures(quotaFailures);
   } catch (error) {
     Message.error(`导入失败：${errorText(error)}`);
   } finally {
@@ -2047,7 +2100,9 @@ async function handleLocalImport(): Promise<void> {
     const imported = await importCodexFromLocal();
     addModalVisible.value = false;
     await loadAccounts();
+    const quotaFailures = await refreshAccountsAfterMutation(imported);
     Message.success(`已从本机 Codex 导入 ${imported.length} 个账号`);
+    warnQuotaRefreshFailures(quotaFailures);
   } catch (error) {
     Message.error(`本地导入失败：${errorText(error)}`);
   } finally {
@@ -2059,15 +2114,17 @@ async function handleFileImport(files: File[]): Promise<void> {
   if (!files.length) return;
   importing.value = true;
   try {
-    let count = 0;
+    const importedAccounts: CodexAccount[] = [];
     for (const file of files) {
       const content = await file.text();
       const imported = await importCodexFromJson(content);
-      count += imported.length;
+      importedAccounts.push(...imported);
     }
     addModalVisible.value = false;
     await loadAccounts();
-    Message.success(`已从 ${files.length} 个文件导入 ${count} 个账号`);
+    const quotaFailures = await refreshAccountsAfterMutation(importedAccounts);
+    Message.success(`已从 ${files.length} 个文件导入 ${importedAccounts.length} 个账号`);
+    warnQuotaRefreshFailures(quotaFailures);
   } catch (error) {
     Message.error(`文件导入失败：${errorText(error)}`);
   } finally {
@@ -2096,7 +2153,9 @@ async function handleApiKeyAdd(): Promise<void> {
     apiKeyForm.boundOauthAccountId = "";
     addModalVisible.value = false;
     await loadAccounts();
+    const quotaFailures = await refreshAccountsAfterMutation([account]);
     Message.success(`已添加 ${displayName(account)}`);
+    warnQuotaRefreshFailures(quotaFailures);
   } catch (error) {
     Message.error(`添加失败：${errorText(error)}`);
   } finally {
@@ -2288,7 +2347,9 @@ async function completeOAuthLoginFlow(loginId: string): Promise<void> {
     oauthCallbackInput.value = "";
     oauthCallbackReceived.value = false;
     await loadAccounts();
+    const quotaFailures = await refreshAccountsAfterMutation([account]);
     Message.success(`已添加 ${displayName(account)}`);
+    warnQuotaRefreshFailures(quotaFailures);
   } catch (error) {
     oauthError.value = errorText(error);
     Message.error(`OAuth 授权失败：${oauthError.value}`);
@@ -2385,7 +2446,9 @@ async function handleEditSave(): Promise<void> {
     }
     editVisible.value = false;
     await loadAccounts();
+    const quotaFailures = await refreshAccountsAfterMutation([updated]);
     Message.success(`已更新 ${displayName(updated)}`);
+    warnQuotaRefreshFailures(quotaFailures);
   } catch (error) {
     Message.error(`保存失败：${errorText(error)}`);
   } finally {
@@ -3448,7 +3511,7 @@ onUnmounted(() => {
       :active="activeView === 'apiService'"
       :accounts="apiServiceAccounts"
       :settings="settings"
-      @account-added="loadAccounts"
+      @account-added="handleApiServiceAccountAdded"
     />
 
     <SettingsPanel

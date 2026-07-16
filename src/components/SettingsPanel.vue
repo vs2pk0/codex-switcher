@@ -132,8 +132,8 @@ function changeLanguage(value: unknown): void {
 
         <a-card :title="t('刷新')" :bordered="false" class="settings-card settings-refresh">
           <a-form :model="settings" layout="vertical">
-            <a-form-item :label="t('监控额度')">
-              <a-switch v-model="settings.monitorQuota" @change="emit('save')" />
+            <a-form-item :label="t('显示 GPT 5.3 Codex Spark 额度')">
+              <a-switch v-model="settings.showAdditionalQuotaWindows" @change="emit('save')" />
             </a-form-item>
             <a-form-item :label="t('额度自动刷新')">
               <a-input-number

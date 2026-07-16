@@ -4,7 +4,12 @@ import { computed, ref } from "vue";
 import type { CodexApiKeyBalanceState, CodexSwitcherSettings } from "../services/codex";
 import type { CodexAccount, CodexResetCredit } from "../types/codex";
 import { currentLocale, formatLocalizedDuration, t } from "../i18n";
-import { hasAnyQuotaWindow, hasQuotaWindow } from "../quota";
+import {
+  additionalQuotaWindows,
+  hasAnyQuotaWindow,
+  hasQuotaWindow,
+  type AdditionalQuotaWindowSnapshot,
+} from "../quota";
 import PlanBadge from "./PlanBadge.vue";
 
 const props = defineProps<{
@@ -58,6 +63,23 @@ const gridClass = computed(() => {
 const accountViewMode = computed(() => {
   const mode = props.settings.accountViewMode;
   return mode === "compact" || mode === "table" ? mode : "card";
+});
+
+const additionalQuotaByAccountId = computed(() => {
+  const entries = props.accounts.map((account) => [
+    account.id,
+    props.settings.showAdditionalQuotaWindows ? additionalQuotaWindows(account.quota) : [],
+  ] as const);
+  return new Map(entries);
+});
+
+const accountGridStyle = computed<Record<string, string>>(() => {
+  const maxQuotaRows = props.accounts.reduce(
+    (currentMax, account) => Math.max(currentMax, visibleQuotaRowCount(account)),
+    0,
+  );
+  const extraRows = Math.max(0, maxQuotaRows - 2);
+  return { "--additional-quota-height": `${extraRows * 70}px` };
 });
 
 function isPinned(account: CodexAccount): boolean {
@@ -181,7 +203,20 @@ function canShowQuota(account: CodexAccount): boolean {
 }
 
 function shouldShowQuota(account: CodexAccount): boolean {
-  return canShowQuota(account) && hasAnyQuotaWindow(account.quota);
+  return canShowQuota(account) &&
+    (hasAnyQuotaWindow(account.quota) || visibleAdditionalQuotaWindows(account).length > 0);
+}
+
+function visibleAdditionalQuotaWindows(account: CodexAccount): AdditionalQuotaWindowSnapshot[] {
+  return additionalQuotaByAccountId.value.get(account.id) ?? [];
+}
+
+function visibleQuotaRowCount(account: CodexAccount): number {
+  if (!canShowQuota(account) || !account.quota) return 0;
+  const primaryRows = hasQuotaWindow(account.quota, "hourly") ? 1 : 0;
+  const weeklyRows =
+    !isFreePlanAccount(account) && hasQuotaWindow(account.quota, "weekly") ? 1 : 0;
+  return primaryRows + weeklyRows + visibleAdditionalQuotaWindows(account).length;
 }
 
 function shouldShowQuotaError(account: CodexAccount): boolean {
@@ -613,6 +648,11 @@ function quotaWindowShortLabel(minutes?: number, fallbackMinutes = 300): string 
   return `${value} ${t("分钟")}`;
 }
 
+function additionalQuotaWindowLabel(window: AdditionalQuotaWindowSnapshot): string {
+  if (!window.windowMinutes) return window.label;
+  return `${window.label} ${quotaWindowShortLabel(window.windowMinutes, window.windowMinutes)}`;
+}
+
 function quotaColor(value?: number): string {
   const percentage = value ?? 0;
   if (percentage >= 70) return "#22c55e";
@@ -737,7 +777,12 @@ function formatTime(value?: number | null): string {
 
 <template>
   <a-spin class="accounts-spin" :loading="loading" dot>
-    <section v-if="accounts.length && accountViewMode === 'card'" class="account-grid" :class="gridClass">
+    <section
+      v-if="accounts.length && accountViewMode === 'card'"
+      class="account-grid"
+      :class="gridClass"
+      :style="accountGridStyle"
+    >
       <a-card
         v-for="account in accounts"
         :key="account.id"
@@ -922,6 +967,31 @@ function formatTime(value?: number | null): string {
                         background: quotaColor(account.quota.weekly_percentage),
                       }"
                     />
+                  </div>
+                </div>
+
+                <div
+                  v-for="window in visibleAdditionalQuotaWindows(account)"
+                  :key="window.key"
+                  class="quota-metric additional-quota-metric"
+                >
+                  <div class="quota-metric-main">
+                    <span
+                      class="quota-window-label"
+                      :title="additionalQuotaWindowLabel(window)"
+                    >
+                      <icon-calendar v-if="(window.windowMinutes || 0) >= 1440" />
+                      <icon-clock-circle v-else />
+                      <span>{{ additionalQuotaWindowLabel(window) }}</span>
+                    </span>
+                    <em>{{ quotaResetDateLabel(window.resetTime) }}</em>
+                    <small>{{ quotaResetLeftLabel(window.resetTime) }}</small>
+                    <strong :style="{ color: quotaColor(window.percentage) }">
+                      {{ quotaPercentLabel(window.percentage) }}
+                    </strong>
+                  </div>
+                  <div class="quota-bar">
+                    <span :style="quotaProgressStyle(window.percentage)" />
                   </div>
                 </div>
 
@@ -1294,6 +1364,20 @@ function formatTime(value?: number | null): string {
                     {{ quotaPercentLabel(account.quota.weekly_percentage) }}
                   </strong>
                   <small>{{ quotaResetLeftLabel(account.quota.weekly_reset_time) }}</small>
+                </div>
+                <div
+                  v-for="window in visibleAdditionalQuotaWindows(account)"
+                  :key="window.key"
+                  class="table-quota-line additional-quota-line"
+                >
+                  <span :title="additionalQuotaWindowLabel(window)">
+                    {{ additionalQuotaWindowLabel(window) }}
+                  </span>
+                  <div><i :style="quotaProgressStyle(window.percentage)" /></div>
+                  <strong :style="{ color: quotaColor(window.percentage) }">
+                    {{ quotaPercentLabel(window.percentage) }}
+                  </strong>
+                  <small>{{ quotaResetLeftLabel(window.resetTime) }}</small>
                 </div>
               </div>
               <div

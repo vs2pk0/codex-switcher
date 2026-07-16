@@ -2875,8 +2875,8 @@ textarea {
 .account-card {
   position: relative;
   min-width: 0;
-  min-height: 468px;
-  height: 468px;
+  min-height: calc(468px + var(--additional-quota-height, 0px));
+  height: calc(468px + var(--additional-quota-height, 0px));
   width: 100%;
   max-width: none;
   overflow: hidden;
@@ -3201,7 +3201,7 @@ textarea {
   z-index: 1;
   display: flex;
   height: 100%;
-  min-height: 468px;
+  min-height: calc(468px + var(--additional-quota-height, 0px));
   flex-direction: column;
   padding: 0;
 }
@@ -3224,13 +3224,13 @@ textarea {
 }
 
 .account-grid.columns-5.expanded .account-card {
-    min-height: 428px;
-    height: 428px;
+    min-height: calc(428px + var(--additional-quota-height, 0px));
+    height: calc(428px + var(--additional-quota-height, 0px));
   }
 
   .account-grid.columns-5.expanded .account-card .arco-card-body {
     height: 100%;
-    min-height: 426px;
+    min-height: calc(426px + var(--additional-quota-height, 0px));
     padding: 0;
   }
 
@@ -3722,6 +3722,16 @@ textarea {
   color: #5f6f86;
   font-size: 12px;
   font-weight: 760;
+}
+
+.table-quota-line.additional-quota-line {
+  grid-template-columns: minmax(150px, 0.9fr) minmax(100px, 1fr) 44px 78px;
+}
+
+.table-quota-line > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .table-quota-line > div {
@@ -4820,6 +4830,13 @@ textarea {
   color: #172033;
   font-size: 13px;
   font-weight: 850;
+  white-space: nowrap;
+}
+
+.quota-window-label > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -6327,6 +6344,7 @@ textarea {
 }
 
 .status-remaining-time {
+  flex: 0 0 auto;
   min-width: 0;
   overflow: hidden;
   font-size: 11px;
@@ -6337,7 +6355,8 @@ textarea {
 }
 
 .status-card strong {
-  flex: 0 1 48%;
+  flex: 0 1 auto;
+  max-width: 45%;
   min-width: 0;
   overflow: hidden;
   color: #526176;

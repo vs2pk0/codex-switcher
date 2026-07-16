@@ -137,6 +137,7 @@ const en: Record<string, string> = {
   "额度自动刷新": "Quota Auto Refresh",
   "当前账号刷新": "Current Account Refresh",
   "等待刷新倒计时": "Refresh Countdown",
+  "显示 GPT 5.3 Codex Spark 额度": "Show GPT 5.3 Codex Spark Quotas",
   "保存": "Save",
   "外观": "Appearance",
   "每行固定账号数": "Fixed Accounts Per Row",
@@ -762,6 +763,7 @@ const ru: Record<string, string> = {
   "额度自动刷新": "Автообновление квоты",
   "当前账号刷新": "Обновление текущего аккаунта",
   "等待刷新倒计时": "Таймер обновления",
+  "显示 GPT 5.3 Codex Spark 额度": "Показывать квоты GPT 5.3 Codex Spark",
   "保存": "Сохранить",
   "外观": "Внешний вид",
   "每行固定账号数": "Аккаунтов в строке",
@@ -1276,6 +1278,7 @@ const dictionary: Record<Exclude<AppLanguage, "zh-CN" | "zh-TW">, Record<string,
 let reverseDictionary: Map<string, string> | null = null;
 
 const simplifiedToTraditional: Record<string, string> = {
+  "显示 GPT 5.3 Codex Spark 额度": "顯示 GPT 5.3 Codex Spark 額度",
   "配额 / 余额": "配額 / 餘額",
   "余额": "餘額",
   "密钥额度": "金鑰額度",
