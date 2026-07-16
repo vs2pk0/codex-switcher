@@ -79,6 +79,7 @@ struct CodexRelayBalanceEndpoints {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexSwitcherSettings {
+    #[serde(default = "default_monitor_quota")]
     monitor_quota: bool,
     quota_refresh_minutes: u64,
     current_account_refresh_minutes: u64,
@@ -102,6 +103,8 @@ struct CodexSwitcherSettings {
     sidebar_enabled: bool,
     #[serde(default = "default_show_quota_countdowns")]
     show_quota_countdowns: bool,
+    #[serde(default = "default_show_additional_quota_windows")]
+    show_additional_quota_windows: bool,
     #[serde(default = "default_badge_style")]
     badge_style: String,
     #[serde(default = "default_badge_styles")]
@@ -117,7 +120,7 @@ const MAX_REFRESH_MINUTES: u64 = 1440;
 impl Default for CodexSwitcherSettings {
     fn default() -> Self {
         Self {
-            monitor_quota: false,
+            monitor_quota: true,
             quota_refresh_minutes: 10,
             current_account_refresh_minutes: 10,
             quota_next_refresh_at: 0,
@@ -131,6 +134,7 @@ impl Default for CodexSwitcherSettings {
             account_view_mode: default_account_view_mode(),
             sidebar_enabled: default_sidebar_enabled(),
             show_quota_countdowns: default_show_quota_countdowns(),
+            show_additional_quota_windows: default_show_additional_quota_windows(),
             badge_style: default_badge_style(),
             badge_styles: default_badge_styles(),
             max_columns: default_max_columns(),
@@ -141,6 +145,7 @@ impl Default for CodexSwitcherSettings {
 
 impl CodexSwitcherSettings {
     fn normalized(mut self) -> Self {
+        self.monitor_quota = true;
         self.quota_refresh_minutes = clamp_refresh_minutes(self.quota_refresh_minutes);
         self.current_account_refresh_minutes =
             clamp_refresh_minutes(self.current_account_refresh_minutes);
@@ -154,6 +159,10 @@ impl CodexSwitcherSettings {
         self.language = normalize_language(&self.language);
         self
     }
+}
+
+fn default_monitor_quota() -> bool {
+    true
 }
 
 fn clamp_refresh_minutes(value: u64) -> u64 {
@@ -208,6 +217,10 @@ fn normalize_account_view_mode(value: &str) -> String {
 }
 
 fn default_show_quota_countdowns() -> bool {
+    true
+}
+
+fn default_show_additional_quota_windows() -> bool {
     true
 }
 
@@ -3347,6 +3360,18 @@ mod tests {
     };
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn quota_monitoring_is_always_enabled() {
+        assert!(super::CodexSwitcherSettings::default().monitor_quota);
+        assert!(super::CodexSwitcherSettings::default().show_additional_quota_windows);
+
+        let settings = super::CodexSwitcherSettings {
+            monitor_quota: false,
+            ..Default::default()
+        };
+        assert!(settings.normalized().monitor_quota);
+    }
 
     #[test]
     fn model_endpoint_preserves_provider_prefix_and_avoids_duplicate_suffix() {

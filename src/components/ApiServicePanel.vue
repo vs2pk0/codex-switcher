@@ -40,7 +40,7 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  (event: "account-added"): void;
+  (event: "account-added", account: CodexAccount): void;
 }>();
 
 const state = ref<ApiServiceState | null>(null);
@@ -272,7 +272,7 @@ async function addToAccountOverview(): Promise<void> {
       apiOfficialUrl: state.value?.service.managementUrl || "",
       accountName: "本地 API 服务",
     });
-    emit("account-added");
+    emit("account-added", account);
     Message.success(`已添加 ${account.account_name || account.email}`);
   } catch (error) {
     Message.error(`添加到账号总览失败：${errorText(error)}`);

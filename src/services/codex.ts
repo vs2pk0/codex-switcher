@@ -23,6 +23,7 @@ export interface CodexSwitcherSettings {
   accountViewMode: "card" | "compact" | "table";
   sidebarEnabled: boolean;
   showQuotaCountdowns: boolean;
+  showAdditionalQuotaWindows: boolean;
   badgeStyle: string;
   badgeStyles: Record<string, string>;
   maxColumns: 3 | 4 | 5;
