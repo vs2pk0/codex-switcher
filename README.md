@@ -48,7 +48,7 @@ The **API Service** page provides integrated management for the official [CLIPro
 Download the latest installer from [GitHub Releases](https://github.com/vs2pk0/codex-switcher/releases):
 
 - **Windows**: use the `.exe` or `.msi` installer.
-- **macOS**: open the `.dmg` package and move Codex Switcher to Applications.
+- **macOS**: open the `.dmg` and move Codex Switcher to Applications, or run the `.pkg` installer.
 
 If macOS blocks the first launch, open **System Settings > Privacy & Security** and allow the app to open.
 
@@ -80,6 +80,23 @@ Application data is stored under `~/.codex_switcher` by default, including:
 - Backups: `~/.codex_switcher/backup`
 
 The active profile is written to the local Codex directory at `~/.codex`. Account exports may contain credentials; store exported files securely.
+
+## Support the project
+
+Thank you for supporting Codex Switcher. Donations help cover ongoing maintenance, feature development, test devices, and packaging and distribution costs. If the app saves you time, you can support the project through any of the methods below.
+
+<table>
+  <tr>
+    <th>Alipay</th>
+    <th>WeChat Pay</th>
+    <th>Binance</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="doc/assets/sponsor/alipay.png" height="220" alt="Alipay donation QR code"></td>
+    <td align="center"><img src="doc/assets/sponsor/wechat.png" height="220" alt="WeChat Pay donation QR code"></td>
+    <td align="center"><img src="doc/assets/sponsor/binance.jpg" height="220" alt="Binance donation QR code"></td>
+  </tr>
+</table>
 
 ## Development
 

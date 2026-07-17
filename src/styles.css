@@ -5255,10 +5255,15 @@ textarea {
   font: inherit;
 }
 
-.about-tile:is(button):hover {
+.about-tile:is(button):not(:disabled):hover {
   border-color: rgba(37, 99, 235, 0.24);
   box-shadow: 0 20px 52px rgba(37, 99, 235, 0.1);
   transform: translateY(-2px);
+}
+
+.about-tile:is(button):disabled {
+  cursor: progress;
+  opacity: 0.72;
 }
 
 .about-tile-icon {

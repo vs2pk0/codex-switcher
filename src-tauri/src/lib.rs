@@ -1,5 +1,6 @@
 mod account;
 mod api_service;
+mod app_update;
 mod oauth;
 mod session;
 mod usage;
@@ -3931,6 +3932,7 @@ pub fn run() {
         .manage(api_service::ApiServiceProcessState::default())
         .manage(api_service::ApiServiceDownloadState::default())
         .manage(api_service::ApiServiceOperationState::default())
+        .manage(app_update::AppUpdateDownloadState::default())
         .setup(|app| {
             if let Err(error) = api_service::prune_api_service_runtimes_on_startup() {
                 eprintln!("API service runtime maintenance failed during startup: {error}");
@@ -3953,6 +3955,10 @@ pub fn run() {
             api_service::api_service_bind_accounts,
             api_service::api_service_list_bound_accounts,
             api_service::api_service_delete_bound_accounts,
+            app_update::app_update_check,
+            app_update::app_update_download,
+            app_update::app_update_cancel_download,
+            app_update::app_update_open_installer,
             list_codex_accounts,
             get_current_codex_account,
             detect_current_codex_account,
@@ -4020,6 +4026,8 @@ pub fn run() {
                 let download = window.state::<api_service::ApiServiceDownloadState>();
                 let operation = window.state::<api_service::ApiServiceOperationState>();
                 api_service::shutdown_api_service(process, download, operation);
+                let app_update_download = window.state::<app_update::AppUpdateDownloadState>();
+                app_update::shutdown_app_update(app_update_download);
             }
         })
         .run(tauri::generate_context!())

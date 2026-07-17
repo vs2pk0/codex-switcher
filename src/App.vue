@@ -10,6 +10,7 @@ import AccountToolbar from "./components/AccountToolbar.vue";
 import AddAccountModal from "./components/AddAccountModal.vue";
 import ApiServicePanel from "./components/ApiServicePanel.vue";
 import ApiKeyModelModal from "./components/ApiKeyModelModal.vue";
+import AppUpdateModal from "./components/AppUpdateModal.vue";
 import AppHeader from "./components/AppHeader.vue";
 import BackupProgressModal from "./components/BackupProgressModal.vue";
 import BadgeStyleModal from "./components/BadgeStyleModal.vue";
@@ -85,6 +86,16 @@ import {
   getApiServiceState,
   isCurrentApiServiceAccount,
 } from "./services/apiService";
+import {
+  APP_UPDATE_DOWNLOAD_PROGRESS_EVENT,
+  cancelAppUpdateDownload,
+  downloadAppUpdate,
+  fetchAppUpdateInfo,
+  openAppUpdateInstaller,
+  type AppUpdateDownloadProgress,
+  type AppUpdateDownloadResult,
+  type AppUpdateInfo,
+} from "./services/appUpdate";
 import { getCodexUsageDashboard } from "./services/usage";
 import {
   listSessionVisibilityRepairInstances,
@@ -108,6 +119,15 @@ import type { ActiveView, SessionGroup } from "./types/ui";
 
 const activeView = ref<ActiveView>("accounts");
 const appVersion = ref("0.1.0");
+const checkingAppUpdate = ref(false);
+const appUpdateVisible = ref(false);
+const appUpdateInfo = ref<AppUpdateInfo | null>(null);
+const appUpdateProgress = ref<AppUpdateDownloadProgress | null>(null);
+const appUpdateResult = ref<AppUpdateDownloadResult | null>(null);
+const appUpdateError = ref("");
+const appUpdateDownloading = ref(false);
+const appUpdateCancelling = ref(false);
+const appUpdateOpening = ref(false);
 const usagePanelMounted = ref(false);
 const accounts = ref<CodexAccount[]>([]);
 const currentAccount = ref<CodexAccount | null>(null);
@@ -216,6 +236,7 @@ const oauthCompleting = ref(false);
 const oauthError = ref("");
 const oauthCallbackReceived = ref(false);
 let oauthUnlisten: UnlistenFn | null = null;
+let appUpdateUnlisten: UnlistenFn | null = null;
 
 interface OAuthCallbackEvent {
   loginId: string;
@@ -2219,8 +2240,6 @@ const repositoryUrl = "https://github.com/vs2pk0/codex-switcher";
 const sponsorUrl = "https://github.com/vs2pk0/codex-switcher/blob/main/doc/sponsor.md";
 const feedbackUrl = "https://github.com/vs2pk0/codex-switcher/issues";
 const releasesUrl = "https://github.com/vs2pk0/codex-switcher/releases";
-const latestReleaseApiUrl = "https://api.github.com/repos/vs2pk0/codex-switcher/releases/latest";
-const checkingAppUpdate = ref(false);
 
 function openAboutUrl(url: string, label: string): void {
   void openExternalUrl(url).catch((error) => {
@@ -2248,60 +2267,21 @@ function openReleasesPage(): void {
   openAboutUrl(releasesUrl, "下载页面");
 }
 
-function normalizeVersionTag(value: string): string {
-  return value.trim().replace(/^v/i, "");
-}
-
-function compareVersion(left: string, right: string): number {
-  const leftParts = normalizeVersionTag(left).split(/[.-]/).map((item) => Number.parseInt(item, 10) || 0);
-  const rightParts = normalizeVersionTag(right).split(/[.-]/).map((item) => Number.parseInt(item, 10) || 0);
-  const length = Math.max(leftParts.length, rightParts.length);
-  for (let index = 0; index < length; index += 1) {
-    const diff = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
-    if (diff !== 0) return diff > 0 ? 1 : -1;
-  }
-  return 0;
-}
-
-async function fetchLatestAppRelease(): Promise<{ tagName: string; htmlUrl: string; name?: string }> {
-  const response = await fetch(latestReleaseApiUrl, {
-    headers: {
-      Accept: "application/vnd.github+json",
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
-  const data = await response.json() as {
-    tag_name?: string;
-    html_url?: string;
-    name?: string;
-  };
-  if (!data.tag_name) throw new Error("未找到最新版本号");
-  return {
-    tagName: data.tag_name,
-    htmlUrl: data.html_url || releasesUrl,
-    name: data.name,
-  };
-}
-
-function showUpdateDialog(input: {
-  latestVersion: string;
-  currentVersion: string;
-  url: string;
-  hasUpdate: boolean;
-}): void {
-  const title = input.hasUpdate ? `发现新版本 ${input.latestVersion}` : "当前已是最新版本";
-  const content = input.hasUpdate
-    ? `当前版本 v${input.currentVersion}，最新版本 ${input.latestVersion}。请前往 GitHub Releases 下载最新安装包。`
-    : `当前版本 v${input.currentVersion}，最新发布版本 ${input.latestVersion}。如需重新下载安装包，可以打开 GitHub Releases。`;
+function showUpdateDialog(info: AppUpdateInfo): void {
+  const content = info.canDownload
+    ? `${t("当前版本")} v${info.currentVersion}，${t("最新版本")} v${info.latestVersion}。${t("可直接在应用内下载安装包。")}`
+    : `${t("当前版本")} v${info.currentVersion}，${t("最新版本")} v${info.latestVersion}。${t("当前平台没有可用的在线安装包，请前往 GitHub Releases 下载。")}`;
   Modal.confirm({
-    title,
+    title: `${t("发现新版本")} v${info.latestVersion}`,
     content,
-    okText: "前往下载",
-    cancelText: input.hasUpdate ? "稍后再说" : "关闭",
+    okText: t(info.canDownload ? "在线更新" : "前往下载"),
+    cancelText: t("稍后再说"),
     onOk: () => {
-      openAboutUrl(input.url, "下载页面");
+      if (info.canDownload) {
+        void startAppUpdateDownload(info);
+      } else {
+        openAboutUrl(info.releaseUrl, "下载页面");
+      }
     },
   });
 }
@@ -2310,30 +2290,88 @@ async function checkAppUpdate(options: { silent?: boolean } = {}): Promise<void>
   if (checkingAppUpdate.value) return;
   checkingAppUpdate.value = true;
   try {
-    const release = await fetchLatestAppRelease();
-    const currentVersion = normalizeVersionTag(appVersion.value || "0.0.0");
-    const hasUpdate = compareVersion(release.tagName, currentVersion) > 0;
-    if (hasUpdate || !options.silent) {
-      showUpdateDialog({
-        latestVersion: release.tagName,
-        currentVersion,
-        url: release.htmlUrl,
-        hasUpdate,
-      });
+    const info = await fetchAppUpdateInfo();
+    appUpdateInfo.value = info;
+    if (info.hasUpdate) {
+      showUpdateDialog(info);
+    } else if (!options.silent) {
+      Message.success(`${t("当前已是最新版本")} v${info.currentVersion}`);
     }
   } catch (error) {
     if (!options.silent) {
       Modal.confirm({
-        title: "检查更新失败",
-        content: `暂时无法获取最新版本信息：${errorText(error)}。可以前往 GitHub Releases 手动查看。`,
-        okText: "打开 Releases",
-        cancelText: "关闭",
+        title: t("检查更新失败"),
+        content: `${t("暂时无法获取最新版本信息")}：${errorText(error)}。${t("可以前往 GitHub Releases 手动查看。")}`,
+        okText: t("打开 Releases"),
+        cancelText: t("关闭"),
         onOk: openReleasesPage,
       });
     }
   } finally {
     checkingAppUpdate.value = false;
   }
+}
+
+async function startAppUpdateDownload(info: AppUpdateInfo | null = appUpdateInfo.value): Promise<void> {
+  if (!info || appUpdateDownloading.value) return;
+  appUpdateInfo.value = info;
+  appUpdateProgress.value = {
+    status: "checking",
+    version: info.latestVersion,
+    assetName: info.assetName || "",
+    downloadedBytes: 0,
+    totalBytes: info.assetSize || null,
+    message: null,
+  };
+  appUpdateResult.value = null;
+  appUpdateError.value = "";
+  appUpdateVisible.value = true;
+  appUpdateDownloading.value = true;
+  try {
+    appUpdateResult.value = await downloadAppUpdate();
+  } catch (error) {
+    const message = errorText(error);
+    if (message !== "下载已取消") {
+      appUpdateError.value = message;
+    }
+  } finally {
+    appUpdateDownloading.value = false;
+    appUpdateCancelling.value = false;
+  }
+}
+
+async function cancelCurrentAppUpdate(): Promise<void> {
+  if (!appUpdateDownloading.value || appUpdateCancelling.value) return;
+  appUpdateCancelling.value = true;
+  try {
+    await cancelAppUpdateDownload();
+  } catch (error) {
+    appUpdateCancelling.value = false;
+    Message.error(`${t("取消下载失败")}：${errorText(error)}`);
+  }
+}
+
+async function openDownloadedAppUpdate(): Promise<void> {
+  const result = appUpdateResult.value;
+  if (!result || appUpdateOpening.value) return;
+  appUpdateOpening.value = true;
+  try {
+    await openAppUpdateInstaller(result.path);
+    Message.success(t("安装包已打开，请按安装程序完成更新。"));
+  } catch (error) {
+    Message.error(`${t("打开安装包失败")}：${errorText(error)}`);
+  } finally {
+    appUpdateOpening.value = false;
+  }
+}
+
+function closeAppUpdateModal(): void {
+  if (appUpdateDownloading.value) return;
+  appUpdateVisible.value = false;
+}
+
+function openAppUpdateReleases(): void {
+  openAboutUrl(appUpdateInfo.value?.releaseUrl || releasesUrl, "下载页面");
 }
 
 async function completeOAuthLoginFlow(loginId: string): Promise<void> {
@@ -3276,6 +3314,24 @@ onMounted(() => {
       prefetchVisibleApiKeyBalances();
     }
   }, 60_000);
+  void listen<AppUpdateDownloadProgress>(APP_UPDATE_DOWNLOAD_PROGRESS_EVENT, (event) => {
+    appUpdateProgress.value = event.payload;
+    if (event.payload.status === "completed") {
+      appUpdateDownloading.value = false;
+      appUpdateCancelling.value = false;
+    } else if (event.payload.status === "cancelled") {
+      appUpdateDownloading.value = false;
+      appUpdateCancelling.value = false;
+      appUpdateVisible.value = false;
+      Message.info(t("下载已取消"));
+    } else if (event.payload.status === "failed") {
+      appUpdateDownloading.value = false;
+      appUpdateCancelling.value = false;
+      appUpdateError.value = event.payload.message || t("更新下载失败");
+    }
+  }).then((unlisten) => {
+    appUpdateUnlisten = unlisten;
+  });
   void getVersion()
     .then((version) => {
       if (version) appVersion.value = version;
@@ -3307,6 +3363,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   oauthUnlisten?.();
+  appUpdateUnlisten?.();
   window.removeEventListener("resize", handleWindowResize);
   if (windowResizeTimer) window.clearTimeout(windowResizeTimer);
   if (viewLoadTimer) window.clearTimeout(viewLoadTimer);
@@ -3537,11 +3594,28 @@ onUnmounted(() => {
     <AboutPanel
       v-if="activeView === 'about'"
       :app-version="appVersion"
+      :checking-update="checkingAppUpdate"
       @open-github-profile="openGithubProfile"
       @open-repository="openRepository"
       @open-sponsor-page="openSponsorPage"
       @open-feedback-page="openFeedbackPage"
       @check-update="checkAppUpdate"
+    />
+
+    <AppUpdateModal
+      :visible="appUpdateVisible"
+      :info="appUpdateInfo"
+      :progress="appUpdateProgress"
+      :result="appUpdateResult"
+      :error="appUpdateError"
+      :downloading="appUpdateDownloading"
+      :cancelling="appUpdateCancelling"
+      :opening="appUpdateOpening"
+      @close="closeAppUpdateModal"
+      @cancel="cancelCurrentAppUpdate"
+      @retry="startAppUpdateDownload()"
+      @open-installer="openDownloadedAppUpdate"
+      @open-releases="openAppUpdateReleases"
     />
 
     <CodexConfigEditorModal

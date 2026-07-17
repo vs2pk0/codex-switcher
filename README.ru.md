@@ -48,7 +48,7 @@ Codex Switcher объединяет несколько профилей вход
 Загрузите актуальный установщик на странице [GitHub Releases](https://github.com/vs2pk0/codex-switcher/releases):
 
 - **Windows**: используйте установщик `.exe` или `.msi`.
-- **macOS**: откройте образ `.dmg` и переместите Codex Switcher в папку «Программы».
+- **macOS**: откройте образ `.dmg` и переместите Codex Switcher в папку «Программы» либо запустите установщик `.pkg`.
 
 Если macOS блокирует первый запуск, откройте **Системные настройки > Конфиденциальность и безопасность** и разрешите запуск приложения.
 
@@ -80,6 +80,23 @@ sudo xattr -rd com.apple.quarantine "/Applications/Codex Switcher.app"
 - Резервные копии: `~/.codex_switcher/backup`
 
 Активный профиль записывается в локальный каталог Codex `~/.codex`. Экспортированные файлы учетных записей могут содержать данные авторизации, поэтому храните их в безопасном месте.
+
+## Поддержать проект
+
+Спасибо за поддержку Codex Switcher. Пожертвования помогают оплачивать дальнейшую поддержку, разработку функций, тестовые устройства, сборку и распространение приложения. Если программа экономит ваше время, вы можете поддержать проект любым из способов ниже.
+
+<table>
+  <tr>
+    <th>Alipay</th>
+    <th>WeChat Pay</th>
+    <th>Binance</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="doc/assets/sponsor/alipay.png" height="220" alt="QR-код для пожертвования через Alipay"></td>
+    <td align="center"><img src="doc/assets/sponsor/wechat.png" height="220" alt="QR-код для пожертвования через WeChat Pay"></td>
+    <td align="center"><img src="doc/assets/sponsor/binance.jpg" height="220" alt="QR-код для пожертвования через Binance"></td>
+  </tr>
+</table>
 
 ## Разработка
 

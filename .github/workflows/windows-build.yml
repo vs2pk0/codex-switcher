@@ -132,12 +132,38 @@ jobs:
       - name: Build macOS app
         run: npm run tauri build
 
+      - name: Build macOS PKG installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          app_path="src-tauri/target/release/bundle/macos/Codex Switcher.app"
+          pkg_dir="src-tauri/target/release/bundle/pkg"
+          arch="$(uname -m)"
+          pkg_path="${pkg_dir}/Codex Switcher_${version}_${arch}.pkg"
+
+          if [ ! -d "${app_path}" ]; then
+            echo "macOS application bundle not found: ${app_path}" >&2
+            exit 1
+          fi
+
+          mkdir -p "${pkg_dir}"
+          pkgbuild \
+            --component "${app_path}" \
+            --identifier "com.codex.switcher.pkg" \
+            --version "${version}" \
+            --install-location "/Applications" \
+            "${pkg_path}"
+
+          test -s "${pkg_path}"
+          pkgutil --payload-files "${pkg_path}" | grep -F "Codex Switcher.app" >/dev/null
+
       - name: Collect macOS installers
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "release-assets/macos"
-          find "src-tauri/target/release/bundle" -type f \( -name "*.dmg" -o -name "*.tar.gz" \) -print0 |
+          find "src-tauri/target/release/bundle" -type f \( -name "*.dmg" -o -name "*.pkg" -o -name "*.tar.gz" \) -print0 |
             while IFS= read -r -d '' asset; do
               cp "$asset" "release-assets/macos/$(basename "$asset")"
             done
