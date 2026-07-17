@@ -4,6 +4,7 @@ import appIcon from "../assets/app-icon.png";
 
 defineProps<{
   appVersion: string;
+  checkingUpdate: boolean;
 }>();
 
 defineEmits<{
@@ -70,12 +71,18 @@ defineEmits<{
           <span>{{ t("提交 Issue 或改进建议") }}</span>
         </span>
       </button>
-      <button type="button" class="about-tile" @click="$emit('check-update')">
+      <button
+        type="button"
+        class="about-tile"
+        :disabled="checkingUpdate"
+        @click="$emit('check-update')"
+      >
         <span class="about-tile-icon about-tile-icon-update">
-          <icon-refresh />
+          <icon-loading v-if="checkingUpdate" spin />
+          <icon-refresh v-else />
         </span>
         <span class="about-tile-copy">
-          <strong>{{ t("检查更新") }}</strong>
+          <strong>{{ t(checkingUpdate ? "正在检查更新" : "检查更新") }}</strong>
           <span>{{ t("查看最新版本并下载安装包") }}</span>
         </span>
       </button>

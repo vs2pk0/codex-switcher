@@ -48,7 +48,7 @@ Codex Switcher 將多個 Codex 登入設定集中在一個桌面應用程式中�
 從 [GitHub Releases](https://github.com/vs2pk0/codex-switcher/releases) 下載最新安裝檔：
 
 - **Windows**：使用 `.exe` 或 `.msi` 安裝檔。
-- **macOS**：開啟 `.dmg`，將 Codex Switcher 移至「應用程式」。
+- **macOS**：開啟 `.dmg` 並將 Codex Switcher 移至「應用程式」，或直接執行 `.pkg` 安裝檔。
 
 若 macOS 在首次啟動時阻擋應用程式，請前往 **系統設定 > 隱私權與安全性**，允許開啟此應用程式。
 
@@ -80,6 +80,23 @@ sudo xattr -rd com.apple.quarantine "/Applications/Codex Switcher.app"
 - 備份：`~/.codex_switcher/backup`
 
 目前帳號會寫入本機 Codex 目錄 `~/.codex`。帳號匯出檔案可能包含驗證資訊，請妥善保管。
+
+## 贊賞支持
+
+感謝你願意支持 Codex Switcher。贊賞會用於持續維護、功能開發、測試裝置與打包發佈成本。如果這個工具幫你節省了時間，歡迎選擇下列任一方式支持專案。
+
+<table>
+  <tr>
+    <th>支付寶</th>
+    <th>微信</th>
+    <th>Binance</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="doc/assets/sponsor/alipay.png" height="220" alt="支付寶贊賞碼"></td>
+    <td align="center"><img src="doc/assets/sponsor/wechat.png" height="220" alt="微信贊賞碼"></td>
+    <td align="center"><img src="doc/assets/sponsor/binance.jpg" height="220" alt="Binance 收款碼"></td>
+  </tr>
+</table>
 
 ## 本機開發
 
