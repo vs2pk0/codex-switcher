@@ -3,9 +3,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use toml_edit::{value, Document, Item};
@@ -110,6 +111,14 @@ pub struct CodexAccount {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_token_expires_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_updated_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_query_last_attempt_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_query_next_retry_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_query_last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<CodexQuota>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_error: Option<CodexQuotaErrorInfo>,
@@ -135,6 +144,21 @@ pub struct ApiKeyAccountBindingInput {
 pub struct AccountStore {
     storage_dir: PathBuf,
     codex_home: PathBuf,
+}
+
+static ACCOUNT_DATABASE_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
+pub(super) fn lock_account_database_mutation() -> Result<MutexGuard<'static, ()>, String> {
+    ACCOUNT_DATABASE_MUTATION_LOCK
+        .lock()
+        .map_err(|_| "账号库写入锁已损坏".to_string())
+}
+
+pub(super) fn validate_account_database_backup(path: &Path) -> Result<(), String> {
+    let file = fs::File::open(path).map_err(|error| format!("打开备份账号库失败: {}", error))?;
+    serde_json::from_reader::<_, AccountDatabase>(file)
+        .map(|_| ())
+        .map_err(|error| format!("备份账号库无效: {}", error))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -280,6 +304,7 @@ impl AccountStore {
     }
 
     pub fn detect_current_account_from_codex_config(&self) -> Result<Option<CodexAccount>, String> {
+        let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         if database.accounts.is_empty() {
             return Ok(None);
@@ -302,6 +327,14 @@ impl AccountStore {
     }
 
     pub fn import_from_json(&self, json_content: &str) -> Result<Vec<CodexAccount>, String> {
+        let _database_guard = lock_account_database_mutation()?;
+        self.import_from_json_while_locked(json_content)
+    }
+
+    pub(super) fn import_from_json_while_locked(
+        &self,
+        json_content: &str,
+    ) -> Result<Vec<CodexAccount>, String> {
         let trimmed = json_content.trim();
         if trimmed.is_empty() {
             return Err("请输入 Token 或 JSON".to_string());
@@ -359,6 +392,7 @@ impl AccountStore {
             }
         });
         let mut account = self.account_from_import_value(&payload)?;
+        let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         let current_id = database.current_account_id.clone();
         let existing = database
@@ -416,6 +450,156 @@ impl AccountStore {
         Ok(account)
     }
 
+    pub fn update_refreshed_oauth_tokens(
+        &self,
+        account_id: &str,
+        tokens: CodexTokens,
+    ) -> Result<CodexAccount, String> {
+        let _database_guard = lock_account_database_mutation()?;
+        let mut database = self.read_database()?;
+        let account = database
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| "账号不存在".to_string())?;
+        if account.auth_mode.as_deref() == Some("apikey") {
+            return Err("API Key 账号不支持刷新 OAuth Token".to_string());
+        }
+
+        apply_refreshed_oauth_tokens(account, tokens, now_timestamp());
+        let updated = account.clone();
+        let projection = projection_account_after_oauth_update(&database, account_id);
+        self.write_database(&database)?;
+        if let Some(current) = projection {
+            write_codex_auth_projection(
+                &self.codex_home,
+                &current,
+                &database.accounts,
+                ManagedModelTransition::default(),
+            )?;
+        }
+        Ok(updated)
+    }
+
+    pub fn sync_oauth_account_from_current_auth(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<CodexAccount>, String> {
+        let _database_guard = lock_account_database_mutation()?;
+        let mut database = self.read_database()?;
+        let is_current_source = database
+            .current_account_id
+            .as_deref()
+            .and_then(|current_id| {
+                database
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == current_id)
+            })
+            .is_some_and(|current| {
+                current.id == account_id
+                    || (current.auth_mode.as_deref() == Some("apikey")
+                        && current.bound_oauth_account_id.as_deref() == Some(account_id))
+            });
+        if !is_current_source {
+            return Ok(None);
+        }
+
+        let auth_path = self.codex_home.join("auth.json");
+        if !auth_path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(&auth_path)
+            .map_err(|error| format!("读取 auth.json 失败: {error}"))?;
+        let value: Value = serde_json::from_str(&content)
+            .map_err(|error| format!("解析 auth.json 失败: {error}"))?;
+        if read_string(
+            &value,
+            &["OPENAI_API_KEY", "openai_api_key", "apiKey", "api_key"],
+        )
+        .is_some()
+        {
+            return Ok(None);
+        }
+        let authority_updated_at = read_token_updated_at(&value);
+        let snapshot = self.account_from_import_value(&value)?;
+        let account = database
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| "账号不存在".to_string())?;
+        if account.auth_mode.as_deref() == Some("apikey")
+            || !account.email.eq_ignore_ascii_case(&snapshot.email)
+        {
+            return Ok(None);
+        }
+        if account.tokens == snapshot.tokens {
+            return Ok(None);
+        }
+
+        let account_updated_at = account.token_updated_at.unwrap_or_default();
+        let stored_expires_at = jwt_expiration_timestamp(&account.tokens.access_token);
+        let authority_expires_at = jwt_expiration_timestamp(&snapshot.tokens.access_token);
+        let stored_expired = stored_expires_at
+            .map(|expires_at| expires_at <= now_timestamp() + 300)
+            .unwrap_or(true);
+        let authority_valid = authority_expires_at
+            .map(|expires_at| expires_at > now_timestamp() + 300)
+            .unwrap_or(false);
+        let authority_is_newer = authority_updated_at
+            .is_some_and(|updated_at| updated_at >= account_updated_at)
+            || authority_expires_at
+                .zip(stored_expires_at)
+                .is_some_and(|(authority, stored)| authority > stored)
+            || (stored_expired && authority_valid);
+        if !authority_is_newer {
+            return Ok(None);
+        }
+
+        apply_refreshed_oauth_tokens(
+            account,
+            snapshot.tokens,
+            authority_updated_at.unwrap_or_else(now_timestamp),
+        );
+        let updated = account.clone();
+        self.write_database(&database)?;
+        Ok(Some(updated))
+    }
+
+    pub fn update_account_subscription_status(
+        &self,
+        account_id: &str,
+        plan_type: Option<String>,
+        subscription_active_until: Option<String>,
+        retry_error: Option<String>,
+    ) -> Result<CodexAccount, String> {
+        const SUBSCRIPTION_RETRY_SECONDS: i64 = 30 * 60;
+
+        let _database_guard = lock_account_database_mutation()?;
+        let mut database = self.read_database()?;
+        let account = database
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| "账号不存在".to_string())?;
+        if let Some(plan_type) = normalize_optional(plan_type.as_deref()) {
+            account.plan_type = Some(plan_type);
+        }
+        if let Some(active_until) = normalize_optional(subscription_active_until.as_deref()) {
+            account.subscription_active_until = Some(active_until);
+        }
+        let now = now_timestamp();
+        account.subscription_query_last_attempt_at = Some(now);
+        account.subscription_query_last_error = normalize_optional(retry_error.as_deref());
+        account.subscription_query_next_retry_at = account
+            .subscription_query_last_error
+            .as_ref()
+            .map(|_| now + SUBSCRIPTION_RETRY_SECONDS);
+        let updated = account.clone();
+        self.write_database(&database)?;
+        Ok(updated)
+    }
+
     pub fn add_api_key_account(
         &self,
         api_key: String,
@@ -432,6 +616,7 @@ impl AccountStore {
             account_name,
         )?;
 
+        let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         upsert_account(&mut database.accounts, account.clone());
         self.write_database(&database)?;
@@ -471,6 +656,7 @@ impl AccountStore {
         let (api_key, api_base_url) =
             validate_api_key_credentials(&api_key, api_base_url.as_deref())?;
         let api_official_url = validate_optional_url(api_official_url.as_deref(), "官网地址")?;
+        let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         let account = database
             .accounts
@@ -498,6 +684,7 @@ impl AccountStore {
         model_id: String,
     ) -> Result<CodexAccount, String> {
         let model_id = validate_default_model(&model_id)?;
+        let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         let account_index = database
             .accounts
@@ -606,6 +793,7 @@ impl AccountStore {
     }
 
     pub fn release_current_api_key_default_model(&self) -> Result<bool, String> {
+        let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         let mut changed = database.managed_model_config_backup.take().is_some();
         if let Some(current_id) = database.current_account_id.as_deref() {
@@ -626,6 +814,7 @@ impl AccountStore {
         account_id: &str,
         account_name: Option<String>,
     ) -> Result<CodexAccount, String> {
+        let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         let account = database
             .accounts
@@ -644,6 +833,7 @@ impl AccountStore {
         bound_oauth_account_id: Option<String>,
         bound_oauth_use_local_gateway: bool,
     ) -> Result<CodexAccount, String> {
+        let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         let bound_id = normalize_optional(bound_oauth_account_id.as_deref());
 
@@ -703,6 +893,7 @@ impl AccountStore {
         account_id: &str,
         phone: String,
     ) -> Result<CodexAccount, String> {
+        let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         let account = database
             .accounts
@@ -722,6 +913,7 @@ impl AccountStore {
     ) -> Result<CodexAccount, String> {
         let value: Value = serde_json::from_str(json_content)
             .map_err(|error| format!("JSON 解析失败: {}", error))?;
+        let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         let old_account = database
             .accounts
@@ -742,6 +934,20 @@ impl AccountStore {
         }
         if updated.last_used <= 0 {
             updated.last_used = old_account.last_used;
+        }
+        if updated.token_updated_at.is_none() {
+            updated.token_updated_at = old_account.token_updated_at;
+        }
+        if updated.subscription_query_last_attempt_at.is_none() {
+            updated.subscription_query_last_attempt_at =
+                old_account.subscription_query_last_attempt_at;
+        }
+        if updated.subscription_query_next_retry_at.is_none() {
+            updated.subscription_query_next_retry_at = old_account.subscription_query_next_retry_at;
+        }
+        if updated.subscription_query_last_error.is_none() {
+            updated.subscription_query_last_error =
+                old_account.subscription_query_last_error.clone();
         }
         apply_import_metadata(&mut updated, import_value);
 
@@ -897,6 +1103,7 @@ impl AccountStore {
         account_id: &str,
         quota: CodexQuota,
     ) -> Result<CodexAccount, String> {
+        let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         let account = database
             .accounts
@@ -916,6 +1123,7 @@ impl AccountStore {
         account_id: &str,
         message: String,
     ) -> Result<CodexAccount, String> {
+        let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         let account = database
             .accounts
@@ -934,6 +1142,32 @@ impl AccountStore {
         account.usage_updated_at = Some(now_timestamp());
         let updated = account.clone();
         self.write_database(&database)?;
+        Ok(updated)
+    }
+
+    pub fn clear_account_refresh_token_error(
+        &self,
+        account_id: &str,
+    ) -> Result<CodexAccount, String> {
+        let _database_guard = lock_account_database_mutation()?;
+        let mut database = self.read_database()?;
+        let account = database
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| "账号不存在".to_string())?;
+        let should_clear = account
+            .quota_error
+            .as_ref()
+            .is_some_and(|error| is_refresh_token_failure_message(&error.message));
+        if should_clear {
+            account.quota_error = None;
+            account.usage_updated_at = Some(now_timestamp());
+        }
+        let updated = account.clone();
+        if should_clear {
+            self.write_database(&database)?;
+        }
         Ok(updated)
     }
 
@@ -969,6 +1203,7 @@ impl AccountStore {
     }
 
     pub fn delete_account(&self, account_id: &str) -> Result<(), String> {
+        let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         let removed_account = database
             .accounts
@@ -1040,6 +1275,7 @@ impl AccountStore {
     }
 
     pub fn switch_account(&self, account_id: &str) -> Result<CodexAccount, String> {
+        let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         if database
             .managed_model_config_backup
@@ -1275,6 +1511,28 @@ impl AccountStore {
             bound_phone: None,
             subscription_active_until: None,
             access_token_expires_at: None,
+            token_updated_at: read_token_updated_at(value).or(Some(now)),
+            subscription_query_last_attempt_at: read_i64(
+                value,
+                &[
+                    "subscription_query_last_attempt_at",
+                    "subscriptionQueryLastAttemptAt",
+                ],
+            ),
+            subscription_query_next_retry_at: read_i64(
+                value,
+                &[
+                    "subscription_query_next_retry_at",
+                    "subscriptionQueryNextRetryAt",
+                ],
+            ),
+            subscription_query_last_error: read_string(
+                value,
+                &[
+                    "subscription_query_last_error",
+                    "subscriptionQueryLastError",
+                ],
+            ),
             quota: None,
             quota_error: None,
             usage_updated_at: None,
@@ -1486,13 +1744,82 @@ fn upsert_account(accounts: &mut Vec<CodexAccount>, account: CodexAccount) {
     }
 }
 
+fn apply_refreshed_oauth_tokens(
+    account: &mut CodexAccount,
+    mut tokens: CodexTokens,
+    updated_at: i64,
+) {
+    if normalize_optional(tokens.refresh_token.as_deref()).is_none() {
+        tokens.refresh_token = normalize_optional(account.tokens.refresh_token.as_deref());
+    }
+    account.tokens = tokens;
+    account.token_updated_at = Some(updated_at);
+    account.access_token_expires_at =
+        jwt_expiration_timestamp(&account.tokens.access_token).map(|value| value.to_string());
+    account.plan_type =
+        resolve_auth_field(account, "chatgpt_plan_type").or_else(|| account.plan_type.clone());
+    account.subscription_active_until =
+        resolve_auth_field(account, "chatgpt_subscription_active_until")
+            .or_else(|| account.subscription_active_until.clone());
+    if account
+        .quota_error
+        .as_ref()
+        .and_then(|error| error.code.as_deref())
+        == Some("token_expired")
+    {
+        account.quota_error = None;
+    }
+}
+
+fn projection_account_after_oauth_update(
+    database: &AccountDatabase,
+    oauth_account_id: &str,
+) -> Option<CodexAccount> {
+    let current_id = database.current_account_id.as_deref()?;
+    let current = database
+        .accounts
+        .iter()
+        .find(|account| account.id == current_id)?;
+    (current.id == oauth_account_id
+        || (current.auth_mode.as_deref() == Some("apikey")
+            && current.bound_oauth_account_id.as_deref() == Some(oauth_account_id)))
+    .then(|| current.clone())
+}
+
 fn now_timestamp() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+fn parse_timestamp_seconds(value: &str) -> Option<i64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(mut timestamp) = trimmed.parse::<i64>() {
+        if timestamp > 1_000_000_000_000 {
+            timestamp /= 1000;
+        }
+        return Some(timestamp);
+    }
+    chrono::DateTime::parse_from_rfc3339(trimmed)
+        .ok()
+        .map(|value| value.timestamp())
+}
+
+fn read_token_updated_at(value: &Value) -> Option<i64> {
+    read_i64(value, &["token_updated_at", "tokenUpdatedAt"]).or_else(|| {
+        read_scalar_string(value, &["last_refresh", "lastRefresh"])
+            .and_then(|raw| parse_timestamp_seconds(&raw))
+    })
 }
 
 fn quota_error_code(message: &str) -> Option<String> {
     let lower = message.to_ascii_lowercase();
     if lower.contains("token_expired")
+        || lower.contains("refresh_token_reused")
+        || lower.contains("refresh_token_expired")
+        || lower.contains("refresh_token_invalidated")
+        || lower.contains("invalid_grant")
         || lower.contains("unauthorized")
         || lower.contains("401")
         || lower.contains("authentication token is expired")
@@ -1500,6 +1827,13 @@ fn quota_error_code(message: &str) -> Option<String> {
         return Some("token_expired".to_string());
     }
     None
+}
+
+pub(crate) fn is_refresh_token_failure_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("refresh_token")
+        || lower.contains("refresh token")
+        || lower.contains("invalid_grant")
 }
 
 fn normalize_optional(value: Option<&str>) -> Option<String> {
@@ -1615,7 +1949,7 @@ fn match_current_account_from_config(
                 Some((score, account.clone()))
             })
             .collect();
-        scored.sort_by(|left, right| right.0.cmp(&left.0));
+        scored.sort_by_key(|item| std::cmp::Reverse(item.0));
         if let Some((_, account)) = scored.into_iter().next() {
             return Some(account);
         }
@@ -1680,6 +2014,10 @@ fn build_api_key_account_record(
         bound_phone: None,
         subscription_active_until: None,
         access_token_expires_at: None,
+        token_updated_at: None,
+        subscription_query_last_attempt_at: None,
+        subscription_query_next_retry_at: None,
+        subscription_query_last_error: None,
         quota: None,
         quota_error: None,
         usage_updated_at: None,
@@ -2129,6 +2467,14 @@ fn jwt_payload_value(token: &str) -> Option<Value> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
     serde_json::from_slice(&decoded).ok()
+}
+
+pub(crate) fn jwt_expiration_timestamp(token: &str) -> Option<i64> {
+    jwt_payload_value(token)?.get("exp")?.as_i64()
+}
+
+pub(crate) fn chatgpt_account_id(account: &CodexAccount) -> Option<String> {
+    resolve_auth_field(account, "chatgpt_account_id")
 }
 
 const MANAGED_MODEL_ROOT_KEYS: [&str; 8] = [
@@ -2619,6 +2965,10 @@ fn write_string_atomic(path: &Path, content: &str) -> Result<(), String> {
 }
 
 pub(super) fn write_bytes_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
+    write_reader_atomic(path, Cursor::new(content))
+}
+
+pub(super) fn write_reader_atomic(path: &Path, mut content: impl Read) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("创建目录失败: {}", error))?;
     }
@@ -2641,9 +2991,7 @@ pub(super) fn write_bytes_atomic(path: &Path, content: &[u8]) -> Result<(), Stri
     let mut tmp_file = options
         .open(&tmp_path)
         .map_err(|error| format!("创建临时文件失败: {}", error))?;
-    if let Err(error) = tmp_file
-        .write_all(content)
-        .and_then(|_| tmp_file.sync_all())
+    if let Err(error) = std::io::copy(&mut content, &mut tmp_file).and_then(|_| tmp_file.sync_all())
     {
         drop(tmp_file);
         let _ = fs::remove_file(&tmp_path);

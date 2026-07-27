@@ -2,12 +2,15 @@ mod account;
 mod api_service;
 mod app_update;
 mod oauth;
+mod push;
 mod session;
+mod subscription;
+mod token_keeper;
 mod usage;
 
 use account::{
-    write_bytes_atomic, AccountStore, ApiKeyAccountBindingInput, CodexAccount, CodexQuota,
-    CodexResetCredit,
+    write_bytes_atomic, write_reader_atomic, AccountStore, ApiKeyAccountBindingInput, CodexAccount,
+    CodexQuota, CodexResetCredit,
 };
 use oauth::CodexOAuthLoginStartResponse;
 use rand::Rng;
@@ -24,9 +27,11 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
+use tempfile::TempDir;
 use usage::{CodexUsageActivity, CodexUsageDashboard, CodexUsagePricing, CodexUsagePricingConfig};
 
 #[cfg(windows)]
@@ -117,6 +122,7 @@ struct CodexSwitcherSettings {
 }
 
 const MAX_REFRESH_MINUTES: u64 = 1440;
+static SWITCHER_SETTINGS_LOCK: Mutex<()> = Mutex::new(());
 
 impl Default for CodexSwitcherSettings {
     fn default() -> Self {
@@ -1552,7 +1558,21 @@ fn delete_codex_account(account_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn switch_codex_account(account_id: String) -> Result<CodexAccount, String> {
+async fn switch_codex_account(account_id: String) -> Result<CodexAccount, String> {
+    let accounts = AccountStore::default().list_accounts()?;
+    let target = accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .ok_or_else(|| "账号不存在".to_string())?;
+    let oauth_account_id = if target.auth_mode.as_deref() == Some("apikey") {
+        target.bound_oauth_account_id.clone()
+    } else {
+        Some(target.id.clone())
+    };
+    if let Some(oauth_account_id) = oauth_account_id {
+        token_keeper::ensure_fresh_access_token(&oauth_account_id, "切换账号前 Token 需要续期")
+            .await?;
+    }
     AccountStore::default().switch_account(&account_id)
 }
 
@@ -1563,6 +1583,7 @@ fn restart_codex_app() -> Result<String, String> {
 
 #[tauri::command]
 fn get_codex_switcher_settings() -> Result<CodexSwitcherSettings, String> {
+    let _settings_guard = lock_switcher_settings()?;
     read_switcher_settings()
 }
 
@@ -1570,6 +1591,7 @@ fn get_codex_switcher_settings() -> Result<CodexSwitcherSettings, String> {
 fn update_codex_switcher_settings(
     settings: CodexSwitcherSettings,
 ) -> Result<CodexSwitcherSettings, String> {
+    let _settings_guard = lock_switcher_settings()?;
     let settings = settings.normalized();
     write_switcher_settings(&settings)?;
     Ok(settings)
@@ -1864,8 +1886,8 @@ fn get_codex_switcher_paths() -> Result<CodexSwitcherPaths, String> {
 }
 
 #[tauri::command]
-fn export_codex_switcher_backup() -> Result<CodexSwitcherBackupFile, String> {
-    export_codex_switcher_backup_with_progress(|_, _| {})
+fn export_codex_switcher_backup(app_handle: AppHandle) -> Result<CodexSwitcherBackupFile, String> {
+    export_codex_switcher_backup_with_progress(&app_handle, |_, _| {})
 }
 
 #[tauri::command]
@@ -1884,16 +1906,17 @@ fn start_codex_switcher_backup(app_handle: AppHandle, task_id: String) -> Result
             "正在准备备份任务...",
             None,
         );
-        let result = export_codex_switcher_backup_with_progress(|progress, message| {
-            emit_backup_progress(
-                &app_handle,
-                &emit_task_id,
-                "running",
-                progress,
-                message,
-                None,
-            );
-        });
+        let result =
+            export_codex_switcher_backup_with_progress(&app_handle, |progress, message| {
+                emit_backup_progress(
+                    &app_handle,
+                    &emit_task_id,
+                    "running",
+                    progress,
+                    message,
+                    None,
+                );
+            });
         match result {
             Ok(backup_file) => emit_backup_progress(
                 &app_handle,
@@ -1977,38 +2000,59 @@ fn emit_backup_progress(
     );
 }
 
+fn with_switcher_data_maintenance<T>(
+    app_handle: &AppHandle,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let runtime = app_handle.state::<push::PushRuntimeState>();
+    // Backup and restore must acquire shared data locks in this single order.
+    let _run_guard = push::begin_run(&runtime)?;
+    let _push_settings_guard = push::lock_settings(&runtime)?;
+    let _settings_guard = lock_switcher_settings()?;
+    let _account_guard = account::lock_account_database_mutation()?;
+    let _push_database_guard = push::lock_push_database()?;
+    let _usage_guard = usage::lock_usage_data()?;
+    push::checkpoint_push_database_for_backup()?;
+    usage::checkpoint_usage_database_for_backup()?;
+    operation()
+}
+
 fn export_codex_switcher_backup_with_progress<F>(
+    app_handle: &AppHandle,
     mut progress: F,
 ) -> Result<CodexSwitcherBackupFile, String>
 where
     F: FnMut(u8, &str),
 {
-    progress(5, "正在读取账号、设置与会话信息...");
-    let codex_session_summary = codex_session_backup_summary(&default_codex_home());
-    let statistics_summary = switcher_statistics_backup_summary();
-    let backup = serde_json::json!({
-        "app": "Codex Switcher",
-        "version": 2,
-        "exportedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        "accounts": list_codex_accounts()?,
-        "currentAccount": get_current_codex_account()?,
-        "settings": read_switcher_settings()?,
-        "codexSessions": codex_session_summary,
-        "statistics": statistics_summary,
-    });
-    progress(15, "正在生成备份清单...");
-    let content = serde_json::to_string_pretty(&backup)
-        .map_err(|error| format!("序列化备份失败: {}", error))?;
-    let backup_dir = switcher_backup_dir();
-    std::fs::create_dir_all(&backup_dir).map_err(|error| format!("创建备份目录失败: {}", error))?;
-    let filename = format!(
-        "codex-switcher-backup-{}.zip",
-        chrono::Local::now().format("%Y%m%d-%H%M%S-%3f")
-    );
-    let backup_path = backup_dir.join(filename);
-    write_switcher_backup_zip(&backup_path, &content, &mut progress)?;
-    progress(98, "正在刷新备份文件信息...");
-    backup_file_info(&backup_path)
+    with_switcher_data_maintenance(app_handle, || {
+        progress(5, "正在读取账号、设置与会话信息...");
+        let codex_session_summary = codex_session_backup_summary(&default_codex_home());
+        let statistics_summary = switcher_statistics_backup_summary();
+        let backup = serde_json::json!({
+            "app": "Codex Switcher",
+            "version": 2,
+            "exportedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "accounts": list_codex_accounts()?,
+            "currentAccount": get_current_codex_account()?,
+            "settings": read_switcher_settings()?,
+            "codexSessions": codex_session_summary,
+            "statistics": statistics_summary,
+        });
+        progress(15, "正在生成备份清单...");
+        let content = serde_json::to_string_pretty(&backup)
+            .map_err(|error| format!("序列化备份失败: {}", error))?;
+        let backup_dir = switcher_backup_dir();
+        std::fs::create_dir_all(&backup_dir)
+            .map_err(|error| format!("创建备份目录失败: {}", error))?;
+        let filename = format!(
+            "codex-switcher-backup-{}.zip",
+            chrono::Local::now().format("%Y%m%d-%H%M%S-%3f")
+        );
+        let backup_path = backup_dir.join(filename);
+        write_switcher_backup_zip(&backup_path, &content, &mut progress)?;
+        progress(98, "正在刷新备份文件信息...");
+        backup_file_info(&backup_path)
+    })
 }
 
 fn export_codex_switcher_session_backup_with_progress<F>(
@@ -2075,19 +2119,53 @@ fn list_backup_files_in_dir(
 }
 
 #[tauri::command]
-fn restore_codex_switcher_backup(backup_path: String) -> Result<Vec<CodexAccount>, String> {
+fn restore_codex_switcher_backup(
+    app_handle: AppHandle,
+    backup_path: String,
+) -> Result<Vec<CodexAccount>, String> {
     let path = validate_backup_zip_path(&backup_path)?;
     let file = std::fs::File::open(&path).map_err(|error| format!("打开备份失败: {}", error))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|error| format!("读取 ZIP 备份失败: {}", error))?;
-    restore_backup_archive_files(&mut archive)?;
     let mut backup_json = String::new();
     archive
         .by_name("backup.json")
         .map_err(|error| format!("备份中缺少 backup.json: {}", error))?
         .read_to_string(&mut backup_json)
         .map_err(|error| format!("读取备份 JSON 失败: {}", error))?;
-    import_codex_switcher_backup(backup_json)
+    let backup_value: Value = serde_json::from_str(&backup_json)
+        .map_err(|error| format!("备份 JSON 解析失败: {}", error))?;
+    let restored_settings = backup_value
+        .get("settings")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<CodexSwitcherSettings>(value).ok());
+    let accounts_value = backup_value
+        .get("accounts")
+        .cloned()
+        .unwrap_or_else(|| backup_value.clone());
+    let accounts_json = serde_json::to_string(&accounts_value)
+        .map_err(|error| format!("备份账号解析失败: {}", error))?;
+    let mut prepared =
+        prepare_backup_archive_files_with(&mut archive, backup_entry_restore_target)?;
+    validate_prepared_switcher_backup(&mut prepared)?;
+    let restores_account_database = prepared
+        .entries
+        .iter()
+        .any(|entry| entry.target == switcher_account_dir().join("accounts.json"));
+
+    with_switcher_data_maintenance(&app_handle, || {
+        remove_restored_database_sidecars(&prepared)?;
+        apply_prepared_backup_archive(&prepared)?;
+        if let Some(settings) = restored_settings.as_ref() {
+            write_switcher_settings(settings)?;
+        }
+        let store = AccountStore::default();
+        if restores_account_database {
+            store.list_accounts()
+        } else {
+            store.import_from_json_while_locked(&accounts_json)
+        }
+    })
 }
 
 #[tauri::command]
@@ -2097,7 +2175,9 @@ fn restore_codex_switcher_session_backup(backup_path: String) -> Result<(), Stri
     let file = std::fs::File::open(&path).map_err(|error| format!("打开备份失败: {}", error))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|error| format!("读取 ZIP 备份失败: {}", error))?;
-    restore_backup_archive_session_files(&mut archive)
+    let prepared =
+        prepare_backup_archive_files_with(&mut archive, backup_session_entry_restore_target)?;
+    apply_prepared_backup_archive(&prepared)
 }
 
 #[tauri::command]
@@ -2115,6 +2195,7 @@ fn import_codex_switcher_backup(json_content: String) -> Result<Vec<CodexAccount
         if let Ok(settings) =
             serde_json::from_value::<CodexSwitcherSettings>(settings_value.clone())
         {
+            let _settings_guard = lock_switcher_settings()?;
             write_switcher_settings(&settings)?;
         }
     }
@@ -2168,7 +2249,7 @@ async fn refresh_all_codex_quotas() -> Result<i32, String> {
 
 #[tauri::command]
 async fn consume_codex_reset_credit(account_id: String) -> Result<CodexAccount, String> {
-    let source = quota_source_account(&account_id)?;
+    let source = refreshed_quota_source_account(&account_id).await?;
     let access_token = source.tokens.access_token.trim();
     if access_token.is_empty() {
         return Err("OAuth access_token 为空，无法重置额度".to_string());
@@ -2693,22 +2774,24 @@ fn count_files_under_skipping_shadow(root: &Path, current: &Path, shadow_root: &
         .sum()
 }
 
-fn restore_backup_archive_files(
-    archive: &mut zip::ZipArchive<std::fs::File>,
-) -> Result<(), String> {
-    restore_backup_archive_files_with(archive, backup_entry_restore_target)
+struct PreparedBackupEntry {
+    target: PathBuf,
+    staged_path: PathBuf,
 }
 
-fn restore_backup_archive_session_files(
-    archive: &mut zip::ZipArchive<std::fs::File>,
-) -> Result<(), String> {
-    restore_backup_archive_files_with(archive, backup_session_entry_restore_target)
+struct PreparedBackupArchive {
+    _staging_dir: TempDir,
+    entries: Vec<PreparedBackupEntry>,
 }
 
-fn restore_backup_archive_files_with(
+fn prepare_backup_archive_files_with(
     archive: &mut zip::ZipArchive<std::fs::File>,
     restore_target: fn(&str) -> Option<PathBuf>,
-) -> Result<(), String> {
+) -> Result<PreparedBackupArchive, String> {
+    let staging_dir =
+        tempfile::tempdir().map_err(|error| format!("创建恢复临时目录失败: {}", error))?;
+    let mut entries = Vec::new();
+    let mut targets = HashSet::new();
     for index in 0..archive.len() {
         let mut file = archive
             .by_index(index)
@@ -2719,16 +2802,140 @@ fn restore_backup_archive_files_with(
         let Some(target) = restore_target(file.name()) else {
             continue;
         };
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("创建恢复目录失败 ({}): {}", parent.display(), error))?;
+        if !targets.insert(target.clone()) {
+            return Err(format!("备份中存在重复恢复目标: {}", target.display()));
         }
-        let mut output = std::fs::File::create(&target)
-            .map_err(|error| format!("创建恢复文件失败 ({}): {}", target.display(), error))?;
+        let staged_path = staging_dir.path().join(format!("{index:08x}.restore"));
+        let mut output = std::fs::File::create(&staged_path)
+            .map_err(|error| format!("创建恢复临时文件失败: {}", error))?;
         std::io::copy(&mut file, &mut output)
-            .map_err(|error| format!("恢复备份文件失败 ({}): {}", target.display(), error))?;
+            .and_then(|_| output.sync_all())
+            .map_err(|error| format!("校验备份文件失败 ({}): {}", target.display(), error))?;
+        entries.push(PreparedBackupEntry {
+            target,
+            staged_path,
+        });
+    }
+    Ok(PreparedBackupArchive {
+        _staging_dir: staging_dir,
+        entries,
+    })
+}
+
+fn validate_prepared_switcher_backup(prepared: &mut PreparedBackupArchive) -> Result<(), String> {
+    let account_database = switcher_account_dir().join("accounts.json");
+    let app_settings = switcher_config_data_dir().join("settings.json");
+    let push_settings = push::settings_path();
+    for entry in &prepared.entries {
+        if entry.target == account_database {
+            account::validate_account_database_backup(&entry.staged_path)?;
+        } else if entry.target == app_settings {
+            let file = std::fs::File::open(&entry.staged_path)
+                .map_err(|error| format!("打开备份应用设置失败: {}", error))?;
+            serde_json::from_reader::<_, CodexSwitcherSettings>(file)
+                .map_err(|error| format!("备份应用设置无效: {}", error))?;
+        } else if entry.target == push_settings {
+            push::validate_settings_backup(&entry.staged_path)?;
+        }
+    }
+    normalize_prepared_sqlite_databases(prepared)
+}
+
+fn normalize_prepared_sqlite_databases(prepared: &mut PreparedBackupArchive) -> Result<(), String> {
+    let database_targets = prepared
+        .entries
+        .iter()
+        .filter(|entry| entry.target.extension().and_then(|value| value.to_str()) == Some("sqlite"))
+        .map(|entry| entry.target.clone())
+        .collect::<Vec<_>>();
+    for target in database_targets {
+        let staged_database = prepared
+            .entries
+            .iter()
+            .find(|entry| entry.target == target)
+            .map(|entry| entry.staged_path.clone())
+            .ok_or_else(|| format!("备份数据库条目不存在: {}", target.display()))?;
+        let wal_target = path_with_suffix(&target, "-wal");
+        if let Some(wal_path) = prepared
+            .entries
+            .iter()
+            .find(|entry| entry.target == wal_target)
+            .map(|entry| entry.staged_path.clone())
+        {
+            std::fs::rename(&wal_path, path_with_suffix(&staged_database, "-wal"))
+                .map_err(|error| format!("准备备份数据库 WAL 失败: {}", error))?;
+        }
+        let connection = rusqlite::Connection::open(&staged_database)
+            .map_err(|error| format!("打开备份数据库失败 ({}): {}", target.display(), error))?;
+        let quick_check = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("校验备份数据库失败 ({}): {}", target.display(), error))?;
+        if quick_check != "ok" {
+            return Err(format!(
+                "备份数据库校验失败 ({}): {}",
+                target.display(),
+                quick_check
+            ));
+        }
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|error| format!("整理备份数据库失败 ({}): {}", target.display(), error))?;
+    }
+    prepared
+        .entries
+        .retain(|entry| !is_sqlite_sidecar(&entry.target));
+    Ok(())
+}
+
+fn apply_prepared_backup_archive(prepared: &PreparedBackupArchive) -> Result<(), String> {
+    for entry in &prepared.entries {
+        let input = std::fs::File::open(&entry.staged_path)
+            .map_err(|error| format!("打开恢复临时文件失败: {}", error))?;
+        write_reader_atomic(&entry.target, input).map_err(|error| {
+            format!(
+                "原子恢复备份文件失败 ({}): {}",
+                entry.target.display(),
+                error
+            )
+        })?;
     }
     Ok(())
+}
+
+fn remove_restored_database_sidecars(prepared: &PreparedBackupArchive) -> Result<(), String> {
+    for entry in prepared
+        .entries
+        .iter()
+        .filter(|entry| entry.target.extension().and_then(|value| value.to_str()) == Some("sqlite"))
+    {
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = path_with_suffix(&entry.target, suffix);
+            match std::fs::remove_file(&sidecar) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "清理数据库临时文件失败 ({}): {}",
+                        sidecar.display(),
+                        error
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn is_sqlite_sidecar(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name.ends_with(".sqlite-wal") || name.ends_with(".sqlite-shm"))
 }
 
 fn backup_entry_restore_target(name: &str) -> Option<PathBuf> {
@@ -2875,29 +3082,39 @@ fn read_switcher_settings() -> Result<CodexSwitcherSettings, String> {
         .map_err(|error| format!("解析设置失败: {}", error))
 }
 
+fn lock_switcher_settings() -> Result<MutexGuard<'static, ()>, String> {
+    SWITCHER_SETTINGS_LOCK
+        .lock()
+        .map_err(|_| "应用设置锁已损坏".to_string())
+}
+
 fn write_switcher_settings(settings: &CodexSwitcherSettings) -> Result<(), String> {
     let settings = settings.clone().normalized();
     std::fs::create_dir_all(switcher_config_data_dir())
         .map_err(|error| format!("创建设置目录失败: {}", error))?;
-    let content = serde_json::to_string_pretty(&settings)
+    let content = serde_json::to_vec_pretty(&settings)
         .map_err(|error| format!("序列化设置失败: {}", error))?;
-    std::fs::write(switcher_settings_path(), content)
+    write_bytes_atomic(&switcher_settings_path(), &content)
         .map_err(|error| format!("写入设置失败: {}", error))
 }
 
 async fn fetch_codex_quota_for_account(account_id: &str) -> Result<CodexQuota, String> {
+    let source = refreshed_quota_source_account(account_id).await?;
     let accounts = AccountStore::default().list_accounts()?;
     let target = accounts
         .iter()
         .find(|item| item.id == account_id)
         .cloned()
         .ok_or_else(|| "账号不存在".to_string())?;
-    let source = quota_source_account_from_accounts(&accounts, &target)?;
     let access_token = source.tokens.access_token.trim();
     if access_token.is_empty() {
         return Err("OAuth access_token 为空，无法查询额度".to_string());
     }
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("初始化额度请求失败: {}", error))?;
     let response = client
         .get("https://chatgpt.com/backend-api/wham/usage")
         .bearer_auth(access_token)
@@ -2921,12 +3138,19 @@ async fn fetch_codex_quota_for_account(account_id: &str) -> Result<CodexQuota, S
         serde_json::from_str(&body).map_err(|error| format!("解析额度 JSON 失败: {}", error))?;
     let mut quota = parse_codex_quota(raw);
     hydrate_reset_credits_once(
+        &client,
         &source,
         target.quota.as_ref(),
         source.quota.as_ref(),
         &mut quota,
     )
     .await;
+    if let Err(error) = subscription::refresh_account_subscription(&source.id, false).await {
+        eprintln!(
+            "刷新 Codex 额度后同步订阅状态失败: account_id={}, error={error}",
+            source.id
+        );
+    }
     Ok(quota)
 }
 
@@ -2938,6 +3162,11 @@ fn quota_source_account(account_id: &str) -> Result<CodexAccount, String> {
         .cloned()
         .ok_or_else(|| "账号不存在".to_string())?;
     quota_source_account_from_accounts(&accounts, &account)
+}
+
+async fn refreshed_quota_source_account(account_id: &str) -> Result<CodexAccount, String> {
+    let source = quota_source_account(account_id)?;
+    token_keeper::ensure_fresh_access_token(&source.id, "额度刷新前 Token 需要续期").await
 }
 
 fn quota_source_account_from_accounts(
@@ -2963,6 +3192,7 @@ fn quota_source_account_from_accounts(
 }
 
 async fn hydrate_reset_credits_once(
+    client: &reqwest::Client,
     source: &CodexAccount,
     target_cached_quota: Option<&CodexQuota>,
     source_cached_quota: Option<&CodexQuota>,
@@ -2980,7 +3210,8 @@ async fn hydrate_reset_credits_once(
         .or_else(|| reset_credits_from_cached_quota(source_cached_quota));
     if let Some(credits) = cached {
         if !reset_credits_match_available_count(&credits, quota.reset_credits_available) {
-            if let Ok((available_count, fetched_credits)) = fetch_codex_reset_credits(source).await
+            if let Ok((available_count, fetched_credits)) =
+                fetch_codex_reset_credits(client, source).await
             {
                 if !fetched_credits.is_empty() {
                     quota.reset_credits = fetched_credits;
@@ -3023,7 +3254,7 @@ async fn hydrate_reset_credits_once(
         return;
     }
 
-    if let Ok((available_count, credits)) = fetch_codex_reset_credits(source).await {
+    if let Ok((available_count, credits)) = fetch_codex_reset_credits(client, source).await {
         if credits.is_empty() {
             if quota.reset_credits_available.is_none() {
                 quota.reset_credits_available = available_count;
@@ -3080,13 +3311,14 @@ fn reset_credits_available_from_cached_quota(quota: Option<&CodexQuota>) -> Opti
 }
 
 async fn fetch_codex_reset_credits(
+    client: &reqwest::Client,
     source: &CodexAccount,
 ) -> Result<(Option<i64>, Vec<CodexResetCredit>), String> {
     let access_token = source.tokens.access_token.trim();
     if access_token.is_empty() {
         return Err("OAuth access_token 为空，无法查询重置次数".to_string());
     }
-    let response = reqwest::Client::new()
+    let response = client
         .get("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")
         .bearer_auth(access_token)
         .header("OpenAI-Beta", "codex-1")
@@ -3352,14 +3584,18 @@ fn compact_http_body(body: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
         backup_entry_restore_target, codex_config_backup_path, codex_session_trash_dir,
         default_codex_home, format_codex_config_content, parse_codex_api_key_models,
-        parse_codex_quota, read_codex_config_file_from, rollback_file_on_error, switcher_data_dir,
-        write_codex_config_file_to, CodexApiKeyModel, CodexConfigFileKind,
+        parse_codex_quota, prepare_backup_archive_files_with, read_codex_config_file_from,
+        rollback_file_on_error, switcher_account_dir, switcher_data_dir,
+        validate_prepared_switcher_backup, write_codex_config_file_to, CodexApiKeyModel,
+        CodexConfigFileKind,
     };
     use serde_json::json;
+    use std::io::Write;
     use tempfile::tempdir;
 
     #[test]
@@ -3780,6 +4016,46 @@ mod tests {
     }
 
     #[test]
+    fn malformed_backup_is_rejected_before_live_files_are_replaced() {
+        let live_account_database = switcher_account_dir().join("accounts.json");
+        std::fs::create_dir_all(
+            live_account_database
+                .parent()
+                .expect("live account database parent"),
+        )
+        .expect("create live account directory");
+        let original = br#"{"accounts":[],"current_account_id":null}"#;
+        std::fs::write(&live_account_database, original).expect("write live account database");
+
+        let temp = tempdir().expect("backup tempdir");
+        let zip_path = temp.path().join("malformed-backup.zip");
+        let file = std::fs::File::create(&zip_path).expect("create backup zip");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o600);
+        zip.start_file("data/account/accounts.json", options)
+            .expect("start malformed account entry");
+        zip.write_all(b"{not-json")
+            .expect("write malformed account entry");
+        zip.finish().expect("finish malformed backup");
+
+        let file = std::fs::File::open(&zip_path).expect("open malformed backup");
+        let mut archive = zip::ZipArchive::new(file).expect("read malformed backup");
+        let mut prepared =
+            prepare_backup_archive_files_with(&mut archive, backup_entry_restore_target)
+                .expect("stage malformed backup");
+        let error = validate_prepared_switcher_backup(&mut prepared)
+            .expect_err("reject malformed account database");
+        assert!(error.contains("备份账号库无效"));
+        assert_eq!(
+            std::fs::read(&live_account_database).expect("read live account database"),
+            original
+        );
+        let _ = std::fs::remove_dir_all(switcher_data_dir());
+    }
+
+    #[test]
     fn legacy_session_trash_backup_skips_shadowed_files_only() {
         let temp = tempdir().expect("backup tempdir");
         let legacy = temp.path().join("legacy-trash");
@@ -3928,16 +4204,29 @@ mod tests {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .manage(api_service::ApiServiceProcessState::default())
         .manage(api_service::ApiServiceDownloadState::default())
         .manage(api_service::ApiServiceOperationState::default())
         .manage(app_update::AppUpdateDownloadState::default())
+        .manage(push::PushRuntimeState::default())
         .setup(|app| {
+            if let Err(error) = app_update::cleanup_pending_update_artifacts_on_startup() {
+                eprintln!("App update cleanup failed during startup: {error}");
+            }
             if let Err(error) = api_service::prune_api_service_runtimes_on_startup() {
                 eprintln!("API service runtime maintenance failed during startup: {error}");
             }
             api_service::start_auto_update_scheduler(app.handle().clone());
+            push::start_push_scheduler(app.handle().clone());
+            token_keeper::start_token_keeper(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -3959,6 +4248,14 @@ pub fn run() {
             app_update::app_update_download,
             app_update::app_update_cancel_download,
             app_update::app_update_open_installer,
+            push::push_get_settings,
+            push::push_update_settings,
+            push::push_run_now,
+            push::push_run_rule_now,
+            push::push_test_channel,
+            push::push_list_logs,
+            push::push_count_successful_logs_since,
+            push::push_clear_logs,
             list_codex_accounts,
             get_current_codex_account,
             detect_current_codex_account,
@@ -4028,6 +4325,8 @@ pub fn run() {
                 api_service::shutdown_api_service(process, download, operation);
                 let app_update_download = window.state::<app_update::AppUpdateDownloadState>();
                 app_update::shutdown_app_update(app_update_download);
+                let push_runtime = window.state::<push::PushRuntimeState>();
+                push::shutdown_push_scheduler(push_runtime);
             }
         })
         .run(tauri::generate_context!())

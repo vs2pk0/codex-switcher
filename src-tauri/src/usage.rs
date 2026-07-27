@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Serialize)]
@@ -274,6 +275,25 @@ struct ParsedUsageEvent {
 const USAGE_CACHE_VERSION: u32 = 4;
 const PRICING_DEFAULTS_VERSION: u32 = 1;
 const GPT_56_DEFAULT_MODEL_IDS: [&str; 3] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+static USAGE_DATA_LOCK: Mutex<()> = Mutex::new(());
+
+pub(super) fn lock_usage_data() -> Result<MutexGuard<'static, ()>, String> {
+    USAGE_DATA_LOCK
+        .lock()
+        .map_err(|_| "统计数据锁已损坏".to_string())
+}
+
+pub(super) fn checkpoint_usage_database_for_backup() -> Result<(), String> {
+    let path = usage_db_path();
+    if !path.is_file() {
+        return Ok(());
+    }
+    let connection =
+        Connection::open(&path).map_err(|error| format!("打开统计数据库失败: {}", error))?;
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|error| format!("整理统计数据库失败: {}", error))
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ModelPricing {
@@ -290,6 +310,7 @@ pub fn get_codex_usage_dashboard(
     page_size: Option<usize>,
     refresh: Option<bool>,
 ) -> Result<CodexUsageDashboard, String> {
+    let _data_guard = lock_usage_data()?;
     let (conn, cache) = ensure_usage_cache_db(refresh.unwrap_or(false))?;
     let pricing = load_pricing()?;
     let pricing_configs = load_pricing_configs()?;
@@ -327,6 +348,7 @@ pub fn get_codex_usage_dashboard(
 }
 
 pub fn get_codex_usage_activity(refresh: Option<bool>) -> Result<CodexUsageActivity, String> {
+    let _data_guard = lock_usage_data()?;
     let (conn, _) = ensure_usage_cache_db(refresh.unwrap_or(false))?;
     let start = local_day_start_timestamp(usage_activity_start_date(Local::now().date_naive()));
     let logs = read_usage_logs_db_range(&conn, start, i64::MAX)?;
@@ -334,10 +356,12 @@ pub fn get_codex_usage_activity(refresh: Option<bool>) -> Result<CodexUsageActiv
 }
 
 pub fn list_model_pricing() -> Result<Vec<CodexUsagePricing>, String> {
+    let _data_guard = lock_usage_data()?;
     load_pricing()
 }
 
 pub fn update_model_pricing(input: CodexUsagePricing) -> Result<(), String> {
+    let _data_guard = lock_usage_data()?;
     validate_pricing(&input)?;
     let mut pricing = load_pricing()?;
     let model_id = clean_model_id_for_pricing(&input.model_id);
@@ -353,6 +377,7 @@ pub fn update_model_pricing(input: CodexUsagePricing) -> Result<(), String> {
 }
 
 pub fn delete_model_pricing(model_id: &str) -> Result<(), String> {
+    let _data_guard = lock_usage_data()?;
     let model_id = clean_model_id_for_pricing(model_id);
     let mut pricing = load_pricing()?;
     pricing.retain(|item| item.model_id != model_id);
@@ -360,18 +385,21 @@ pub fn delete_model_pricing(model_id: &str) -> Result<(), String> {
 }
 
 pub fn reset_model_pricing() -> Result<Vec<CodexUsagePricing>, String> {
+    let _data_guard = lock_usage_data()?;
     let pricing = default_pricing();
     write_pricing(&pricing)?;
     Ok(pricing)
 }
 
 pub fn get_pricing_config() -> Result<Vec<CodexUsagePricingConfig>, String> {
+    let _data_guard = lock_usage_data()?;
     load_pricing_configs()
 }
 
 pub fn update_pricing_config(
     configs: Vec<CodexUsagePricingConfig>,
 ) -> Result<Vec<CodexUsagePricingConfig>, String> {
+    let _data_guard = lock_usage_data()?;
     let next = normalize_pricing_configs(configs)?;
     Ok(next)
 }

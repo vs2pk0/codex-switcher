@@ -1,9 +1,10 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import type { CodexSessionRecord, CodexTrashedSessionRecord } from "../services/session";
 import type { SessionGroup } from "../types/ui";
 import { formatLocalizedCount, t } from "../i18n";
 
-defineProps<{
+const props = defineProps<{
   sessionSearch: { titleQuery: string; contentQuery: string };
   sessionTrashMode: boolean;
   sessionLoading: boolean;
@@ -24,7 +25,7 @@ defineProps<{
   isSessionGroupSelected: (group: SessionGroup) => boolean;
 }>();
 
-defineEmits<{
+const emit = defineEmits<{
   (event: "update:session-trash-mode", value: boolean): void;
   (event: "load-sessions"): void;
   (event: "toggle-all-sessions"): void;
@@ -39,6 +40,9 @@ defineEmits<{
   (event: "open-session-folder", path: string): void;
 }>();
 
+const totalTokens = computed(() => props.sessionGroups.reduce((sum, group) => sum + group.approximateTokens, 0));
+const totalSize = computed(() => props.sessionGroups.reduce((sum, group) => sum + group.sizeBytes, 0));
+
 function formatFileSize(bytes?: number | null): string {
   const safeBytes = typeof bytes === "number" && Number.isFinite(bytes) ? bytes : 0;
   if (safeBytes <= 0) return "0 B";
@@ -52,195 +56,110 @@ function formatFileSize(bytes?: number | null): string {
   const digits = value >= 10 || unitIndex === 0 ? 0 : 1;
   return `${value.toFixed(digits)} ${units[unitIndex]}`;
 }
+
+function formatTokens(value: number): string {
+  return new Intl.NumberFormat("en-US").format(value);
+}
+
+function switchMode(trashMode: boolean): void {
+  emit("update:session-trash-mode", trashMode);
+  emit("load-sessions");
+}
 </script>
 
 <template>
-  <section class="session-panel">
-    <div class="session-toolbar">
+  <section class="session-panel session-workspace">
+    <section class="session-overview-grid">
+      <article>
+        <span class="session-overview-icon blue"><icon-folder /></span>
+        <div><small>{{ t("项目") }}</small><strong>{{ sessionGroups.length }} <em>{{ t("个") }}</em></strong></div>
+      </article>
+      <article>
+        <span class="session-overview-icon green"><icon-message /></span>
+        <div><small>{{ t("会话") }}</small><strong>{{ sessions.length }} <em>{{ t("条") }}</em></strong></div>
+      </article>
+      <article>
+        <span class="session-overview-icon violet"><icon-storage /></span>
+        <div><small>Tokens</small><strong>{{ formatTokens(totalTokens) }} <em>tokens</em></strong></div>
+      </article>
+      <article>
+        <span class="session-overview-icon orange"><icon-computer /></span>
+        <div><small>{{ t("磁盘占用") }}</small><strong>{{ formatFileSize(totalSize) }}</strong></div>
+      </article>
+    </section>
+
+    <div class="session-toolbar session-command-bar">
       <div class="session-search">
-        <a-input
-          v-model="sessionSearch.titleQuery"
-          allow-clear
-          :placeholder="t('搜索会话标题')"
-          @press-enter="$emit('load-sessions')"
-        />
-        <a-input
-          v-model="sessionSearch.contentQuery"
-          allow-clear
-          :placeholder="t('搜索会话内容')"
-          @press-enter="$emit('load-sessions')"
-        />
+        <a-input v-model="sessionSearch.titleQuery" allow-clear :placeholder="t('搜索会话标题')" @press-enter="emit('load-sessions')">
+          <template #prefix><icon-search /></template>
+        </a-input>
+        <a-input v-model="sessionSearch.contentQuery" allow-clear :placeholder="t('搜索会话内容')" @press-enter="emit('load-sessions')">
+          <template #prefix><icon-search /></template>
+        </a-input>
+      </div>
+      <div class="session-view-switch">
+        <a-button :type="sessionTrashMode ? 'secondary' : 'primary'" @click="switchMode(false)">{{ t("会话列表") }}</a-button>
+        <a-button :type="sessionTrashMode ? 'primary' : 'secondary'" @click="switchMode(true)">{{ t("回收站") }}</a-button>
       </div>
       <div class="session-actions">
-        <a-button
-          :disabled="!activeSessionIds.length"
-          @click="$emit('toggle-all-sessions')"
-        >
-          {{ allSessionsSelected ? t("取消全选") : (sessionTrashMode ? t("全选回收站") : t("全选")) }}
-        </a-button>
-        <a-button
-          :type="sessionTrashMode ? 'secondary' : 'primary'"
-          @click="() => { $emit('update:session-trash-mode', false); $emit('load-sessions'); }"
-        >
-          {{ t("会话列表") }}
-        </a-button>
-        <a-button
-          :type="sessionTrashMode ? 'primary' : 'secondary'"
-          @click="() => { $emit('update:session-trash-mode', true); $emit('load-sessions'); }"
-        >
-          {{ t("回收站") }}
-        </a-button>
-        <a-button :loading="sessionLoading" @click="$emit('load-sessions')">
-          <template #icon><icon-refresh /></template>
-          {{ t("刷新") }}
-        </a-button>
-        <a-button :loading="backupWorking" @click="$emit('export-session-backup')">
-          <template #icon><icon-download /></template>
-          {{ backupButtonText }}
-        </a-button>
-        <a-button :loading="sessionBackupLoading" :disabled="backupWorking" @click="$emit('open-session-restore-modal')">
-          <template #icon><icon-import /></template>
-          {{ t("恢复会话") }}
-        </a-button>
-        <a-button :loading="sessionRepairing" type="primary" @click="$emit('repair-sessions')">
-          <template #icon><icon-tool /></template>
-          {{ t("修复可见性") }}
-        </a-button>
-        <a-button
-          v-if="!sessionTrashMode"
-          status="danger"
-          :disabled="!selectedSessionIdList.length"
-          @click="$emit('trash-sessions')"
-        >
-          <template #icon><icon-delete /></template>
-          {{ t("移入回收站") }}
-        </a-button>
-        <a-button
-          v-else
-          type="primary"
-          :disabled="!selectedSessionIdList.length"
-          @click="$emit('restore-sessions')"
-        >
-          <template #icon><icon-undo /></template>
-          {{ t("恢复") }}
-        </a-button>
+        <a-button :loading="sessionLoading" @click="emit('load-sessions')"><template #icon><icon-refresh /></template>{{ t("刷新") }}</a-button>
+        <a-button :loading="backupWorking" @click="emit('export-session-backup')"><template #icon><icon-download /></template>{{ backupButtonText }}</a-button>
+        <a-button :loading="sessionBackupLoading" :disabled="backupWorking" @click="emit('open-session-restore-modal')"><template #icon><icon-import /></template>{{ t("恢复会话") }}</a-button>
+        <a-button :loading="sessionRepairing" type="primary" @click="emit('repair-sessions')"><template #icon><icon-tool /></template>{{ t("修复可见性") }}</a-button>
+        <a-button v-if="!sessionTrashMode" status="danger" :disabled="!selectedSessionIdList.length" @click="emit('trash-sessions')"><template #icon><icon-delete /></template>{{ t("移入回收站") }}</a-button>
+        <template v-else>
+          <a-button :disabled="!activeSessionIds.length" @click="emit('toggle-all-sessions')"><template #icon><icon-check /></template>{{ t(allSessionsSelected ? "取消全选" : "全选回收站") }}</a-button>
+          <a-button type="primary" :disabled="!selectedSessionIdList.length" @click="emit('restore-sessions')"><template #icon><icon-undo /></template>{{ t("恢复") }}</a-button>
+        </template>
       </div>
     </div>
 
     <a-spin :loading="sessionLoading" dot>
-      <div v-if="!sessionTrashMode" class="session-list">
+      <div v-if="!sessionTrashMode" class="session-list session-project-table">
+        <div class="session-table-head">
+          <a-checkbox :model-value="allSessionsSelected" :disabled="!activeSessionIds.length" @change="emit('toggle-all-sessions')" />
+          <span>{{ t("项目名称") }}</span><span>{{ t("会话") }}</span><span>Tokens</span><span>{{ t("占用") }}</span><span>{{ t("更新时间") }}</span><span>{{ t("操作") }}</span>
+        </div>
         <section v-for="group in sessionGroups" :key="group.key" class="session-group">
           <div class="session-group-row">
-            <a-button
-              class="session-expand-button"
-              size="mini"
-              shape="circle"
-              @click="$emit('toggle-session-group-expanded', group.key)"
-            >
-              <template #icon>
-                <icon-down v-if="expandedSessionGroups.has(group.key)" />
-                <icon-right v-else />
-              </template>
+            <a-button class="session-expand-button" size="mini" shape="circle" :title="expandedSessionGroups.has(group.key) ? t('收起') : t('展开')" @click="emit('toggle-session-group-expanded', group.key)">
+              <template #icon><icon-down v-if="expandedSessionGroups.has(group.key)" /><icon-right v-else /></template>
             </a-button>
-            <a-checkbox
-              :model-value="isSessionGroupSelected(group)"
-              @change="$emit('toggle-session-group-selection', group)"
-            />
+            <a-checkbox :model-value="isSessionGroupSelected(group)" @change="emit('toggle-session-group-selection', group)" />
             <icon-folder class="session-group-icon" />
-            <button
-              class="session-group-title"
-              type="button"
-              :title="group.projectName"
-              @click="$emit('toggle-session-group-expanded', group.key)"
-            >
-              {{ group.projectName }}
-            </button>
+            <button class="session-group-title" type="button" :title="group.projectName" @click="emit('toggle-session-group-expanded', group.key)">{{ group.projectName }}</button>
             <span class="session-group-meta">{{ formatLocalizedCount(group.sessions.length, "条会话") }}</span>
-            <span class="token-count">{{ new Intl.NumberFormat("en-US").format(group.approximateTokens) }} tokens</span>
+            <span class="token-count">{{ formatTokens(group.approximateTokens) }}</span>
             <span class="session-size">{{ formatFileSize(group.sizeBytes) }}</span>
             <span class="session-group-time">{{ formatTime(group.latestUpdatedAt) }}</span>
+            <a-button class="session-more-button" size="mini" type="text" :title="t('展开会话')" @click="emit('toggle-session-group-expanded', group.key)"><template #icon><icon-more /></template></a-button>
           </div>
           <div v-if="expandedSessionGroups.has(group.key)" class="session-group-children">
             <article v-for="session in group.sessions" :key="session.id" class="session-child-row">
-              <a-checkbox
-                :model-value="selectedSessionIds.has(session.id)"
-                @change="$emit('toggle-session', session.id)"
-              />
-              <div class="session-main session-main-name-only">
-                <strong class="session-name-only" :title="session.title">
-                  {{ session.title || t("未命名会话") }}
-                </strong>
-              </div>
-              <div class="session-stat">
-                <span class="token-count">{{ sessionApproxTokens(session.id) }}</span>
-                <span class="session-size">{{ formatFileSize(session.sizeBytes) }}</span>
-                <span>{{ formatTime(session.updatedAt) }}</span>
-                <a-button size="small" @click="$emit('open-session-folder', session.path)">
-                  <template #icon><icon-folder /></template>
-                  {{ t("打开文件夹") }}
-                </a-button>
-              </div>
+              <a-checkbox :model-value="selectedSessionIds.has(session.id)" @change="emit('toggle-session', session.id)" />
+              <strong class="session-name-only" :title="session.title">{{ session.title || t("未命名会话") }}</strong>
+              <span class="token-count">{{ sessionApproxTokens(session.id) }}</span>
+              <span class="session-size">{{ formatFileSize(session.sizeBytes) }}</span>
+              <span>{{ formatTime(session.updatedAt) }}</span>
+              <a-button size="small" type="text" @click="emit('open-session-folder', session.path)"><template #icon><icon-folder /></template>{{ t("打开文件夹") }}</a-button>
             </article>
           </div>
         </section>
         <div v-if="!sessions.length" class="session-empty-state">
-          <div class="session-empty-icon">
-            <icon-message />
-          </div>
-          <div class="session-empty-copy">
-            <strong>{{ sessionSearch.titleQuery || sessionSearch.contentQuery ? t("没有匹配的会话") : t("还没有可显示的会话") }}</strong>
-            <span>
-              {{ sessionSearch.titleQuery || sessionSearch.contentQuery
-                ? t("换个关键词试试，或清空搜索后重新刷新。")
-                : t("可以先刷新本机会话；如果是切号后看不到旧会话，使用修复可见性重新挂回列表。")
-              }}
-            </span>
-          </div>
-          <div class="session-empty-actions">
-            <a-button type="primary" :loading="sessionLoading" @click="$emit('load-sessions')">
-              <template #icon><icon-refresh /></template>
-              {{ t("刷新会话") }}
-            </a-button>
-            <a-button :loading="sessionBackupLoading" :disabled="backupWorking" @click="$emit('open-session-restore-modal')">
-              <template #icon><icon-import /></template>
-              {{ t("从备份恢复") }}
-            </a-button>
-            <a-button :loading="sessionRepairing" @click="$emit('repair-sessions')">
-              <template #icon><icon-tool /></template>
-              {{ t("修复可见性") }}
-            </a-button>
-          </div>
+          <div class="session-empty-icon"><icon-message /></div>
+          <div class="session-empty-copy"><strong>{{ sessionSearch.titleQuery || sessionSearch.contentQuery ? t("没有匹配的会话") : t("还没有可显示的会话") }}</strong><span>{{ sessionSearch.titleQuery || sessionSearch.contentQuery ? t("换个关键词试试，或清空搜索后重新刷新。") : t("可以先刷新本机会话；如果是切号后看不到旧会话，使用修复可见性重新挂回列表。") }}</span></div>
+          <div class="session-empty-actions"><a-button type="primary" :loading="sessionLoading" @click="emit('load-sessions')"><template #icon><icon-refresh /></template>{{ t("刷新会话") }}</a-button><a-button :loading="sessionBackupLoading" :disabled="backupWorking" @click="emit('open-session-restore-modal')"><template #icon><icon-import /></template>{{ t("从备份恢复") }}</a-button><a-button :loading="sessionRepairing" @click="emit('repair-sessions')"><template #icon><icon-tool /></template>{{ t("修复可见性") }}</a-button></div>
         </div>
+        <footer v-if="sessions.length" class="session-table-footer"><span><icon-check-circle /> {{ t("已选择") }} {{ selectedSessionIdList.length }} {{ t("项") }}</span><div><span>{{ t("共") }} {{ sessions.length }} {{ t("条会话") }}</span><span>{{ t("总 Tokens") }} {{ formatTokens(totalTokens) }}</span><span>{{ t("总占用") }} {{ formatFileSize(totalSize) }}</span></div></footer>
       </div>
 
-      <div v-else class="session-list">
+      <div v-else class="session-list session-trash-table">
         <article v-for="session in trashedSessions" :key="session.id" class="session-row">
-          <a-checkbox
-            :model-value="selectedSessionIds.has(session.id)"
-            @change="$emit('toggle-session', session.id)"
-          />
-          <div class="session-main">
-            <strong :title="session.title">{{ session.title }}</strong>
-            <span :title="session.originalPath">{{ session.originalPath }}</span>
-          </div>
-          <div class="session-stat">
-            <span>{{ t("已删除") }}</span>
-            <span>{{ formatTime(session.deletedAt) }}</span>
-            <a-button size="small" @click="$emit('open-session-folder', session.originalPath)">
-              <template #icon><icon-folder /></template>
-              {{ t("打开文件夹") }}
-            </a-button>
-          </div>
+          <a-checkbox :model-value="selectedSessionIds.has(session.id)" @change="emit('toggle-session', session.id)" />
+          <div class="session-main"><strong :title="session.title">{{ session.title }}</strong><span :title="session.originalPath">{{ session.originalPath }}</span></div>
+          <div class="session-stat"><span>{{ t("已删除") }}</span><span>{{ formatTime(session.deletedAt) }}</span><a-button size="small" @click="emit('open-session-folder', session.originalPath)"><template #icon><icon-folder /></template>{{ t("打开文件夹") }}</a-button></div>
         </article>
-        <div v-if="!trashedSessions.length" class="session-empty-state compact">
-          <div class="session-empty-icon">
-            <icon-delete />
-          </div>
-          <div class="session-empty-copy">
-            <strong>{{ t("回收站为空") }}</strong>
-            <span>{{ t("被移入回收站的会话会显示在这里，恢复后会回到原来的会话路径。") }}</span>
-          </div>
-        </div>
+        <div v-if="!trashedSessions.length" class="session-empty-state compact"><div class="session-empty-icon"><icon-delete /></div><div class="session-empty-copy"><strong>{{ t("回收站为空") }}</strong><span>{{ t("被移入回收站的会话会显示在这里，恢复后会回到原来的会话路径。") }}</span></div></div>
       </div>
     </a-spin>
   </section>

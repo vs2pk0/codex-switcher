@@ -4,6 +4,7 @@ import { Message, Modal } from "@arco-design/web-vue";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { isSubscriptionExpired } from "./accountStatus";
 import AccountList from "./components/AccountList.vue";
 import AboutPanel from "./components/AboutPanel.vue";
 import AccountToolbar from "./components/AccountToolbar.vue";
@@ -19,6 +20,7 @@ import EditAccountModal from "./components/EditAccountModal.vue";
 import ExportJsonModal from "./components/ExportJsonModal.vue";
 import OAuthBindingModal from "./components/OAuthBindingModal.vue";
 import PhoneModal from "./components/PhoneModal.vue";
+import PushSettingsPanel from "./components/PushSettingsPanel.vue";
 import ResetCreditModal from "./components/ResetCreditModal.vue";
 import SessionPanel from "./components/SessionPanel.vue";
 import SessionRepairModal from "./components/SessionRepairModal.vue";
@@ -164,9 +166,12 @@ let countdownSettingsPersistTimer: number | undefined;
 let apiKeyBalanceRefreshTimer: number | undefined;
 let scheduledQuotaRefreshRunning = false;
 let scheduledCurrentAccountRefreshRunning = false;
+let accountLoadRequested = false;
+let accountLoadPromise: Promise<void> | undefined;
 const nextQuotaRefreshAt = ref(0);
 const nextCurrentAccountRefreshAt = ref(0);
 const nowMs = ref(Date.now());
+const accountStatusClockMs = computed(() => Math.floor(nowMs.value / 5_000) * 5_000);
 const addModalVisible = ref(false);
 const addModalTitle = ref("接入新账号");
 const badgeStyleVisible = ref(false);
@@ -237,6 +242,7 @@ const oauthError = ref("");
 const oauthCallbackReceived = ref(false);
 let oauthUnlisten: UnlistenFn | null = null;
 let appUpdateUnlisten: UnlistenFn | null = null;
+let accountStateUnlisten: UnlistenFn | null = null;
 
 interface OAuthCallbackEvent {
   loginId: string;
@@ -327,6 +333,7 @@ const sessionSearch = reactive({
   titleQuery: "",
   contentQuery: "",
 });
+let sessionLoadSequence = 0;
 
 const currentId = computed(() => currentAccount.value?.id ?? "");
 const quotaSortModes = new Set(["weekly_quota", "hourly_quota", "weekly_reset", "hourly_reset", "subscription"]);
@@ -340,9 +347,9 @@ const filteredAccounts = computed(() => {
       (filter === "apikey" && isApiKeyAccount(account)) ||
       (filter === "error" && isAccountAbnormal(account)) ||
       (filter === "valid" && !isAccountAbnormal(account)) ||
-      (filter === "pro" && normalizePlanKey(account.plan_type) === "pro") ||
-      (filter === "team" && ["team", "business", "enterprise", "edu", "go"].includes(normalizePlanKey(account.plan_type))) ||
-      normalizePlanKey(account.plan_type) === filter;
+      (filter === "pro" && effectivePlanKey(account) === "pro") ||
+      (filter === "team" && ["team", "business", "enterprise", "edu", "go"].includes(effectivePlanKey(account))) ||
+      effectivePlanKey(account) === filter;
     if (!matchesType) return false;
     if (!keyword) return true;
     return [account.email, account.account_name]
@@ -352,6 +359,7 @@ const filteredAccounts = computed(() => {
 function sortAccountsForDisplay(source: CodexAccount[]): CodexAccount[] {
   const order = new Map(settings.customOrder.map((id, index) => [id, index]));
   const pinned = new Map((settings.pinnedAccountIds || []).map((id, index) => [id, index]));
+  const sourcePosition = new Map(source.map((account, index) => [account.id, index]));
   const sortDirection = settings.sortDirection === "asc" ? 1 : -1;
   const sortValue = (account: CodexAccount): number => {
     switch (settings.sortMode) {
@@ -388,6 +396,20 @@ function sortAccountsForDisplay(source: CodexAccount[]): CodexAccount[] {
       const groupDiff = accountSortGroup(a) - accountSortGroup(b);
       if (groupDiff !== 0) return groupDiff;
     }
+    if (
+      settings.sortMode !== "created_at" &&
+      settings.sortMode !== "custom" &&
+      isApiKeyAccount(a) &&
+      isApiKeyAccount(b)
+    ) {
+      const createdDiff = a.created_at - b.created_at;
+      if (createdDiff !== 0) return createdDiff;
+      const insertionDiff =
+        (sourcePosition.get(b.id) ?? Number.MAX_SAFE_INTEGER) -
+        (sourcePosition.get(a.id) ?? Number.MAX_SAFE_INTEGER);
+      if (insertionDiff !== 0) return insertionDiff;
+      return a.id.localeCompare(b.id);
+    }
     const left = sortValue(a);
     const right = sortValue(b);
     if (left !== right) {
@@ -417,12 +439,12 @@ const accountTypeOptions = computed(() => {
     { label: `${t("全部")} (${accounts.value.length})`, value: "all" },
     { label: `OAuth (${oauthCount.value})`, value: "oauth" },
     { label: `API Key (${apiKeyCount.value})`, value: "apikey" },
-    { label: `FREE (${count((account) => !isApiKeyAccount(account) && normalizePlanKey(account.plan_type) === "free")})`, value: "free" },
-    { label: `PLUS (${count((account) => !isApiKeyAccount(account) && normalizePlanKey(account.plan_type) === "plus")})`, value: "plus" },
-    { label: `PRO (${count((account) => !isApiKeyAccount(account) && normalizePlanKey(account.plan_type) === "pro")})`, value: "pro" },
+    { label: `FREE (${count((account) => !isApiKeyAccount(account) && effectivePlanKey(account) === "free")})`, value: "free" },
+    { label: `PLUS (${count((account) => !isApiKeyAccount(account) && effectivePlanKey(account) === "plus")})`, value: "plus" },
+    { label: `PRO (${count((account) => !isApiKeyAccount(account) && effectivePlanKey(account) === "pro")})`, value: "pro" },
     {
       label: `TEAM (${count((account) =>
-        !isApiKeyAccount(account) && ["team", "business", "enterprise", "edu", "go"].includes(normalizePlanKey(account.plan_type)),
+        !isApiKeyAccount(account) && ["team", "business", "enterprise", "edu", "go"].includes(effectivePlanKey(account)),
       )})`,
       value: "team",
     },
@@ -690,7 +712,12 @@ function shouldShowQuotaError(account: CodexAccount): boolean {
 
 function isAccountAbnormal(account: CodexAccount): boolean {
   if (account.quota_error) return true;
-  if (!isApiKeyAccount(account) && tokenExpiryStatus(accountTokenExpiresAt(account)) === "expired") return true;
+  if (
+    !isApiKeyAccount(account) &&
+    tokenExpiryStatus(accountTokenExpiresAt(account), accountStatusClockMs.value) === "expired"
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -764,7 +791,7 @@ function shortAccountId(account: CodexAccount): string {
 
 function planLabel(account: CodexAccount): string {
   if (isApiKeyAccount(account)) return "API_KEY";
-  const base = planDisplayName(account.plan_type);
+  const base = planDisplayName(effectivePlanKey(account));
   if (base !== "PRO") return base;
   const authPlan = normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type);
   return authPlan === "prolite" ? "PRO 5X" : "PRO 20X";
@@ -778,7 +805,7 @@ function planClass(account: CodexAccount): string {
     "classic";
   const style = `badge-${styleName}`;
   if (isApiKeyAccount(account)) return `api ${style}`;
-  const key = normalizePlanKey(account.plan_type);
+  const key = effectivePlanKey(account);
   if (key === "pro") {
     const proClass = normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type) === "prolite"
       ? "pro-lite"
@@ -790,7 +817,7 @@ function planClass(account: CodexAccount): string {
 
 function badgeTypeKey(account: CodexAccount): string {
   if (isApiKeyAccount(account)) return "api";
-  const key = normalizePlanKey(account.plan_type);
+  const key = effectivePlanKey(account);
   if (key === "pro") {
     return normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type) === "prolite"
       ? "proLite"
@@ -828,6 +855,16 @@ function normalizePlanKey(planType?: string): string {
   if (normalized.includes("pro")) return "pro";
   if (normalized.includes("free")) return "free";
   return normalized;
+}
+
+function effectivePlanKey(account: CodexAccount): string {
+  if (
+    !isApiKeyAccount(account) &&
+    isSubscriptionExpired(accountSubscriptionUntil(account), accountStatusClockMs.value)
+  ) {
+    return "free";
+  }
+  return normalizePlanKey(account.plan_type);
 }
 
 function normalizeAuthFilePlan(value?: string): "prolite" | "promax" | undefined {
@@ -994,10 +1031,10 @@ function expiryDaysLabel(value?: string): string {
   return formatLocalizedDuration(days, hours, minutes);
 }
 
-function tokenExpiryStatus(value?: string): "normal" | "expired" {
+function tokenExpiryStatus(value?: string, referenceTime = Date.now()): "normal" | "expired" {
   const date = parseFlexibleDate(value);
   if (!date) return "normal";
-  return date.getTime() <= Date.now() ? "expired" : "normal";
+  return date.getTime() <= referenceTime ? "expired" : "normal";
 }
 
 function dateSortValue(value?: string): number {
@@ -1147,47 +1184,62 @@ function formatResetCreditDate(value?: number): string {
 }
 
 function isFreePlanAccount(account: CodexAccount): boolean {
-  return !isApiKeyAccount(account) && normalizePlanKey(account.plan_type) === "free";
+  return !isApiKeyAccount(account) && effectivePlanKey(account) === "free";
 }
 
 function errorText(error: unknown): string {
   return String(error instanceof Error ? error.message : error).replace(/^Error:\s*/, "");
 }
 
-async function loadAccounts(): Promise<void> {
+async function drainAccountLoadQueue(): Promise<void> {
   loading.value = true;
   try {
-    const [nextAccounts, nextCurrent] = await Promise.all([
-      listCodexAccounts(),
-      getCurrentCodexAccount(),
-    ]);
-    let shouldPrefetchBalances = false;
-    const previousAccounts = new Map(accounts.value.map((account) => [account.id, account]));
-    const nextAccountIds = new Set(nextAccounts.map((account) => account.id));
-    for (const account of nextAccounts) {
-      const previous = previousAccounts.get(account.id);
-      if (previous && apiKeyCredentialsChanged(previous, account)) {
-        invalidateApiKeyBalance(account.id);
-        shouldPrefetchBalances = true;
+    while (accountLoadRequested) {
+      accountLoadRequested = false;
+      try {
+        const [nextAccounts, nextCurrent] = await Promise.all([
+          listCodexAccounts(),
+          getCurrentCodexAccount(),
+        ]);
+        let shouldPrefetchBalances = false;
+        const previousAccounts = new Map(accounts.value.map((account) => [account.id, account]));
+        const nextAccountIds = new Set(nextAccounts.map((account) => account.id));
+        for (const account of nextAccounts) {
+          const previous = previousAccounts.get(account.id);
+          if (previous && apiKeyCredentialsChanged(previous, account)) {
+            invalidateApiKeyBalance(account.id);
+            shouldPrefetchBalances = true;
+          }
+        }
+        const trackedBalanceAccountIds = new Set([
+          ...Object.keys(apiKeyBalanceStates),
+          ...apiKeyBalanceRequestSequences.keys(),
+        ]);
+        for (const accountId of trackedBalanceAccountIds) {
+          if (!nextAccountIds.has(accountId)) forgetApiKeyBalance(accountId);
+        }
+        accounts.value = nextAccounts;
+        currentAccount.value = nextCurrent;
+        if (shouldPrefetchBalances && activeView.value === "accounts") {
+          void nextTick(() => prefetchVisibleApiKeyBalances());
+        }
+      } catch (error) {
+        Message.error(`加载账号失败：${errorText(error)}`);
       }
     }
-    const trackedBalanceAccountIds = new Set([
-      ...Object.keys(apiKeyBalanceStates),
-      ...apiKeyBalanceRequestSequences.keys(),
-    ]);
-    for (const accountId of trackedBalanceAccountIds) {
-      if (!nextAccountIds.has(accountId)) forgetApiKeyBalance(accountId);
-    }
-    accounts.value = nextAccounts;
-    currentAccount.value = nextCurrent;
-    if (shouldPrefetchBalances && activeView.value === "accounts") {
-      void nextTick(() => prefetchVisibleApiKeyBalances());
-    }
-  } catch (error) {
-    Message.error(`加载账号失败：${errorText(error)}`);
   } finally {
     loading.value = false;
   }
+}
+
+function loadAccounts(): Promise<void> {
+  accountLoadRequested = true;
+  if (!accountLoadPromise) {
+    accountLoadPromise = drainAccountLoadQueue().finally(() => {
+      accountLoadPromise = undefined;
+    });
+  }
+  return accountLoadPromise;
 }
 
 function apiKeyCredentialsChanged(previous: CodexAccount, next: CodexAccount): boolean {
@@ -2701,31 +2753,43 @@ async function handleBindingSave(): Promise<void> {
 }
 
 async function loadSessions(options: { silent?: boolean } = {}): Promise<void> {
+  const requestSequence = ++sessionLoadSequence;
+  const trashMode = sessionTrashMode.value;
+  const titleQuery = sessionSearch.titleQuery;
+  const contentQuery = sessionSearch.contentQuery;
   sessionLoading.value = true;
   try {
-    if (sessionTrashMode.value) {
-      trashedSessions.value = await listTrashedSessionsAcrossInstances();
+    if (trashMode) {
+      const nextTrashedSessions = await listTrashedSessionsAcrossInstances();
+      if (requestSequence !== sessionLoadSequence || trashMode !== sessionTrashMode.value) return;
+      trashedSessions.value = nextTrashedSessions;
       sessions.value = [];
       sessionStats.value = [];
     } else {
-      sessions.value = await listSessionsAcrossInstances({
-        titleQuery: sessionSearch.titleQuery,
-        contentQuery: sessionSearch.contentQuery,
+      const nextSessions = await listSessionsAcrossInstances({
+        titleQuery,
+        contentQuery,
       });
+      if (requestSequence !== sessionLoadSequence || trashMode !== sessionTrashMode.value) return;
+      sessions.value = nextSessions;
       trashedSessions.value = [];
-      sessionStats.value = sessions.value.map((session) => ({
+      sessionStats.value = nextSessions.map((session) => ({
         sessionId: session.id,
         approximateTokens: Math.ceil((session.charCount || 0) / 4),
         charCount: session.charCount || 0,
       }));
-      const firstGroup = sessions.value[0] ? sessionGroupKey(sessions.value[0]) : "";
+      const firstGroup = nextSessions[0] ? sessionGroupKey(nextSessions[0]) : "";
       expandedSessionGroups.value = firstGroup ? new Set([firstGroup]) : new Set();
     }
     selectedSessionIds.value = new Set();
   } catch (error) {
-    if (!options.silent) Message.error(`加载会话失败：${errorText(error)}`);
+    if (requestSequence === sessionLoadSequence && !options.silent) {
+      Message.error(`加载会话失败：${errorText(error)}`);
+    }
   } finally {
-    sessionLoading.value = false;
+    if (requestSequence === sessionLoadSequence) {
+      sessionLoading.value = false;
+    }
   }
 }
 
@@ -3359,11 +3423,17 @@ onMounted(() => {
   }).then((unlisten) => {
     oauthUnlisten = unlisten;
   });
+  void listen("codex-account-state-updated", () => {
+    void loadAccounts();
+  }).then((unlisten) => {
+    accountStateUnlisten = unlisten;
+  });
 });
 
 onUnmounted(() => {
   oauthUnlisten?.();
   appUpdateUnlisten?.();
+  accountStateUnlisten?.();
   window.removeEventListener("resize", handleWindowResize);
   if (windowResizeTimer) window.clearTimeout(windowResizeTimer);
   if (viewLoadTimer) window.clearTimeout(viewLoadTimer);
@@ -3444,6 +3514,7 @@ onUnmounted(() => {
         :quota-refreshing-id="quotaRefreshingId"
         :api-key-balance-states="apiKeyBalanceStates"
         :privacy-masked="privacyMasked"
+        :status-clock-ms="accountStatusClockMs"
         @toggle-account="toggleAccount"
         @toggle-pin="toggleAccountPin"
         @drag-start="handleDragStart"
@@ -3589,6 +3660,18 @@ onUnmounted(() => {
       @refresh-backups="loadBackups"
       @restore-backup="handleRestoreBackup"
       @delete-backup="handleDeleteBackup"
+      @open-push-settings="switchView('pushSettings')"
+    />
+
+    <PushSettingsPanel
+      v-if="activeView === 'pushSettings'"
+      :accounts="apiServiceAccounts"
+      :display-name="displayNameForUi"
+      :plan-label="planLabel"
+      :plan-class="planClass"
+      :privacy-masked="privacyMasked"
+      @back="switchView('settings')"
+      @accounts-refreshed="loadAccounts"
     />
 
     <AboutPanel

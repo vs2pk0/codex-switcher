@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use url::Url;
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -16,6 +17,7 @@ const SCOPES: &str =
 pub const CALLBACK_PORT: u16 = 1455;
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const ORIGINATOR: &str = "codex_vscode";
+const TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +109,59 @@ pub async fn complete_oauth_login(login_id: &str) -> Result<OAuthTokenResponse, 
         .map_err(|_| "OAuth 状态锁定失败".to_string())?
         .remove(login_id);
     Ok(tokens)
+}
+
+pub async fn refresh_access_token_with_fallback(
+    refresh_token: &str,
+    current_id_token: Option<&str>,
+) -> Result<OAuthTokenResponse, String> {
+    let refresh_token = refresh_token.trim();
+    if refresh_token.is_empty() {
+        return Err("缺少 refresh_token，无法自动续期".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(TOKEN_REFRESH_TIMEOUT)
+        .timeout(TOKEN_REFRESH_TIMEOUT)
+        .build()
+        .map_err(|error| format!("创建 Token 刷新客户端失败: {error}"))?;
+    let response = client
+        .post(TOKEN_ENDPOINT)
+        .json(&serde_json::json!({
+            "client_id": CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("Token 刷新请求失败: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("读取 Token 刷新响应失败: {error}"))?;
+    if !status.is_success() {
+        let error_code = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|error| {
+                        error
+                            .as_str()
+                            .map(str::to_string)
+                            .or_else(|| error.get("code")?.as_str().map(str::to_string))
+                            .or_else(|| error.get("type")?.as_str().map(str::to_string))
+                    })
+                    .or_else(|| value.get("code")?.as_str().map(str::to_string))
+            });
+        return Err(format!(
+            "Token 刷新失败: status={}, error_code={}, body_len={}",
+            status,
+            error_code.unwrap_or_else(|| "unknown".to_string()),
+            body.len()
+        ));
+    }
+    parse_refresh_token_response(&body, refresh_token, current_id_token)
 }
 
 pub fn cancel_oauth_login(login_id: Option<&str>) -> Result<(), String> {
@@ -230,9 +285,52 @@ fn generate_code_challenge(code_verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest)
 }
 
+fn parse_refresh_token_response(
+    body: &str,
+    current_refresh_token: &str,
+    current_id_token: Option<&str>,
+) -> Result<OAuthTokenResponse, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| format!("解析 Token 刷新响应失败: {error}"))?;
+    let access_token = value
+        .get("access_token")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Token 刷新响应缺少 access_token".to_string())?
+        .to_string();
+    let id_token = value
+        .get("id_token")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            current_id_token
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| "Token 刷新响应缺少 id_token，且本地没有可复用值".to_string())?;
+    let refresh_token = value
+        .get("refresh_token")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| Some(current_refresh_token.to_string()));
+    Ok(OAuthTokenResponse {
+        id_token,
+        access_token,
+        refresh_token,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{start_oauth_login, submit_callback_url, OAuthTokenResponse};
+    use super::{
+        parse_refresh_token_response, start_oauth_login, submit_callback_url, OAuthTokenResponse,
+    };
 
     #[test]
     fn oauth_start_builds_openai_pkce_authorize_url() {
@@ -279,5 +377,31 @@ mod tests {
         assert_eq!(tokens.id_token, "id-token");
         assert_eq!(tokens.access_token, "access-token");
         assert_eq!(tokens.refresh_token.as_deref(), Some("refresh-token"));
+    }
+
+    #[test]
+    fn refresh_response_keeps_rotating_credentials_and_falls_back_to_existing_id_token() {
+        let tokens = parse_refresh_token_response(
+            r#"{"access_token":"new-access","refresh_token":"new-refresh"}"#,
+            "old-refresh",
+            Some("old-id"),
+        )
+        .expect("parse refresh response");
+
+        assert_eq!(tokens.id_token, "old-id");
+        assert_eq!(tokens.access_token, "new-access");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("new-refresh"));
+    }
+
+    #[test]
+    fn refresh_response_keeps_old_refresh_token_when_server_omits_rotation() {
+        let tokens = parse_refresh_token_response(
+            r#"{"id_token":"new-id","access_token":"new-access"}"#,
+            "old-refresh",
+            None,
+        )
+        .expect("parse refresh response");
+
+        assert_eq!(tokens.refresh_token.as_deref(), Some("old-refresh"));
     }
 }
