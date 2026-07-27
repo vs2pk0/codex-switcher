@@ -27,6 +27,7 @@ const emit = defineEmits<{
   (event: "refresh-backups"): void;
   (event: "restore-backup", backup: CodexSwitcherBackupFile): void;
   (event: "delete-backup", backup: CodexSwitcherBackupFile): void;
+  (event: "open-push-settings"): void;
 }>();
 
 function openPath(path?: string): void {
@@ -217,6 +218,14 @@ function changeLanguage(value: unknown): void {
             <a-button status="danger" @click="emit('reset-config')">
               <template #icon><icon-delete /></template>
               {{ t("重置 config.toml") }}
+            </a-button>
+          </div>
+        </a-card>
+        <a-card :title="t('推送')" :bordered="false" class="settings-card settings-push">
+          <div class="settings-config-actions">
+            <a-button type="primary" @click="emit('open-push-settings')">
+              <template #icon><icon-notification /></template>
+              {{ t("推送设置") }}
             </a-button>
           </div>
         </a-card>

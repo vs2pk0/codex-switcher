@@ -1,9 +1,12 @@
 use super::{
     codex_restart_commands, codex_restart_delay_ms, rollback_config_on_error, AccountStore,
-    ApiKeyAccountBindingInput, CodexAccount, CodexQuota,
+    ApiKeyAccountBindingInput, CodexAccount, CodexQuota, CodexTokens,
 };
 use serde_json::json;
-use std::fs;
+use std::{
+    fs,
+    sync::{Arc, Barrier},
+};
 use tempfile::tempdir;
 
 fn test_store() -> (tempfile::TempDir, tempfile::TempDir, AccountStore) {
@@ -52,6 +55,42 @@ fn imports_token_json_and_persists_account() {
     assert_eq!(imported.len(), 1);
     assert_eq!(imported[0].email, "owner@example.com");
     assert_eq!(store.list_accounts().expect("list accounts").len(), 1);
+}
+
+#[test]
+fn clears_only_refresh_token_quota_errors() {
+    let (_storage, _codex, store) = test_store();
+    let input = json!({
+        "email": "owner@example.com",
+        "tokens": {
+            "id_token": "id-token",
+            "access_token": "access-token",
+            "refresh_token": "refresh-token"
+        }
+    });
+    let account = store
+        .import_from_json(&input.to_string())
+        .expect("import succeeds")
+        .remove(0);
+
+    store
+        .update_account_quota_error(
+            &account.id,
+            "Token 刷新失败: refresh_token_reused".to_string(),
+        )
+        .expect("store refresh token error");
+    let cleared = store
+        .clear_account_refresh_token_error(&account.id)
+        .expect("clear refresh token error");
+    assert!(cleared.quota_error.is_none());
+
+    store
+        .update_account_quota_error(&account.id, "额度接口返回 401 Unauthorized".to_string())
+        .expect("store quota unauthorized error");
+    let preserved = store
+        .clear_account_refresh_token_error(&account.id)
+        .expect("preserve unrelated token error");
+    assert!(preserved.quota_error.is_some());
 }
 
 #[test]
@@ -186,7 +225,7 @@ fn exports_sub2api_and_cpa_formats() {
         .remove(0);
 
     let sub2api = store
-        .export_accounts(&[account.id.clone()], Some("sub2api"))
+        .export_accounts(std::slice::from_ref(&account.id), Some("sub2api"))
         .expect("export sub2api");
     let sub2api_value: serde_json::Value = serde_json::from_str(&sub2api).expect("sub2api json");
     assert_eq!(sub2api_value["type"], "sub2api-data");
@@ -531,7 +570,7 @@ fn updates_phone_and_exports_cockpit_tools_json() {
         .update_account_phone(&account.id, "+1 724 806 2018".to_string())
         .expect("update phone");
     let exported = store
-        .export_accounts(&[updated.id.clone()], None)
+        .export_accounts(std::slice::from_ref(&updated.id), None)
         .expect("export account");
     let value: serde_json::Value = serde_json::from_str(&exported).expect("json export");
 
@@ -631,6 +670,117 @@ fn save_oauth_tokens_refreshes_current_account_projection_by_email() {
     let auth: serde_json::Value = serde_json::from_str(&auth_json).expect("valid auth json");
     assert_eq!(auth["tokens"]["access_token"], "new-access-token");
     assert_eq!(auth["tokens"]["refresh_token"], "new-refresh-token");
+}
+
+#[test]
+fn refreshed_oauth_tokens_are_persisted_and_projected_without_losing_refresh_token() {
+    let (_storage, codex, store) = test_store();
+    let account = store
+        .import_from_json(
+            &json!({
+                "email": "owner@example.com",
+                "tokens": {
+                    "id_token": "old-id-token",
+                    "access_token": "old-access-token",
+                    "refresh_token": "old-refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import account")
+        .remove(0);
+    store.switch_account(&account.id).expect("switch account");
+
+    let updated = store
+        .update_refreshed_oauth_tokens(
+            &account.id,
+            CodexTokens {
+                id_token: "new-id-token".to_string(),
+                access_token: "new-access-token".to_string(),
+                refresh_token: None,
+            },
+        )
+        .expect("persist refreshed tokens");
+
+    assert_eq!(updated.tokens.access_token, "new-access-token");
+    assert_eq!(
+        updated.tokens.refresh_token.as_deref(),
+        Some("old-refresh-token")
+    );
+    assert!(updated.token_updated_at.is_some());
+    let persisted = store
+        .list_accounts()
+        .expect("list accounts")
+        .into_iter()
+        .find(|item| item.id == account.id)
+        .expect("persisted account");
+    assert_eq!(persisted.tokens.access_token, "new-access-token");
+    let auth: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(codex.path().join("auth.json")).expect("read auth projection"),
+    )
+    .expect("parse auth projection");
+    assert_eq!(auth["tokens"]["access_token"], "new-access-token");
+    assert_eq!(auth["tokens"]["refresh_token"], "old-refresh-token");
+}
+
+#[test]
+fn stale_current_auth_snapshot_cannot_replace_newer_refreshed_tokens() {
+    let (_storage, codex, store) = test_store();
+    let account = store
+        .import_from_json(
+            &json!({
+                "email": "owner@example.com",
+                "tokens": {
+                    "id_token": "initial-id-token",
+                    "access_token": "initial-access-token",
+                    "refresh_token": "initial-refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import account")
+        .remove(0);
+    store.switch_account(&account.id).expect("switch account");
+    store
+        .update_refreshed_oauth_tokens(
+            &account.id,
+            CodexTokens {
+                id_token: "fresh-id-token".to_string(),
+                access_token: "fresh-access-token".to_string(),
+                refresh_token: Some("fresh-refresh-token".to_string()),
+            },
+        )
+        .expect("persist fresh tokens");
+    fs::write(
+        codex.path().join("auth.json"),
+        json!({
+            "email": "owner@example.com",
+            "last_refresh": 1_000,
+            "tokens": {
+                "id_token": "stale-id-token",
+                "access_token": "stale-access-token",
+                "refresh_token": "stale-refresh-token"
+            }
+        })
+        .to_string(),
+    )
+    .expect("write stale authority snapshot");
+
+    assert!(store
+        .sync_oauth_account_from_current_auth(&account.id)
+        .expect("sync current auth")
+        .is_none());
+    let persisted = store
+        .list_accounts()
+        .expect("list accounts")
+        .into_iter()
+        .find(|item| item.id == account.id)
+        .expect("persisted account");
+    assert_eq!(persisted.tokens.access_token, "fresh-access-token");
+    assert_eq!(
+        persisted.tokens.refresh_token.as_deref(),
+        Some("fresh-refresh-token")
+    );
 }
 
 #[test]
@@ -1054,6 +1204,65 @@ fn test_quota() -> CodexQuota {
         reset_credits_next_expires_at: None,
         raw_data: None,
     }
+}
+
+#[test]
+fn concurrent_quota_updates_preserve_every_account() {
+    let (_storage, _codex, store) = test_store();
+    let accounts = store
+        .import_from_json(
+            &json!([
+                {
+                    "email": "first@example.com",
+                    "tokens": {
+                        "id_token": "first-id-token",
+                        "access_token": "first-access-token",
+                        "refresh_token": "first-refresh-token"
+                    }
+                },
+                {
+                    "email": "second@example.com",
+                    "tokens": {
+                        "id_token": "second-id-token",
+                        "access_token": "second-access-token",
+                        "refresh_token": "second-refresh-token"
+                    }
+                }
+            ])
+            .to_string(),
+        )
+        .expect("import accounts");
+    let barrier = Arc::new(Barrier::new(accounts.len() + 1));
+    let handles = accounts
+        .iter()
+        .enumerate()
+        .map(|(index, account)| {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            let account_id = account.id.clone();
+            std::thread::spawn(move || {
+                let mut quota = test_quota();
+                quota.hourly_percentage = 80 + index as i64;
+                barrier.wait();
+                store
+                    .update_account_quota(&account_id, quota)
+                    .expect("update quota");
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    for handle in handles {
+        handle.join().expect("quota update thread");
+    }
+
+    let updated = store.list_accounts().expect("list updated accounts");
+    assert_eq!(
+        updated
+            .iter()
+            .filter(|account| account.quota.is_some())
+            .count(),
+        accounts.len()
+    );
 }
 
 #[test]

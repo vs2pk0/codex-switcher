@@ -28,6 +28,10 @@ export interface CodexAccount {
   bound_phone?: string;
   subscription_active_until?: string;
   access_token_expires_at?: string;
+  token_updated_at?: number;
+  subscription_query_last_attempt_at?: number;
+  subscription_query_next_retry_at?: number;
+  subscription_query_last_error?: string;
   quota?: CodexQuota;
   quota_error?: CodexQuotaErrorInfo;
   usage_updated_at?: number;

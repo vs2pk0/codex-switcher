@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -15,6 +16,8 @@ const LATEST_RELEASE_API: &str =
 const GITHUB_USER_AGENT: &str = "Codex-Switcher-App-Updater";
 const DOWNLOAD_PROGRESS_EVENT: &str = "codex-switcher-app-update-download-progress";
 const MAX_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
+const CLEANUP_MARKER_FILE: &str = ".cleanup-after-install";
+const POST_INSTALLER_CLEANUP_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub struct AppUpdateDownloadState(Mutex<DownloadControl>);
@@ -160,13 +163,28 @@ pub fn app_update_open_installer(path: String) -> Result<(), String> {
         return Err("只能打开 Codex Switcher 更新目录中的安装包".to_string());
     }
 
-    open_installer_with_system(&canonical_installer)
+    open_installer_with_system(&canonical_installer)?;
+    mark_updates_cleanup_pending(&canonical_root)?;
+    schedule_delayed_updates_cleanup(canonical_root);
+    Ok(())
 }
 
 pub fn shutdown_app_update(download: State<'_, AppUpdateDownloadState>) {
     if let Ok(mut guard) = download.0.lock() {
         guard.cancel_requested = true;
     }
+}
+
+pub fn cleanup_pending_update_artifacts_on_startup() -> Result<(), String> {
+    let root = updates_dir()?;
+    cleanup_pending_update_artifacts_at(&root)
+}
+
+fn cleanup_pending_update_artifacts_at(root: &Path) -> Result<(), String> {
+    if !root.join(CLEANUP_MARKER_FILE).exists() {
+        return Ok(());
+    }
+    cleanup_updates_dir_contents(root)
 }
 
 fn latest_update(app: &AppHandle) -> Result<(GitHubRelease, AppUpdateInfo), String> {
@@ -424,6 +442,68 @@ fn updates_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "无法确定用户主目录".to_string())
 }
 
+fn mark_updates_cleanup_pending(root: &Path) -> Result<(), String> {
+    fs::create_dir_all(root).map_err(|error| format!("创建更新清理标记目录失败: {error}"))?;
+    fs::write(root.join(CLEANUP_MARKER_FILE), b"pending")
+        .map_err(|error| format!("写入更新清理标记失败: {error}"))
+}
+
+fn schedule_delayed_updates_cleanup(root: PathBuf) {
+    thread::spawn(move || {
+        thread::sleep(POST_INSTALLER_CLEANUP_DELAY);
+        let _ = cleanup_updates_dir_contents(&root);
+    });
+}
+
+fn cleanup_updates_dir_contents(root: &Path) -> Result<(), String> {
+    if !root.exists() {
+        return Ok(());
+    }
+    if !root.is_dir() {
+        return Err("更新目录不是有效文件夹".to_string());
+    }
+
+    let marker = root.join(CLEANUP_MARKER_FILE);
+    let mut errors = Vec::new();
+    let entries = fs::read_dir(root).map_err(|error| format!("读取更新目录失败: {error}"))?;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(format!("读取更新目录项失败: {error}"));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path == marker {
+            continue;
+        }
+        let remove_result = match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => fs::remove_dir_all(&path),
+            Ok(_) => fs::remove_file(&path),
+            Err(error) => {
+                errors.push(format!("读取更新文件类型失败: {error}"));
+                continue;
+            }
+        };
+        if let Err(error) = remove_result {
+            errors.push(format!("删除更新内容失败 {}: {error}", path.display()));
+        }
+    }
+
+    if errors.is_empty() && marker.exists() {
+        if let Err(error) = fs::remove_file(&marker) {
+            errors.push(format!("删除更新清理标记失败: {error}"));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 fn safe_file_name(name: &str) -> Result<String, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() || trimmed.len() > 240 {
@@ -676,5 +756,30 @@ mod tests {
             "http://github.com/vs2pk0/codex-switcher/releases/download/v0.1.12/app.dmg"
         )
         .is_err());
+    }
+
+    #[test]
+    fn cleanup_updates_dir_removes_downloaded_artifacts_and_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join(CLEANUP_MARKER_FILE), b"pending").unwrap();
+        fs::write(root.join("installer.dmg"), b"installer").unwrap();
+        fs::create_dir(root.join("0.1.12")).unwrap();
+        fs::write(root.join("0.1.12").join("installer.dmg"), b"old").unwrap();
+
+        cleanup_updates_dir_contents(root).unwrap();
+
+        assert!(fs::read_dir(root).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn startup_cleanup_skips_unmarked_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("installer.dmg"), b"installer").unwrap();
+
+        cleanup_pending_update_artifacts_at(root).unwrap();
+
+        assert!(root.join("installer.dmg").exists());
     }
 }

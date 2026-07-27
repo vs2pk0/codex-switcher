@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { Message } from "@arco-design/web-vue";
 import { computed, ref } from "vue";
+import { isSubscriptionExpired } from "../accountStatus";
 import type { CodexApiKeyBalanceState, CodexSwitcherSettings } from "../services/codex";
 import type { CodexAccount, CodexResetCredit } from "../types/codex";
 import { currentLocale, formatLocalizedDuration, t } from "../i18n";
@@ -26,6 +27,7 @@ const props = defineProps<{
   quotaRefreshingId: string;
   apiKeyBalanceStates: Record<string, CodexApiKeyBalanceState>;
   privacyMasked: boolean;
+  statusClockMs: number;
 }>();
 
 const emit = defineEmits<{
@@ -323,7 +325,7 @@ function planDisplayName(planType?: string): string {
 
 function planLabel(account: CodexAccount): string {
   if (isApiKeyAccount(account)) return "API_KEY";
-  const base = planDisplayName(account.plan_type);
+  const base = planDisplayName(effectivePlanKey(account));
   if (base !== "PRO") return base;
   const authPlan = normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type);
   return authPlan === "prolite" ? "PRO 5X" : "PRO 20X";
@@ -337,7 +339,7 @@ function planClass(account: CodexAccount): string {
     "classic";
   const style = `badge-${styleName}`;
   if (isApiKeyAccount(account)) return `api ${style}`;
-  const key = normalizePlanKey(account.plan_type);
+  const key = effectivePlanKey(account);
   if (key === "pro") {
     const proClass =
       normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type) === "prolite"
@@ -350,7 +352,7 @@ function planClass(account: CodexAccount): string {
 
 function badgeTypeKey(account: CodexAccount): string {
   if (isApiKeyAccount(account)) return "api";
-  const key = normalizePlanKey(account.plan_type);
+  const key = effectivePlanKey(account);
   if (key === "pro") {
     return normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type) === "prolite"
       ? "proLite"
@@ -370,8 +372,18 @@ function accountAuthLine(account: CodexAccount): string {
   return account.tokens.refresh_token ? t("OAuth 登录") : t("Token 登录");
 }
 
+function effectivePlanKey(account: CodexAccount): string {
+  if (
+    !isApiKeyAccount(account) &&
+    isSubscriptionExpired(accountSubscriptionUntil(account), props.statusClockMs)
+  ) {
+    return "free";
+  }
+  return normalizePlanKey(account.plan_type);
+}
+
 function isFreePlanAccount(account: CodexAccount): boolean {
-  return !isApiKeyAccount(account) && normalizePlanKey(account.plan_type) === "free";
+  return !isApiKeyAccount(account) && effectivePlanKey(account) === "free";
 }
 
 function displayPhone(value: string): string {
@@ -618,7 +630,7 @@ function resetCreditStatusKey(credit: CodexResetCredit): "available" | "used" | 
   if (status === "expired") return "expired";
   if (status === "available" || !status) {
     const expiresAt = normalizeDate(credit.expires_at);
-    return expiresAt && expiresAt.getTime() <= Date.now() ? "expired" : "available";
+    return expiresAt && expiresAt.getTime() <= props.statusClockMs ? "expired" : "available";
   }
   return "unknown";
 }
@@ -680,7 +692,7 @@ function accountSubscriptionClass(account: CodexAccount): string {
   const value = accountSubscriptionUntil(account);
   if (!value) return "unknown";
   const date = normalizeDate(value);
-  if (date && date.getTime() <= Date.now()) return "expired";
+  if (date && date.getTime() <= props.statusClockMs) return "expired";
   return "active";
 }
 
@@ -688,7 +700,7 @@ function accountSubscriptionBadge(account: CodexAccount): string {
   const value = accountSubscriptionUntil(account);
   if (!value) return t("未获得订阅信息");
   const date = normalizeDate(value);
-  if (date && date.getTime() <= Date.now()) return t("已过期");
+  if (date && date.getTime() <= props.statusClockMs) return t("已过期");
   return expiryDaysLabel(value) || t("已记录");
 }
 
@@ -699,7 +711,7 @@ function quotaResetLeftLabel(value?: string | number): string {
     ? new Date(timestamp > 10_000_000_000 ? timestamp : timestamp * 1000)
     : new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
-  const diff = date.getTime() - Date.now();
+  const diff = date.getTime() - props.statusClockMs;
   const abs = Math.max(0, diff);
   const day = Math.floor(abs / 86_400_000);
   const hour = Math.floor((abs % 86_400_000) / 3_600_000);
@@ -714,7 +726,7 @@ function quotaResetDateLabel(value?: string | number): string {
 }
 
 function formatRemainingTimeLabel(targetTime: number): string {
-  const diff = targetTime - Date.now();
+  const diff = targetTime - props.statusClockMs;
   if (diff <= 0) return t("已过期");
   const totalMinutes = Math.floor(diff / 60_000);
   const days = Math.floor(totalMinutes / 1440);
@@ -748,7 +760,7 @@ function isTokenExpiredError(account: CodexAccount): boolean {
 function tokenExpiryStatus(value?: string): "valid" | "expired" {
   const date = normalizeDate(value);
   if (!date) return "valid";
-  return date.getTime() <= Date.now() ? "expired" : "valid";
+  return date.getTime() <= props.statusClockMs ? "expired" : "valid";
 }
 
 function normalizeDate(value?: string | number | null): Date | undefined {

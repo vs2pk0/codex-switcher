@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { isSubscriptionExpired } from "../accountStatus";
 import { addCodexAccountWithApiKey, openExternalUrl, type CodexSwitcherSettings } from "../services/codex";
 import { t } from "../i18n";
 import { hasAnyQuotaWindow, hasQuotaWindow } from "../quota";
@@ -358,7 +359,7 @@ function planDisplayName(planType?: string): string {
 
 function planLabel(account: CodexAccount): string {
   if (isApiKeyAccount(account)) return "API_KEY";
-  const base = planDisplayName(account.plan_type);
+  const base = planDisplayName(effectivePlanKey(account));
   if (base !== "PRO") return base;
   const authPlan = normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type);
   return authPlan === "prolite" ? "PRO 5X" : "PRO 20X";
@@ -366,7 +367,7 @@ function planLabel(account: CodexAccount): string {
 
 function badgeTypeKey(account: CodexAccount): string {
   if (isApiKeyAccount(account)) return "api";
-  const key = normalizePlanKey(account.plan_type);
+  const key = effectivePlanKey(account);
   if (key === "pro") {
     return normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type) === "prolite"
       ? "proLite"
@@ -385,7 +386,7 @@ function planClass(account: CodexAccount): string {
     "classic";
   const style = `badge-${styleName}`;
   if (isApiKeyAccount(account)) return `api ${style}`;
-  const key = normalizePlanKey(account.plan_type);
+  const key = effectivePlanKey(account);
   if (key === "pro") {
     const proClass =
       normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type) === "prolite"
@@ -398,6 +399,16 @@ function planClass(account: CodexAccount): string {
 
 function normalizedEmail(value?: string | null): string {
   return (value || "").trim().toLowerCase();
+}
+
+function effectivePlanKey(account: CodexAccount): string {
+  if (
+    !isApiKeyAccount(account) &&
+    isSubscriptionExpired(account.subscription_active_until)
+  ) {
+    return "free";
+  }
+  return normalizePlanKey(account.plan_type);
 }
 
 function boundSourceAccount(account: ApiServiceBoundAccount): CodexAccount | undefined {
@@ -426,7 +437,7 @@ function boundPlanClass(account: ApiServiceBoundAccount): string {
 }
 
 function isFreePlanAccount(account: CodexAccount): boolean {
-  return !isApiKeyAccount(account) && normalizePlanKey(account.plan_type) === "free";
+  return !isApiKeyAccount(account) && effectivePlanKey(account) === "free";
 }
 
 function quotaWindowLabel(minutes?: number, fallback = "5 小时窗口"): string {

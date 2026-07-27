@@ -81,7 +81,7 @@ const sidebarCollapsed = ref(true);
       <a-tooltip :content="t('设置')" position="right" :disabled="!sidebarCollapsed">
         <button
           type="button"
-          :class="{ active: activeView === 'settings' }"
+          :class="{ active: activeView === 'settings' || activeView === 'pushSettings' }"
           @click="$emit('switch-view', 'settings')"
         >
           <icon-settings />
@@ -186,7 +186,7 @@ const sidebarCollapsed = ref(true);
         <template #icon><icon-code /></template>
         {{ t("API 服务") }}
       </a-button>
-      <a-button :type="activeView === 'settings' ? 'primary' : 'text'" @click="$emit('switch-view', 'settings')">
+      <a-button :type="activeView === 'settings' || activeView === 'pushSettings' ? 'primary' : 'text'" @click="$emit('switch-view', 'settings')">
         <template #icon><icon-settings /></template>
         {{ t("设置") }}
       </a-button>

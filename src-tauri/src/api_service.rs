@@ -3580,7 +3580,7 @@ mod tests {
     #[test]
     fn runtimes_are_sorted_by_semver_not_lexicographically() {
         let target = current_package_target();
-        let mut runtimes = vec![
+        let mut runtimes = [
             test_runtime("7.2.9", &target, 30),
             test_runtime("7.2.10", &target, 10),
             test_runtime("7.2.10-rc.1", &target, 40),
