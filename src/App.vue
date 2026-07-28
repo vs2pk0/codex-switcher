@@ -1,15 +1,22 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import {
+  computed,
+  defineAsyncComponent,
+  nextTick,
+  onMounted,
+  onUnmounted,
+  reactive,
+  ref,
+  watch,
+} from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { isSubscriptionExpired } from "./accountStatus";
 import AccountList from "./components/AccountList.vue";
 import AboutPanel from "./components/AboutPanel.vue";
 import AccountToolbar from "./components/AccountToolbar.vue";
 import AddAccountModal from "./components/AddAccountModal.vue";
-import ApiServicePanel from "./components/ApiServicePanel.vue";
 import ApiKeyModelModal from "./components/ApiKeyModelModal.vue";
 import AppUpdateModal from "./components/AppUpdateModal.vue";
 import AppHeader from "./components/AppHeader.vue";
@@ -27,7 +34,6 @@ import SessionRepairModal from "./components/SessionRepairModal.vue";
 import SessionRestoreModal from "./components/SessionRestoreModal.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
 import SortEditorModal from "./components/SortEditorModal.vue";
-import UsagePanel from "./components/UsagePanel.vue";
 import { defaultBadgeStyles } from "./constants/badgeStyles";
 import { currentLanguage, formatLocalizedDuration, setLanguage, t } from "./i18n";
 import { quotaWindowForMinutes } from "./quota";
@@ -84,9 +90,11 @@ import {
   type CodexSwitcherSettings,
 } from "./services/codex";
 import {
+  API_SERVICE_AUTO_UPDATE_EVENT,
   bindApiServiceAccounts,
   getApiServiceState,
   isCurrentApiServiceAccount,
+  type ApiServiceAutoUpdateEvent,
 } from "./services/apiService";
 import {
   APP_UPDATE_DOWNLOAD_PROGRESS_EVENT,
@@ -98,7 +106,6 @@ import {
   type AppUpdateDownloadResult,
   type AppUpdateInfo,
 } from "./services/appUpdate";
-import { getCodexUsageDashboard } from "./services/usage";
 import {
   listSessionVisibilityRepairInstances,
   listSessionVisibilityRepairProviders,
@@ -119,6 +126,9 @@ import {
 import type { CodexAccount, CodexResetCredit } from "./types/codex";
 import type { ActiveView, SessionGroup } from "./types/ui";
 
+const ApiServicePanel = defineAsyncComponent(() => import("./components/ApiServicePanel.vue"));
+const UsagePanel = defineAsyncComponent(() => import("./components/UsagePanel.vue"));
+
 const activeView = ref<ActiveView>("accounts");
 const appVersion = ref("0.1.0");
 const checkingAppUpdate = ref(false);
@@ -131,6 +141,8 @@ const appUpdateDownloading = ref(false);
 const appUpdateCancelling = ref(false);
 const appUpdateOpening = ref(false);
 const usagePanelMounted = ref(false);
+const apiServicePanelMounted = ref(false);
+const apiServiceAutoUpdateEvent = ref<ApiServiceAutoUpdateEvent | null>(null);
 const accounts = ref<CodexAccount[]>([]);
 const currentAccount = ref<CodexAccount | null>(null);
 const loading = ref(false);
@@ -206,11 +218,9 @@ const backupButtonText = computed(() =>
 );
 const sessionRestoreVisible = ref(false);
 const expandedLayout = ref(false);
-let windowResizeTimer: number | undefined;
-let initialLayoutWidth = 0;
+let windowResizeFrame: number | undefined;
 let viewLoadTimer: number | undefined;
-let initialPrewarmTimer: number | undefined;
-const EXPANDED_LAYOUT_WIDTH_DELTA = 80;
+const EXPANDED_LAYOUT_MIN_WIDTH = 1260;
 const settings = reactive<CodexSwitcherSettings>({
   monitorQuota: true,
   quotaRefreshMinutes: 10,
@@ -242,6 +252,7 @@ const oauthError = ref("");
 const oauthCallbackReceived = ref(false);
 let oauthUnlisten: UnlistenFn | null = null;
 let appUpdateUnlisten: UnlistenFn | null = null;
+let apiServiceAutoUpdateUnlisten: UnlistenFn | null = null;
 let accountStateUnlisten: UnlistenFn | null = null;
 
 interface OAuthCallbackEvent {
@@ -1426,13 +1437,13 @@ async function handleDetectCurrentAccount(): Promise<void> {
   }
 }
 
-async function loadSettings(): Promise<void> {
+async function loadSettings(options: { includeStorage?: boolean } = {}): Promise<void> {
   settingsLoading.value = true;
   try {
     const [nextSettings, nextPaths, nextBackups] = await Promise.all([
       getCodexSwitcherSettings(),
-      getCodexSwitcherPaths(),
-      listCodexSwitcherBackups(),
+      options.includeStorage === false ? Promise.resolve(null) : getCodexSwitcherPaths(),
+      options.includeStorage === false ? Promise.resolve(null) : listCodexSwitcherBackups(),
     ]);
     Object.assign(settings, {
       ...nextSettings,
@@ -1457,8 +1468,8 @@ async function loadSettings(): Promise<void> {
       language: nextSettings.language || "zh-CN",
     });
     setLanguage(settings.language);
-    appPaths.value = nextPaths;
-    backupFiles.value = nextBackups;
+    if (nextPaths) appPaths.value = nextPaths;
+    if (nextBackups) backupFiles.value = nextBackups;
     resetQuotaTimer();
     resetCurrentAccountQuotaTimer();
   } catch (error) {
@@ -3253,6 +3264,9 @@ function switchView(view: ActiveView): void {
   if (view === "usage") {
     usagePanelMounted.value = true;
   }
+  if (view === "apiService") {
+    apiServicePanelMounted.value = true;
+  }
   if (viewLoadTimer) {
     window.clearTimeout(viewLoadTimer);
     viewLoadTimer = undefined;
@@ -3270,69 +3284,16 @@ function switchView(view: ActiveView): void {
   });
 }
 
-function todayUsageRange(): { startDate: number; endDate: number } {
-  const now = new Date();
-  const start = new Date(now);
-  start.setHours(0, 0, 0, 0);
-  const end = new Date(now);
-  end.setHours(now.getHours() + 1, 0, 0, 0);
-  return {
-    startDate: Math.floor(start.getTime() / 1000),
-    endDate: Math.floor(end.getTime() / 1000),
-  };
-}
-
-async function prewarmUsageDashboard(): Promise<void> {
-  try {
-    const range = todayUsageRange();
-    await getCodexUsageDashboard({
-      ...range,
-      page: 1,
-      pageSize: 1,
-      refresh: false,
-    });
-  } catch {
-    // 预热失败不打扰首屏，用户进入统计页时仍会正常加载并提示。
-  }
-}
-
-function scheduleInitialPrewarm(): void {
-  if (initialPrewarmTimer) window.clearTimeout(initialPrewarmTimer);
-  initialPrewarmTimer = window.setTimeout(() => {
-    if (!sessions.value.length && !trashedSessions.value.length) {
-      void loadSessions({ silent: true });
-    }
-    if (!sessionBackupFiles.value.length) {
-      void loadSessionBackups({ silent: true });
-    }
-    void prewarmUsageDashboard();
-    usagePanelMounted.value = true;
-  }, 900);
-}
-
-async function syncExpandedLayout(): Promise<void> {
-  if (!initialLayoutWidth && window.innerWidth > 0) {
-    initialLayoutWidth = window.innerWidth;
-  }
-  const resizedWider =
-    initialLayoutWidth > 0 && window.innerWidth >= initialLayoutWidth + EXPANDED_LAYOUT_WIDTH_DELTA;
-  try {
-    const currentWindow = getCurrentWindow();
-    const [maximized, fullscreen] = await Promise.all([
-      currentWindow.isMaximized(),
-      currentWindow.isFullscreen(),
-    ]);
-    expandedLayout.value = maximized || fullscreen || resizedWider;
-  } catch {
-    expandedLayout.value = resizedWider;
-  }
+function syncExpandedLayout(): void {
+  expandedLayout.value = window.innerWidth >= EXPANDED_LAYOUT_MIN_WIDTH;
 }
 
 function handleWindowResize(): void {
-  if (windowResizeTimer) window.clearTimeout(windowResizeTimer);
-  windowResizeTimer = window.setTimeout(() => {
-    void syncExpandedLayout();
-  }, 80);
+  if (windowResizeFrame) return;
+  windowResizeFrame = window.requestAnimationFrame(() => {
+    windowResizeFrame = undefined;
+    syncExpandedLayout();
+  });
 }
 
 watch([sortedAccounts, () => settings.pageSize], () => {
@@ -3396,6 +3357,16 @@ onMounted(() => {
   }).then((unlisten) => {
     appUpdateUnlisten = unlisten;
   });
+  void listen<ApiServiceAutoUpdateEvent>(API_SERVICE_AUTO_UPDATE_EVENT, (event) => {
+    apiServiceAutoUpdateEvent.value = event.payload;
+    if (event.payload.status === "failed") {
+      Message.warning(
+        `${t("自动更新失败")}：${event.payload.message || t("请稍后手动检测更新")}`,
+      );
+    }
+  }).then((unlisten) => {
+    apiServiceAutoUpdateUnlisten = unlisten;
+  });
   void getVersion()
     .then((version) => {
       if (version) appVersion.value = version;
@@ -3404,11 +3375,10 @@ onMounted(() => {
     .catch(() => {
       void checkAppUpdate({ silent: true });
     });
-  void syncExpandedLayout();
+  syncExpandedLayout();
   window.addEventListener("resize", handleWindowResize);
   void loadAccounts();
-  void loadSettings();
-  scheduleInitialPrewarm();
+  void loadSettings({ includeStorage: false });
   void listen<OAuthCallbackEvent>("codex-oauth-callback-received", async (event) => {
     const payload = event.payload;
     if (!payload?.loginId || payload.loginId !== oauthLoginId.value) return;
@@ -3433,11 +3403,11 @@ onMounted(() => {
 onUnmounted(() => {
   oauthUnlisten?.();
   appUpdateUnlisten?.();
+  apiServiceAutoUpdateUnlisten?.();
   accountStateUnlisten?.();
   window.removeEventListener("resize", handleWindowResize);
-  if (windowResizeTimer) window.clearTimeout(windowResizeTimer);
+  if (windowResizeFrame) window.cancelAnimationFrame(windowResizeFrame);
   if (viewLoadTimer) window.clearTimeout(viewLoadTimer);
-  if (initialPrewarmTimer) window.clearTimeout(initialPrewarmTimer);
   window.removeEventListener("pointerup", handleSortDraftPointerEnd);
   window.removeEventListener("pointercancel", handleSortDraftPointerEnd);
   if (quotaTimer) window.clearTimeout(quotaTimer);
@@ -3635,10 +3605,12 @@ onUnmounted(() => {
     />
 
     <ApiServicePanel
+      v-if="apiServicePanelMounted"
       v-show="activeView === 'apiService'"
       :active="activeView === 'apiService'"
       :accounts="apiServiceAccounts"
       :settings="settings"
+      :auto-update-event="apiServiceAutoUpdateEvent"
       @account-added="handleApiServiceAccountAdded"
     />
 

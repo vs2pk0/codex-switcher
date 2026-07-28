@@ -270,10 +270,15 @@ struct GitHubAsset {
 }
 
 #[tauri::command]
-pub fn api_service_state(
-    process: State<'_, ApiServiceProcessState>,
-) -> Result<ApiServiceState, String> {
-    build_state(&process)
+pub async fn api_service_state(app: AppHandle) -> Result<ApiServiceState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let process = app.state::<ApiServiceProcessState>();
+        let operation = app.state::<ApiServiceOperationState>();
+        let _guard = lock_operation(&operation)?;
+        build_state(&process)
+    })
+    .await
+    .map_err(|error| format!("读取 API 服务状态任务失败: {error}"))?
 }
 
 #[tauri::command]
@@ -834,7 +839,10 @@ pub fn shutdown_api_service(
     let _ = stop_service_process_only(&process);
 }
 
-pub fn prune_api_service_runtimes_on_startup() -> Result<(), String> {
+pub fn prune_api_service_runtimes_on_startup(app: &AppHandle) -> Result<(), String> {
+    let operation = app.state::<ApiServiceOperationState>();
+    let _guard = lock_operation(&operation)?;
+    ensure_not_shutting_down(&operation)?;
     let dirs = ApiServiceDirs::new()?;
     if active_runtime(&dirs).is_err() {
         if let Some(runtime) = latest_compatible_runtime(&dirs)? {

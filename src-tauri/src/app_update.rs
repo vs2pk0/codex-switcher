@@ -6,7 +6,6 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
-    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -17,7 +16,6 @@ const GITHUB_USER_AGENT: &str = "Codex-Switcher-App-Updater";
 const DOWNLOAD_PROGRESS_EVENT: &str = "codex-switcher-app-update-download-progress";
 const MAX_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
 const CLEANUP_MARKER_FILE: &str = ".cleanup-after-install";
-const POST_INSTALLER_CLEANUP_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub struct AppUpdateDownloadState(Mutex<DownloadControl>);
@@ -147,7 +145,16 @@ pub fn app_update_cancel_download(
 }
 
 #[tauri::command]
-pub fn app_update_open_installer(path: String) -> Result<(), String> {
+pub fn app_update_open_installer(app: AppHandle, path: String) -> Result<(), String> {
+    let download = app.state::<AppUpdateDownloadState>();
+    let update_guard = download
+        .0
+        .lock()
+        .map_err(|_| "应用更新下载状态锁已损坏".to_string())?;
+    if update_guard.active_id.is_some() {
+        return Err("应用更新仍在下载，请等待下载完成后再安装".to_string());
+    }
+
     let installer = PathBuf::from(path.trim());
     if !installer.is_file() {
         return Err("更新安装包不存在，请重新下载".to_string());
@@ -165,7 +172,7 @@ pub fn app_update_open_installer(path: String) -> Result<(), String> {
 
     open_installer_with_system(&canonical_installer)?;
     mark_updates_cleanup_pending(&canonical_root)?;
-    schedule_delayed_updates_cleanup(canonical_root);
+    drop(update_guard);
     Ok(())
 }
 
@@ -175,9 +182,12 @@ pub fn shutdown_app_update(download: State<'_, AppUpdateDownloadState>) {
     }
 }
 
-pub fn cleanup_pending_update_artifacts_on_startup() -> Result<(), String> {
+pub fn cleanup_pending_update_artifacts_on_startup(app: &AppHandle) -> Result<(), String> {
     let root = updates_dir()?;
-    cleanup_pending_update_artifacts_at(&root)
+    if !root.join(CLEANUP_MARKER_FILE).exists() {
+        return Ok(());
+    }
+    cleanup_updates_dir_contents_if_idle(app, &root)
 }
 
 fn cleanup_pending_update_artifacts_at(root: &Path) -> Result<(), String> {
@@ -448,11 +458,16 @@ fn mark_updates_cleanup_pending(root: &Path) -> Result<(), String> {
         .map_err(|error| format!("写入更新清理标记失败: {error}"))
 }
 
-fn schedule_delayed_updates_cleanup(root: PathBuf) {
-    thread::spawn(move || {
-        thread::sleep(POST_INSTALLER_CLEANUP_DELAY);
-        let _ = cleanup_updates_dir_contents(&root);
-    });
+fn cleanup_updates_dir_contents_if_idle(app: &AppHandle, root: &Path) -> Result<(), String> {
+    let download = app.state::<AppUpdateDownloadState>();
+    let guard = download
+        .0
+        .lock()
+        .map_err(|_| "应用更新下载状态锁已损坏".to_string())?;
+    if guard.active_id.is_some() {
+        return Ok(());
+    }
+    cleanup_pending_update_artifacts_at(root)
 }
 
 fn cleanup_updates_dir_contents(root: &Path) -> Result<(), String> {
