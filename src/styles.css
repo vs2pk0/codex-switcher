@@ -3178,6 +3178,8 @@ textarea {
 
 .account-card {
   position: relative;
+  contain: layout paint style;
+  content-visibility: auto;
   min-width: 0;
   min-height: calc(468px + var(--additional-quota-height, 0px));
   height: calc(468px + var(--additional-quota-height, 0px));

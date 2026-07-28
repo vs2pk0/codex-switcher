@@ -10,7 +10,6 @@ import { hasAnyQuotaWindow, hasQuotaWindow } from "../quota";
 import type { CodexAccount } from "../types/codex";
 import PlanBadge from "./PlanBadge.vue";
 import {
-  API_SERVICE_AUTO_UPDATE_EVENT,
   API_SERVICE_DOWNLOAD_PROGRESS_EVENT,
   activateApiServiceRuntime,
   bindApiServiceAccounts,
@@ -38,6 +37,7 @@ const props = defineProps<{
   accounts: CodexAccount[];
   settings: CodexSwitcherSettings;
   active: boolean;
+  autoUpdateEvent?: ApiServiceAutoUpdateEvent | null;
 }>();
 
 const emit = defineEmits<{
@@ -68,9 +68,9 @@ const bindSearchKeyword = ref("");
 const boundAccounts = ref<ApiServiceBoundAccount[]>([]);
 const progress = ref<ApiServiceDownloadProgress | null>(null);
 let unlistenProgress: UnlistenFn | null = null;
-let unlistenAutoUpdate: UnlistenFn | null = null;
 let countdownTimer: number | undefined;
 let progressClearTimer: number | undefined;
+let panelMounted = false;
 const countdownNow = ref(Date.now());
 
 const form = reactive({
@@ -912,7 +912,36 @@ function errorText(error: unknown): string {
   return String(error instanceof Error ? error.message : error).replace(/^Error:\s*/, "");
 }
 
+function applyAutoUpdateEvent(event: ApiServiceAutoUpdateEvent): void {
+  if (event.updateInfo) updateInfo.value = event.updateInfo;
+  if (event.status === "failed") {
+    downloading.value = false;
+    progress.value = {
+      status: "failed",
+      assetName: event.updateInfo?.assetName || "CLIProxyAPI",
+      downloadedBytes: progress.value?.downloadedBytes || 0,
+      totalBytes: progress.value?.totalBytes || null,
+      message: event.message || t("自动更新失败"),
+    };
+  } else if (event.status === "checked") {
+    if (progress.value?.status === "failed") progress.value = null;
+  } else if (event.status === "updated") {
+    downloading.value = false;
+    clearProgressLater();
+  }
+  if (panelMounted) void refreshState(true, false);
+}
+
+watch(
+  () => props.autoUpdateEvent,
+  (event) => {
+    if (event) applyAutoUpdateEvent(event);
+  },
+  { immediate: true },
+);
+
 onMounted(async () => {
+  panelMounted = true;
   unlistenProgress = await listen<ApiServiceDownloadProgress>(
     API_SERVICE_DOWNLOAD_PROGRESS_EVENT,
     (event) => {
@@ -925,29 +954,6 @@ onMounted(async () => {
       if (["done", "cancelled"].includes(event.payload.status)) {
         clearProgressLater();
       }
-    },
-  );
-  unlistenAutoUpdate = await listen<ApiServiceAutoUpdateEvent>(
-    API_SERVICE_AUTO_UPDATE_EVENT,
-    (event) => {
-      if (event.payload.updateInfo) updateInfo.value = event.payload.updateInfo;
-      if (event.payload.status === "failed") {
-        downloading.value = false;
-        progress.value = {
-          status: "failed",
-          assetName: event.payload.updateInfo?.assetName || "CLIProxyAPI",
-          downloadedBytes: progress.value?.downloadedBytes || 0,
-          totalBytes: progress.value?.totalBytes || null,
-          message: event.payload.message || t("自动更新失败"),
-        };
-        Message.warning(`${t("自动更新失败")}：${event.payload.message || t("请稍后手动检测更新")}`);
-      } else if (event.payload.status === "checked") {
-        if (progress.value?.status === "failed") progress.value = null;
-      } else if (event.payload.status === "updated") {
-        downloading.value = false;
-        clearProgressLater();
-      }
-      void refreshState(true, false);
     },
   );
   countdownTimer = window.setInterval(() => {
@@ -966,8 +972,8 @@ watch(
 );
 
 onUnmounted(() => {
+  panelMounted = false;
   unlistenProgress?.();
-  unlistenAutoUpdate?.();
   if (countdownTimer) window.clearInterval(countdownTimer);
   if (progressClearTimer) window.clearTimeout(progressClearTimer);
 });

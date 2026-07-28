@@ -4218,13 +4218,7 @@ pub fn run() {
         .manage(app_update::AppUpdateDownloadState::default())
         .manage(push::PushRuntimeState::default())
         .setup(|app| {
-            if let Err(error) = app_update::cleanup_pending_update_artifacts_on_startup() {
-                eprintln!("App update cleanup failed during startup: {error}");
-            }
-            if let Err(error) = api_service::prune_api_service_runtimes_on_startup() {
-                eprintln!("API service runtime maintenance failed during startup: {error}");
-            }
-            api_service::start_auto_update_scheduler(app.handle().clone());
+            start_startup_maintenance(app.handle().clone());
             push::start_push_scheduler(app.handle().clone());
             token_keeper::start_token_keeper(app.handle().clone());
             Ok(())
@@ -4331,4 +4325,18 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn start_startup_maintenance(app: AppHandle) {
+    thread::spawn(move || {
+        // Give the first window paint priority over installer and runtime directory maintenance.
+        thread::sleep(Duration::from_secs(2));
+        if let Err(error) = app_update::cleanup_pending_update_artifacts_on_startup(&app) {
+            eprintln!("App update cleanup failed during startup: {error}");
+        }
+        if let Err(error) = api_service::prune_api_service_runtimes_on_startup(&app) {
+            eprintln!("API service runtime maintenance failed during startup: {error}");
+        }
+        api_service::start_auto_update_scheduler(app);
+    });
 }
