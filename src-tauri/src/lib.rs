@@ -1108,12 +1108,7 @@ fn open_path_in_file_manager(path: String) -> Result<(), String> {
             .map(PathBuf::from)
             .ok_or_else(|| "无法定位文件夹".to_string())?
     };
-    let status = open_path_with_system(&target)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("打开文件夹失败".to_string())
-    }
+    open_path_with_system(&target)
 }
 
 fn start_oauth_callback_listener(app_handle: AppHandle, login_id: String) -> Result<(), String> {
@@ -1487,27 +1482,40 @@ fn bind_oauth_callback_listener() -> Result<TcpListener, String> {
     ))
 }
 
-fn open_path_with_system(path: &PathBuf) -> Result<std::process::ExitStatus, String> {
+fn open_path_with_system(path: &PathBuf) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        Command::new("open")
+        let status = Command::new("open")
             .arg(path)
             .status()
-            .map_err(|error| format!("打开文件夹失败: {}", error))
+            .map_err(|error| format!("打开文件夹失败: {}", error))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("打开文件夹失败".to_string())
+        }
     }
     #[cfg(target_os = "windows")]
     {
-        Command::new("explorer")
-            .arg(path)
-            .status()
+        let mut command = Command::new("explorer.exe");
+        command.arg(path);
+        hide_command_window(&mut command);
+        command
+            .spawn()
+            .map(|_| ())
             .map_err(|error| format!("打开文件夹失败: {}", error))
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
-        Command::new("xdg-open")
+        let status = Command::new("xdg-open")
             .arg(path)
             .status()
-            .map_err(|error| format!("打开文件夹失败: {}", error))
+            .map_err(|error| format!("打开文件夹失败: {}", error))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("打开文件夹失败".to_string())
+        }
     }
 }
 

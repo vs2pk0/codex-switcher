@@ -94,6 +94,120 @@ fn clears_only_refresh_token_quota_errors() {
 }
 
 #[test]
+fn transient_quota_refresh_failures_do_not_mark_accounts_abnormal() {
+    let (_storage, _codex, store) = test_store();
+    let input = json!({
+        "email": "owner@example.com",
+        "tokens": {
+            "id_token": "id-token",
+            "access_token": "access-token",
+            "refresh_token": "refresh-token"
+        }
+    });
+    let account = store
+        .import_from_json(&input.to_string())
+        .expect("import succeeds")
+        .remove(0);
+
+    let network_failure = store
+        .update_account_quota_error(
+            &account.id,
+            "请求额度失败: error sending request: operation timed out".to_string(),
+        )
+        .expect("handle network failure");
+    assert!(network_failure.quota_error.is_none());
+
+    let region_failure = store
+        .update_account_quota_error(
+            &account.id,
+            "Codex Token 自动刷新失败: Token 刷新失败: status=403 Forbidden, error_code=unsupported_country_region_territory, body_len=153".to_string(),
+        )
+        .expect("handle network region failure");
+    assert!(region_failure.quota_error.is_none());
+
+    let expired = store
+        .update_account_quota_error(&account.id, "额度接口返回 401 Unauthorized".to_string())
+        .expect("store confirmed auth failure");
+    assert_eq!(
+        expired
+            .quota_error
+            .as_ref()
+            .and_then(|error| error.code.as_deref()),
+        Some("token_expired")
+    );
+
+    let preserved = store
+        .update_account_quota_error(
+            &account.id,
+            "请求额度失败: error sending request: connection reset".to_string(),
+        )
+        .expect("preserve confirmed auth failure");
+    assert_eq!(
+        preserved
+            .quota_error
+            .as_ref()
+            .and_then(|error| error.code.as_deref()),
+        Some("token_expired")
+    );
+}
+
+#[test]
+fn legacy_transient_quota_errors_are_ignored_when_loading_accounts() {
+    let (storage, _codex, store) = test_store();
+    let input = json!({
+        "email": "owner@example.com",
+        "tokens": {
+            "id_token": "id-token",
+            "access_token": "access-token",
+            "refresh_token": "refresh-token"
+        }
+    });
+    store
+        .import_from_json(&input.to_string())
+        .expect("import succeeds");
+
+    let database_path = storage.path().join("accounts.json");
+    let mut database: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&database_path).expect("read account database"))
+            .expect("parse account database");
+    database["accounts"][0]["quota_error"] = json!({
+        "code": "unsupported_country_region_territory",
+        "message": "Token 刷新失败: status=403 Forbidden, Unauthorized country or region",
+        "timestamp": 1
+    });
+    fs::write(
+        &database_path,
+        serde_json::to_vec_pretty(&database).expect("serialize account database"),
+    )
+    .expect("write legacy account database");
+
+    let loaded = store.list_accounts().expect("load normalized accounts");
+    assert!(loaded[0].quota_error.is_none());
+
+    database["accounts"][0]["quota_error"] = json!({
+        "code": "token_expired",
+        "message": "已确认 Token 失效",
+        "timestamp": 2
+    });
+    fs::write(
+        &database_path,
+        serde_json::to_vec_pretty(&database).expect("serialize account database"),
+    )
+    .expect("write persistent account database");
+
+    let loaded = store
+        .list_accounts()
+        .expect("load persistent account error");
+    assert_eq!(
+        loaded[0]
+            .quota_error
+            .as_ref()
+            .and_then(|error| error.code.as_deref()),
+        Some("token_expired")
+    );
+}
+
+#[test]
 fn imports_flat_token_account_from_root_array() {
     let (_storage, _codex, store) = test_store();
     let input = json!([

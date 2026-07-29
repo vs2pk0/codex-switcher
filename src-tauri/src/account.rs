@@ -1130,12 +1130,25 @@ impl AccountStore {
             .iter_mut()
             .find(|account| account.id == account_id)
             .ok_or_else(|| "账号不存在".to_string())?;
-        let code = quota_error_code(&message);
-        if code.as_deref() == Some("token_expired") {
+        let Some(code) = quota_error_code(&message) else {
+            let should_clear = account
+                .quota_error
+                .as_ref()
+                .is_some_and(|error| !is_persistent_quota_error(error));
+            if should_clear {
+                account.quota_error = None;
+            }
+            let updated = account.clone();
+            if should_clear {
+                self.write_database(&database)?;
+            }
+            return Ok(updated);
+        };
+        if code == "token_expired" {
             account.quota = None;
         }
         account.quota_error = Some(CodexQuotaErrorInfo {
-            code,
+            code: Some(code),
             message,
             timestamp: now_timestamp(),
         });
@@ -1390,7 +1403,18 @@ impl AccountStore {
         }
         let content =
             fs::read_to_string(&path).map_err(|error| format!("读取账号库失败: {}", error))?;
-        serde_json::from_str(&content).map_err(|error| format!("解析账号库失败: {}", error))
+        let mut database: AccountDatabase =
+            serde_json::from_str(&content).map_err(|error| format!("解析账号库失败: {}", error))?;
+        for account in &mut database.accounts {
+            if account
+                .quota_error
+                .as_ref()
+                .is_some_and(|error| !is_persistent_quota_error(error))
+            {
+                account.quota_error = None;
+            }
+        }
+        Ok(database)
     }
 
     fn write_database(&self, database: &AccountDatabase) -> Result<(), String> {
@@ -1820,13 +1844,36 @@ fn quota_error_code(message: &str) -> Option<String> {
         || lower.contains("refresh_token_expired")
         || lower.contains("refresh_token_invalidated")
         || lower.contains("invalid_grant")
-        || lower.contains("unauthorized")
-        || lower.contains("401")
+        || lower.contains("status=401")
+        || lower.contains("status 401")
+        || lower.contains("返回 401")
+        || lower.contains("http 401")
         || lower.contains("authentication token is expired")
+        || lower.contains("oauth access_token 为空")
+        || lower.contains("缺少 refresh_token")
     {
         return Some("token_expired".to_string());
     }
+    if lower.contains("account_deactivated")
+        || lower.contains("account_disabled")
+        || lower.contains("user_account_deactivated")
+        || lower.contains("account suspended")
+        || lower.contains("账号已停用")
+        || lower.contains("账号已禁用")
+    {
+        return Some("account_disabled".to_string());
+    }
     None
+}
+
+fn is_persistent_quota_error(error: &CodexQuotaErrorInfo) -> bool {
+    let known_code = error.code.as_deref().is_some_and(|code| {
+        matches!(
+            code.trim().to_ascii_lowercase().as_str(),
+            "token_expired" | "account_disabled"
+        )
+    });
+    known_code || quota_error_code(&error.message).is_some()
 }
 
 pub(crate) fn is_refresh_token_failure_message(message: &str) -> bool {
