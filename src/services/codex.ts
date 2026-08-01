@@ -8,6 +8,10 @@ export interface CodexOAuthLoginStartResponse {
   authUrl: string;
 }
 
+export interface CodexResetCreditConsumeResult {
+  quotaRefreshError?: string;
+}
+
 export interface CodexSwitcherSettings {
   monitorQuota: boolean;
   quotaRefreshMinutes: number;
@@ -341,7 +345,7 @@ export function refreshCodexQuota(accountId: string): Promise<CodexAccount> {
   return invoke("refresh_codex_quota", { accountId });
 }
 
-export function consumeCodexResetCredit(accountId: string): Promise<CodexAccount> {
+export function consumeCodexResetCredit(accountId: string): Promise<CodexResetCreditConsumeResult> {
   return invoke("consume_codex_reset_credit", { accountId });
 }
 

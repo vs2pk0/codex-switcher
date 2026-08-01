@@ -29,14 +29,28 @@ import OAuthBindingModal from "./components/OAuthBindingModal.vue";
 import PhoneModal from "./components/PhoneModal.vue";
 import PushSettingsPanel from "./components/PushSettingsPanel.vue";
 import ResetCreditModal from "./components/ResetCreditModal.vue";
+import ResetPanel from "./components/ResetPanel.vue";
+import ResetScheduleModal from "./components/ResetScheduleModal.vue";
 import SessionPanel from "./components/SessionPanel.vue";
 import SessionRepairModal from "./components/SessionRepairModal.vue";
 import SessionRestoreModal from "./components/SessionRestoreModal.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
 import SortEditorModal from "./components/SortEditorModal.vue";
 import { defaultBadgeStyles } from "./constants/badgeStyles";
-import { currentLanguage, formatLocalizedDuration, setLanguage, t } from "./i18n";
+import {
+  currentLanguage,
+  formatLocalizedDuration,
+  formatTranslatedText,
+  setLanguage,
+  t,
+} from "./i18n";
 import { quotaWindowForMinutes } from "./quota";
+import { resolveResetScheduleEntry } from "./services/resetScheduleEntry";
+import {
+  beginPendingItem,
+  finishPendingItem,
+  hasAvailableResetCredit,
+} from "./services/resetUiState";
 import {
   addCodexAccountWithApiKey,
   cancelCodexOAuthLogin,
@@ -123,6 +137,21 @@ import {
   type CodexSessionVisibilityRepairSummary,
   type CodexTrashedSessionRecord,
 } from "./services/session";
+import {
+  appendCodexResetLog,
+  cancelCodexScheduledReset,
+  claimCodexScheduledReset,
+  clearCodexResetLogs,
+  createCodexScheduledReset,
+  deleteCodexResetLog,
+  finishCodexScheduledReset,
+  formatResetCountdown,
+  getCodexResetState,
+  initializeCodexResetState,
+  updateCodexScheduledReset,
+  type ResetState,
+  type ScheduledReset,
+} from "./services/reset";
 import type { CodexAccount, CodexResetCredit } from "./types/codex";
 import type { ActiveView, SessionGroup } from "./types/ui";
 
@@ -303,8 +332,20 @@ const phoneAccount = ref<CodexAccount | null>(null);
 const phoneForm = reactive({ phone: "" });
 const savingPhone = ref(false);
 const resetCreditVisible = ref(false);
+const resetScheduleVisible = ref(false);
 const resetCreditAccount = ref<CodexAccount | null>(null);
-const selectedResetCreditIndex = ref(0);
+const resetState = ref<ResetState>({ scheduledResets: [], logs: [] });
+const resetStateLoading = ref(false);
+const resetStateSaving = ref(false);
+const editingResetSchedule = ref<ScheduledReset | null>(null);
+const updatingResetScheduleIds = ref<string[]>([]);
+const cancellingResetScheduleIds = ref<string[]>([]);
+const deletingResetLogIds = ref<string[]>([]);
+const clearingResetLogs = ref(false);
+let resetExecutionPromise: Promise<void> | undefined;
+let resetStateLoadPromise: Promise<void> | undefined;
+let resetStateOperationTail: Promise<void> = Promise.resolve();
+let resetStatePendingMutations = 0;
 
 const bindingVisible = ref(false);
 const bindingAccount = ref<CodexAccount | null>(null);
@@ -1088,9 +1129,33 @@ const resetCreditRecordsForModal = computed(() =>
   resetCreditAccount.value ? resetCreditRecords(resetCreditAccount.value) : [],
 );
 
-const selectedResetCredit = computed(
-  () => resetCreditRecordsForModal.value[selectedResetCreditIndex.value] ?? null,
+const hasAvailableResetCreditForModal = computed(() =>
+  hasAvailableResetCredit(resetCreditRecordsForModal.value, isAvailableResetCredit),
 );
+
+const scheduledResetForModal = computed<ScheduledReset | null>(() => {
+  const accountId = resetCreditAccount.value?.id;
+  if (!accountId) return null;
+  return (
+    resetState.value.scheduledResets.find(
+      (task) =>
+        task.accountId === accountId &&
+        (task.status === "scheduled" || task.status === "running"),
+    ) ?? null
+  );
+});
+
+const resetScheduleAccountLabel = computed(
+  () =>
+    editingResetSchedule.value?.accountLabel ||
+    (resetCreditAccount.value ? displayNameForUi(resetCreditAccount.value) : ""),
+);
+
+const resetScheduleMode = computed<"create" | "edit">(() =>
+  editingResetSchedule.value ? "edit" : "create",
+);
+
+const resetScheduleInitialAt = computed(() => editingResetSchedule.value?.scheduledAt);
 
 function canUseResetCredit(account: CodexAccount): boolean {
   return shouldShowQuota(account) && resetCreditCount(account) > 0;
@@ -1192,6 +1257,379 @@ function resetCreditStatusLabel(credit: CodexResetCredit): string {
 
 function formatResetCreditDate(value?: number): string {
   return Number.isFinite(value) ? formatTime(Number(value)) : t("时间未知");
+}
+
+function resetLogId(prefix: string): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function enqueueResetStateOperation<T>(operation: () => Promise<T>): Promise<T> {
+  const queued = resetStateOperationTail.then(operation, operation);
+  resetStateOperationTail = queued.then(
+    () => undefined,
+    () => undefined,
+  );
+  return queued;
+}
+
+async function runResetStateMutation<T>(
+  operation: () => Promise<T>,
+  stateFromResult: (result: T) => ResetState,
+  errorPrefix: string,
+  silent = false,
+): Promise<T> {
+  resetStatePendingMutations += 1;
+  resetStateSaving.value = true;
+  try {
+    const result = await enqueueResetStateOperation(operation);
+    resetState.value = stateFromResult(result);
+    return result;
+  } catch (error) {
+    if (!silent) Message.error(`${t(errorPrefix)}: ${errorText(error)}`);
+    throw error;
+  } finally {
+    resetStatePendingMutations = Math.max(0, resetStatePendingMutations - 1);
+    resetStateSaving.value = resetStatePendingMutations > 0;
+  }
+}
+
+async function loadResetStateFrom(loader: () => Promise<ResetState>): Promise<void> {
+  if (resetStateLoadPromise) return resetStateLoadPromise;
+  resetStateLoading.value = true;
+  resetStateLoadPromise = enqueueResetStateOperation(loader)
+    .then((state) => {
+      resetState.value = state;
+    })
+    .catch((error) => {
+      Message.error(formatTranslatedText("加载重置记录失败：{error}", {
+        error: errorText(error),
+      }));
+    })
+    .finally(() => {
+      resetStateLoading.value = false;
+      resetStateLoadPromise = undefined;
+    });
+  return resetStateLoadPromise;
+}
+
+async function loadResetState(): Promise<void> {
+  return loadResetStateFrom(getCodexResetState);
+}
+
+async function initializeResetState(): Promise<void> {
+  return loadResetStateFrom(initializeCodexResetState);
+}
+
+function scheduledResetForAccount(accountId: string): ScheduledReset | null {
+  return (
+    resetState.value.scheduledResets.find(
+      (task) =>
+        task.accountId === accountId &&
+        (task.status === "scheduled" || task.status === "running"),
+    ) ?? null
+  );
+}
+
+async function handleScheduleReset(payload: { scheduledAt: number }): Promise<boolean> {
+  const account = resetCreditAccount.value;
+  if (!account) return false;
+  if (!Number.isFinite(payload.scheduledAt) || payload.scheduledAt <= Date.now()) {
+    Message.warning("预约时间必须晚于当前时间");
+    return false;
+  }
+  if (scheduledResetForAccount(account.id)) {
+    Message.warning("该账号已有预约重置");
+    return false;
+  }
+  if (!hasAvailableResetCreditForModal.value) {
+    Message.warning("当前账号没有可用的重置次数");
+    return false;
+  }
+  const now = Date.now();
+  const task: ScheduledReset = {
+    id: resetLogId("schedule"),
+    accountId: account.id,
+    accountLabel: displayNameForUi(account),
+    scheduledAt: Math.floor(payload.scheduledAt / 60_000) * 60_000,
+    status: "scheduled",
+    createdAt: now,
+  };
+  try {
+    await runResetStateMutation(
+      () => createCodexScheduledReset(task),
+      (state) => state,
+      "保存预约重置失败",
+    );
+    Message.success("预约重置已保存");
+    return true;
+  } catch {
+    // runResetStateMutation 已经显示具体错误。
+    return false;
+  }
+}
+
+function handleViewResetSchedules(): void {
+  updateResetScheduleVisible(false);
+  resetCreditVisible.value = false;
+  switchView("resets");
+}
+
+function handleOpenResetSchedule(): void {
+  const account = resetCreditAccount.value;
+  if (!account) return;
+  if (resolveResetScheduleEntry(Boolean(scheduledResetForAccount(account.id))) === "view") {
+    handleViewResetSchedules();
+    return;
+  }
+  if (!hasAvailableResetCreditForModal.value) {
+    Message.warning("当前账号没有可用的重置次数");
+    return;
+  }
+  editingResetSchedule.value = null;
+  resetScheduleVisible.value = true;
+}
+
+function handleEditScheduledReset(task: ScheduledReset): void {
+  const current = resetState.value.scheduledResets.find((item) => item.id === task.id);
+  if (!current || current.status !== "scheduled" || current.scheduledAt <= Date.now()) {
+    Message.warning("预约已开始执行或已无法修改");
+    return;
+  }
+  editingResetSchedule.value = current;
+  resetScheduleVisible.value = true;
+}
+
+function updateResetScheduleVisible(visible: boolean): void {
+  resetScheduleVisible.value = visible;
+  if (!visible) editingResetSchedule.value = null;
+}
+
+async function handleUpdateScheduledReset(
+  scheduleId: string,
+  scheduledAt: number,
+): Promise<boolean> {
+  if (!Number.isFinite(scheduledAt) || scheduledAt <= Date.now()) {
+    Message.warning("预约时间必须晚于当前时间");
+    return false;
+  }
+  const task = resetState.value.scheduledResets.find((item) => item.id === scheduleId);
+  if (!task || task.status !== "scheduled" || task.scheduledAt <= Date.now()) {
+    Message.warning("预约已开始执行或已无法修改");
+    return false;
+  }
+  const nextUpdatingIds = beginPendingItem(updatingResetScheduleIds.value, scheduleId);
+  if (!nextUpdatingIds) return false;
+  updatingResetScheduleIds.value = nextUpdatingIds;
+  try {
+    await runResetStateMutation(
+      () => updateCodexScheduledReset(scheduleId, Math.floor(scheduledAt / 60_000) * 60_000),
+      (state) => state,
+      "保存预约修改失败",
+    );
+    Message.success("预约时间已更新");
+    return true;
+  } catch {
+    // runResetStateMutation 已经显示具体错误。
+    return false;
+  } finally {
+    updatingResetScheduleIds.value = finishPendingItem(
+      updatingResetScheduleIds.value,
+      scheduleId,
+    );
+  }
+}
+
+async function handleSaveResetSchedule(scheduledAt: number): Promise<void> {
+  if (resetStateSaving.value) return;
+  const editingTask = editingResetSchedule.value;
+  if (editingTask) {
+    const updated = await handleUpdateScheduledReset(editingTask.id, scheduledAt);
+    if (!updated) return;
+    updateResetScheduleVisible(false);
+    return;
+  }
+  const created = await handleScheduleReset({ scheduledAt });
+  if (!created) return;
+  updateResetScheduleVisible(false);
+  resetCreditVisible.value = false;
+}
+
+async function handleCancelScheduledReset(scheduleId: string): Promise<void> {
+  const task = resetState.value.scheduledResets.find((item) => item.id === scheduleId);
+  if (!task || task.status !== "scheduled") return;
+  const nextCancellingIds = beginPendingItem(
+    cancellingResetScheduleIds.value,
+    scheduleId,
+  );
+  if (!nextCancellingIds) return;
+  cancellingResetScheduleIds.value = nextCancellingIds;
+  const now = Date.now();
+  try {
+    await runResetStateMutation(
+      () => cancelCodexScheduledReset(scheduleId, now, resetLogId("log")),
+      (state) => state,
+      "取消预约失败",
+    );
+    Message.success("预约已取消");
+  } catch {
+    // runResetStateMutation 已经显示具体错误。
+  } finally {
+    cancellingResetScheduleIds.value = finishPendingItem(
+      cancellingResetScheduleIds.value,
+      scheduleId,
+    );
+  }
+}
+
+async function handleDeleteResetLog(logId: string): Promise<void> {
+  if (clearingResetLogs.value || !resetState.value.logs.some((log) => log.id === logId)) return;
+  const nextDeletingIds = beginPendingItem(deletingResetLogIds.value, logId);
+  if (!nextDeletingIds) return;
+  deletingResetLogIds.value = nextDeletingIds;
+  try {
+    await runResetStateMutation(
+      () => deleteCodexResetLog(logId),
+      (state) => state,
+      "删除重置日志失败",
+    );
+    Message.success("重置日志已删除");
+  } catch {
+    // runResetStateMutation 已经显示具体错误。
+  } finally {
+    deletingResetLogIds.value = finishPendingItem(deletingResetLogIds.value, logId);
+  }
+}
+
+async function handleClearResetLogs(): Promise<void> {
+  if (
+    clearingResetLogs.value ||
+    deletingResetLogIds.value.length > 0 ||
+    resetState.value.logs.length === 0
+  ) {
+    return;
+  }
+  clearingResetLogs.value = true;
+  try {
+    await runResetStateMutation(
+      clearCodexResetLogs,
+      (state) => state,
+      "清空重置日志失败",
+    );
+    Message.success("重置日志已清空");
+  } catch {
+    // runResetStateMutation 已经显示具体错误。
+  } finally {
+    clearingResetLogs.value = false;
+  }
+}
+
+async function executeScheduledReset(task: ScheduledReset): Promise<void> {
+  let resetError: unknown;
+  let quotaRefreshError: string | undefined;
+  try {
+    const result = await consumeCodexResetCredit(task.accountId);
+    quotaRefreshError = result.quotaRefreshError;
+  } catch (error) {
+    resetError = error;
+  }
+  const finishedAt = Date.now();
+  if (resetError) {
+    let logError: unknown;
+    try {
+      await runResetStateMutation(
+        () =>
+          finishCodexScheduledReset(
+            task.id,
+            finishedAt,
+            "failed",
+            errorText(resetError),
+            resetLogId("log"),
+          ),
+        (state) => state,
+        "保存预约失败日志失败",
+        true,
+      );
+    } catch (error) {
+      logError = error;
+    }
+    const suffix = logError
+      ? formatTranslatedText("；保存日志失败：{error}", { error: errorText(logError) })
+      : "";
+    Message.error(`${formatTranslatedText("{account} 预约重置失败：{error}", {
+      account: task.accountLabel,
+      error: errorText(resetError),
+    })}${suffix}`);
+    return;
+  }
+
+  let logError: unknown;
+  try {
+    await runResetStateMutation(
+      () =>
+        finishCodexScheduledReset(
+          task.id,
+          finishedAt,
+          "success",
+          undefined,
+          resetLogId("log"),
+        ),
+      (state) => state,
+      "保存预约成功日志失败",
+      true,
+    );
+  } catch (error) {
+    logError = error;
+  }
+  await loadAccounts();
+  if (logError) {
+    Message.error(formatTranslatedText("{account} 已重置，但保存日志失败：{error}", {
+      account: task.accountLabel,
+      error: errorText(logError),
+    }));
+  } else if (quotaRefreshError) {
+    Message.warning(formatTranslatedText("{account} 预约重置完成，但刷新额度失败：{error}", {
+      account: task.accountLabel,
+      error: quotaRefreshError,
+    }));
+  } else {
+    Message.success(formatTranslatedText("{account} 预约重置完成", {
+      account: task.accountLabel,
+    }));
+  }
+}
+
+async function runDueResetTasks(): Promise<void> {
+  if (resetExecutionPromise) return;
+  const hasDueTask = resetState.value.scheduledResets.some(
+    (task) => task.status === "scheduled" && task.scheduledAt <= Date.now(),
+  );
+  if (!hasDueTask) return;
+  resetExecutionPromise = (async () => {
+    while (true) {
+      const task = resetState.value.scheduledResets
+        .filter((item) => item.status === "scheduled" && item.scheduledAt <= Date.now())
+        .sort((left, right) => left.scheduledAt - right.scheduledAt)[0];
+      if (!task) return;
+      const claim = await runResetStateMutation(
+        () => claimCodexScheduledReset(task.id),
+        (result) => result.state,
+        "领取预约任务失败",
+        true,
+      );
+      if (!claim.task) continue;
+      await executeScheduledReset(claim.task);
+    }
+  })().catch((error) => {
+    Message.error(formatTranslatedText("执行预约任务失败：{error}", {
+      error: errorText(error),
+    }));
+  }).finally(() => {
+    resetExecutionPromise = undefined;
+  });
+  await resetExecutionPromise;
 }
 
 function isFreePlanAccount(account: CodexAccount): boolean {
@@ -1754,7 +2192,9 @@ async function confirmResetCredit(account: CodexAccount): Promise<void> {
       count = resetCreditCount(targetAccount);
     } catch (error) {
       await loadAccounts();
-      Message.warning(`获取重置次数明细失败：${errorText(error)}`);
+      Message.warning(formatTranslatedText("获取重置次数明细失败：{error}", {
+        error: errorText(error),
+      }));
       return;
     } finally {
       quotaRefreshingId.value = "";
@@ -1771,30 +2211,94 @@ async function confirmResetCredit(account: CodexAccount): Promise<void> {
   }
 
   resetCreditAccount.value = targetAccount;
-  const firstAvailableIndex = resetCreditRecords(targetAccount).findIndex(isAvailableResetCredit);
-  selectedResetCreditIndex.value = Math.max(0, firstAvailableIndex);
   resetCreditVisible.value = true;
 }
 
 async function handleConsumeSelectedResetCredit(): Promise<void> {
   const account = resetCreditAccount.value;
   if (!account) return;
-  const selected = selectedResetCredit.value;
-  if (selected && !isAvailableResetCredit(selected)) {
-    Message.warning("请选择一个可用的重置次数");
+  if (scheduledResetForAccount(account.id)) {
+    Message.warning("该账号已有活动预约，请先取消预约");
+    return;
+  }
+  if (!hasAvailableResetCreditForModal.value) {
+    Message.warning("当前账号没有可用的重置次数");
     return;
   }
   quotaRefreshingId.value = account.id;
   try {
-    await consumeCodexResetCredit(account.id);
-    resetCreditVisible.value = false;
-    resetCreditAccount.value = null;
-    selectedResetCreditIndex.value = 0;
-    await loadAccounts();
-    Message.success("额度已重置");
-  } catch (error) {
-    await loadAccounts();
-    Message.error(`重置额度失败：${errorText(error)}`);
+    const occurredAt = Date.now();
+    let resetError: unknown;
+    let quotaRefreshError: string | undefined;
+    try {
+      const result = await consumeCodexResetCredit(account.id);
+      quotaRefreshError = result.quotaRefreshError;
+    } catch (error) {
+      resetError = error;
+    }
+    if (resetError) {
+      let logError: unknown;
+      try {
+        await runResetStateMutation(
+          () =>
+            appendCodexResetLog({
+              id: resetLogId("log"),
+              accountId: account.id,
+              accountLabel: displayNameForUi(account),
+              type: "immediate",
+              occurredAt,
+              result: "failed",
+              error: errorText(resetError),
+            }),
+          (state) => state,
+          "保存立即重置失败日志失败",
+          true,
+        );
+      } catch (error) {
+        logError = error;
+      }
+      await loadAccounts();
+      const suffix = logError
+        ? formatTranslatedText("；保存日志失败：{error}", { error: errorText(logError) })
+        : "";
+      Message.error(`${formatTranslatedText("重置额度失败：{error}", {
+        error: errorText(resetError),
+      })}${suffix}`);
+    } else {
+      let logError: unknown;
+      try {
+        await runResetStateMutation(
+          () =>
+            appendCodexResetLog({
+              id: resetLogId("log"),
+              accountId: account.id,
+              accountLabel: displayNameForUi(account),
+              type: "immediate",
+              occurredAt,
+              result: "success",
+            }),
+          (state) => state,
+          "保存立即重置成功日志失败",
+          true,
+        );
+      } catch (error) {
+        logError = error;
+      }
+      resetCreditVisible.value = false;
+      resetCreditAccount.value = null;
+      await loadAccounts();
+      if (logError) {
+        Message.error(formatTranslatedText("额度已重置，但保存日志失败：{error}", {
+          error: errorText(logError),
+        }));
+      } else if (quotaRefreshError) {
+        Message.warning(formatTranslatedText("额度已重置，但刷新额度失败：{error}", {
+          error: quotaRefreshError,
+        }));
+      } else {
+        Message.success("额度已重置");
+      }
+    }
   } finally {
     quotaRefreshingId.value = "";
   }
@@ -3329,6 +3833,7 @@ onMounted(() => {
   quotaCountdownTimer = window.setInterval(() => {
     nowMs.value = Date.now();
     refreshOverdueQuotaCountdowns();
+    void runDueResetTasks();
   }, 1000);
   apiKeyBalanceRefreshTimer = window.setInterval(() => {
     if (
@@ -3377,6 +3882,7 @@ onMounted(() => {
     });
   syncExpandedLayout();
   window.addEventListener("resize", handleWindowResize);
+  void initializeResetState();
   void loadAccounts();
   void loadSettings({ includeStorage: false });
   void listen<OAuthCallbackEvent>("codex-oauth-callback-received", async (event) => {
@@ -3563,6 +4069,24 @@ onUnmounted(() => {
       :settings="settings"
       :saving="savingSettings"
       @save="saveSettings"
+    />
+
+    <ResetPanel
+      v-if="activeView === 'resets'"
+      :state="resetState"
+      :accounts="accounts"
+      :now-ms="nowMs"
+      :loading="resetStateLoading"
+      :saving="resetStateSaving"
+      :updating-schedule-ids="updatingResetScheduleIds"
+      :cancelling-schedule-ids="cancellingResetScheduleIds"
+      :deleting-log-ids="deletingResetLogIds"
+      :clearing-logs="clearingResetLogs"
+      @refresh="loadResetState"
+      @edit-schedule="handleEditScheduledReset"
+      @cancel-schedule="handleCancelScheduledReset"
+      @delete-log="handleDeleteResetLog"
+      @clear-logs="handleClearResetLogs"
     />
 
     <SessionPanel
@@ -3821,8 +4345,6 @@ onUnmounted(() => {
       v-model:visible="resetCreditVisible"
       :account="resetCreditAccount"
       :records="resetCreditRecordsForModal"
-      :selected-index="selectedResetCreditIndex"
-      :selected-credit="selectedResetCredit"
       :quota-refreshing-id="quotaRefreshingId"
       :display-name="displayNameForUi"
       :reset-credit-count="resetCreditCount"
@@ -3830,8 +4352,21 @@ onUnmounted(() => {
       :reset-credit-status-key="resetCreditStatusKey"
       :reset-credit-status-label="resetCreditStatusLabel"
       :format-reset-credit-date="formatResetCreditDate"
-      @update:selected-index="selectedResetCreditIndex = $event"
+      :scheduled-reset="scheduledResetForModal"
+      :reset-state-busy="resetStateLoading || resetStateSaving"
       @consume="handleConsumeSelectedResetCredit"
+      @open-schedule="handleOpenResetSchedule"
+      @view-schedules="handleViewResetSchedules"
+    />
+
+    <ResetScheduleModal
+      :visible="resetScheduleVisible"
+      :account-label="resetScheduleAccountLabel"
+      :saving="resetStateSaving"
+      :mode="resetScheduleMode"
+      :initial-scheduled-at="resetScheduleInitialAt"
+      @update:visible="updateResetScheduleVisible"
+      @save="handleSaveResetSchedule"
     />
 
     <SessionRepairModal

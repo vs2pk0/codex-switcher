@@ -58,6 +58,16 @@ const sidebarCollapsed = ref(true);
           <span class="sidebar-label">{{ t("会话管理") }}</span>
         </button>
       </a-tooltip>
+      <a-tooltip :content="t('重置记录')" position="right" :disabled="!sidebarCollapsed">
+        <button
+          type="button"
+          :class="{ active: activeView === 'resets' }"
+          @click="$emit('switch-view', 'resets')"
+        >
+          <icon-thunderbolt />
+          <span class="sidebar-label">{{ t("重置记录") }}</span>
+        </button>
+      </a-tooltip>
       <a-tooltip :content="t('使用统计')" position="right" :disabled="!sidebarCollapsed">
         <button
           type="button"
@@ -177,6 +187,10 @@ const sidebarCollapsed = ref(true);
       <a-button :type="activeView === 'sessions' ? 'primary' : 'text'" @click="$emit('switch-view', 'sessions')">
         <template #icon><icon-folder /></template>
         {{ t("会话管理") }}
+      </a-button>
+      <a-button :type="activeView === 'resets' ? 'primary' : 'text'" @click="$emit('switch-view', 'resets')">
+        <template #icon><icon-thunderbolt /></template>
+        {{ t("重置记录") }}
       </a-button>
       <a-button :type="activeView === 'usage' ? 'primary' : 'text'" @click="$emit('switch-view', 'usage')">
         <template #icon><icon-bar-chart /></template>
