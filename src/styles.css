@@ -8045,9 +8045,27 @@ textarea {
   gap: 10px;
 }
 
+.reset-credit-account-action-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid rgba(37, 99, 235, 0.14);
+  border-radius: 8px;
+  color: #526176;
+  background: rgba(239, 246, 255, 0.66);
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.reset-credit-account-action-note svg {
+  flex: 0 0 auto;
+  color: #2563eb;
+}
+
 .reset-credit-choice {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) minmax(170px, auto);
+  grid-template-columns: auto minmax(0, 1fr) minmax(170px, auto) auto;
   gap: 14px;
   align-items: center;
   width: 100%;
@@ -8056,23 +8074,10 @@ textarea {
   border-radius: 8px;
   color: var(--text-main);
   background: rgba(255, 255, 255, 0.88);
-  cursor: pointer;
   text-align: left;
-  transition:
-    border-color 0.18s ease,
-    box-shadow 0.18s ease,
-    transform 0.18s ease;
 }
 
-.reset-credit-choice:hover:not(:disabled),
-.reset-credit-choice.selected {
-  border-color: rgba(37, 99, 235, 0.5);
-  box-shadow: 0 16px 36px rgba(37, 99, 235, 0.1);
-  transform: translateY(-1px);
-}
-
-.reset-credit-choice:disabled {
-  cursor: not-allowed;
+.reset-credit-choice.disabled {
   opacity: 0.62;
 }
 
@@ -8135,10 +8140,278 @@ textarea {
   color: #1f2a44;
 }
 
+.reset-credit-choice-actions {
+  display: inline-flex;
+  justify-self: end;
+  gap: 8px;
+  white-space: nowrap;
+}
+
 .reset-credit-modal-actions {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+.reset-schedule-modal .arco-modal-body {
+  padding-top: 18px;
+}
+
+.reset-schedule-modal-body {
+  display: grid;
+  gap: 16px;
+}
+
+.reset-schedule-modal-body > p {
+  margin: 0;
+  color: var(--text-soft);
+  line-height: 1.6;
+}
+
+.reset-schedule-account {
+  overflow: hidden;
+  padding: 12px 14px;
+  border: 1px solid rgba(37, 99, 235, 0.16);
+  border-radius: 8px;
+  color: #1f2a44;
+  background: rgba(239, 246, 255, 0.62);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reset-schedule-date-picker {
+  width: 100%;
+}
+
+.reset-schedule-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 4px;
+}
+
+.reset-credit-scheduled-button {
+  border-color: rgba(37, 99, 235, 0.42);
+  color: #2563eb;
+  background: rgba(239, 246, 255, 0.82);
+}
+
+.reset-panel {
+  display: grid;
+  gap: 24px;
+  width: 100%;
+  padding: 4px 0 30px;
+}
+
+.reset-panel-head,
+.reset-panel-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.reset-panel-head {
+  padding: 6px 2px 0;
+}
+
+.reset-panel-head h2,
+.reset-panel-section-head h3 {
+  margin: 8px 0 0;
+  color: var(--text-main);
+}
+
+.reset-panel-head h2 {
+  font-size: 28px;
+}
+
+.reset-panel-head p {
+  margin: 8px 0 0;
+  color: var(--text-soft);
+}
+
+.panel-eyebrow {
+  color: var(--blue);
+  font-size: 12px;
+  font-weight: 820;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.reset-panel-section {
+  display: grid;
+  gap: 12px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 12px 30px rgba(20, 35, 55, 0.05);
+}
+
+.reset-panel-section-head {
+  align-items: center;
+}
+
+.reset-panel-section-head h3 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.reset-panel-section-head > span {
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.reset-panel-section-tools,
+.reset-schedule-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.reset-panel-section-tools > span {
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.reset-schedule-list,
+.reset-log-list {
+  display: grid;
+  gap: 8px;
+}
+
+.reset-schedule-row,
+.reset-log-row {
+  display: grid;
+  align-items: center;
+  gap: 14px;
+  padding: 14px;
+  border: 1px solid rgba(85, 113, 156, 0.15);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.86);
+}
+
+.reset-schedule-row {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
+.reset-log-row {
+  grid-template-columns: minmax(0, 1fr) auto auto minmax(0, 1.2fr) auto;
+}
+
+.reset-schedule-main,
+.reset-log-main {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.reset-schedule-main strong,
+.reset-log-main strong {
+  overflow: hidden;
+  color: #1f2a44;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reset-schedule-main span,
+.reset-log-main span,
+.reset-log-type,
+.reset-log-error {
+  overflow: hidden;
+  color: var(--text-soft);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reset-schedule-countdown {
+  display: grid;
+  justify-items: end;
+  gap: 4px;
+  min-width: 110px;
+}
+
+.reset-schedule-countdown small {
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.reset-schedule-countdown b {
+  color: #0f766e;
+  font-variant-numeric: tabular-nums;
+}
+
+.reset-log-result {
+  display: inline-flex;
+  min-width: 56px;
+  justify-content: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.reset-log-result.is-success {
+  color: #047857;
+  background: rgba(209, 250, 229, 0.9);
+}
+
+.reset-log-result.is-failed,
+.reset-log-result.is-missed {
+  color: #b91c1c;
+  background: rgba(254, 226, 226, 0.9);
+}
+
+.reset-log-result.is-cancelled {
+  color: #475569;
+  background: rgba(226, 232, 240, 0.9);
+}
+
+@media (max-width: 760px) {
+  .reset-credit-choice {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .reset-credit-choice-time,
+  .reset-credit-choice-actions {
+    grid-column: 2;
+    justify-self: start;
+  }
+
+  .reset-credit-choice-actions {
+    flex-wrap: wrap;
+  }
+
+  .reset-panel-head,
+  .reset-panel-section-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .reset-schedule-row,
+  .reset-log-row {
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+
+  .reset-schedule-countdown {
+    justify-items: start;
+  }
+
+  .reset-panel-section-tools {
+    justify-content: space-between;
+  }
+
+  .reset-schedule-actions {
+    justify-self: start;
+  }
+
+  .reset-log-error {
+    white-space: normal;
+  }
 }
 
 .add-account-intro {

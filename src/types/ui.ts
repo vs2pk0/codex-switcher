@@ -2,6 +2,7 @@ import type { CodexSessionRecord } from "../services/session";
 
 export type ActiveView =
   | "accounts"
+  | "resets"
   | "sessions"
   | "usage"
   | "apiService"

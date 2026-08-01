@@ -1,6 +1,6 @@
 [package]
 name = "codex-switcher"
-version = "0.1.15"
+version = "0.1.16"
 description = "Standalone Codex Switcher"
 authors = ["Codex"]
 edition = "2021"

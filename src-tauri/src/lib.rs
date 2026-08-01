@@ -3,6 +3,7 @@ mod api_service;
 mod app_update;
 mod oauth;
 mod push;
+mod reset;
 mod session;
 mod subscription;
 mod token_keeper;
@@ -1605,6 +1606,81 @@ fn update_codex_switcher_settings(
     Ok(settings)
 }
 
+#[tauri::command]
+fn get_codex_reset_state() -> Result<reset::ResetState, String> {
+    reset::ResetStateStore::default().load()
+}
+
+#[tauri::command]
+fn initialize_codex_reset_state() -> Result<reset::ResetState, String> {
+    reset::ResetStateStore::default().initialize(chrono::Utc::now().timestamp_millis())
+}
+
+#[tauri::command]
+fn create_codex_scheduled_reset(task: reset::ScheduledReset) -> Result<reset::ResetState, String> {
+    reset::ResetStateStore::default()
+        .create_scheduled_reset(task, chrono::Utc::now().timestamp_millis())
+}
+
+#[tauri::command]
+fn update_codex_scheduled_reset(
+    schedule_id: String,
+    scheduled_at: i64,
+) -> Result<reset::ResetState, String> {
+    reset::ResetStateStore::default().update_scheduled_reset(
+        &schedule_id,
+        scheduled_at,
+        chrono::Utc::now().timestamp_millis(),
+    )
+}
+
+#[tauri::command]
+fn cancel_codex_scheduled_reset(
+    schedule_id: String,
+    occurred_at: i64,
+    log_id: String,
+) -> Result<reset::ResetState, String> {
+    reset::ResetStateStore::default().cancel_scheduled_reset(&schedule_id, occurred_at, log_id)
+}
+
+#[tauri::command]
+fn claim_codex_scheduled_reset(schedule_id: String) -> Result<reset::ResetClaim, String> {
+    reset::ResetStateStore::default()
+        .claim_scheduled_reset(&schedule_id, chrono::Utc::now().timestamp_millis())
+}
+
+#[tauri::command]
+fn finish_codex_scheduled_reset(
+    schedule_id: String,
+    occurred_at: i64,
+    result: reset::ResetLogResult,
+    error: Option<String>,
+    log_id: String,
+) -> Result<reset::ResetState, String> {
+    reset::ResetStateStore::default().finish_scheduled_reset(
+        &schedule_id,
+        occurred_at,
+        result,
+        error,
+        log_id,
+    )
+}
+
+#[tauri::command]
+fn append_codex_reset_log(log: reset::ResetLog) -> Result<reset::ResetState, String> {
+    reset::ResetStateStore::default().append_log(log)
+}
+
+#[tauri::command]
+fn delete_codex_reset_log(log_id: String) -> Result<reset::ResetState, String> {
+    reset::ResetStateStore::default().delete_log(&log_id)
+}
+
+#[tauri::command]
+fn clear_codex_reset_logs() -> Result<reset::ResetState, String> {
+    reset::ResetStateStore::default().clear_logs()
+}
+
 fn codex_config_file_path(codex_home: &Path, kind: CodexConfigFileKind) -> PathBuf {
     codex_home.join(kind.file_name())
 }
@@ -2255,8 +2331,25 @@ async fn refresh_all_codex_quotas() -> Result<i32, String> {
     Ok(count)
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CodexResetCreditConsumeResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota_refresh_error: Option<String>,
+}
+
+fn reset_credit_consume_result<T>(
+    quota_refresh_result: Result<T, String>,
+) -> CodexResetCreditConsumeResult {
+    CodexResetCreditConsumeResult {
+        quota_refresh_error: quota_refresh_result.err(),
+    }
+}
+
 #[tauri::command]
-async fn consume_codex_reset_credit(account_id: String) -> Result<CodexAccount, String> {
+async fn consume_codex_reset_credit(
+    account_id: String,
+) -> Result<CodexResetCreditConsumeResult, String> {
     let source = refreshed_quota_source_account(&account_id).await?;
     let access_token = source.tokens.access_token.trim();
     if access_token.is_empty() {
@@ -2289,7 +2382,9 @@ async fn consume_codex_reset_credit(account_id: String) -> Result<CodexAccount, 
             compact_http_body(&body)
         ));
     }
-    refresh_codex_quota(account_id).await
+    Ok(reset_credit_consume_result(
+        refresh_codex_quota(account_id).await,
+    ))
 }
 
 #[tauri::command]
@@ -3607,6 +3702,17 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn successful_reset_credit_consume_keeps_refresh_failure_as_warning() {
+        let result =
+            super::reset_credit_consume_result(Err::<(), String>("额度刷新网络不可用".to_string()));
+
+        assert_eq!(
+            result.quota_refresh_error.as_deref(),
+            Some("额度刷新网络不可用")
+        );
+    }
+
+    #[test]
     fn quota_monitoring_is_always_enabled() {
         assert!(super::CodexSwitcherSettings::default().monitor_quota);
         assert!(super::CodexSwitcherSettings::default().show_additional_quota_windows);
@@ -4285,6 +4391,16 @@ pub fn run() {
             restart_codex_app,
             get_codex_switcher_settings,
             update_codex_switcher_settings,
+            get_codex_reset_state,
+            initialize_codex_reset_state,
+            create_codex_scheduled_reset,
+            update_codex_scheduled_reset,
+            cancel_codex_scheduled_reset,
+            claim_codex_scheduled_reset,
+            finish_codex_scheduled_reset,
+            append_codex_reset_log,
+            delete_codex_reset_log,
+            clear_codex_reset_logs,
             read_codex_config_file,
             format_codex_config_file,
             write_codex_config_file,
