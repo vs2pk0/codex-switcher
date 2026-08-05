@@ -1453,11 +1453,17 @@ impl AccountStore {
         let config_path = self.codex_home.join("config.toml");
         if config_path.exists() {
             let document = read_toml_document(&config_path)?;
-            if let Some(provider) = document["model_provider"].as_str().and_then(|provider_id| {
-                document
-                    .get("model_providers")
-                    .and_then(|providers| providers.get(provider_id))
-            }) {
+            if let Some(provider) = document
+                .get("model_provider")
+                .and_then(Item::as_str)
+                .and_then(|provider_id| {
+                    document
+                        .get("model_providers")
+                        .and_then(Item::as_table_like)
+                        .and_then(|providers| providers.get(provider_id))
+                })
+                .and_then(Item::as_table_like)
+            {
                 config.provider_base_url = provider
                     .get("base_url")
                     .and_then(|value| value.as_str())
@@ -2902,23 +2908,23 @@ fn remove_legacy_managed_gpt_5_6_values(document: &mut Document, provider_ids: &
     let root_values_match = [
         (
             "model_reasoning_effort",
-            document["model_reasoning_effort"].as_str() == Some("high"),
+            managed_gpt_5_6_root_value_is_unchanged(document, "model_reasoning_effort"),
         ),
         (
             "disable_response_storage",
-            document["disable_response_storage"].as_bool() == Some(true),
+            managed_gpt_5_6_root_value_is_unchanged(document, "disable_response_storage"),
         ),
         (
             "network_access",
-            document["network_access"].as_str() == Some("enabled"),
+            managed_gpt_5_6_root_value_is_unchanged(document, "network_access"),
         ),
         (
             "windows_wsl_setup_acknowledged",
-            document["windows_wsl_setup_acknowledged"].as_bool() == Some(true),
+            managed_gpt_5_6_root_value_is_unchanged(document, "windows_wsl_setup_acknowledged"),
         ),
         (
             "requires_openai_auth",
-            document["requires_openai_auth"].as_bool() == Some(true),
+            managed_gpt_5_6_root_value_is_unchanged(document, "requires_openai_auth"),
         ),
     ];
     for (key, matches) in root_values_match {
