@@ -1,6 +1,7 @@
 use super::{
-    codex_restart_commands, codex_restart_delay_ms, rollback_config_on_error, AccountStore,
-    ApiKeyAccountBindingInput, CodexAccount, CodexQuota, CodexTokens,
+    codex_restart_commands, codex_restart_delay_ms, remove_legacy_managed_gpt_5_6_values,
+    rollback_config_on_error, AccountStore, ApiKeyAccountBindingInput, CodexAccount, CodexQuota,
+    CodexTokens,
 };
 use serde_json::json;
 use std::{
@@ -1095,6 +1096,51 @@ fn detects_oauth_current_account_from_auth_json() {
 }
 
 #[test]
+fn detects_oauth_current_account_when_config_has_no_model_provider() {
+    let (_storage, codex, store) = test_store();
+    let account = store
+        .import_from_json(
+            &json!({
+                "email": "missing-provider@example.com",
+                "tokens": {
+                    "id_token": "id-token",
+                    "access_token": "missing-provider-access-token",
+                    "refresh_token": "refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import oauth")
+        .remove(0);
+    fs::write(
+        codex.path().join("auth.json"),
+        json!({
+            "OPENAI_API_KEY": null,
+            "email": "missing-provider@example.com",
+            "tokens": {
+                "id_token": "id-token",
+                "access_token": "missing-provider-access-token",
+                "refresh_token": "refresh-token"
+            }
+        })
+        .to_string(),
+    )
+    .expect("write auth json");
+    fs::write(
+        codex.path().join("config.toml"),
+        "[features]\njs_repl = false\n",
+    )
+    .expect("write config without model provider");
+
+    let detected = store
+        .detect_current_account_from_codex_config()
+        .expect("detect current")
+        .expect("matched oauth account");
+
+    assert_eq!(detected.id, account.id);
+}
+
+#[test]
 fn detects_oauth_current_account_when_official_provider_has_base_url() {
     let (_storage, codex, store) = test_store();
     store
@@ -1502,6 +1548,58 @@ fn api_key_model_access_check_is_strict_and_read_only() {
         fs::read(&config_path).expect("read config after conflict check"),
         config_before
     );
+}
+
+#[test]
+fn api_key_model_access_is_false_when_provider_config_is_missing_or_invalid() {
+    let (_storage, codex, store) = test_store();
+    let account = store
+        .add_api_key_account(
+            "sk-missing-provider-123456".to_string(),
+            Some("https://missing-provider.example/v1".to_string()),
+            Some("Missing Provider".to_string()),
+            None,
+            None,
+        )
+        .expect("add api key account");
+    fs::write(
+        codex.path().join("auth.json"),
+        json!({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "sk-missing-provider-123456"
+        })
+        .to_string(),
+    )
+    .expect("write auth json");
+    fs::write(
+        codex.path().join("config.toml"),
+        "[features]\njs_repl = false\n",
+    )
+    .expect("write config without model provider");
+
+    assert!(!store
+        .check_api_key_model_access(&account.id)
+        .expect("check access without provider"));
+
+    fs::write(
+        codex.path().join("config.toml"),
+        "model_provider = 42\nmodel_providers = \"not-a-table\"\n",
+    )
+    .expect("write config with invalid provider types");
+    assert!(!store
+        .check_api_key_model_access(&account.id)
+        .expect("check access with invalid provider types"));
+}
+
+#[test]
+fn legacy_gpt_5_6_cleanup_tolerates_missing_managed_fields() {
+    let mut document = "model_reasoning_effort = \"high\"\n"
+        .parse::<toml_edit::Document>()
+        .expect("parse partial legacy config");
+
+    remove_legacy_managed_gpt_5_6_values(&mut document, &[]);
+
+    assert!(document.get("model_reasoning_effort").is_none());
 }
 
 #[test]
