@@ -140,7 +140,7 @@ function changeLanguage(value: unknown): void {
               <a-input-number
                 v-model="settings.quotaRefreshMinutes"
                 :min="1"
-                :max="1440"
+                :max="518400"
                 mode="button"
               >
                 <template #suffix>{{ t("分钟") }}</template>
@@ -150,7 +150,7 @@ function changeLanguage(value: unknown): void {
               <a-input-number
                 v-model="settings.currentAccountRefreshMinutes"
                 :min="1"
-                :max="1440"
+                :max="518400"
                 mode="button"
               >
                 <template #suffix>{{ t("分钟") }}</template>

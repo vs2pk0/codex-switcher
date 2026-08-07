@@ -748,6 +748,7 @@ pub async fn api_service_bind_accounts(
     let auth_dir = api_auth_dir(&dirs);
     fs::create_dir_all(&auth_dir)
         .map_err(|error| format!("创建 API 服务认证目录失败: {}", error))?;
+    clear_api_service_bound_accounts(&dirs, &auth_dir)?;
     if !api_key_bindings.is_empty() {
         bind_managed_api_key_accounts(&dirs, &api_key_bindings)?;
     }
@@ -2014,6 +2015,36 @@ fn bind_managed_api_key_accounts(
     }
 
     persist_managed_api_key_config(dirs, &entries, &managed)
+}
+
+fn clear_api_service_bound_accounts(dirs: &ApiServiceDirs, auth_dir: &Path) -> Result<(), String> {
+    if auth_dir.exists() {
+        for entry in fs::read_dir(auth_dir)
+            .map_err(|error| format!("读取 API 服务认证目录失败: {}", error))?
+        {
+            let path = entry
+                .map_err(|error| format!("读取认证文件失败: {}", error))?
+                .path();
+            if path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("json") {
+                fs::remove_file(&path)
+                    .map_err(|error| format!("清空 API 服务认证文件失败: {}", error))?;
+            }
+        }
+    }
+
+    let config_path = dirs.workspace_dir.join("config.yaml");
+    let mut entries = read_codex_api_key_entries(&config_path)?;
+    let managed = read_managed_api_key_bindings(dirs)?;
+    if managed.bindings.is_empty() {
+        return Ok(());
+    }
+    entries.retain(|entry| {
+        !managed
+            .bindings
+            .iter()
+            .any(|binding| binding.owns_config_entry && entry_matches_binding(entry, binding))
+    });
+    persist_managed_api_key_config(dirs, &entries, &ManagedApiKeyBindings::default())
 }
 
 fn list_all_bound_accounts(dirs: &ApiServiceDirs) -> Result<Vec<ApiServiceBoundAccount>, String> {
@@ -4055,6 +4086,56 @@ mod tests {
         .unwrap();
 
         assert_eq!(removed, 2);
+        let entries = read_codex_api_key_entries(&config_path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].api_key, "manual-key");
+        assert!(read_managed_api_key_bindings(&dirs)
+            .unwrap()
+            .bindings
+            .is_empty());
+    }
+
+    #[test]
+    fn clearing_api_service_bound_accounts_removes_auth_files_and_managed_upstreams() {
+        let (_temporary, dirs) = test_dirs();
+        fs::create_dir_all(&dirs.workspace_dir).unwrap();
+        let auth_dir = api_auth_dir(&dirs);
+        fs::create_dir_all(&auth_dir).unwrap();
+        fs::write(
+            auth_dir.join("codex-switcher-old@example.com.json"),
+            r#"{"email":"old@example.com"}"#,
+        )
+        .unwrap();
+        let config_path = dirs.workspace_dir.join("config.yaml");
+        fs::write(
+            &config_path,
+            concat!(
+                "port: 17877\n",
+                "codex-api-key:\n",
+                "  - api-key: manual-key\n",
+                "    base-url: https://manual.example/v1\n",
+                "  - api-key: managed-key\n",
+                "    base-url: https://managed.example/v1\n",
+            ),
+        )
+        .unwrap();
+        write_json(
+            &managed_api_key_bindings_path(&dirs),
+            &ManagedApiKeyBindings {
+                bindings: vec![ManagedApiKeyBinding {
+                    account_id: "api_managed".to_string(),
+                    api_key_hash: api_service_hash("managed-key"),
+                    base_url: "https://managed.example/v1".to_string(),
+                    label: "Managed Provider".to_string(),
+                    owns_config_entry: true,
+                }],
+            },
+        )
+        .unwrap();
+
+        clear_api_service_bound_accounts(&dirs, &auth_dir).unwrap();
+
+        assert!(fs::read_dir(&auth_dir).unwrap().next().is_none());
         let entries = read_codex_api_key_entries(&config_path).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].api_key, "manual-key");

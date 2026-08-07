@@ -42,6 +42,13 @@ function cycleAccountViewMode(): void {
   props.settings.accountViewMode = accountViewModes[nextIndex];
   emit("save-settings");
 }
+
+function handleSortModeChange(value: string): void {
+  if (value === "quota_reset_countdown") {
+    props.settings.sortDirection = "asc";
+  }
+  emit("save-settings");
+}
 </script>
 
 <template>
@@ -89,11 +96,12 @@ function cycleAccountViewMode(): void {
         popup-container="body"
         :scrollbar="false"
         :trigger-props="{ contentClass: 'account-filter-dropdown account-sort-dropdown' }"
-        @change="$emit('save-settings')"
+        @change="(value) => handleSortModeChange(String(value))"
       >
         <a-option value="created_at">{{ t("按创建时间") }}</a-option>
         <a-option value="weekly_quota">{{ t("按周配额") }}</a-option>
         <a-option value="hourly_quota">{{ t("按5小时配额") }}</a-option>
+        <a-option value="quota_reset_countdown">{{ t("按额度恢复倒计时") }}</a-option>
         <a-option value="weekly_reset">{{ t("按周配额重置时间") }}</a-option>
         <a-option value="hourly_reset">{{ t("按5小时配额重置时间") }}</a-option>
         <a-option value="subscription">{{ t("按订阅有效期") }}</a-option>
