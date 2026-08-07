@@ -95,6 +95,7 @@ const en: Record<string, string> = {
   "按创建时间": "By creation time",
   "按周配额": "By weekly quota",
   "按5小时配额": "By 5-hour quota",
+  "按额度恢复倒计时": "By quota recovery countdown",
   "按周配额重置时间": "By weekly reset time",
   "按5小时配额重置时间": "By 5-hour reset time",
   "按订阅有效期": "By subscription expiry",
@@ -111,6 +112,7 @@ const en: Record<string, string> = {
   "紧凑视图": "Compact View",
   "表格视图": "Table View",
   "绑定到 API 服务": "Bind to API Service",
+  "加入了 API 服务": "Joined API service",
   "批量导出": "Batch Export",
   "批量导入": "Batch Import",
   "当前账号": "Current Account",
@@ -643,6 +645,8 @@ const en: Record<string, string> = {
     "Selected OAuth accounts are converted to CPA format and written to the API service auth directory.",
   "OAuth 账号会写入认证目录，API Key 账号会写入 CLIProxyAPI 上游配置。":
     "OAuth accounts are written to the auth directory, while API Key accounts are written to the CLIProxyAPI upstream config.",
+  "本次确认会先清空 API 服务中的现有账号，再写入所选账号。OAuth 账号会写入认证目录，API Key 账号会写入 CLIProxyAPI 上游配置。":
+    "This confirmation first clears existing accounts in the API service, then writes the selected accounts. OAuth accounts go to the auth directory, and API Key accounts go to the CLIProxyAPI upstream config.",
   "已选": "Selected",
   "确认绑定": "Confirm Bind",
   "删除 API 服务账号": "Delete API Service Accounts",
@@ -954,6 +958,7 @@ const ru: Record<string, string> = {
   "按创建时间": "По времени создания",
   "按周配额": "По недельной квоте",
   "按5小时配额": "По квоте 5 часов",
+  "按额度恢复倒计时": "По таймеру восстановления квоты",
   "按周配额重置时间": "По сбросу недельной квоты",
   "按5小时配额重置时间": "По сбросу квоты 5 часов",
   "按订阅有效期": "По сроку подписки",
@@ -970,6 +975,7 @@ const ru: Record<string, string> = {
   "紧凑视图": "Компактный вид",
   "表格视图": "Таблица",
   "绑定到 API 服务": "Привязать к API",
+  "加入了 API 服务": "Добавлен в API-сервис",
   "批量导出": "Экспорт",
   "批量导入": "Импорт",
   "当前账号": "Текущий аккаунт",
@@ -1500,6 +1506,8 @@ const ru: Record<string, string> = {
     "Выбранные OAuth-аккаунты будут преобразованы в формат CPA и записаны в каталог авторизации API-сервиса.",
   "OAuth 账号会写入认证目录，API Key 账号会写入 CLIProxyAPI 上游配置。":
     "OAuth-аккаунты записываются в каталог авторизации, а API Key — в конфигурацию upstream CLIProxyAPI.",
+  "本次确认会先清空 API 服务中的现有账号，再写入所选账号。OAuth 账号会写入认证目录，API Key 账号会写入 CLIProxyAPI 上游配置。":
+    "При подтверждении текущие аккаунты API-сервиса будут очищены, затем будут записаны выбранные аккаунты. OAuth-аккаунты попадут в каталог авторизации, API Key — в upstream-конфигурацию CLIProxyAPI.",
   "已选": "Выбрано",
   "确认绑定": "Подтвердить привязку",
   "删除 API 服务账号": "Удалить аккаунты API-сервиса",
@@ -1763,6 +1771,10 @@ const simplifiedToTraditional: Record<string, string> = {
   "剩余时间不超过": "剩餘時間不超過",
   "剩余额度低于": "剩餘額度低於",
   "剩余额度升序": "剩餘額度遞增",
+  "加入了 API 服务": "加入了 API 服務",
+  "按额度恢复倒计时": "依額度恢復倒數",
+  "本次确认会先清空 API 服务中的现有账号，再写入所选账号。OAuth 账号会写入认证目录，API Key 账号会写入 CLIProxyAPI 上游配置。":
+    "本次確認會先清空 API 服務中的現有帳號，再寫入所選帳號。OAuth 帳號會寫入認證目錄，API Key 帳號會寫入 CLIProxyAPI 上游設定。",
   "副本": "副本",
   "匹配账号": "符合帳號",
   "匹配账号 / 事件": "符合帳號 / 事件",

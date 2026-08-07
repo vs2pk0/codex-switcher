@@ -42,6 +42,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (event: "account-added", account: CodexAccount): void;
+  (event: "bound-accounts-changed"): void;
 }>();
 
 const state = ref<ApiServiceState | null>(null);
@@ -513,6 +514,7 @@ async function bindSelectedAccounts(): Promise<void> {
       `已绑定 ${summary.count} 个账号到 API 服务（OAuth ${summary.oauthCount}，API Key ${summary.apiKeyCount}）`,
     );
     await loadBoundAccounts();
+    emit("bound-accounts-changed");
   } catch (error) {
     Message.error(`绑定失败：${errorText(error)}`);
   } finally {
@@ -549,6 +551,7 @@ async function deleteSelectedBoundAccounts(): Promise<void> {
     await loadBoundAccounts();
     selectedDeleteIds.value = new Set();
     deleteVisible.value = false;
+    emit("bound-accounts-changed");
     Message.success(`已删除 ${summary.count} 个 API 服务账号`);
   } catch (error) {
     Message.error(`删除失败：${errorText(error)}`);
@@ -602,6 +605,7 @@ function resetService(): void {
         progress.value = null;
         downloading.value = false;
         syncForm(next);
+        emit("bound-accounts-changed");
         Message.success("API 服务已重置");
       } catch (error) {
         Message.error(`重置失败：${errorText(error)}`);
@@ -1330,7 +1334,7 @@ onUnmounted(() => {
       :footer="false"
     >
       <div class="api-service-account-modal">
-        <p>{{ t("OAuth 账号会写入认证目录，API Key 账号会写入 CLIProxyAPI 上游配置。") }}</p>
+        <p>{{ t("本次确认会先清空 API 服务中的现有账号，再写入所选账号。OAuth 账号会写入认证目录，API Key 账号会写入 CLIProxyAPI 上游配置。") }}</p>
         <a-input
           v-model="bindSearchKeyword"
           allow-clear

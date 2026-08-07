@@ -122,7 +122,7 @@ struct CodexSwitcherSettings {
     language: String,
 }
 
-const MAX_REFRESH_MINUTES: u64 = 1440;
+const MAX_REFRESH_MINUTES: u64 = 518400;
 static SWITCHER_SETTINGS_LOCK: Mutex<()> = Mutex::new(());
 
 impl Default for CodexSwitcherSettings {
@@ -244,7 +244,7 @@ fn default_badge_styles() -> HashMap<String, String> {
 }
 
 fn default_max_columns() -> u64 {
-    3
+    5
 }
 
 fn default_language() -> String {

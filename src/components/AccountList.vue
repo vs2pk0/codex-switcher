@@ -28,6 +28,7 @@ const props = defineProps<{
   apiKeyBalanceStates: Record<string, CodexApiKeyBalanceState>;
   privacyMasked: boolean;
   statusClockMs: number;
+  apiServiceAccountIds: Set<string>;
 }>();
 
 const emit = defineEmits<{
@@ -55,7 +56,7 @@ const emit = defineEmits<{
 const dragOverAccountId = ref("");
 
 const gridClass = computed(() => {
-  const columns = [3, 4, 5].includes(props.settings.maxColumns) ? props.settings.maxColumns : 3;
+  const columns = [3, 4, 5].includes(props.settings.maxColumns) ? props.settings.maxColumns : 5;
   return {
     [`columns-${columns}`]: true,
     expanded: props.expandedLayout,
@@ -145,6 +146,10 @@ function isInteractiveClick(event: MouseEvent): boolean {
 
 function isApiKeyAccount(account: CodexAccount): boolean {
   return account.auth_mode === "apikey" || Boolean(account.openai_api_key || account.openaiApiKey);
+}
+
+function isApiServiceAccount(account: CodexAccount): boolean {
+  return props.apiServiceAccountIds.has(account.id);
 }
 
 function displayName(account: CodexAccount): string {
@@ -841,6 +846,9 @@ function formatTime(value?: number | null): string {
                   {{ t("当前") }}
                 </span>
                 <span v-else class="identity-current-placeholder" aria-hidden="true" />
+                <a-tooltip v-if="isApiServiceAccount(account)" :content="t('加入了 API 服务')">
+                  <span class="api-service-pill" :title="t('加入了 API 服务')">A</span>
+                </a-tooltip>
                 <PlanBadge :label="planLabel(account)" :badge-class="planClass(account)" />
               </div>
             </div>
@@ -1193,6 +1201,9 @@ function formatTime(value?: number | null): string {
           {{ displayAccountName(account) }}
         </button>
         <span v-if="account.id === currentId" class="current-account-pill compact-current">{{ t("当前") }}</span>
+        <a-tooltip v-if="isApiServiceAccount(account)" :content="t('加入了 API 服务')">
+          <span class="api-service-pill compact-api-service-pill" :title="t('加入了 API 服务')">A</span>
+        </a-tooltip>
         <a-tooltip v-if="isApiKeyAccount(account)" :content="apiKeyBalanceTooltip(account)">
           <button
             class="compact-api-balance"
@@ -1322,6 +1333,12 @@ function formatTime(value?: number | null): string {
                 <span>
                   {{ accountAuthLine(account) }}
                   <template v-if="account.id === currentId"> · {{ t("当前") }}</template>
+                  <template v-if="isApiServiceAccount(account)">
+                    ·
+                    <a-tooltip :content="t('加入了 API 服务')">
+                      <span class="api-service-pill table-api-service-pill" :title="t('加入了 API 服务')">A</span>
+                    </a-tooltip>
+                  </template>
                 </span>
                 <small>{{ t("用户 ID") }}: {{ shortAccountId(account) }}</small>
               </div>

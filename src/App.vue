@@ -44,7 +44,7 @@ import {
   setLanguage,
   t,
 } from "./i18n";
-import { quotaWindowForMinutes } from "./quota";
+import { additionalQuotaWindows, hasQuotaWindow, quotaWindowForMinutes } from "./quota";
 import { resolveResetScheduleEntry } from "./services/resetScheduleEntry";
 import {
   beginPendingItem,
@@ -108,6 +108,7 @@ import {
   bindApiServiceAccounts,
   getApiServiceState,
   isCurrentApiServiceAccount,
+  listApiServiceBoundAccounts,
   type ApiServiceAutoUpdateEvent,
 } from "./services/apiService";
 import {
@@ -172,6 +173,7 @@ const appUpdateOpening = ref(false);
 const usagePanelMounted = ref(false);
 const apiServicePanelMounted = ref(false);
 const apiServiceAutoUpdateEvent = ref<ApiServiceAutoUpdateEvent | null>(null);
+const apiServiceAccountIds = ref<Set<string>>(new Set());
 const accounts = ref<CodexAccount[]>([]);
 const currentAccount = ref<CodexAccount | null>(null);
 const loading = ref(false);
@@ -268,7 +270,7 @@ const settings = reactive<CodexSwitcherSettings>({
   showAdditionalQuotaWindows: true,
   badgeStyle: "classic",
   badgeStyles: defaultBadgeStyles(),
-  maxColumns: 3,
+  maxColumns: 5,
   language: "zh-CN",
 });
 
@@ -388,7 +390,14 @@ const sessionSearch = reactive({
 let sessionLoadSequence = 0;
 
 const currentId = computed(() => currentAccount.value?.id ?? "");
-const quotaSortModes = new Set(["weekly_quota", "hourly_quota", "weekly_reset", "hourly_reset", "subscription"]);
+const quotaSortModes = new Set([
+  "weekly_quota",
+  "hourly_quota",
+  "quota_reset_countdown",
+  "weekly_reset",
+  "hourly_reset",
+  "subscription",
+]);
 const filteredAccounts = computed(() => {
   const filter = settings.accountTypeFilter || "all";
   const keyword = accountSearchKeyword.value.trim().toLocaleLowerCase();
@@ -421,6 +430,8 @@ function sortAccountsForDisplay(source: CodexAccount[]): CodexAccount[] {
       case "hourly_quota":
         return quotaWindowForMinutes(account.quota, 300)?.percentage
           ?? Number.NEGATIVE_INFINITY;
+      case "quota_reset_countdown":
+        return nearestQuotaResetTime(account) ?? Number.POSITIVE_INFINITY;
       case "weekly_reset":
         return quotaWindowForMinutes(account.quota, 10_080)?.resetTime
           ?? Number.NEGATIVE_INFINITY;
@@ -464,6 +475,11 @@ function sortAccountsForDisplay(source: CodexAccount[]): CodexAccount[] {
     }
     const left = sortValue(a);
     const right = sortValue(b);
+    if (settings.sortMode === "quota_reset_countdown") {
+      const leftFinite = Number.isFinite(left);
+      const rightFinite = Number.isFinite(right);
+      if (leftFinite !== rightFinite) return leftFinite ? -1 : 1;
+    }
     if (left !== right) {
       return settings.sortMode === "custom" ? left - right : (left - right) * sortDirection;
     }
@@ -582,7 +598,7 @@ const showSortDirection = computed(() => quotaSortModes.has(settings.sortMode));
 function clampRefreshMinutes(value: unknown, fallback = 10): number {
   const minutes = Number(value);
   if (!Number.isFinite(minutes)) return fallback;
-  return Math.max(1, Math.min(1440, Math.round(minutes)));
+  return Math.max(1, Math.min(518400, Math.round(minutes)));
 }
 
 function normalizeAccountViewMode(value: unknown): CodexSwitcherSettings["accountViewMode"] {
@@ -625,7 +641,7 @@ function scheduleCountdownSettingsPersist(): void {
         : 0,
       showQuotaCountdowns: settings.showQuotaCountdowns ?? true,
       showAdditionalQuotaWindows: settings.showAdditionalQuotaWindows ?? true,
-      maxColumns: [3, 4, 5].includes(settings.maxColumns) ? settings.maxColumns : 3,
+      maxColumns: [3, 4, 5].includes(settings.maxColumns) ? settings.maxColumns : 5,
       language: settings.language || "zh-CN",
     }).catch(() => {
       // 倒计时缓存失败不影响主流程，下一次正常保存设置会带上最新时间。
@@ -752,6 +768,15 @@ function sessionGroupKey(session: CodexSessionRecord): string {
 function canShowQuota(account: CodexAccount): boolean {
   if (!settings.monitorQuota) return false;
   return !isApiKeyAccount(account);
+}
+
+function nearestQuotaResetTime(account: CodexAccount): number | undefined {
+  const candidates = [
+    hasQuotaWindow(account.quota, "hourly") ? account.quota?.hourly_reset_time : undefined,
+    hasQuotaWindow(account.quota, "weekly") ? account.quota?.weekly_reset_time : undefined,
+    ...additionalQuotaWindows(account.quota).map((window) => window.resetTime),
+  ].filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  return candidates.length ? Math.min(...candidates) : undefined;
 }
 
 function shouldShowQuota(account: CodexAccount): boolean {
@@ -1902,7 +1927,7 @@ async function loadSettings(options: { includeStorage?: boolean } = {}): Promise
       currentAccountNextRefreshAt: Number(nextSettings.currentAccountNextRefreshAt || 0),
       showQuotaCountdowns: nextSettings.showQuotaCountdowns ?? true,
       showAdditionalQuotaWindows: nextSettings.showAdditionalQuotaWindows ?? true,
-      maxColumns: [3, 4, 5].includes(nextSettings.maxColumns) ? nextSettings.maxColumns : 3,
+      maxColumns: [3, 4, 5].includes(nextSettings.maxColumns) ? nextSettings.maxColumns : 5,
       language: nextSettings.language || "zh-CN",
     });
     setLanguage(settings.language);
@@ -1963,7 +1988,7 @@ async function saveSettings(): Promise<void> {
         : 0,
       showQuotaCountdowns: settings.showQuotaCountdowns ?? true,
       showAdditionalQuotaWindows: settings.showAdditionalQuotaWindows ?? true,
-      maxColumns: [3, 4, 5].includes(settings.maxColumns) ? settings.maxColumns : 3,
+      maxColumns: [3, 4, 5].includes(settings.maxColumns) ? settings.maxColumns : 5,
       language: settings.language || "zh-CN",
     });
     Object.assign(settings, saved);
@@ -2095,19 +2120,45 @@ async function handleRefreshCurrentQuota(
   showMessage = true,
   updateNextRefresh = true,
 ): Promise<void> {
-  if (!settings.monitorQuota || !currentAccount.value || !canShowQuota(currentAccount.value)) {
+  if (!settings.monitorQuota || !currentAccount.value) {
     return;
   }
-  const accountId = currentAccount.value.id;
-  quotaRefreshingId.value = accountId;
+  const current = currentAccount.value;
+  const targetIds = await apiServiceQuotaRefreshAccountIds();
+  if (canShowQuota(current)) targetIds.add(current.id);
+  const targets = [...targetIds]
+    .map((id) => accounts.value.find((account) => account.id === id) ?? (
+      current.id === id ? current : undefined
+    ))
+    .filter((account): account is CodexAccount => Boolean(account))
+    .filter(canShowQuota);
+  if (!targets.length) return;
+  let refreshedCount = 0;
+  let failedCount = 0;
   try {
-    const updated = await refreshCodexQuota(accountId);
-    currentAccount.value = updated;
+    for (const account of targets) {
+      quotaRefreshingId.value = account.id;
+      try {
+        const updated = await refreshCodexQuota(account.id);
+        refreshedCount += 1;
+        if (currentAccount.value?.id === updated.id) {
+          currentAccount.value = updated;
+        }
+      } catch {
+        failedCount += 1;
+      }
+    }
     await loadAccounts();
     if (updateNextRefresh) {
       resetCurrentAccountQuotaTimer(true);
     }
-    if (showMessage) Message.success("当前账号额度已刷新");
+    if (showMessage) {
+      if (failedCount > 0) {
+        Message.warning(`已刷新 ${refreshedCount} 个账号额度，${failedCount} 个失败`);
+      } else {
+        Message.success(refreshedCount > 1 ? `已刷新 ${refreshedCount} 个账号额度` : "当前账号额度已刷新");
+      }
+    }
   } catch (error) {
     await loadAccounts();
     if (showMessage) Message.warning(`当前账号额度刷新失败：${errorText(error)}`);
@@ -2171,8 +2222,34 @@ function warnQuotaRefreshFailures(count: number): void {
 
 async function handleApiServiceAccountAdded(account: CodexAccount): Promise<void> {
   await loadAccounts();
+  await refreshApiServiceAccountIds();
   const quotaFailures = await refreshAccountsAfterMutation([account]);
   warnQuotaRefreshFailures(quotaFailures);
+}
+
+async function refreshApiServiceAccountIds(showError = false): Promise<void> {
+  try {
+    const bound = await listApiServiceBoundAccounts();
+    apiServiceAccountIds.value = new Set(
+      bound
+        .map((account) => account.accountId)
+        .filter((accountId): accountId is string => Boolean(accountId)),
+    );
+  } catch (error) {
+    apiServiceAccountIds.value = new Set();
+    if (showError) Message.error(`读取 API 服务账号失败：${errorText(error)}`);
+  }
+}
+
+async function apiServiceQuotaRefreshAccountIds(): Promise<Set<string>> {
+  try {
+    const serviceState = await getApiServiceState();
+    if (!serviceState.service.running) return new Set();
+    await refreshApiServiceAccountIds();
+    return new Set(apiServiceAccountIds.value);
+  } catch {
+    return new Set();
+  }
 }
 
 async function confirmResetCredit(account: CodexAccount): Promise<void> {
@@ -2475,13 +2552,14 @@ async function confirmBindSelectedToApiService(): Promise<void> {
   const apiKeyCount = selected.length - oauthCount;
   Modal.warning({
     title: "绑定到 API 服务",
-    content: `将绑定 ${selected.length} 个账号（OAuth ${oauthCount}，API Key ${apiKeyCount}）到 API 服务。是否继续？`,
+    content: `将先清空 API 服务中的现有账号，再写入本次选择的 ${selected.length} 个账号（OAuth ${oauthCount}，API Key ${apiKeyCount}）。是否继续？`,
     okText: "确认绑定",
     cancelText: "取消",
     hideCancel: false,
     async onOk() {
       try {
         const summary = await bindApiServiceAccounts(selected.map((account) => account.id));
+        await refreshApiServiceAccountIds();
         Message.success(
           `已绑定 ${summary.count} 个账号到 API 服务（OAuth ${summary.oauthCount}，API Key ${summary.apiKeyCount}）`,
         );
@@ -3884,6 +3962,7 @@ onMounted(() => {
   window.addEventListener("resize", handleWindowResize);
   void initializeResetState();
   void loadAccounts();
+  void refreshApiServiceAccountIds();
   void loadSettings({ includeStorage: false });
   void listen<OAuthCallbackEvent>("codex-oauth-callback-received", async (event) => {
     const payload = event.payload;
@@ -3991,6 +4070,7 @@ onUnmounted(() => {
         :api-key-balance-states="apiKeyBalanceStates"
         :privacy-masked="privacyMasked"
         :status-clock-ms="accountStatusClockMs"
+        :api-service-account-ids="apiServiceAccountIds"
         @toggle-account="toggleAccount"
         @toggle-pin="toggleAccountPin"
         @drag-start="handleDragStart"
@@ -4136,6 +4216,7 @@ onUnmounted(() => {
       :settings="settings"
       :auto-update-event="apiServiceAutoUpdateEvent"
       @account-added="handleApiServiceAccountAdded"
+      @bound-accounts-changed="refreshApiServiceAccountIds"
     />
 
     <SettingsPanel
