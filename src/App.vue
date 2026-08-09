@@ -307,6 +307,7 @@ const editTab = ref("form");
 const editJsonText = ref("");
 const editForm = reactive({
   accountName: "",
+  tags: [] as string[],
   apiKey: "",
   apiBaseUrl: "",
   apiProviderName: "",
@@ -397,6 +398,7 @@ const quotaSortModes = new Set([
   "weekly_reset",
   "hourly_reset",
   "subscription",
+  "tags",
 ]);
 const filteredAccounts = computed(() => {
   const filter = settings.accountTypeFilter || "all";
@@ -410,10 +412,11 @@ const filteredAccounts = computed(() => {
       (filter === "valid" && !isAccountAbnormal(account)) ||
       (filter === "pro" && effectivePlanKey(account) === "pro") ||
       (filter === "team" && ["team", "business", "enterprise", "edu", "go"].includes(effectivePlanKey(account))) ||
+      (filter.startsWith("tag:") && accountTags(account).includes(filter.slice(4))) ||
       effectivePlanKey(account) === filter;
     if (!matchesType) return false;
     if (!keyword) return true;
-    return [account.email, account.account_name]
+    return [account.email, account.account_name, ...accountTags(account)]
       .some((value) => (value || "").toLocaleLowerCase().includes(keyword));
   });
 });
@@ -442,6 +445,7 @@ function sortAccountsForDisplay(source: CodexAccount[]): CodexAccount[] {
         return dateSortValue(accountSubscriptionUntil(account));
       case "custom":
         return order.get(account.id) ?? Number.MAX_SAFE_INTEGER;
+      case "tags":
       case "created_at":
       default:
         return account.created_at;
@@ -456,7 +460,7 @@ function sortAccountsForDisplay(source: CodexAccount[]): CodexAccount[] {
       return aPinned - bPinned;
     }
     if (settings.sortMode !== "custom") {
-      const groupDiff = accountSortGroup(a) - accountSortGroup(b);
+      const groupDiff = settings.sortMode === "tags" ? 0 : accountSortGroup(a) - accountSortGroup(b);
       if (groupDiff !== 0) return groupDiff;
     }
     if (
@@ -480,6 +484,13 @@ function sortAccountsForDisplay(source: CodexAccount[]): CodexAccount[] {
       const rightFinite = Number.isFinite(right);
       if (leftFinite !== rightFinite) return leftFinite ? -1 : 1;
     }
+    if (settings.sortMode === "tags") {
+      const aHasTags = accountTags(a).length > 0;
+      const bHasTags = accountTags(b).length > 0;
+      if (aHasTags !== bHasTags) return aHasTags ? -1 : 1;
+      const tagDiff = accountTagSortKey(a).localeCompare(accountTagSortKey(b), currentLanguage.value);
+      if (tagDiff !== 0) return tagDiff * sortDirection;
+    }
     if (left !== right) {
       return settings.sortMode === "custom" ? left - right : (left - right) * sortDirection;
     }
@@ -488,6 +499,12 @@ function sortAccountsForDisplay(source: CodexAccount[]): CodexAccount[] {
 }
 const sortedAccounts = computed(() => sortAccountsForDisplay(filteredAccounts.value));
 const apiServiceAccounts = computed(() => sortAccountsForDisplay(accounts.value));
+const allAccountTags = computed(() => {
+  currentLanguage.value;
+  return [...new Set(accounts.value.flatMap(accountTags))].sort((a, b) =>
+    a.localeCompare(b, currentLanguage.value),
+  );
+});
 const totalPages = computed(() =>
   Math.max(1, Math.ceil(sortedAccounts.value.length / Math.max(1, settings.pageSize || 50))),
 );
@@ -503,7 +520,7 @@ const isCurrentPageSelected = computed(
 const accountTypeOptions = computed(() => {
   currentLanguage.value;
   const count = (predicate: (account: CodexAccount) => boolean) => accounts.value.filter(predicate).length;
-  return [
+  const baseOptions = [
     { label: `${t("全部")} (${accounts.value.length})`, value: "all" },
     { label: `OAuth (${oauthCount.value})`, value: "oauth" },
     { label: `API Key (${apiKeyCount.value})`, value: "apikey" },
@@ -519,6 +536,11 @@ const accountTypeOptions = computed(() => {
     { label: `${t("异常")} (${count(isAccountAbnormal)})`, value: "error" },
     { label: `${t("有效账号")} (${count((account) => !isAccountAbnormal(account))})`, value: "valid" },
   ];
+  const tagOptions = allAccountTags.value.map((tag) => ({
+    label: `${t("标签")}：${tag} (${count((account) => accountTags(account).includes(tag))})`,
+    value: `tag:${tag}`,
+  }));
+  return [...baseOptions, ...tagOptions];
 });
 const oauthCount = computed(
   () => accounts.value.filter((account) => !isApiKeyAccount(account)).length,
@@ -720,6 +742,20 @@ function apiKeyBalanceCanAutoFetch(account: CodexAccount): boolean {
 
 function displayName(account: CodexAccount): string {
   return account.account_name || account.email || account.id;
+}
+
+function accountTags(account: CodexAccount): string[] {
+  if (!Array.isArray(account.tags)) return [];
+  const tags: string[] = [];
+  for (const rawTag of account.tags) {
+    const tag = String(rawTag || "").trim();
+    if (tag && !tags.includes(tag)) tags.push(tag);
+  }
+  return tags;
+}
+
+function accountTagSortKey(account: CodexAccount): string {
+  return accountTags(account)[0] || "\uffff";
 }
 
 function maskDisplayText(value: string): string {
@@ -3068,6 +3104,7 @@ async function openEdit(account: CodexAccount): Promise<void> {
   editTab.value = "form";
   editJsonText.value = JSON.stringify(account, null, 2);
   editForm.accountName = account.account_name ?? "";
+  editForm.tags = accountTags(account);
   editForm.apiKey = account.openai_api_key ?? account.openaiApiKey ?? "";
   editForm.apiBaseUrl = account.api_base_url ?? account.apiBaseUrl ?? "https://api.openai.com/v1";
   editForm.apiProviderName = account.api_provider_name ?? account.apiProviderName ?? "OpenAI Official";
@@ -3116,6 +3153,7 @@ async function handleEditSave(): Promise<void> {
       updated = await updateCodexAccountProfile({
         accountId: account.id,
         accountName: editForm.accountName.trim(),
+        tags: editForm.tags,
       });
       if (isApiKeyAccount(account)) {
         updated = await updateCodexApiKeyCredentials({
@@ -4346,6 +4384,7 @@ onUnmounted(() => {
       :edit-form="editForm"
       :edit-json-text="editJsonText"
       :editing="editing"
+      :tag-options="allAccountTags"
       :is-api-key-account="isApiKeyAccount"
       @update:active-tab="editTab = $event"
       @update:edit-json-text="editJsonText = $event"

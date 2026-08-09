@@ -722,10 +722,45 @@ fn updates_account_profile_name_for_oauth_account() {
         .remove(0);
 
     let updated = store
-        .update_account_profile(&account.id, Some("主账号".to_string()))
+        .update_account_profile(&account.id, Some("主账号".to_string()), None)
         .expect("update profile");
 
     assert_eq!(updated.account_name.as_deref(), Some("主账号"));
+}
+
+#[test]
+fn updates_account_profile_tags_and_normalizes_duplicates() {
+    let (_storage, _codex, store) = test_store();
+    let account = store
+        .import_from_json(
+            &json!({
+                "email": "tagged@example.com",
+                "tokens": {
+                    "id_token": "id-token",
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import account")
+        .remove(0);
+
+    let updated = store
+        .update_account_profile(
+            &account.id,
+            Some("带标签账号".to_string()),
+            Some(vec![
+                " 主力 ".to_string(),
+                "测试".to_string(),
+                "主力".to_string(),
+                " ".to_string(),
+            ]),
+        )
+        .expect("update profile");
+
+    assert_eq!(updated.account_name.as_deref(), Some("带标签账号"));
+    assert_eq!(updated.tags, vec!["主力".to_string(), "测试".to_string()]);
 }
 
 #[test]

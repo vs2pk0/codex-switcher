@@ -190,6 +190,28 @@ function displayAccountEmail(account: CodexAccount): string {
   return displayIdentity(account.email || displayName(account));
 }
 
+function accountTags(account: CodexAccount): string[] {
+  if (!Array.isArray(account.tags)) return [];
+  const tags: string[] = [];
+  for (const rawTag of account.tags) {
+    const tag = String(rawTag || "").trim();
+    if (tag && !tags.includes(tag)) tags.push(tag);
+  }
+  return tags;
+}
+
+function visibleAccountTags(account: CodexAccount): string[] {
+  return accountTags(account).slice(0, 2);
+}
+
+function hiddenAccountTagCount(account: CodexAccount): number {
+  return Math.max(0, accountTags(account).length - visibleAccountTags(account).length);
+}
+
+function accountTagsTitle(account: CodexAccount): string {
+  return accountTags(account).join(" / ");
+}
+
 function boundOAuthAccount(account: CodexAccount): CodexAccount | undefined {
   if (!account.bound_oauth_account_id) return undefined;
   return props.accounts.find((item) => item.id === account.bound_oauth_account_id);
@@ -834,10 +856,10 @@ function formatTime(value?: number | null): string {
               <div class="account-title-main">
                 <span
                   class="account-name"
-                  :title="`${displayAccountEmail(account)}, ${t('双击复制邮箱')}`"
+                  :title="`${displayAccountName(account)} · ${displayAccountEmail(account)}, ${t('双击复制邮箱')}`"
                   @dblclick.stop="emit('copy-email', account)"
                 >
-                  {{ displayAccountEmail(account) }}
+                  {{ displayAccountName(account) }}
                 </span>
               </div>
               <div class="account-action-meta">
@@ -845,7 +867,21 @@ function formatTime(value?: number | null): string {
                 <span v-if="account.id === currentId" class="current-account-pill identity-current-pill">
                   {{ t("当前") }}
                 </span>
-                <span v-else class="identity-current-placeholder" aria-hidden="true" />
+                <span
+                  v-else-if="!accountTags(account).length && !isApiServiceAccount(account)"
+                  class="identity-current-placeholder"
+                  aria-hidden="true"
+                />
+                <a-tooltip v-if="accountTags(account).length" :content="accountTagsTitle(account)">
+                  <span class="account-tag-list">
+                    <span v-for="tag in visibleAccountTags(account)" :key="tag" class="account-tag-pill">
+                      {{ tag }}
+                    </span>
+                    <span v-if="hiddenAccountTagCount(account)" class="account-tag-pill more">
+                      +{{ hiddenAccountTagCount(account) }}
+                    </span>
+                  </span>
+                </a-tooltip>
                 <a-tooltip v-if="isApiServiceAccount(account)" :content="t('加入了 API 服务')">
                   <span class="api-service-pill" :title="t('加入了 API 服务')">A</span>
                 </a-tooltip>
@@ -1201,6 +1237,16 @@ function formatTime(value?: number | null): string {
           {{ displayAccountName(account) }}
         </button>
         <span v-if="account.id === currentId" class="current-account-pill compact-current">{{ t("当前") }}</span>
+        <a-tooltip v-if="accountTags(account).length" :content="accountTagsTitle(account)">
+          <span class="account-tag-list compact-account-tags">
+            <span v-for="tag in visibleAccountTags(account)" :key="tag" class="account-tag-pill">
+              {{ tag }}
+            </span>
+            <span v-if="hiddenAccountTagCount(account)" class="account-tag-pill more">
+              +{{ hiddenAccountTagCount(account) }}
+            </span>
+          </span>
+        </a-tooltip>
         <a-tooltip v-if="isApiServiceAccount(account)" :content="t('加入了 API 服务')">
           <span class="api-service-pill compact-api-service-pill" :title="t('加入了 API 服务')">A</span>
         </a-tooltip>
@@ -1333,6 +1379,9 @@ function formatTime(value?: number | null): string {
                 <span>
                   {{ accountAuthLine(account) }}
                   <template v-if="account.id === currentId"> · {{ t("当前") }}</template>
+                  <template v-if="accountTags(account).length">
+                    · {{ t("标签") }}: {{ accountTagsTitle(account) }}
+                  </template>
                   <template v-if="isApiServiceAccount(account)">
                     ·
                     <a-tooltip :content="t('加入了 API 服务')">

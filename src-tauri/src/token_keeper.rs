@@ -348,6 +348,7 @@ mod tests {
             id: "account-1".to_string(),
             email: "owner@example.com".to_string(),
             account_name: None,
+            tags: Vec::new(),
             auth_mode: None,
             openai_api_key: None,
             api_base_url: None,

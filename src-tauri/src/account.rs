@@ -80,6 +80,8 @@ pub struct CodexAccount {
     pub email: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -418,6 +420,7 @@ impl AccountStore {
         if let Some(existing) = existing {
             account.id = existing.id;
             account.account_name = existing.account_name;
+            account.tags = existing.tags;
             account.bound_phone = existing.bound_phone;
             account.created_at = existing.created_at;
             account.last_used = existing.last_used;
@@ -813,6 +816,7 @@ impl AccountStore {
         &self,
         account_id: &str,
         account_name: Option<String>,
+        tags: Option<Vec<String>>,
     ) -> Result<CodexAccount, String> {
         let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
@@ -822,6 +826,9 @@ impl AccountStore {
             .find(|account| account.id == account_id)
             .ok_or_else(|| "账号不存在".to_string())?;
         account.account_name = normalize_optional(account_name.as_deref());
+        if let Some(tags) = tags {
+            account.tags = normalize_account_tags(tags);
+        }
         let updated = account.clone();
         self.write_database(&database)?;
         Ok(updated)
@@ -1528,6 +1535,7 @@ impl AccountStore {
                 .unwrap_or_else(|| build_oauth_account_id(&email, &access_token)),
             email,
             account_name: read_string(value, &["account_name", "name"]),
+            tags: read_account_tags(value),
             auth_mode: None,
             openai_api_key: None,
             api_base_url: None,
@@ -1898,6 +1906,43 @@ fn normalize_optional(value: Option<&str>) -> Option<String> {
     }
 }
 
+fn normalize_account_tags(tags: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() || normalized.iter().any(|item| item == tag) {
+            continue;
+        }
+        normalized.push(tag.to_string());
+    }
+    normalized
+}
+
+fn read_account_tags(value: &Value) -> Vec<String> {
+    let Some(raw_tags) = value
+        .get("tags")
+        .or_else(|| value.get("tag"))
+        .or_else(|| value.get("labels"))
+        .or_else(|| value.get("label_tags"))
+        .or_else(|| value.get("标签"))
+    else {
+        return Vec::new();
+    };
+
+    let tags = match raw_tags {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+            .collect(),
+        Value::String(text) => text
+            .split(|ch| matches!(ch, ',' | '，' | ';' | '；' | '、'))
+            .map(ToOwned::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    };
+    normalize_account_tags(tags)
+}
+
 fn normalize_base_url(value: Option<&str>) -> Option<String> {
     normalize_optional(value).map(|url| url.trim_end_matches('/').to_ascii_lowercase())
 }
@@ -2054,6 +2099,7 @@ fn build_api_key_account_record(
         email: build_api_key_email(&api_key),
         account_name: normalize_optional(account_name.as_deref())
             .or_else(|| normalize_optional(api_provider_name.as_deref())),
+        tags: Vec::new(),
         auth_mode: Some("apikey".to_string()),
         openai_api_key: Some(api_key),
         api_base_url,
@@ -2158,6 +2204,10 @@ fn read_i64(value: &Value, keys: &[&str]) -> Option<i64> {
 }
 
 fn apply_import_metadata(account: &mut CodexAccount, value: &Value) {
+    let tags = read_account_tags(value);
+    if !tags.is_empty() {
+        account.tags = tags;
+    }
     account.plan_type = read_string(
         value,
         &[
@@ -2296,6 +2346,9 @@ fn token_export_account(account: &CodexAccount, accounts: &[CodexAccount]) -> Co
         .cloned()
         .unwrap_or_else(|| account.clone());
     source.account_name = account.account_name.clone().or(source.account_name);
+    if !account.tags.is_empty() {
+        source.tags = account.tags.clone();
+    }
     source.bound_phone = account.bound_phone.clone().or(source.bound_phone);
     source.default_model = account.default_model.clone().or(source.default_model);
     source
@@ -2432,6 +2485,19 @@ fn insert_account_metadata(payload: &mut serde_json::Map<String, Value>, account
     {
         payload.insert("bound_phone".to_string(), Value::String(phone.clone()));
         payload.insert("phone".to_string(), Value::String(phone));
+    }
+    if !account.tags.is_empty() {
+        payload.insert(
+            "tags".to_string(),
+            Value::Array(
+                account
+                    .tags
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect::<Vec<_>>(),
+            ),
+        );
     }
 }
 
