@@ -213,10 +213,12 @@ export function setCodexApiKeyDefaultModel(input: {
 export function updateCodexAccountProfile(input: {
   accountId: string;
   accountName?: string;
+  tags?: string[];
 }): Promise<CodexAccount> {
   return invoke("update_codex_account_profile", {
     accountId: input.accountId,
     accountName: input.accountName || null,
+    tags: input.tags || [],
   });
 }
 

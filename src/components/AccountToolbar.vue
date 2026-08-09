@@ -44,7 +44,7 @@ function cycleAccountViewMode(): void {
 }
 
 function handleSortModeChange(value: string): void {
-  if (value === "quota_reset_countdown") {
+  if (value === "quota_reset_countdown" || value === "tags") {
     props.settings.sortDirection = "asc";
   }
   emit("save-settings");
@@ -84,7 +84,7 @@ function handleSortModeChange(value: string): void {
         :model-value="accountSearchKeyword"
         class="account-search-input"
         allow-clear
-        :placeholder="t('筛选邮箱 / 昵称')"
+        :placeholder="t('筛选邮箱 / 昵称 / 标签')"
         @input="(value) => { $emit('update:account-search-keyword', String(value)); $emit('reset-page'); }"
         @clear="() => { $emit('update:account-search-keyword', ''); $emit('reset-page'); }"
       >
@@ -102,6 +102,7 @@ function handleSortModeChange(value: string): void {
         <a-option value="weekly_quota">{{ t("按周配额") }}</a-option>
         <a-option value="hourly_quota">{{ t("按5小时配额") }}</a-option>
         <a-option value="quota_reset_countdown">{{ t("按额度恢复倒计时") }}</a-option>
+        <a-option value="tags">{{ t("按标签") }}</a-option>
         <a-option value="weekly_reset">{{ t("按周配额重置时间") }}</a-option>
         <a-option value="hourly_reset">{{ t("按5小时配额重置时间") }}</a-option>
         <a-option value="subscription">{{ t("按订阅有效期") }}</a-option>

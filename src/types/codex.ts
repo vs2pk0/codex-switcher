@@ -10,6 +10,7 @@ export interface CodexAccount {
   id: string;
   email: string;
   account_name?: string;
+  tags?: string[];
   auth_mode?: CodexAuthMode;
   openai_api_key?: string;
   openaiApiKey?: string;

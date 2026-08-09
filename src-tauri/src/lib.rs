@@ -1019,8 +1019,9 @@ fn set_codex_api_key_default_model(
 fn update_codex_account_profile(
     account_id: String,
     account_name: Option<String>,
+    tags: Option<Vec<String>>,
 ) -> Result<CodexAccount, String> {
-    AccountStore::default().update_account_profile(&account_id, account_name)
+    AccountStore::default().update_account_profile(&account_id, account_name, tags)
 }
 
 #[tauri::command]

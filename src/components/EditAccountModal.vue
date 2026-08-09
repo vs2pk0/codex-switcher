@@ -9,6 +9,7 @@ defineProps<{
   editingAccount: CodexAccount | null;
   editForm: {
     accountName: string;
+    tags: string[];
     apiKey: string;
     apiBaseUrl: string;
     apiProviderName: string;
@@ -16,6 +17,7 @@ defineProps<{
   };
   editJsonText: string;
   editing: boolean;
+  tagOptions: string[];
   isApiKeyAccount: (account: CodexAccount) => boolean;
 }>();
 
@@ -41,6 +43,20 @@ defineEmits<{
           <a-form :model="editForm" layout="vertical">
             <a-form-item :label="t('账号名称')">
               <a-input v-model="editForm.accountName" :placeholder="t('例如：主力账号')" />
+            </a-form-item>
+            <a-form-item :label="t('标签')">
+              <a-select
+                v-model="editForm.tags"
+                multiple
+                allow-create
+                allow-clear
+                popup-container="body"
+                :placeholder="t('选择或输入标签')"
+              >
+                <a-option v-for="tag in tagOptions" :key="tag" :value="tag">
+                  {{ tag }}
+                </a-option>
+              </a-select>
             </a-form-item>
             <a-form-item v-if="editingAccount && isApiKeyAccount(editingAccount)" :label="t('供应商')">
               <a-input v-model="editForm.apiProviderName" placeholder="OpenAI Official" />
