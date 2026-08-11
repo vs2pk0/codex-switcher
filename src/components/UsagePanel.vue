@@ -1120,6 +1120,15 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
+    <a-alert
+      v-if="dashboard?.errors.length"
+      type="warning"
+      show-icon
+      class="usage-session-warning"
+    >
+      {{ t(`有 ${dashboard.errors.length} 个会话文件暂时无法读取，已跳过这些文件。`) }}
+    </a-alert>
+
     <a-spin :loading="loading" dot>
       <div class="usage-dashboard-grid">
         <div class="usage-main-column">
@@ -1596,12 +1605,6 @@ onBeforeUnmount(() => {
           </section>
         </aside>
       </div>
-
-      <a-alert
-        v-if="dashboard?.errors.length"
-        type="warning"
-        :content="t(`有 ${dashboard.errors.length} 个会话文件暂时无法读取，已跳过这些文件。`)"
-      />
     </a-spin>
 
     <a-modal

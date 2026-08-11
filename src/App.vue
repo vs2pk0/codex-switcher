@@ -31,8 +31,12 @@ import PushSettingsPanel from "./components/PushSettingsPanel.vue";
 import ResetCreditModal from "./components/ResetCreditModal.vue";
 import ResetPanel from "./components/ResetPanel.vue";
 import ResetScheduleModal from "./components/ResetScheduleModal.vue";
+import SessionCopyModal from "./components/SessionCopyModal.vue";
+import SessionContentModal from "./components/SessionContentModal.vue";
+import SessionDirectoryModal from "./components/SessionDirectoryModal.vue";
 import SessionPanel from "./components/SessionPanel.vue";
 import SessionRepairModal from "./components/SessionRepairModal.vue";
+import SessionRenameModal from "./components/SessionRenameModal.vue";
 import SessionRestoreModal from "./components/SessionRestoreModal.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
 import SortEditorModal from "./components/SortEditorModal.vue";
@@ -122,6 +126,7 @@ import {
   type AppUpdateInfo,
 } from "./services/appUpdate";
 import {
+  copySessionHistoryAcrossInstances,
   listSessionVisibilityRepairInstances,
   listSessionVisibilityRepairProviders,
   listSessionsAcrossInstances,
@@ -129,7 +134,9 @@ import {
   moveSessionsToTrashAcrossInstances,
   openPathInFileManager,
   repairSessionVisibilityAcrossInstances,
+  renameSessionAcrossInstances,
   restoreSessionsFromTrashAcrossInstances,
+  updateSessionWorkingDirectoryAcrossInstances,
   type CodexSessionRecord,
   type CodexSessionTokenStats,
   type CodexSessionVisibilityRepairInstanceOption,
@@ -384,6 +391,17 @@ const repairInstances = ref<CodexSessionVisibilityRepairInstanceOption[]>([]);
 const repairProviders = ref<CodexSessionVisibilityRepairProviderOption[]>([]);
 const repairResult = ref<CodexSessionVisibilityRepairSummary | null>(null);
 const sessionTrashMode = ref(false);
+const sessionCopyVisible = ref(false);
+const sessionCopySource = ref<CodexSessionRecord | null>(null);
+const sessionCopySaving = ref(false);
+const sessionContentVisible = ref(false);
+const sessionContentTarget = ref<CodexSessionRecord | null>(null);
+const sessionRenameVisible = ref(false);
+const sessionRenameTarget = ref<CodexSessionRecord | null>(null);
+const sessionRenameSaving = ref(false);
+const sessionDirectoryVisible = ref(false);
+const sessionDirectoryTarget = ref<CodexSessionRecord | null>(null);
+const sessionDirectorySaving = ref(false);
 const sessionSearch = reactive({
   titleQuery: "",
   contentQuery: "",
@@ -798,7 +816,7 @@ function isBoundApiKeyAccount(account: CodexAccount): boolean {
 }
 
 function sessionGroupKey(session: CodexSessionRecord): string {
-  return session.projectName || t("未归属项目");
+  return session.projectPath || session.projectName || t("未归属项目");
 }
 
 function canShowQuota(account: CodexAccount): boolean {
@@ -3479,6 +3497,94 @@ async function openSessionFolder(path: string): Promise<void> {
   }
 }
 
+function openSessionCopy(session: CodexSessionRecord): void {
+  if (sessions.value.length < 2) {
+    Message.warning(t("请先新建一个空会话并刷新列表"));
+    return;
+  }
+  sessionCopySource.value = session;
+  sessionCopyVisible.value = true;
+}
+
+function openSessionContent(session: CodexSessionRecord): void {
+  sessionContentTarget.value = session;
+  sessionContentVisible.value = true;
+}
+
+function handleSessionContentUpdated(): void {
+  void loadSessions({ silent: true });
+}
+
+async function handleCopySession(targetSessionId: string): Promise<void> {
+  const source = sessionCopySource.value;
+  if (!source || sessionCopySaving.value) return;
+  sessionCopySaving.value = true;
+  try {
+    const result = await copySessionHistoryAcrossInstances(source.id, targetSessionId);
+    sessionCopyVisible.value = false;
+    sessionCopySource.value = null;
+    Message.success(t("会话数据已复制，目标会话可以继续使用"));
+    if (result.warnings.length) {
+      Message.warning(`${t("会话已复制，但部分索引同步失败")}：${result.warnings.join("；")}`);
+    }
+    await loadSessions();
+  } catch (error) {
+    Message.error(`${t("复制会话失败")}：${errorText(error)}`);
+  } finally {
+    sessionCopySaving.value = false;
+  }
+}
+
+function openSessionRename(session: CodexSessionRecord): void {
+  sessionRenameTarget.value = session;
+  sessionRenameVisible.value = true;
+}
+
+async function handleRenameSession(title: string): Promise<void> {
+  const session = sessionRenameTarget.value;
+  if (!session || sessionRenameSaving.value) return;
+  sessionRenameSaving.value = true;
+  try {
+    const result = await renameSessionAcrossInstances(session.id, title);
+    sessionRenameVisible.value = false;
+    sessionRenameTarget.value = null;
+    Message.success(t("会话名称已修改"));
+    if (result.warnings.length) {
+      Message.warning(`${t("名称已保存，但部分索引同步失败")}：${result.warnings.join("；")}`);
+    }
+    await loadSessions();
+  } catch (error) {
+    Message.error(`${t("修改会话名称失败")}：${errorText(error)}`);
+  } finally {
+    sessionRenameSaving.value = false;
+  }
+}
+
+function openSessionDirectory(session: CodexSessionRecord): void {
+  sessionDirectoryTarget.value = session;
+  sessionDirectoryVisible.value = true;
+}
+
+async function handleSessionDirectorySave(projectPath: string): Promise<void> {
+  const session = sessionDirectoryTarget.value;
+  if (!session || sessionDirectorySaving.value) return;
+  sessionDirectorySaving.value = true;
+  try {
+    const result = await updateSessionWorkingDirectoryAcrossInstances(session.id, projectPath);
+    sessionDirectoryVisible.value = false;
+    sessionDirectoryTarget.value = null;
+    Message.success(t("工作目录已修改"));
+    if (result.warnings.length) {
+      Message.warning(`${t("工作目录已保存，但部分索引同步失败")}：${result.warnings.join("；")}`);
+    }
+    await loadSessions();
+  } catch (error) {
+    Message.error(`${t("修改工作目录失败")}：${errorText(error)}`);
+  } finally {
+    sessionDirectorySaving.value = false;
+  }
+}
+
 async function handleRepairSessions(): Promise<void> {
   repairResult.value = null;
   repairMode.value = "quick";
@@ -4238,6 +4344,38 @@ onUnmounted(() => {
       @toggle-session-group-selection="toggleSessionGroupSelection"
       @toggle-session="toggleSession"
       @open-session-folder="openSessionFolder"
+      @view-session-content="openSessionContent"
+      @copy-session="openSessionCopy"
+      @rename-session="openSessionRename"
+      @edit-session-directory="openSessionDirectory"
+    />
+
+    <SessionContentModal
+      v-model:visible="sessionContentVisible"
+      :session="sessionContentTarget"
+      @session-updated="handleSessionContentUpdated"
+    />
+
+    <SessionCopyModal
+      v-model:visible="sessionCopyVisible"
+      :source="sessionCopySource"
+      :sessions="sessions"
+      :saving="sessionCopySaving"
+      @save="handleCopySession"
+    />
+
+    <SessionRenameModal
+      v-model:visible="sessionRenameVisible"
+      :session="sessionRenameTarget"
+      :saving="sessionRenameSaving"
+      @save="handleRenameSession"
+    />
+
+    <SessionDirectoryModal
+      v-model:visible="sessionDirectoryVisible"
+      :session="sessionDirectoryTarget"
+      :saving="sessionDirectorySaving"
+      @save="handleSessionDirectorySave"
     />
 
     <UsagePanel

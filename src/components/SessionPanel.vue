@@ -38,6 +38,10 @@ const emit = defineEmits<{
   (event: "toggle-session-group-selection", group: SessionGroup): void;
   (event: "toggle-session", id: string): void;
   (event: "open-session-folder", path: string): void;
+  (event: "view-session-content", session: CodexSessionRecord): void;
+  (event: "copy-session", session: CodexSessionRecord): void;
+  (event: "rename-session", session: CodexSessionRecord): void;
+  (event: "edit-session-directory", session: CodexSessionRecord): void;
 }>();
 
 const totalTokens = computed(() => props.sessionGroups.reduce((sum, group) => sum + group.approximateTokens, 0));
@@ -127,7 +131,7 @@ function switchMode(trashMode: boolean): void {
             </a-button>
             <a-checkbox :model-value="isSessionGroupSelected(group)" @change="emit('toggle-session-group-selection', group)" />
             <icon-folder class="session-group-icon" />
-            <button class="session-group-title" type="button" :title="group.projectName" @click="emit('toggle-session-group-expanded', group.key)">{{ group.projectName }}</button>
+            <button class="session-group-title" type="button" :title="group.key" @click="emit('toggle-session-group-expanded', group.key)">{{ group.projectName }}</button>
             <span class="session-group-meta">{{ formatLocalizedCount(group.sessions.length, "条会话") }}</span>
             <span class="token-count">{{ formatTokens(group.approximateTokens) }}</span>
             <span class="session-size">{{ formatFileSize(group.sizeBytes) }}</span>
@@ -141,7 +145,23 @@ function switchMode(trashMode: boolean): void {
               <span class="token-count">{{ sessionApproxTokens(session.id) }}</span>
               <span class="session-size">{{ formatFileSize(session.sizeBytes) }}</span>
               <span>{{ formatTime(session.updatedAt) }}</span>
-              <a-button size="small" type="text" @click="emit('open-session-folder', session.path)"><template #icon><icon-folder /></template>{{ t("打开文件夹") }}</a-button>
+              <div class="session-child-actions">
+                <a-tooltip :content="t('查看会话内容')">
+                  <a-button size="small" type="text" @click="emit('view-session-content', session)"><template #icon><icon-eye /></template></a-button>
+                </a-tooltip>
+                <a-tooltip :content="t('复制到其他会话')">
+                  <a-button size="small" type="text" @click="emit('copy-session', session)"><template #icon><icon-copy /></template></a-button>
+                </a-tooltip>
+                <a-tooltip :content="t('修改会话名称')">
+                  <a-button size="small" type="text" @click="emit('rename-session', session)"><template #icon><icon-edit /></template></a-button>
+                </a-tooltip>
+                <a-tooltip :content="t('修改工作目录')">
+                  <a-button size="small" type="text" @click="emit('edit-session-directory', session)"><template #icon><icon-folder-add /></template></a-button>
+                </a-tooltip>
+                <a-tooltip :content="t('打开文件夹')">
+                  <a-button size="small" type="text" @click="emit('open-session-folder', session.path)"><template #icon><icon-folder /></template></a-button>
+                </a-tooltip>
+              </div>
             </article>
           </div>
         </section>

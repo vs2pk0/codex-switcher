@@ -1,8 +1,11 @@
+use crate::account::{replace_file_atomic, write_bytes_atomic};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -12,6 +15,7 @@ pub struct CodexSessionRecord {
     pub id: String,
     pub title: String,
     pub project_name: String,
+    pub project_path: String,
     pub path: String,
     pub updated_at: i64,
     pub message_count: usize,
@@ -58,6 +62,90 @@ pub struct CodexSessionTrashSummary {
     pub moved: usize,
     pub restored: usize,
     pub failed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionMutationResult {
+    pub session_id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
+    pub backup_path: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionContentPage {
+    pub session_id: String,
+    pub cursor: u64,
+    pub next_cursor: Option<u64>,
+    pub turns: Vec<CodexSessionTurn>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionTurn {
+    pub id: String,
+    pub timestamp: String,
+    pub messages: Vec<CodexSessionMessage>,
+    pub technical_item_count: usize,
+    pub can_delete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionMessage {
+    pub id: String,
+    pub role: String,
+    pub phase: String,
+    pub timestamp: String,
+    pub text: String,
+    pub attachments: Vec<CodexSessionAttachment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionAttachment {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub source_path: Option<String>,
+    pub mime_type: Option<String>,
+    pub size_bytes: u64,
+    pub available: bool,
+    pub inline: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionAsset {
+    pub data_url: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionTurnMutationResult {
+    pub session_id: String,
+    pub deleted_turn_id: String,
+    pub backup_id: String,
+    pub backup_path: String,
+    pub removed_bytes: u64,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionMessageMutationResult {
+    pub session_id: String,
+    pub deleted_message_ids: Vec<String>,
+    pub backup_id: String,
+    pub backup_path: String,
+    pub removed_bytes: u64,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +214,46 @@ struct SessionRepairRecord {
 }
 
 #[derive(Debug, Clone)]
+struct ParsedSessionTurn {
+    public: CodexSessionTurn,
+    start_offset: u64,
+    end_offset: u64,
+    complete: bool,
+    response_item_ids: HashSet<String>,
+    response_item_fingerprints: HashMap<String, usize>,
+}
+
+#[derive(Debug)]
+struct SessionMessageDeletionPlan {
+    message_ids: Vec<String>,
+    line_offsets: HashSet<u64>,
+    response_item_ids: HashSet<String>,
+    response_item_fingerprints: HashMap<String, usize>,
+}
+
+#[derive(Debug)]
+struct SessionTurnAccumulator {
+    id: String,
+    timestamp: String,
+    start_offset: u64,
+    end_offset: u64,
+    complete: bool,
+    response_messages: Vec<CodexSessionMessage>,
+    fallback_user_messages: Vec<CodexSessionMessage>,
+    fallback_assistant_messages: Vec<CodexSessionMessage>,
+    local_image_paths: Vec<String>,
+    technical_item_count: usize,
+    response_item_ids: HashSet<String>,
+    response_item_fingerprints: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionFileFingerprint {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SessionStore {
     codex_home: PathBuf,
 }
@@ -157,11 +285,15 @@ impl SessionStore {
     ) -> Result<Vec<CodexSessionRecord>, String> {
         let title_query = normalize_query(title_query);
         let content_query = normalize_query(content_query);
+        let custom_titles = self.read_session_titles();
         let mut sessions = Vec::new();
         for path in collect_jsonl_files(&self.sessions_dir())? {
             let content = fs::read_to_string(&path)
                 .map_err(|error| format!("读取会话失败 {}: {}", path.display(), error))?;
-            let record = build_session_record(&path, &content)?;
+            let mut record = build_session_record(&path, &content)?;
+            if let Some(title) = custom_titles.get(&record.id) {
+                record.title = title.clone();
+            }
             if let Some(query) = title_query.as_deref() {
                 if !record.title.to_lowercase().contains(query) {
                     continue;
@@ -176,6 +308,369 @@ impl SessionStore {
         }
         sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         Ok(sessions)
+    }
+
+    pub fn list_session_content(
+        &self,
+        session_id: &str,
+        cursor: Option<u64>,
+        limit: Option<usize>,
+        direction: Option<&str>,
+    ) -> Result<CodexSessionContentPage, String> {
+        let session_id = normalize_required_session_id(session_id)?;
+        let path = self.find_session_path(&session_id)?;
+        let limit = limit.unwrap_or(20).clamp(1, 50);
+        let direction = direction.unwrap_or("asc");
+        let (cursor, turns, next_cursor) = match direction {
+            "asc" => {
+                let cursor = cursor.unwrap_or(0);
+                let (turns, next_cursor) = read_session_turn_page(&path, cursor, limit)?;
+                (cursor, turns, next_cursor)
+            }
+            "desc" => {
+                let cursor = cursor.unwrap_or_else(|| {
+                    fs::metadata(&path)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or_default()
+                });
+                let (turns, next_cursor) = read_session_turn_page_desc(&path, cursor, limit)?;
+                (cursor, turns, next_cursor)
+            }
+            _ => return Err("无效的会话内容排序方向".to_string()),
+        };
+        Ok(CodexSessionContentPage {
+            session_id,
+            cursor,
+            next_cursor,
+            turns: turns.into_iter().map(|turn| turn.public).collect(),
+        })
+    }
+
+    pub fn get_session_asset(
+        &self,
+        session_id: &str,
+        asset_id: &str,
+    ) -> Result<CodexSessionAsset, String> {
+        let session_id = normalize_required_session_id(session_id)?;
+        let path = self.find_session_path(&session_id)?;
+        read_session_asset(&path, asset_id)
+    }
+
+    pub fn delete_session_turn(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<CodexSessionTurnMutationResult, String> {
+        let session_id = normalize_required_session_id(session_id)?;
+        let turn_id = turn_id.trim();
+        if turn_id.is_empty() {
+            return Err("请选择要删除的对话轮次".to_string());
+        }
+        let path = self.find_session_path(&session_id)?;
+        let before = session_file_fingerprint(&path)?;
+        let (target_turn, has_open_turn) = find_session_turn(&path, turn_id)?;
+        if has_open_turn {
+            return Err("该会话仍在生成或写入内容，请等待当前对话结束后再删除".to_string());
+        }
+        if !target_turn.complete {
+            return Err("未完成的对话轮次不能删除".to_string());
+        }
+
+        let tmp_path = rewrite_session_without_turn(&path, &target_turn)?;
+        if session_file_fingerprint(&path)? != before {
+            let _ = fs::remove_file(&tmp_path);
+            return Err("会话在删除过程中发生了更新，本次操作已取消，请刷新后重试".to_string());
+        }
+        let backup_path = self.backup_session_file(&path, "turn-delete")?;
+        if session_file_fingerprint(&path)? != before {
+            let _ = fs::remove_file(&tmp_path);
+            let _ = fs::remove_file(&backup_path);
+            return Err("会话在备份过程中发生了更新，本次操作已取消，请刷新后重试".to_string());
+        }
+        replace_file_atomic(&path, &tmp_path)
+            .map_err(|error| format!("写入删除后的会话失败: {}", error))?;
+        let after_len = fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default();
+        Ok(CodexSessionTurnMutationResult {
+            session_id,
+            deleted_turn_id: turn_id.to_string(),
+            backup_id: backup_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            backup_path: backup_path.to_string_lossy().to_string(),
+            removed_bytes: before.len.saturating_sub(after_len),
+            warnings: Vec::new(),
+        })
+    }
+
+    pub fn delete_session_messages(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        message_ids: &[String],
+    ) -> Result<CodexSessionMessageMutationResult, String> {
+        let session_id = normalize_required_session_id(session_id)?;
+        let turn_id = turn_id.trim();
+        if turn_id.is_empty() {
+            return Err("请选择消息所在的对话轮次".to_string());
+        }
+        let message_ids = message_ids
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        if message_ids.is_empty() {
+            return Err("请选择要删除的消息".to_string());
+        }
+
+        let path = self.find_session_path(&session_id)?;
+        let before = session_file_fingerprint(&path)?;
+        let (target_turn, has_open_turn) = find_session_turn(&path, turn_id)?;
+        if has_open_turn {
+            return Err("该会话仍在生成或写入内容，请等待当前对话结束后再删除".to_string());
+        }
+        if !target_turn.complete {
+            return Err("未完成的对话轮次不能删除消息".to_string());
+        }
+        let plan = build_message_deletion_plan(&path, &target_turn, &message_ids)?;
+        let tmp_path = rewrite_session_without_messages(&path, &plan)?;
+        if session_file_fingerprint(&path)? != before {
+            let _ = fs::remove_file(&tmp_path);
+            return Err("会话在删除过程中发生了更新，本次操作已取消，请刷新后重试".to_string());
+        }
+        let backup_path = self.backup_session_file(&path, "message-delete")?;
+        if session_file_fingerprint(&path)? != before {
+            let _ = fs::remove_file(&tmp_path);
+            let _ = fs::remove_file(&backup_path);
+            return Err("会话在备份过程中发生了更新，本次操作已取消，请刷新后重试".to_string());
+        }
+        replace_file_atomic(&path, &tmp_path)
+            .map_err(|error| format!("写入删除后的会话失败: {}", error))?;
+        let after_len = fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default();
+        Ok(CodexSessionMessageMutationResult {
+            session_id,
+            deleted_message_ids: plan.message_ids,
+            backup_id: backup_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            backup_path: backup_path.to_string_lossy().to_string(),
+            removed_bytes: before.len.saturating_sub(after_len),
+            warnings: Vec::new(),
+        })
+    }
+
+    pub fn restore_session_turn_backup(
+        &self,
+        session_id: &str,
+        backup_id: &str,
+    ) -> Result<CodexSessionMutationResult, String> {
+        let session_id = normalize_required_session_id(session_id)?;
+        let path = self.find_session_path(&session_id)?;
+        let backup_path = self.validated_turn_backup_path(&path, backup_id)?;
+        if session_has_open_turn(&path)? {
+            return Err("该会话仍在生成或写入内容，请等待当前对话结束后再恢复".to_string());
+        }
+        let before = session_file_fingerprint(&path)?;
+        let rollback_path = self.backup_session_file(&path, "before-restore")?;
+        if let Err(error) = restore_session_file_if_unchanged(&path, &backup_path, before) {
+            let _ = fs::remove_file(&rollback_path);
+            return Err(error);
+        }
+        let title = self
+            .read_session_titles()
+            .get(session_id.as_str())
+            .cloned()
+            .unwrap_or_else(|| file_stem(&path));
+        Ok(CodexSessionMutationResult {
+            session_id,
+            title,
+            project_path: None,
+            backup_path: Some(rollback_path.to_string_lossy().to_string()),
+            warnings: Vec::new(),
+        })
+    }
+
+    pub fn copy_session_history(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+    ) -> Result<CodexSessionMutationResult, String> {
+        let source_session_id = source_session_id.trim();
+        let target_session_id = target_session_id.trim();
+        if source_session_id.is_empty() || target_session_id.is_empty() {
+            return Err("源会话和目标会话不能为空".to_string());
+        }
+        if source_session_id == target_session_id {
+            return Err("源会话和目标会话不能相同".to_string());
+        }
+
+        let sessions = self.list_sessions(None, None)?;
+        let source = sessions
+            .iter()
+            .find(|session| session.id == source_session_id)
+            .ok_or_else(|| format!("源会话不存在: {}", source_session_id))?;
+        let target = sessions
+            .iter()
+            .find(|session| session.id == target_session_id)
+            .ok_or_else(|| format!("目标会话不存在: {}", target_session_id))?;
+        let source_path = Path::new(&source.path);
+        let target_path = Path::new(&target.path);
+        if session_has_open_turn(source_path)? {
+            return Err("源会话仍在生成或写入内容，请等待当前对话结束后再复制".to_string());
+        }
+        if session_has_open_turn(target_path)? {
+            return Err("目标会话仍在生成或写入内容，请等待当前对话结束后再复制".to_string());
+        }
+        let source_before = session_file_fingerprint(source_path)?;
+        let target_before = session_file_fingerprint(target_path)?;
+        let source_content = fs::read_to_string(source_path)
+            .map_err(|error| format!("读取源会话失败: {}", error))?;
+        let target_content = fs::read_to_string(target_path)
+            .map_err(|error| format!("读取目标会话失败: {}", error))?;
+        if session_file_fingerprint(source_path)? != source_before
+            || session_file_fingerprint(target_path)? != target_before
+        {
+            return Err(
+                "源会话或目标会话在读取期间发生了更新，本次操作已取消，请刷新后重试".to_string(),
+            );
+        }
+        let next_content = copy_history_onto_target(&source_content, &target_content)?;
+
+        if session_file_fingerprint(source_path)? != source_before
+            || session_file_fingerprint(target_path)? != target_before
+        {
+            return Err(
+                "源会话或目标会话在复制准备期间发生了更新，本次操作已取消，请刷新后重试"
+                    .to_string(),
+            );
+        }
+        let backup_path = self.backup_session_file(target_path, "copy")?;
+        if session_file_fingerprint(source_path)? != source_before
+            || session_file_fingerprint(target_path)? != target_before
+        {
+            let _ = fs::remove_file(&backup_path);
+            return Err(
+                "源会话或目标会话在备份期间发生了更新，本次操作已取消，请刷新后重试".to_string(),
+            );
+        }
+        if let Err(error) =
+            replace_session_bytes_if_unchanged(target_path, next_content.as_bytes(), target_before)
+        {
+            let _ = fs::remove_file(&backup_path);
+            return Err(error);
+        }
+
+        let mut warnings = Vec::new();
+        if let Err(error) = self.write_session_title(target_session_id, &source.title) {
+            warnings.push(error);
+        }
+        if let Err(error) = self.update_sqlite_session_title(target_session_id, &source.title) {
+            warnings.push(error);
+        }
+
+        Ok(CodexSessionMutationResult {
+            session_id: target_session_id.to_string(),
+            title: source.title.clone(),
+            project_path: None,
+            backup_path: Some(backup_path.to_string_lossy().to_string()),
+            warnings,
+        })
+    }
+
+    pub fn rename_session(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<CodexSessionMutationResult, String> {
+        let session_id = session_id.trim();
+        let title = normalize_custom_session_title(title)?;
+        if session_id.is_empty() {
+            return Err("会话不能为空".to_string());
+        }
+        if !self
+            .list_sessions(None, None)?
+            .iter()
+            .any(|session| session.id == session_id)
+        {
+            return Err(format!("会话不存在: {}", session_id));
+        }
+
+        self.write_session_title(session_id, &title)?;
+        let mut warnings = Vec::new();
+        if let Err(error) = self.update_sqlite_session_title(session_id, &title) {
+            warnings.push(error);
+        }
+        Ok(CodexSessionMutationResult {
+            session_id: session_id.to_string(),
+            title,
+            project_path: None,
+            backup_path: None,
+            warnings,
+        })
+    }
+
+    pub fn update_session_working_directory(
+        &self,
+        session_id: &str,
+        project_path: &str,
+    ) -> Result<CodexSessionMutationResult, String> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Err("会话不能为空".to_string());
+        }
+        let project_path = project_path.trim();
+        if project_path.is_empty() {
+            return Err("工作目录不能为空".to_string());
+        }
+        let directory = PathBuf::from(project_path);
+        if !directory.is_absolute() {
+            return Err("工作目录必须使用绝对路径".to_string());
+        }
+        if !directory.is_dir() {
+            return Err(format!(
+                "工作目录不存在或不是文件夹: {}",
+                directory.display()
+            ));
+        }
+        let normalized_path = directory.to_string_lossy().to_string();
+
+        let session = self
+            .list_sessions(None, None)?
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| format!("会话不存在: {}", session_id))?;
+        let session_path = Path::new(&session.path);
+        let content =
+            fs::read_to_string(session_path).map_err(|error| format!("读取会话失败: {}", error))?;
+        let next_content = rewrite_session_meta_cwd(&content, &normalized_path)?;
+        let backup_path = if let Some(next_content) = next_content {
+            let backup_path = self.backup_session_file(session_path, "cwd")?;
+            write_bytes_atomic(session_path, next_content.as_bytes())
+                .map_err(|error| format!("写入会话工作目录失败: {}", error))?;
+            Some(backup_path.to_string_lossy().to_string())
+        } else {
+            None
+        };
+
+        let mut warnings = Vec::new();
+        if let Err(error) = self.update_sqlite_session_cwd(session_id, &normalized_path) {
+            warnings.push(error);
+        }
+        Ok(CodexSessionMutationResult {
+            session_id: session_id.to_string(),
+            title: session.title,
+            project_path: Some(normalized_path),
+            backup_path,
+            warnings,
+        })
     }
 
     pub fn token_stats(
@@ -482,6 +977,186 @@ impl SessionStore {
         self.codex_home.join("sessions")
     }
 
+    fn read_session_titles(&self) -> std::collections::HashMap<String, String> {
+        let path = self.codex_home.join("session_index.jsonl");
+        let Ok(content) = fs::read_to_string(path) else {
+            return std::collections::HashMap::new();
+        };
+        content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|value| {
+                let id = read_string(&value, "id")?;
+                let title = ["thread_name", "title", "name"]
+                    .iter()
+                    .find_map(|key| read_string(&value, key))
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())?;
+                Some((id, title))
+            })
+            .collect()
+    }
+
+    fn write_session_title(&self, session_id: &str, title: &str) -> Result<(), String> {
+        let path = self.codex_home.join("session_index.jsonl");
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        let now = chrono::Utc::now();
+        let now_seconds = now.timestamp();
+        let now_millis = now.timestamp_millis();
+        let now_rfc3339 = now.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let mut found = false;
+        let mut lines = Vec::new();
+        for line in content.lines() {
+            let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+                lines.push(line.to_string());
+                continue;
+            };
+            if read_string(&value, "id").as_deref() != Some(session_id) {
+                lines.push(line.to_string());
+                continue;
+            }
+            found = true;
+            let Some(object) = value.as_object_mut() else {
+                lines.push(line.to_string());
+                continue;
+            };
+            object.insert("thread_name".to_string(), Value::String(title.to_string()));
+            if object.contains_key("title") {
+                object.insert("title".to_string(), Value::String(title.to_string()));
+            }
+            let updated_at = match object.get("updated_at") {
+                Some(Value::Number(_)) => Value::from(now_seconds),
+                _ => Value::String(now_rfc3339.clone()),
+            };
+            object.insert("updated_at".to_string(), updated_at);
+            if object.contains_key("updated_at_ms") {
+                object.insert("updated_at_ms".to_string(), Value::from(now_millis));
+            }
+            lines.push(
+                serde_json::to_string(&value)
+                    .map_err(|error| format!("序列化会话名称失败: {}", error))?,
+            );
+        }
+        if !found {
+            lines.push(
+                serde_json::to_string(&serde_json::json!({
+                    "id": session_id,
+                    "thread_name": title,
+                    "updated_at": now_rfc3339
+                }))
+                .map_err(|error| format!("序列化会话名称失败: {}", error))?,
+            );
+        }
+        let mut next = lines.join("\n");
+        next.push('\n');
+        write_bytes_atomic(&path, next.as_bytes())
+            .map_err(|error| format!("保存会话名称失败: {}", error))
+    }
+
+    fn update_sqlite_session_title(&self, session_id: &str, title: &str) -> Result<(), String> {
+        for db_path in self.sqlite_candidate_paths() {
+            let connection = Connection::open(&db_path).map_err(|error| {
+                format!("打开会话 SQLite 失败 ({}): {}", db_path.display(), error)
+            })?;
+            let columns = sqlite_thread_columns_with_connection(&connection)?;
+            let mut assignments = Vec::new();
+            if columns.contains("title") {
+                assignments.push("title = ?1");
+            }
+            if columns.contains("name") {
+                assignments.push("name = ?1");
+            }
+            if assignments.is_empty() {
+                continue;
+            }
+            connection
+                .execute(
+                    &format!(
+                        "UPDATE threads SET {} WHERE id = ?2",
+                        assignments.join(", ")
+                    ),
+                    params![title, session_id],
+                )
+                .map_err(|error| format!("同步会话名称失败 ({}): {}", db_path.display(), error))?;
+        }
+        Ok(())
+    }
+
+    fn update_sqlite_session_cwd(&self, session_id: &str, cwd: &str) -> Result<(), String> {
+        for db_path in self.sqlite_candidate_paths() {
+            let connection = Connection::open(&db_path).map_err(|error| {
+                format!("打开会话 SQLite 失败 ({}): {}", db_path.display(), error)
+            })?;
+            let columns = sqlite_thread_columns_with_connection(&connection)?;
+            if !columns.contains("cwd") {
+                continue;
+            }
+            connection
+                .execute(
+                    "UPDATE threads SET cwd = ?1 WHERE id = ?2",
+                    params![cwd, session_id],
+                )
+                .map_err(|error| {
+                    format!("同步会话工作目录失败 ({}): {}", db_path.display(), error)
+                })?;
+        }
+        Ok(())
+    }
+
+    fn find_session_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        for path in collect_jsonl_files(&self.sessions_dir())? {
+            if session_id_for_path(&path) == session_id || session_file_has_id(&path, session_id)? {
+                return Ok(path);
+            }
+        }
+        Err(format!("会话不存在: {}", session_id))
+    }
+
+    fn validated_turn_backup_path(
+        &self,
+        session_path: &Path,
+        backup_id: &str,
+    ) -> Result<PathBuf, String> {
+        let backup_id = backup_id.trim();
+        if backup_id.is_empty()
+            || Path::new(backup_id)
+                .file_name()
+                .and_then(|value| value.to_str())
+                != Some(backup_id)
+        {
+            return Err("无效的会话删除备份".to_string());
+        }
+        let session_hash = short_hash(&session_path.to_string_lossy());
+        let valid_suffix = ["turn-delete", "message-delete"]
+            .iter()
+            .any(|operation| backup_id.ends_with(&format!("-{operation}-{session_hash}.jsonl")));
+        if !valid_suffix {
+            return Err("会话删除备份与目标会话不匹配".to_string());
+        }
+        let path = session_edit_backup_dir().join(backup_id);
+        if !path.is_file() {
+            return Err("会话删除备份不存在".to_string());
+        }
+        Ok(path)
+    }
+
+    fn backup_session_file(&self, path: &Path, operation: &str) -> Result<PathBuf, String> {
+        let backup_dir = session_edit_backup_dir();
+        fs::create_dir_all(&backup_dir)
+            .map_err(|error| format!("创建会话备份目录失败: {}", error))?;
+        let file_name = format!(
+            "{}-{}-{}.jsonl",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S-%6f"),
+            operation,
+            short_hash(&path.to_string_lossy())
+        );
+        let backup_path = backup_dir.join(file_name);
+        if fs::hard_link(path, &backup_path).is_err() {
+            fs::copy(path, &backup_path).map_err(|error| format!("备份目标会话失败: {}", error))?;
+        }
+        Ok(backup_path)
+    }
+
     fn trash_dir(&self) -> PathBuf {
         session_trash_dir(&self.codex_home)
     }
@@ -756,6 +1431,20 @@ fn sqlite_thread_columns(db_path: &Path) -> Result<HashSet<String>, String> {
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+fn sqlite_thread_columns_with_connection(
+    connection: &Connection,
+) -> Result<HashSet<String>, String> {
+    let mut statement = connection
+        .prepare("SELECT name FROM pragma_table_info('threads')")
+        .map_err(|error| format!("读取会话 SQLite 表结构失败: {}", error))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("查询会话 SQLite 表结构失败: {}", error))?;
+    columns
+        .collect::<rusqlite::Result<HashSet<_>>>()
+        .map_err(|error| format!("解析会话 SQLite 表结构失败: {}", error))
 }
 
 fn sqlite_repair_set_clause(columns: &HashSet<String>, escaped_provider: &str) -> String {
@@ -1102,6 +1791,10 @@ fn visibility_repair_marker_path() -> PathBuf {
     switcher_root_dir().join("session-visibility-repair.json")
 }
 
+fn session_edit_backup_dir() -> PathBuf {
+    switcher_root_dir().join("session-edit-backups")
+}
+
 fn session_trash_dir(codex_home: &Path) -> PathBuf {
     switcher_root_dir()
         .join("session-trash")
@@ -1275,6 +1968,54 @@ fn rewrite_session_meta_provider(
     }
 }
 
+fn rewrite_session_meta_cwd(content: &str, cwd: &str) -> Result<Option<String>, String> {
+    let mut output = String::with_capacity(content.len() + cwd.len());
+    let mut handled_meta = false;
+    let mut changed = false;
+
+    for segment in content.split_inclusive('\n') {
+        let (body, ending) = if let Some(body) = segment.strip_suffix("\r\n") {
+            (body, "\r\n")
+        } else if let Some(body) = segment.strip_suffix('\n') {
+            (body, "\n")
+        } else {
+            (segment, "")
+        };
+        if handled_meta || body.trim().is_empty() {
+            output.push_str(segment);
+            continue;
+        }
+        let Ok(mut value) = serde_json::from_str::<Value>(body) else {
+            output.push_str(segment);
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            output.push_str(segment);
+            continue;
+        }
+        let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) else {
+            output.push_str(segment);
+            continue;
+        };
+        handled_meta = true;
+        if payload.get("cwd").and_then(Value::as_str) == Some(cwd) {
+            output.push_str(segment);
+            continue;
+        }
+        payload.insert("cwd".to_string(), Value::String(cwd.to_string()));
+        let line = serde_json::to_string(&value)
+            .map_err(|error| format!("序列化会话工作目录失败: {}", error))?;
+        output.push_str(&line);
+        output.push_str(ending);
+        changed = true;
+    }
+
+    if !handled_meta {
+        return Err("会话缺少可修改的 session_meta".to_string());
+    }
+    Ok(changed.then_some(output))
+}
+
 fn run_sqlite(db_path: &Path, sql: &str) -> Result<String, String> {
     let output = Command::new("sqlite3")
         .arg(db_path)
@@ -1305,9 +2046,1259 @@ fn sql_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+impl SessionTurnAccumulator {
+    fn new(id: String, timestamp: String, start_offset: u64) -> Self {
+        Self {
+            id,
+            timestamp,
+            start_offset,
+            end_offset: start_offset,
+            complete: false,
+            response_messages: Vec::new(),
+            fallback_user_messages: Vec::new(),
+            fallback_assistant_messages: Vec::new(),
+            local_image_paths: Vec::new(),
+            technical_item_count: 0,
+            response_item_ids: HashSet::new(),
+            response_item_fingerprints: HashMap::new(),
+        }
+    }
+
+    fn finish(mut self) -> Option<ParsedSessionTurn> {
+        let has_user_response = self
+            .response_messages
+            .iter()
+            .any(|message| message.role == "user");
+        let has_assistant_response = self
+            .response_messages
+            .iter()
+            .any(|message| message.role == "assistant");
+        if !has_user_response {
+            self.response_messages
+                .append(&mut self.fallback_user_messages);
+        }
+        if !has_assistant_response {
+            self.response_messages
+                .append(&mut self.fallback_assistant_messages);
+        }
+        attach_local_image_paths(&mut self.response_messages, &self.local_image_paths);
+        self.response_messages
+            .sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+        if self.response_messages.is_empty() {
+            return None;
+        }
+        if self.timestamp.is_empty() {
+            self.timestamp = self
+                .response_messages
+                .first()
+                .map(|message| message.timestamp.clone())
+                .unwrap_or_default();
+        }
+        Some(ParsedSessionTurn {
+            public: CodexSessionTurn {
+                id: self.id,
+                timestamp: self.timestamp,
+                messages: self.response_messages,
+                technical_item_count: self.technical_item_count,
+                can_delete: self.complete,
+            },
+            start_offset: self.start_offset,
+            end_offset: self.end_offset,
+            complete: self.complete,
+            response_item_ids: self.response_item_ids,
+            response_item_fingerprints: self.response_item_fingerprints,
+        })
+    }
+}
+
+fn normalize_required_session_id(session_id: &str) -> Result<String, String> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Err("会话不能为空".to_string());
+    }
+    Ok(session_id.to_string())
+}
+
+fn session_file_fingerprint(path: &Path) -> Result<SessionFileFingerprint, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("读取会话文件状态失败 ({}): {}", path.display(), error))?;
+    Ok(SessionFileFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+fn session_file_has_id(path: &Path, session_id: &str) -> Result<bool, String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("读取会话失败 {}: {}", path.display(), error))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    for _ in 0..20 {
+        line.clear();
+        if reader
+            .read_line(&mut line)
+            .map_err(|error| format!("读取会话失败 {}: {}", path.display(), error))?
+            == 0
+        {
+            break;
+        }
+        if let Some(found) = extract_session_id(&line) {
+            return Ok(found == session_id);
+        }
+    }
+    Ok(false)
+}
+
+fn read_session_turn_page(
+    path: &Path,
+    cursor: u64,
+    limit: usize,
+) -> Result<(Vec<ParsedSessionTurn>, Option<u64>), String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("读取会话内容失败 ({}): {}", path.display(), error))?;
+    let file_len = file
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or_default();
+    if cursor > file_len {
+        return Err("会话内容游标已失效，请重新打开会话".to_string());
+    }
+    let mut reader = BufReader::new(file);
+    reader
+        .seek(SeekFrom::Start(cursor))
+        .map_err(|error| format!("定位会话内容失败: {}", error))?;
+    let mut turns = Vec::new();
+    let mut current: Option<SessionTurnAccumulator> = None;
+    let mut line = Vec::new();
+    let mut position = cursor;
+
+    loop {
+        line.clear();
+        let line_start = position;
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| format!("读取会话内容失败: {}", error))?;
+        if read == 0 {
+            break;
+        }
+        position = position.saturating_add(read as u64);
+        let text = String::from_utf8_lossy(&line);
+        let needs_parse = text.contains("task_started")
+            || text.contains("task_complete")
+            || text.contains("turn_aborted")
+            || text.contains("response_item")
+            || text.contains("user_message")
+            || text.contains("agent_message");
+        let value = needs_parse
+            .then(|| serde_json::from_slice::<Value>(&line).ok())
+            .flatten();
+
+        if let Some((turn_id, timestamp)) = value.as_ref().and_then(task_started_marker) {
+            if let Some(previous) = current.take() {
+                if let Some(turn) = previous.finish() {
+                    turns.push(turn);
+                }
+            }
+            if turns.len() >= limit {
+                return Ok((turns, Some(line_start)));
+            }
+            let turn_id = if turn_id.is_empty() {
+                format!("offset-{line_start:x}")
+            } else {
+                turn_id
+            };
+            current = Some(SessionTurnAccumulator::new(turn_id, timestamp, line_start));
+            continue;
+        }
+
+        if current.is_none() {
+            if let Some(value) = value.as_ref() {
+                if is_visible_user_response(value) {
+                    current = Some(SessionTurnAccumulator::new(
+                        format!("offset-{line_start:x}"),
+                        read_string(value, "timestamp").unwrap_or_default(),
+                        line_start,
+                    ));
+                }
+            }
+        }
+
+        let Some(accumulator) = current.as_mut() else {
+            continue;
+        };
+        accumulator.end_offset = position;
+        let mut handled = false;
+        if let Some(value) = value.as_ref() {
+            if let Some((item_id, fingerprint)) = response_item_identity(value) {
+                if let Some(item_id) = item_id {
+                    accumulator.response_item_ids.insert(item_id);
+                }
+                *accumulator
+                    .response_item_fingerprints
+                    .entry(fingerprint)
+                    .or_insert(0) += 1;
+            }
+            if let Some(message) = parse_response_message(value, line_start) {
+                handled = true;
+                if should_display_session_message(&message) {
+                    accumulator.response_messages.push(message);
+                } else {
+                    accumulator.technical_item_count += 1;
+                }
+            } else if let Some((message, local_images)) =
+                parse_event_user_message(value, line_start)
+            {
+                handled = true;
+                accumulator.local_image_paths.extend(local_images);
+                if should_display_session_message(&message) {
+                    accumulator.fallback_user_messages.push(message);
+                } else {
+                    accumulator.technical_item_count += 1;
+                }
+            } else if let Some(message) = parse_event_assistant_message(value, line_start) {
+                handled = true;
+                accumulator.fallback_assistant_messages.push(message);
+            }
+        }
+        if !handled && is_technical_session_line(&text) {
+            accumulator.technical_item_count += 1;
+        }
+
+        if value
+            .as_ref()
+            .is_some_and(|value| task_finished_marker(value, accumulator.id.as_str()))
+        {
+            accumulator.complete = true;
+            if let Some(turn) = current.take().and_then(SessionTurnAccumulator::finish) {
+                turns.push(turn);
+            }
+            if turns.len() >= limit {
+                return Ok((turns, (position < file_len).then_some(position)));
+            }
+        }
+    }
+
+    if let Some(turn) = current.and_then(SessionTurnAccumulator::finish) {
+        turns.push(turn);
+    }
+    Ok((turns, None))
+}
+
+fn read_session_turn_page_desc(
+    path: &Path,
+    cursor: u64,
+    limit: usize,
+) -> Result<(Vec<ParsedSessionTurn>, Option<u64>), String> {
+    let file_len = fs::metadata(path)
+        .map_err(|error| format!("读取会话内容失败 ({}): {}", path.display(), error))?
+        .len();
+    if cursor > file_len {
+        return Err("会话内容游标已失效，请重新打开会话".to_string());
+    }
+    if cursor == 0 {
+        return Ok((Vec::new(), None));
+    }
+
+    let mut marker_limit = limit.saturating_add(1).max(2);
+    loop {
+        let scan = find_task_started_offsets_reverse(path, cursor, marker_limit)?;
+        if scan.offsets.is_empty() {
+            return read_session_turn_page_desc_legacy(path, cursor, limit);
+        }
+        let earliest_offset = *scan.offsets.last().unwrap_or(&0);
+        let (mut turns, _) = read_session_turn_page(path, earliest_offset, marker_limit)?;
+        turns.retain(|turn| turn.start_offset < cursor);
+        if turns.len() > limit {
+            let selected = turns.split_off(turns.len() - limit);
+            let next_cursor = selected.first().map(|turn| turn.start_offset);
+            let mut selected = selected;
+            selected.reverse();
+            return Ok((selected, next_cursor));
+        }
+        if scan.reached_start {
+            turns.reverse();
+            return Ok((turns, None));
+        }
+        marker_limit = marker_limit.saturating_mul(2);
+        if marker_limit == usize::MAX {
+            return read_session_turn_page_desc_legacy(path, cursor, limit);
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReverseTurnStartScan {
+    offsets: Vec<u64>,
+    reached_start: bool,
+}
+
+fn find_task_started_offsets_reverse(
+    path: &Path,
+    cursor: u64,
+    max_count: usize,
+) -> Result<ReverseTurnStartScan, String> {
+    const REVERSE_READ_CHUNK_SIZE: usize = 256 * 1024;
+
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("读取会话内容失败 ({}): {}", path.display(), error))?;
+    let file_len = file
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or_default();
+    if cursor > file_len {
+        return Err("会话内容游标已失效，请重新打开会话".to_string());
+    }
+
+    let mut position = cursor;
+    let mut suffix = Vec::new();
+    let mut offsets = Vec::with_capacity(max_count);
+    while position > 0 && offsets.len() < max_count {
+        let start = position.saturating_sub(REVERSE_READ_CHUNK_SIZE as u64);
+        let chunk_len =
+            usize::try_from(position - start).map_err(|_| "会话内容分块长度无效".to_string())?;
+        let mut chunk = vec![0u8; chunk_len];
+        file.seek(SeekFrom::Start(start))
+            .map_err(|error| format!("定位会话内容失败: {}", error))?;
+        file.read_exact(&mut chunk)
+            .map_err(|error| format!("读取会话内容失败: {}", error))?;
+        chunk.extend_from_slice(&suffix);
+
+        let first_complete_index = if start == 0 {
+            0
+        } else {
+            chunk
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|index| index + 1)
+                .unwrap_or(chunk.len())
+        };
+        let mut line_end = chunk.len();
+        if line_end > first_complete_index && chunk[line_end - 1] == b'\n' {
+            line_end -= 1;
+        }
+        while line_end > first_complete_index && offsets.len() < max_count {
+            let line_start = chunk[first_complete_index..line_end]
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map(|index| first_complete_index + index + 1)
+                .unwrap_or(first_complete_index);
+            let line = &chunk[line_start..line_end];
+            if line_contains_task_started(line) {
+                offsets.push(start.saturating_add(line_start as u64));
+            }
+            if line_start == first_complete_index {
+                break;
+            }
+            line_end = line_start - 1;
+        }
+
+        suffix = chunk[..first_complete_index].to_vec();
+        position = start;
+    }
+
+    let reached_start = position == 0 && offsets.len() < max_count;
+    Ok(ReverseTurnStartScan {
+        offsets,
+        reached_start,
+    })
+}
+
+fn line_contains_task_started(line: &[u8]) -> bool {
+    line.windows(12).any(|window| window == b"task_started")
+        && serde_json::from_slice::<Value>(line)
+            .ok()
+            .as_ref()
+            .and_then(task_started_marker)
+            .is_some()
+}
+
+fn read_session_turn_page_desc_legacy(
+    path: &Path,
+    cursor: u64,
+    limit: usize,
+) -> Result<(Vec<ParsedSessionTurn>, Option<u64>), String> {
+    let mut recent = VecDeque::with_capacity(limit.saturating_add(1));
+    let mut scan_cursor = 0u64;
+    loop {
+        let (page, next_cursor) = read_session_turn_page(path, scan_cursor, 50)?;
+        let mut reached_cursor = false;
+        for turn in page {
+            if turn.start_offset >= cursor {
+                reached_cursor = true;
+                break;
+            }
+            recent.push_back(turn);
+            if recent.len() > limit.saturating_add(1) {
+                recent.pop_front();
+            }
+        }
+        if reached_cursor {
+            break;
+        }
+        let Some(next_cursor) = next_cursor else {
+            break;
+        };
+        if next_cursor <= scan_cursor || next_cursor >= cursor {
+            break;
+        }
+        scan_cursor = next_cursor;
+    }
+    let has_more = recent.len() > limit;
+    while recent.len() > limit {
+        recent.pop_front();
+    }
+    let next_cursor = has_more
+        .then(|| recent.front().map(|turn| turn.start_offset))
+        .flatten();
+    let mut turns = recent.into_iter().collect::<Vec<_>>();
+    turns.reverse();
+    Ok((turns, next_cursor))
+}
+
+fn task_started_marker(value: &Value) -> Option<(String, String)> {
+    if value.get("type").and_then(Value::as_str) != Some("event_msg")
+        || value
+            .get("payload")
+            .and_then(|payload| payload.get("type"))
+            .and_then(Value::as_str)
+            != Some("task_started")
+    {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    Some((
+        payload
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_default(),
+        value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    ))
+}
+
+fn task_finished_marker(value: &Value, turn_id: &str) -> bool {
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return false;
+    }
+    let Some(payload) = value.get("payload") else {
+        return false;
+    };
+    let event_type = payload.get("type").and_then(Value::as_str);
+    if !matches!(event_type, Some("task_complete" | "turn_aborted")) {
+        return false;
+    }
+    payload
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .map(|value| value == turn_id)
+        .unwrap_or(true)
+}
+
+fn is_visible_user_response(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("response_item")
+        && value
+            .get("payload")
+            .and_then(|payload| payload.get("type"))
+            .and_then(Value::as_str)
+            == Some("message")
+        && value
+            .get("payload")
+            .and_then(|payload| payload.get("role"))
+            .and_then(Value::as_str)
+            == Some("user")
+}
+
+fn parse_response_message(value: &Value, line_offset: u64) -> Option<CodexSessionMessage> {
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    let role = payload.get("role").and_then(Value::as_str)?;
+    if !matches!(role, "user" | "assistant") {
+        return None;
+    }
+    let timestamp = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let message_id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let id = message_id
+        .clone()
+        .unwrap_or_else(|| format!("message-{line_offset:x}"));
+    let phase = payload
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut text_parts = Vec::new();
+    let mut attachments = Vec::new();
+    for (index, item) in payload
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if matches!(item_type, "input_text" | "output_text" | "text") {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    text_parts.push(text.to_string());
+                }
+            }
+            continue;
+        }
+        if matches!(item_type, "input_image" | "image") {
+            let data_url = item
+                .get("image_url")
+                .or_else(|| item.get("imageUrl"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            attachments.push(CodexSessionAttachment {
+                id: format!("{line_offset:x}:{index}"),
+                kind: "image".to_string(),
+                name: format!("图片 {}", attachments.len() + 1),
+                source_path: None,
+                mime_type: data_url_mime_type(data_url),
+                size_bytes: data_url_size(data_url),
+                available: !data_url.is_empty(),
+                inline: true,
+            });
+        }
+    }
+    let text = text_parts.join("\n\n");
+    attachments.extend(extract_mentioned_files(&text));
+    Some(CodexSessionMessage {
+        id,
+        role: role.to_string(),
+        phase,
+        timestamp,
+        text,
+        attachments,
+    })
+}
+
+fn parse_event_user_message(
+    value: &Value,
+    line_offset: u64,
+) -> Option<(CodexSessionMessage, Vec<String>)> {
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("user_message") {
+        return None;
+    }
+    let text = payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let local_images = payload
+        .get("local_images")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let attachments = extract_mentioned_files(&text);
+    Some((
+        CodexSessionMessage {
+            id: payload
+                .get("client_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("event-user-{line_offset:x}")),
+            role: "user".to_string(),
+            phase: String::new(),
+            timestamp: value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            text,
+            attachments,
+        },
+        local_images,
+    ))
+}
+
+fn parse_event_assistant_message(value: &Value, line_offset: u64) -> Option<CodexSessionMessage> {
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("agent_message") {
+        return None;
+    }
+    Some(CodexSessionMessage {
+        id: format!("event-assistant-{line_offset:x}"),
+        role: "assistant".to_string(),
+        phase: payload
+            .get("phase")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        timestamp: value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        text: payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        attachments: Vec::new(),
+    })
+}
+
+fn should_display_session_message(message: &CodexSessionMessage) -> bool {
+    if message.role != "user" {
+        return !message.text.trim().is_empty() || !message.attachments.is_empty();
+    }
+    let text = message.text.trim();
+    if text.is_empty() {
+        return !message.attachments.is_empty();
+    }
+    !is_internal_session_title(text) || text.contains("My request") || text.contains("我的请求")
+}
+
+fn is_technical_session_line(line: &str) -> bool {
+    !line.contains("\"type\":\"session_meta\"")
+        && !line.contains("\"type\": \"session_meta\"")
+        && !line.contains("\"type\":\"turn_context\"")
+        && !line.contains("\"type\": \"turn_context\"")
+        && !line.contains("\"type\":\"world_state\"")
+        && !line.contains("\"type\": \"world_state\"")
+}
+
+fn attach_local_image_paths(messages: &mut [CodexSessionMessage], paths: &[String]) {
+    let mut path_index = 0usize;
+    for message in messages.iter_mut().filter(|message| message.role == "user") {
+        for attachment in message
+            .attachments
+            .iter_mut()
+            .filter(|attachment| attachment.kind == "image" && attachment.inline)
+        {
+            let Some(path) = paths.get(path_index) else {
+                break;
+            };
+            attachment.source_path = Some(path.clone());
+            attachment.name = Path::new(path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("图片")
+                .to_string();
+            path_index += 1;
+        }
+        deduplicate_message_attachments(&mut message.attachments);
+    }
+    if path_index >= paths.len() {
+        return;
+    }
+    let Some(message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == "user")
+    else {
+        return;
+    };
+    for path in &paths[path_index..] {
+        message.attachments.push(file_attachment(path, None));
+    }
+    deduplicate_message_attachments(&mut message.attachments);
+}
+
+fn deduplicate_message_attachments(attachments: &mut Vec<CodexSessionAttachment>) {
+    let mut seen = HashSet::new();
+    attachments.retain(|attachment| {
+        let key = attachment
+            .source_path
+            .clone()
+            .unwrap_or_else(|| attachment.id.clone());
+        seen.insert(key)
+    });
+}
+
+fn extract_mentioned_files(text: &str) -> Vec<CodexSessionAttachment> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let line = line.strip_prefix("## ")?;
+            let (name, source_path) = line.rsplit_once(": ")?;
+            let source_path = source_path.trim();
+            if source_path.is_empty() || !Path::new(source_path).is_absolute() {
+                return None;
+            }
+            Some(file_attachment(source_path, Some(name.trim())))
+        })
+        .collect()
+}
+
+fn file_attachment(source_path: &str, preferred_name: Option<&str>) -> CodexSessionAttachment {
+    let path = Path::new(source_path);
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let kind = if matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
+    ) {
+        "image"
+    } else if matches!(extension.as_str(), "mp3" | "wav" | "m4a" | "aac" | "ogg") {
+        "audio"
+    } else {
+        "file"
+    };
+    CodexSessionAttachment {
+        id: format!("file-{}", short_hash(source_path)),
+        kind: kind.to_string(),
+        name: preferred_name
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "附件".to_string()),
+        source_path: Some(source_path.to_string()),
+        mime_type: None,
+        size_bytes: fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default(),
+        available: path.is_file(),
+        inline: false,
+    }
+}
+
+fn data_url_mime_type(data_url: &str) -> Option<String> {
+    data_url
+        .strip_prefix("data:")
+        .and_then(|value| value.split_once(';').map(|(mime, _)| mime))
+        .filter(|mime| !mime.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn data_url_size(data_url: &str) -> u64 {
+    let encoded_len = data_url
+        .split_once(',')
+        .map(|(_, encoded)| encoded.len())
+        .unwrap_or_default();
+    (encoded_len.saturating_mul(3) / 4) as u64
+}
+
+fn response_item_identity(value: &Value) -> Option<(Option<String>, String)> {
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    let id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    Some((id, response_item_payload_fingerprint(payload)?))
+}
+
+fn response_item_payload_fingerprint(payload: &Value) -> Option<String> {
+    let mut normalized = payload.clone();
+    normalized.as_object_mut()?.remove("id");
+    let serialized = serde_json::to_vec(&normalized).ok()?;
+    Some(hex_sha256(&serialized))
+}
+
+fn hex_sha256(content: &[u8]) -> String {
+    Sha256::digest(content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn read_session_asset(path: &Path, asset_id: &str) -> Result<CodexSessionAsset, String> {
+    let (offset, content_index) = asset_id
+        .trim()
+        .split_once(':')
+        .ok_or_else(|| "无效的会话附件标识".to_string())?;
+    let offset = u64::from_str_radix(offset, 16).map_err(|_| "无效的会话附件位置".to_string())?;
+    let content_index = content_index
+        .parse::<usize>()
+        .map_err(|_| "无效的会话附件序号".to_string())?;
+    let file = fs::File::open(path).map_err(|error| format!("读取会话附件失败: {}", error))?;
+    let file_len = file
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or_default();
+    if offset >= file_len {
+        return Err("会话附件位置已失效，请刷新后重试".to_string());
+    }
+    let mut reader = BufReader::new(file);
+    reader
+        .seek(SeekFrom::Start(offset))
+        .map_err(|error| format!("定位会话附件失败: {}", error))?;
+    let mut line = Vec::new();
+    reader
+        .read_until(b'\n', &mut line)
+        .map_err(|error| format!("读取会话附件失败: {}", error))?;
+    let value: Value =
+        serde_json::from_slice(&line).map_err(|error| format!("解析会话附件失败: {}", error))?;
+    let item = value
+        .get("payload")
+        .and_then(|payload| payload.get("content"))
+        .and_then(Value::as_array)
+        .and_then(|content| content.get(content_index))
+        .ok_or_else(|| "会话附件不存在".to_string())?;
+    let data_url = item
+        .get("image_url")
+        .or_else(|| item.get("imageUrl"))
+        .or_else(|| item.get("audio_url"))
+        .or_else(|| item.get("audioUrl"))
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("data:"))
+        .ok_or_else(|| "该附件不是可预览的内嵌资源".to_string())?
+        .to_string();
+    Ok(CodexSessionAsset {
+        mime_type: data_url_mime_type(&data_url)
+            .unwrap_or_else(|| "application/octet-stream".to_string()),
+        size_bytes: data_url_size(&data_url),
+        data_url,
+    })
+}
+
+fn find_session_turn(path: &Path, turn_id: &str) -> Result<(ParsedSessionTurn, bool), String> {
+    let mut cursor = 0u64;
+    let mut found = None;
+    loop {
+        let (turns, next_cursor) = read_session_turn_page(path, cursor, 50)?;
+        if let Some(turn) = turns.into_iter().find(|turn| turn.public.id == turn_id) {
+            found = Some(turn);
+        }
+        let Some(next_cursor) = next_cursor else {
+            break;
+        };
+        if next_cursor <= cursor {
+            break;
+        }
+        cursor = next_cursor;
+    }
+    let turn = found.ok_or_else(|| "要删除的对话轮次不存在，请刷新后重试".to_string())?;
+    Ok((turn, session_has_open_turn(path)?))
+}
+
+fn session_has_open_turn(path: &Path) -> Result<bool, String> {
+    let file = fs::File::open(path).map_err(|error| format!("读取会话状态失败: {}", error))?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut open_turn_id: Option<String> = None;
+    loop {
+        line.clear();
+        if reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| format!("读取会话状态失败: {}", error))?
+            == 0
+        {
+            break;
+        }
+        if !line.windows(12).any(|window| window == b"task_started")
+            && !line.windows(13).any(|window| window == b"task_complete")
+            && !line.windows(12).any(|window| window == b"turn_aborted")
+        {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if let Some((turn_id, _)) = task_started_marker(&value) {
+            open_turn_id = Some(turn_id);
+        } else if open_turn_id
+            .as_deref()
+            .is_some_and(|turn_id| task_finished_marker(&value, turn_id))
+        {
+            open_turn_id = None;
+        }
+    }
+    Ok(open_turn_id.is_some())
+}
+
+fn rewrite_session_without_turn(path: &Path, turn: &ParsedSessionTurn) -> Result<PathBuf, String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("session.jsonl");
+    let tmp_path = parent.join(format!(
+        ".{file_name}.turn-delete-{:016x}.tmp",
+        rand::random::<u64>()
+    ));
+    let input = fs::File::open(path).map_err(|error| format!("读取会话失败: {}", error))?;
+    let output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .map_err(|error| format!("创建会话删除临时文件失败: {}", error))?;
+    let mut reader = BufReader::new(input);
+    let mut writer = BufWriter::new(output);
+    let mut line = Vec::new();
+    let mut position = 0u64;
+    let result = (|| -> Result<(), String> {
+        loop {
+            line.clear();
+            let line_start = position;
+            let read = reader
+                .read_until(b'\n', &mut line)
+                .map_err(|error| format!("读取待删除会话失败: {}", error))?;
+            if read == 0 {
+                break;
+            }
+            position = position.saturating_add(read as u64);
+            if line_start >= turn.start_offset && line_start < turn.end_offset {
+                continue;
+            }
+            let next_line = scrub_compacted_line(
+                &line,
+                &turn.response_item_ids,
+                &turn.response_item_fingerprints,
+            )?;
+            writer
+                .write_all(&next_line)
+                .map_err(|error| format!("写入删除后的会话失败: {}", error))?;
+        }
+        writer
+            .flush()
+            .map_err(|error| format!("刷新会话删除临时文件失败: {}", error))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| format!("同步会话删除临时文件失败: {}", error))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        drop(writer);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    drop(writer);
+    Ok(tmp_path)
+}
+
+fn build_message_deletion_plan(
+    path: &Path,
+    turn: &ParsedSessionTurn,
+    requested_message_ids: &HashSet<String>,
+) -> Result<SessionMessageDeletionPlan, String> {
+    let public_messages = turn
+        .public
+        .messages
+        .iter()
+        .filter(|message| requested_message_ids.contains(&message.id))
+        .map(|message| {
+            (
+                message.id.clone(),
+                (message.role.clone(), message.text.clone()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    if public_messages.len() != requested_message_ids.len() {
+        return Err("部分消息已不存在，请刷新会话内容后重试".to_string());
+    }
+
+    let input = fs::File::open(path).map_err(|error| format!("读取会话失败: {}", error))?;
+    let mut reader = BufReader::new(input);
+    let mut line = Vec::new();
+    let mut position = 0u64;
+    let mut line_offsets = HashSet::new();
+    let mut matched_message_ids = HashSet::new();
+    let mut response_item_ids = HashSet::new();
+    let mut response_item_fingerprints = HashMap::new();
+
+    loop {
+        line.clear();
+        let line_start = position;
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| format!("读取待删除消息失败: {}", error))?;
+        if read == 0 {
+            break;
+        }
+        position = position.saturating_add(read as u64);
+        if line_start < turn.start_offset || line_start >= turn.end_offset {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+
+        if let Some(message) = parse_response_message(&value, line_start) {
+            if public_messages.contains_key(&message.id) {
+                matched_message_ids.insert(message.id);
+                line_offsets.insert(line_start);
+                if let Some((item_id, fingerprint)) = response_item_identity(&value) {
+                    if let Some(item_id) = item_id {
+                        response_item_ids.insert(item_id);
+                    }
+                    *response_item_fingerprints.entry(fingerprint).or_insert(0) += 1;
+                }
+            }
+            continue;
+        }
+
+        let event_message = parse_event_user_message(&value, line_start)
+            .map(|(message, _)| message)
+            .or_else(|| parse_event_assistant_message(&value, line_start));
+        let Some(event_message) = event_message else {
+            continue;
+        };
+        let direct_match = public_messages.contains_key(&event_message.id);
+        let duplicate_match = public_messages.values().any(|(role, text)| {
+            role == &event_message.role && text.trim() == event_message.text.trim()
+        });
+        if direct_match || duplicate_match {
+            if direct_match {
+                matched_message_ids.insert(event_message.id.clone());
+            }
+            line_offsets.insert(line_start);
+        }
+    }
+
+    if matched_message_ids.len() != requested_message_ids.len() {
+        return Err("消息对应的会话记录已变化，请刷新后重试".to_string());
+    }
+    let mut message_ids = requested_message_ids.iter().cloned().collect::<Vec<_>>();
+    message_ids.sort();
+    Ok(SessionMessageDeletionPlan {
+        message_ids,
+        line_offsets,
+        response_item_ids,
+        response_item_fingerprints,
+    })
+}
+
+fn rewrite_session_without_messages(
+    path: &Path,
+    plan: &SessionMessageDeletionPlan,
+) -> Result<PathBuf, String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("session.jsonl");
+    let tmp_path = parent.join(format!(
+        ".{file_name}.message-delete-{:016x}.tmp",
+        rand::random::<u64>()
+    ));
+    let input = fs::File::open(path).map_err(|error| format!("读取会话失败: {}", error))?;
+    let output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .map_err(|error| format!("创建消息删除临时文件失败: {}", error))?;
+    let mut reader = BufReader::new(input);
+    let mut writer = BufWriter::new(output);
+    let mut line = Vec::new();
+    let mut position = 0u64;
+    let result = (|| -> Result<(), String> {
+        loop {
+            line.clear();
+            let line_start = position;
+            let read = reader
+                .read_until(b'\n', &mut line)
+                .map_err(|error| format!("读取待删除消息失败: {}", error))?;
+            if read == 0 {
+                break;
+            }
+            position = position.saturating_add(read as u64);
+            if plan.line_offsets.contains(&line_start) {
+                continue;
+            }
+            let next_line = scrub_compacted_line(
+                &line,
+                &plan.response_item_ids,
+                &plan.response_item_fingerprints,
+            )?;
+            writer
+                .write_all(&next_line)
+                .map_err(|error| format!("写入删除后的会话失败: {}", error))?;
+        }
+        writer
+            .flush()
+            .map_err(|error| format!("刷新消息删除临时文件失败: {}", error))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| format!("同步消息删除临时文件失败: {}", error))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        drop(writer);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    drop(writer);
+    Ok(tmp_path)
+}
+
+fn restore_session_file_if_unchanged(
+    path: &Path,
+    backup_path: &Path,
+    expected: SessionFileFingerprint,
+) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("session.jsonl");
+    let tmp_path = parent.join(format!(
+        ".{file_name}.turn-restore-{:016x}.tmp",
+        rand::random::<u64>()
+    ));
+    let result = (|| -> Result<(), String> {
+        let input = fs::File::open(backup_path)
+            .map_err(|error| format!("读取会话删除备份失败: {}", error))?;
+        let output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(|error| format!("创建会话恢复临时文件失败: {}", error))?;
+        let mut reader = BufReader::new(input);
+        let mut writer = BufWriter::new(output);
+        std::io::copy(&mut reader, &mut writer)
+            .map_err(|error| format!("复制会话删除备份失败: {}", error))?;
+        writer
+            .flush()
+            .map_err(|error| format!("刷新会话恢复临时文件失败: {}", error))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| format!("同步会话恢复临时文件失败: {}", error))?;
+        drop(writer);
+
+        if session_file_fingerprint(path)? != expected {
+            return Err("会话在恢复过程中发生了更新，本次操作已取消，请刷新后重试".to_string());
+        }
+        replace_file_atomic(path, &tmp_path)
+            .map_err(|error| format!("恢复会话删除备份失败: {}", error))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+fn replace_session_bytes_if_unchanged(
+    path: &Path,
+    content: &[u8],
+    expected: SessionFileFingerprint,
+) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("session.jsonl");
+    let tmp_path = parent.join(format!(
+        ".{file_name}.copy-{:016x}.tmp",
+        rand::random::<u64>()
+    ));
+    let result = (|| -> Result<(), String> {
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(|error| format!("创建会话复制临时文件失败: {}", error))?;
+        output
+            .write_all(content)
+            .map_err(|error| format!("写入目标会话临时文件失败: {}", error))?;
+        output
+            .sync_all()
+            .map_err(|error| format!("同步目标会话临时文件失败: {}", error))?;
+        drop(output);
+
+        if session_file_fingerprint(path)? != expected {
+            return Err("目标会话在复制过程中发生了更新，本次操作已取消，请刷新后重试".to_string());
+        }
+        replace_file_atomic(path, &tmp_path).map_err(|error| format!("写入目标会话失败: {}", error))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+fn scrub_compacted_line(
+    line: &[u8],
+    response_item_ids: &HashSet<String>,
+    response_item_fingerprints: &HashMap<String, usize>,
+) -> Result<Vec<u8>, String> {
+    if !line.windows(9).any(|window| window == b"compacted") {
+        return Ok(line.to_vec());
+    }
+    let Ok(mut value) = serde_json::from_slice::<Value>(line) else {
+        return Ok(line.to_vec());
+    };
+    if value.get("type").and_then(Value::as_str) != Some("compacted") {
+        return Ok(line.to_vec());
+    }
+    let Some(history) = value
+        .get_mut("payload")
+        .and_then(|payload| payload.get_mut("replacement_history"))
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(line.to_vec());
+    };
+    let mut removed_by_fingerprint = HashMap::<String, usize>::new();
+    history.retain(|item| {
+        let id_matches = item
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| response_item_ids.contains(id));
+        if id_matches {
+            return false;
+        }
+        let Some(fingerprint) = response_item_payload_fingerprint(item) else {
+            return true;
+        };
+        let allowed = response_item_fingerprints
+            .get(&fingerprint)
+            .copied()
+            .unwrap_or_default();
+        let removed = removed_by_fingerprint.entry(fingerprint).or_insert(0);
+        if *removed < allowed {
+            *removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+    let had_newline = line.ends_with(b"\n");
+    let mut serialized =
+        serde_json::to_vec(&value).map_err(|error| format!("更新会话压缩历史失败: {}", error))?;
+    if had_newline {
+        serialized.push(b'\n');
+    }
+    Ok(serialized)
+}
+
 fn build_session_record(path: &Path, content: &str) -> Result<CodexSessionRecord, String> {
     let title = extract_title(content).unwrap_or_else(|| file_stem(path));
-    let project_name = extract_project_name(content).unwrap_or_else(|| "未归属项目".to_string());
+    let project_path = extract_project_path(content).unwrap_or_default();
+    let project_name =
+        project_name_for_path(&project_path).unwrap_or_else(|| "未归属项目".to_string());
     let id = extract_session_id(content).unwrap_or_else(|| session_id_for_path(path));
     let metadata = fs::metadata(path).ok();
     let updated_at = metadata
@@ -1321,6 +3312,7 @@ fn build_session_record(path: &Path, content: &str) -> Result<CodexSessionRecord
         id,
         title,
         project_name,
+        project_path,
         path: path.to_string_lossy().to_string(),
         updated_at,
         message_count: content
@@ -1330,6 +3322,144 @@ fn build_session_record(path: &Path, content: &str) -> Result<CodexSessionRecord
         char_count: content.chars().count(),
         size_bytes,
     })
+}
+
+fn copy_history_onto_target(source: &str, target: &str) -> Result<String, String> {
+    let target_meta = target
+        .lines()
+        .find(|line| is_session_meta_line(line))
+        .ok_or_else(|| "目标会话缺少 session_meta，不能安全复制".to_string())?;
+    let source_history = source
+        .lines()
+        .filter(|line| !is_session_meta_line(line))
+        .collect::<Vec<_>>();
+    if source_history.is_empty() {
+        return Err("源会话没有可复制的历史数据".to_string());
+    }
+    let mut output = String::with_capacity(source.len() + target_meta.len());
+    output.push_str(target_meta);
+    output.push('\n');
+    let mut response_item_ids = HashMap::new();
+    for line in source_history {
+        output.push_str(&rewrite_copied_history_line(line, &mut response_item_ids)?);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn rewrite_copied_history_line(
+    line: &str,
+    response_item_ids: &mut HashMap<String, String>,
+) -> Result<String, String> {
+    let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+        return Ok(line.to_string());
+    };
+    let changed = match value.get("type").and_then(Value::as_str) {
+        Some("response_item") => value
+            .get_mut("payload")
+            .is_some_and(|payload| rewrite_copied_payload_id(payload, response_item_ids)),
+        Some("compacted") => value
+            .get_mut("payload")
+            .and_then(|payload| payload.get_mut("replacement_history"))
+            .and_then(Value::as_array_mut)
+            .map(|history| {
+                let mut changed = false;
+                for item in history {
+                    changed |= rewrite_copied_payload_id(item, response_item_ids);
+                }
+                changed
+            })
+            .unwrap_or(false),
+        _ => false,
+    };
+    if !changed {
+        return Ok(line.to_string());
+    }
+    serde_json::to_string(&value).map_err(|error| format!("重写会话响应 ID 失败: {}", error))
+}
+
+fn rewrite_copied_payload_id(
+    payload: &mut Value,
+    response_item_ids: &mut HashMap<String, String>,
+) -> bool {
+    let Some(payload) = payload.as_object_mut() else {
+        return false;
+    };
+    let source_id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    let item_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if source_id.is_none() && !response_item_type_supports_id(item_type) {
+        return false;
+    }
+    let local_id = match source_id {
+        Some(source_id) => response_item_ids
+            .entry(source_id)
+            .or_insert_with(new_local_response_item_id)
+            .clone(),
+        None => new_local_response_item_id(),
+    };
+    payload.insert("id".to_string(), Value::String(local_id));
+    true
+}
+
+fn new_local_response_item_id() -> String {
+    // Codex assigns a prefixed ID when an item has no ID, then forwards prefixed IDs to the
+    // Responses API. A non-prefixed local ID remains stable in history but is stripped from the
+    // outbound request, so copied items cannot reference response objects owned by the source.
+    format!("{:032x}", rand::random::<u128>())
+}
+
+fn response_item_type_supports_id(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "additional_tools"
+            | "message"
+            | "agent_message"
+            | "reasoning"
+            | "local_shell_call"
+            | "function_call"
+            | "tool_search_call"
+            | "function_call_output"
+            | "custom_tool_call"
+            | "custom_tool_call_output"
+            | "tool_search_output"
+            | "web_search_call"
+            | "image_generation_call"
+            | "compaction"
+            | "compaction_summary"
+            | "context_compaction"
+    )
+}
+
+fn is_session_meta_line(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some("session_meta")
+}
+
+fn normalize_custom_session_title(title: &str) -> Result<String, String> {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        return Err("会话名称不能为空".to_string());
+    }
+    if title.chars().count() > 100 {
+        return Err("会话名称不能超过 100 个字符".to_string());
+    }
+    Ok(title)
 }
 
 fn extract_session_id(content: &str) -> Option<String> {
@@ -1456,24 +3586,38 @@ fn is_internal_session_title(text: &str) -> bool {
         || normalized.contains("primary agent in a team of agents")
 }
 
-fn extract_project_name(content: &str) -> Option<String> {
+fn extract_project_path(content: &str) -> Option<String> {
     for line in content.lines() {
-        let value: Value = serde_json::from_str(line).ok()?;
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         let cwd = find_string_key(&value, "cwd")
             .or_else(|| find_string_key(&value, "workspace"))
             .or_else(|| find_string_key(&value, "projectPath"))
-            .or_else(|| find_string_key(&value, "workingDirectory"))?;
-        let name = Path::new(&cwd)
-            .file_name()
-            .and_then(|item| item.to_str())
-            .map(str::to_string)
-            .unwrap_or(cwd);
-        let trimmed = name.trim();
+            .or_else(|| find_string_key(&value, "workingDirectory"));
+        let Some(cwd) = cwd else {
+            continue;
+        };
+        let trimmed = cwd.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());
         }
     }
     None
+}
+
+fn project_name_for_path(project_path: &str) -> Option<String> {
+    let project_path = project_path.trim();
+    if project_path.is_empty() {
+        return None;
+    }
+    Some(
+        Path::new(project_path)
+            .file_name()
+            .and_then(|item| item.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| project_path.to_string()),
+    )
 }
 
 fn find_text(value: &Value) -> Option<String> {
@@ -1580,10 +3724,506 @@ fn now_timestamp() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_title, SessionStore};
+    use super::{
+        extract_title, find_task_started_offsets_reverse, replace_session_bytes_if_unchanged,
+        restore_session_file_if_unchanged, session_file_fingerprint, SessionStore,
+    };
+    use serde_json::{json, Value};
     use std::fs;
+    use std::io::Write;
+    use std::path::Path;
     use std::process::Command;
     use tempfile::tempdir;
+
+    fn write_jsonl(path: &Path, items: &[Value]) {
+        let mut content = items
+            .iter()
+            .map(|item| serde_json::to_string(item).expect("serialize jsonl item"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        content.push('\n');
+        fs::write(path, content).expect("write jsonl");
+    }
+
+    fn task_started(turn_id: &str, timestamp: &str) -> Value {
+        json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": { "type": "task_started", "turn_id": turn_id }
+        })
+    }
+
+    fn task_complete(turn_id: &str, timestamp: &str) -> Value {
+        json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": { "type": "task_complete", "turn_id": turn_id }
+        })
+    }
+
+    fn response_message(id: &str, role: &str, timestamp: &str, content: Vec<Value>) -> Value {
+        json!({
+            "timestamp": timestamp,
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": id,
+                "role": role,
+                "content": content
+            }
+        })
+    }
+
+    #[test]
+    fn pages_session_turns_and_loads_inline_images_on_demand() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-content.jsonl");
+        let local_image = codex.path().join("preview.png");
+        fs::write(&local_image, b"image").expect("write local image");
+        write_jsonl(
+            &session_path,
+            &[
+                json!({"type":"session_meta","payload":{"id":"session-content"}}),
+                task_started("turn-one", "2026-08-10T01:00:00Z"),
+                response_message(
+                    "message-one",
+                    "user",
+                    "2026-08-10T01:00:01Z",
+                    vec![
+                        json!({"type":"input_text","text":"第一轮问题"}),
+                        json!({"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}),
+                    ],
+                ),
+                json!({
+                    "timestamp":"2026-08-10T01:00:01Z",
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"user_message",
+                        "message":"第一轮问题",
+                        "local_images":[local_image.to_string_lossy()]
+                    }
+                }),
+                response_message(
+                    "message-two",
+                    "assistant",
+                    "2026-08-10T01:00:02Z",
+                    vec![json!({"type":"output_text","text":"第一轮回答"})],
+                ),
+                task_complete("turn-one", "2026-08-10T01:00:03Z"),
+                task_started("turn-two", "2026-08-10T02:00:00Z"),
+                response_message(
+                    "message-three",
+                    "user",
+                    "2026-08-10T02:00:01Z",
+                    vec![json!({"type":"input_text","text":"第二轮问题"})],
+                ),
+                task_complete("turn-two", "2026-08-10T02:00:02Z"),
+            ],
+        );
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let first_page = store
+            .list_session_content("session-content", None, Some(1), None)
+            .expect("first page");
+        assert_eq!(first_page.turns.len(), 1);
+        assert_eq!(first_page.turns[0].id, "turn-one");
+        assert_eq!(first_page.turns[0].messages.len(), 2);
+        let image = &first_page.turns[0].messages[0].attachments[0];
+        assert_eq!(image.kind, "image");
+        assert!(image.inline);
+        assert_eq!(
+            image.source_path.as_deref(),
+            Some(local_image.to_string_lossy().as_ref())
+        );
+        let asset = store
+            .get_session_asset("session-content", &image.id)
+            .expect("load image");
+        assert_eq!(asset.mime_type, "image/png");
+        assert_eq!(asset.data_url, "data:image/png;base64,aGVsbG8=");
+
+        let second_page = store
+            .list_session_content("session-content", first_page.next_cursor, Some(1), None)
+            .expect("second page");
+        assert_eq!(second_page.turns.len(), 1);
+        assert_eq!(second_page.turns[0].id, "turn-two");
+        assert!(second_page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn pages_session_turns_in_descending_order_without_returning_every_turn() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-desc-content.jsonl");
+        let mut lines = vec![json!({
+            "type":"session_meta",
+            "payload":{"id":"session-desc-content"}
+        })];
+        for index in 1..=45 {
+            let turn_id = format!("turn-{index:02}");
+            let timestamp = format!("2026-08-10T{index:02}:00:00Z");
+            lines.push(task_started(&turn_id, &timestamp));
+            lines.push(response_message(
+                &format!("message-{index:02}"),
+                "user",
+                &timestamp,
+                vec![json!({"type":"input_text","text":format!("问题 {index}")})],
+            ));
+            lines.push(task_complete(&turn_id, &timestamp));
+        }
+        write_jsonl(&session_path, &lines);
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let first = store
+            .list_session_content("session-desc-content", None, Some(20), Some("desc"))
+            .expect("first descending page");
+        assert_eq!(first.turns.len(), 20);
+        assert_eq!(
+            first.turns.first().map(|turn| turn.id.as_str()),
+            Some("turn-45")
+        );
+        assert_eq!(
+            first.turns.last().map(|turn| turn.id.as_str()),
+            Some("turn-26")
+        );
+        assert!(first.next_cursor.is_some());
+
+        let second = store
+            .list_session_content(
+                "session-desc-content",
+                first.next_cursor,
+                Some(20),
+                Some("desc"),
+            )
+            .expect("second descending page");
+        assert_eq!(second.turns.len(), 20);
+        assert_eq!(
+            second.turns.first().map(|turn| turn.id.as_str()),
+            Some("turn-25")
+        );
+        assert_eq!(
+            second.turns.last().map(|turn| turn.id.as_str()),
+            Some("turn-06")
+        );
+        assert!(second.next_cursor.is_some());
+
+        let third = store
+            .list_session_content(
+                "session-desc-content",
+                second.next_cursor,
+                Some(20),
+                Some("desc"),
+            )
+            .expect("third descending page");
+        assert_eq!(third.turns.len(), 5);
+        assert_eq!(
+            third.turns.first().map(|turn| turn.id.as_str()),
+            Some("turn-05")
+        );
+        assert_eq!(
+            third.turns.last().map(|turn| turn.id.as_str()),
+            Some("turn-01")
+        );
+        assert!(third.next_cursor.is_none());
+    }
+
+    #[test]
+    fn descending_turn_scan_reads_from_the_tail_without_crossing_a_large_prefix() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-desc-large-prefix.jsonl");
+        let mut lines = vec![json!({
+            "type":"session_meta",
+            "payload":{"id":"session-desc-large-prefix","padding":"x".repeat(300_000)}
+        })];
+        for index in 1..=25 {
+            let turn_id = format!("turn-{index:02}");
+            let timestamp = format!("2026-08-10T{index:02}:00:00Z");
+            lines.push(task_started(&turn_id, &timestamp));
+            lines.push(response_message(
+                &format!("message-{index:02}"),
+                "user",
+                &timestamp,
+                vec![json!({"type":"input_text","text":format!("问题 {index}")})],
+            ));
+            lines.push(task_complete(&turn_id, &timestamp));
+        }
+        write_jsonl(&session_path, &lines);
+        let cursor = fs::metadata(&session_path).expect("session metadata").len();
+
+        let scan = find_task_started_offsets_reverse(&session_path, cursor, 21)
+            .expect("reverse turn start scan");
+
+        assert_eq!(scan.offsets.len(), 21);
+        assert!(!scan.reached_start);
+        assert!(scan.offsets.iter().all(|offset| *offset > 300_000));
+    }
+
+    #[test]
+    fn derives_stable_turn_id_when_legacy_markers_have_no_id() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("legacy-turn-id.jsonl");
+        write_jsonl(
+            &session_path,
+            &[
+                json!({"type":"session_meta","payload":{"id":"legacy-turn-id"}}),
+                json!({
+                    "timestamp":"2026-08-10T01:00:00Z",
+                    "type":"event_msg",
+                    "payload":{"type":"task_started"}
+                }),
+                response_message(
+                    "legacy-message",
+                    "user",
+                    "2026-08-10T01:00:01Z",
+                    vec![json!({"type":"input_text","text":"旧格式消息"})],
+                ),
+                json!({
+                    "timestamp":"2026-08-10T01:00:02Z",
+                    "type":"event_msg",
+                    "payload":{"type":"task_complete"}
+                }),
+            ],
+        );
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let first = store
+            .list_session_content("legacy-turn-id", None, Some(20), None)
+            .expect("first read");
+        let second = store
+            .list_session_content("legacy-turn-id", None, Some(20), None)
+            .expect("second read");
+
+        assert_eq!(first.turns.len(), 1);
+        assert_eq!(first.turns[0].id, second.turns[0].id);
+        assert!(first.turns[0].id.starts_with("offset-"));
+        assert!(first.turns[0].can_delete);
+    }
+
+    #[test]
+    fn deletes_complete_turn_scrubs_compaction_and_restores_backup() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-delete-turn.jsonl");
+        let deleted_message = json!({
+            "type":"message",
+            "id":"message-secret",
+            "role":"user",
+            "content":[{"type":"input_text","text":"需要删除的秘密内容"}]
+        });
+        let deleted_tool_call = json!({
+            "type":"function_call",
+            "id":"tool-call-secret",
+            "name":"shell",
+            "arguments":"{\"command\":\"private command\"}",
+            "call_id":"secret-call"
+        });
+        let deleted_tool_output = json!({
+            "type":"function_call_output",
+            "id":"tool-output-secret",
+            "call_id":"secret-call",
+            "output":"private tool output"
+        });
+        write_jsonl(
+            &session_path,
+            &[
+                json!({"type":"session_meta","payload":{"id":"session-delete-turn"}}),
+                task_started("turn-secret", "2026-08-10T01:00:00Z"),
+                json!({
+                    "timestamp":"2026-08-10T01:00:01Z",
+                    "type":"response_item",
+                    "payload":deleted_message.clone()
+                }),
+                json!({
+                    "timestamp":"2026-08-10T01:00:01Z",
+                    "type":"response_item",
+                    "payload":deleted_tool_call.clone()
+                }),
+                json!({
+                    "timestamp":"2026-08-10T01:00:01Z",
+                    "type":"response_item",
+                    "payload":deleted_tool_output.clone()
+                }),
+                task_complete("turn-secret", "2026-08-10T01:00:02Z"),
+                json!({
+                    "timestamp":"2026-08-10T01:30:00Z",
+                    "type":"compacted",
+                    "payload":{
+                        "replacement_history":[
+                            deleted_message,
+                            deleted_tool_call,
+                            deleted_tool_output
+                        ],
+                        "message":""
+                    }
+                }),
+                task_started("turn-keep", "2026-08-10T02:00:00Z"),
+                response_message(
+                    "message-keep",
+                    "user",
+                    "2026-08-10T02:00:01Z",
+                    vec![json!({"type":"input_text","text":"需要保留的内容"})],
+                ),
+                task_complete("turn-keep", "2026-08-10T02:00:02Z"),
+            ],
+        );
+        let original = fs::read_to_string(&session_path).expect("read original");
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let result = store
+            .delete_session_turn("session-delete-turn", "turn-secret")
+            .expect("delete turn");
+        let deleted = fs::read_to_string(&session_path).expect("read deleted session");
+        assert!(!deleted.contains("需要删除的秘密内容"));
+        assert!(!deleted.contains("private command"));
+        assert!(!deleted.contains("private tool output"));
+        assert!(!deleted.contains("tool-call-secret"));
+        assert!(!deleted.contains("tool-output-secret"));
+        assert!(!deleted.contains("turn-secret"));
+        assert!(deleted.contains("需要保留的内容"));
+        assert!(result.removed_bytes > 0);
+        assert!(Path::new(&result.backup_path).is_file());
+
+        store
+            .restore_session_turn_backup("session-delete-turn", &result.backup_id)
+            .expect("restore deleted turn");
+        assert_eq!(
+            fs::read_to_string(&session_path).expect("read restored session"),
+            original
+        );
+    }
+
+    #[test]
+    fn deletes_selected_messages_and_duplicate_history_then_restores_backup() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-delete-message.jsonl");
+        let deleted_payload = json!({
+            "type":"message",
+            "id":"message-delete",
+            "role":"user",
+            "content":[{"type":"input_text","text":"只删除这一条"}]
+        });
+        let kept_payload = json!({
+            "type":"message",
+            "id":"message-keep",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"这一条必须保留"}]
+        });
+        write_jsonl(
+            &session_path,
+            &[
+                json!({"type":"session_meta","payload":{"id":"session-delete-message"}}),
+                task_started("turn-message", "2026-08-10T01:00:00Z"),
+                json!({
+                    "timestamp":"2026-08-10T01:00:01Z",
+                    "type":"event_msg",
+                    "payload":{"type":"user_message","message":"只删除这一条"}
+                }),
+                json!({
+                    "timestamp":"2026-08-10T01:00:01Z",
+                    "type":"response_item",
+                    "payload":deleted_payload.clone()
+                }),
+                json!({
+                    "timestamp":"2026-08-10T01:00:02Z",
+                    "type":"response_item",
+                    "payload":kept_payload.clone()
+                }),
+                task_complete("turn-message", "2026-08-10T01:00:03Z"),
+                json!({
+                    "timestamp":"2026-08-10T01:30:00Z",
+                    "type":"compacted",
+                    "payload":{"replacement_history":[deleted_payload, kept_payload],"message":""}
+                }),
+            ],
+        );
+        let original = fs::read_to_string(&session_path).expect("read original");
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let result = store
+            .delete_session_messages(
+                "session-delete-message",
+                "turn-message",
+                &["message-delete".to_string()],
+            )
+            .expect("delete selected message");
+        let deleted = fs::read_to_string(&session_path).expect("read deleted session");
+        assert!(!deleted.contains("只删除这一条"));
+        assert!(!deleted.contains("message-delete"));
+        assert!(deleted.contains("这一条必须保留"));
+        assert!(deleted.contains("message-keep"));
+        assert_eq!(result.deleted_message_ids, vec!["message-delete"]);
+        assert!(result.removed_bytes > 0);
+
+        store
+            .restore_session_turn_backup("session-delete-message", &result.backup_id)
+            .expect("restore message deletion");
+        assert_eq!(
+            fs::read_to_string(&session_path).expect("read restored session"),
+            original
+        );
+    }
+
+    #[test]
+    fn restore_guard_preserves_session_when_it_changes_during_restore() {
+        let directory = tempdir().expect("session tempdir");
+        let session_path = directory.path().join("session.jsonl");
+        let backup_path = directory.path().join("backup.jsonl");
+        fs::write(&session_path, "original\n").expect("write session");
+        fs::write(&backup_path, "backup\n").expect("write backup");
+        let expected = session_file_fingerprint(&session_path).expect("session fingerprint");
+        fs::write(&session_path, "updated while restoring\n").expect("update session");
+
+        let error = restore_session_file_if_unchanged(&session_path, &backup_path, expected)
+            .expect_err("changed session should not be replaced");
+
+        assert!(error.contains("恢复过程中发生了更新"));
+        assert_eq!(
+            fs::read_to_string(&session_path).expect("read preserved session"),
+            "updated while restoring\n"
+        );
+    }
+
+    #[test]
+    fn refuses_to_delete_turn_while_session_has_an_open_turn() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-active.jsonl");
+        write_jsonl(
+            &session_path,
+            &[
+                json!({"type":"session_meta","payload":{"id":"session-active"}}),
+                task_started("turn-active", "2026-08-10T01:00:00Z"),
+                response_message(
+                    "message-active",
+                    "user",
+                    "2026-08-10T01:00:01Z",
+                    vec![json!({"type":"input_text","text":"仍在执行"})],
+                ),
+            ],
+        );
+        let original = fs::read_to_string(&session_path).expect("read original");
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let error = store
+            .delete_session_turn("session-active", "turn-active")
+            .expect_err("active turn should be protected");
+
+        assert!(error.contains("仍在生成"));
+        assert_eq!(
+            fs::read_to_string(&session_path).expect("read unchanged session"),
+            original
+        );
+    }
 
     #[test]
     fn lists_moves_and_restores_sessions() {
@@ -1626,6 +4266,353 @@ mod tests {
     }
 
     #[test]
+    fn renames_session_in_official_index_and_uses_custom_title_when_listing() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        fs::write(
+            sessions_dir.join("session-rename.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"session-rename"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"role":"user","content":[{"text":"原始名称"}]}}"#,
+                "\n"
+            ),
+        )
+        .expect("write session");
+        fs::write(
+            codex.path().join("session_index.jsonl"),
+            r#"{"id":"session-rename","thread_name":"旧索引名称","updated_at":"2026-08-01T00:00:00Z"}"#,
+        )
+        .expect("write session index");
+        let db_path = codex.path().join("state_5.sqlite");
+        run_sqlite_test(
+            &db_path,
+            r#"
+                CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, name TEXT);
+                INSERT INTO threads (id, title, name)
+                VALUES ('session-rename', '旧 SQLite 名称', '旧 SQLite 名称');
+                "#,
+        );
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        assert_eq!(
+            store.list_sessions(None, None).expect("list sessions")[0].title,
+            "旧索引名称"
+        );
+
+        let result = store
+            .rename_session("session-rename", "  新的 会话名称  ")
+            .expect("rename session");
+
+        assert_eq!(result.title, "新的 会话名称");
+        assert_eq!(
+            store.list_sessions(None, None).expect("list renamed")[0].title,
+            "新的 会话名称"
+        );
+        let index = fs::read_to_string(codex.path().join("session_index.jsonl"))
+            .expect("read session index");
+        assert!(index.contains(r#""thread_name":"新的 会话名称""#));
+        assert_eq!(
+            run_sqlite_test_output(
+                &db_path,
+                "SELECT title || '|' || name FROM threads WHERE id = 'session-rename';"
+            )
+            .trim(),
+            "新的 会话名称|新的 会话名称"
+        );
+    }
+
+    #[test]
+    fn updates_session_working_directory_in_rollout_and_sqlite_with_backup() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        let next_cwd = codex.path().join("workspaces").join("operator-end-cloud");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        fs::create_dir_all(&next_cwd).expect("next cwd");
+        let session_path = sessions_dir.join("session-cwd.jsonl");
+        let original = concat!(
+            r#"{"type":"session_meta","payload":{"id":"session-cwd","cwd":"/old/project"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"cwd":"/old/project"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"修改目录"}]}}"#,
+            "\n"
+        );
+        fs::write(&session_path, original).expect("write session");
+        let db_path = codex.path().join("state_5.sqlite");
+        run_sqlite_test(
+            &db_path,
+            r#"
+                CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT NOT NULL);
+                INSERT INTO threads (id, cwd) VALUES ('session-cwd', '/old/project');
+                "#,
+        );
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let result = store
+            .update_session_working_directory("session-cwd", &next_cwd.to_string_lossy())
+            .expect("update cwd");
+
+        let updated = fs::read_to_string(&session_path).expect("read updated session");
+        let lines = updated
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid jsonl"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines[0]["payload"]["cwd"].as_str(),
+            Some(next_cwd.to_string_lossy().as_ref())
+        );
+        assert_eq!(lines[1]["payload"]["cwd"].as_str(), Some("/old/project"));
+        assert_eq!(
+            run_sqlite_test_output(
+                &db_path,
+                "SELECT cwd FROM threads WHERE id = 'session-cwd';"
+            )
+            .trim(),
+            next_cwd.to_string_lossy()
+        );
+        let listed = store.list_sessions(None, None).expect("list sessions");
+        assert_eq!(listed[0].project_path, next_cwd.to_string_lossy());
+        assert_eq!(listed[0].project_name, "operator-end-cloud");
+        assert_eq!(
+            result.project_path.as_deref(),
+            Some(next_cwd.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            fs::read_to_string(result.backup_path.expect("backup path")).expect("read backup"),
+            original
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_session_working_directory_without_mutating_rollout() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-cwd-invalid.jsonl");
+        let original = concat!(
+            r#"{"type":"session_meta","payload":{"id":"session-cwd-invalid","cwd":"/old/project"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"目录保持不变"}]}}"#,
+            "\n"
+        );
+        fs::write(&session_path, original).expect("write session");
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let relative_error = store
+            .update_session_working_directory("session-cwd-invalid", "relative/project")
+            .expect_err("relative cwd should fail");
+        assert!(relative_error.contains("绝对路径"));
+        let missing_error = store
+            .update_session_working_directory(
+                "session-cwd-invalid",
+                &codex.path().join("missing-project").to_string_lossy(),
+            )
+            .expect_err("missing cwd should fail");
+        assert!(missing_error.contains("不存在"));
+        assert_eq!(
+            fs::read_to_string(session_path).expect("read unchanged session"),
+            original
+        );
+    }
+
+    #[test]
+    fn copies_history_while_preserving_target_session_identity_and_backup() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let source_path = sessions_dir.join("source.jsonl");
+        let target_path = sessions_dir.join("target.jsonl");
+        fs::write(
+            &source_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"source","session_id":"source","model_provider":"old"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"reasoning","id":"rs_resp_stale_0","summary":[],"content":[],"encrypted_content":null}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","id":"msg_resp_stale_0","role":"user","content":[{"text":"需要复制的历史"}]}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call","id":"fc_call_stale_0","name":"shell","arguments":"{}","call_id":"call_pair"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call_output","id":"fco_call_stale_0","call_id":"call_pair","output":"ok"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"future_response_item","id":"future_resp_stale_0","data":"future"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"历史回复"}]}}"#,
+                "\n",
+                r#"{"type":"compacted","payload":{"replacement_history":[{"type":"reasoning","id":"rs_resp_stale_0","summary":[],"content":[],"encrypted_content":null},{"type":"message","id":"msg_resp_stale_0","role":"user","content":[{"text":"需要复制的历史"}]},{"type":"function_call","id":"fc_call_stale_0","name":"shell","arguments":"{}","call_id":"call_pair"},{"type":"function_call_output","id":"fco_call_stale_0","call_id":"call_pair","output":"ok"}],"message":""}}"#,
+                "\n"
+            ),
+        )
+        .expect("write source");
+        let original_target = concat!(
+            r#"{"type":"session_meta","payload":{"id":"target","session_id":"target","model_provider":"current"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"role":"user","content":[{"text":"占位内容"}]}}"#,
+            "\n"
+        );
+        fs::write(&target_path, original_target).expect("write target");
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let result = store
+            .copy_session_history("source", "target")
+            .expect("copy session history");
+
+        let copied = fs::read_to_string(&target_path).expect("read copied target");
+        assert!(copied.contains(r#""id":"target""#));
+        assert!(copied.contains(r#""model_provider":"current""#));
+        assert!(copied.contains("需要复制的历史"));
+        assert!(copied.contains("历史回复"));
+        assert!(!copied.contains(r#""id":"source""#));
+        for stale_id in [
+            "rs_resp_stale_0",
+            "msg_resp_stale_0",
+            "fc_call_stale_0",
+            "fco_call_stale_0",
+            "future_resp_stale_0",
+        ] {
+            assert!(!copied.contains(stale_id));
+        }
+        assert!(!copied.contains("占位内容"));
+        let copied_items = copied
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| {
+                value.get("type").and_then(serde_json::Value::as_str) == Some("response_item")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(copied_items.len(), 6);
+        for item in &copied_items {
+            let local_id = item
+                .get("payload")
+                .and_then(|payload| payload.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .expect("copied item local id");
+            assert!(!local_id.contains('_'));
+            assert_eq!(local_id.len(), 32);
+        }
+        let call_ids = copied_items
+            .iter()
+            .filter_map(|item| item.get("payload"))
+            .filter_map(|payload| payload.get("call_id"))
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(call_ids, vec!["call_pair", "call_pair"]);
+        let compacted = copied
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|value| {
+                value.get("type").and_then(serde_json::Value::as_str) == Some("compacted")
+            })
+            .expect("copied compacted history");
+        let compacted_items = compacted["payload"]["replacement_history"]
+            .as_array()
+            .expect("replacement history");
+        assert_eq!(compacted_items.len(), 4);
+        for item in compacted_items {
+            let local_id = item["id"].as_str().expect("compacted item local id");
+            assert!(!local_id.contains('_'));
+            assert_eq!(local_id.len(), 32);
+            let item_type = item["type"].as_str().expect("compacted item type");
+            let top_level_id = copied_items
+                .iter()
+                .find(|candidate| candidate["payload"]["type"].as_str() == Some(item_type))
+                .and_then(|candidate| candidate["payload"]["id"].as_str())
+                .expect("matching top-level response item");
+            assert_eq!(local_id, top_level_id);
+        }
+        assert_eq!(result.session_id, "target");
+        assert_eq!(result.title, "需要复制的历史");
+        let backup_path = result.backup_path.expect("backup path");
+        assert_eq!(
+            fs::read_to_string(backup_path).expect("read backup"),
+            original_target
+        );
+    }
+
+    #[test]
+    fn refuses_to_copy_onto_a_target_with_an_open_turn() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let source_path = sessions_dir.join("source-open-guard.jsonl");
+        let target_path = sessions_dir.join("target-open-guard.jsonl");
+        write_jsonl(
+            &source_path,
+            &[
+                json!({"type":"session_meta","payload":{"id":"source-open-guard"}}),
+                response_message(
+                    "source-message",
+                    "user",
+                    "2026-08-10T12:00:00Z",
+                    vec![json!({"type":"input_text","text":"稳定的源会话"})],
+                ),
+            ],
+        );
+        write_jsonl(
+            &target_path,
+            &[
+                json!({"type":"session_meta","payload":{"id":"target-open-guard"}}),
+                task_started("target-active-turn", "2026-08-10T12:01:00Z"),
+                response_message(
+                    "target-message",
+                    "user",
+                    "2026-08-10T12:01:00Z",
+                    vec![json!({"type":"input_text","text":"仍在生成"})],
+                ),
+            ],
+        );
+        let before = fs::read_to_string(&target_path).expect("read target before copy");
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let error = store
+            .copy_session_history("source-open-guard", "target-open-guard")
+            .expect_err("open target should reject copy");
+
+        assert!(error.contains("目标会话仍在生成"));
+        assert_eq!(
+            fs::read_to_string(&target_path).expect("read unchanged target"),
+            before
+        );
+    }
+
+    #[test]
+    fn conditional_session_replace_rejects_a_stale_fingerprint() {
+        let codex = tempdir().expect("codex tempdir");
+        let target_path = codex.path().join("stale-target.jsonl");
+        fs::write(&target_path, "before\n").expect("write target");
+        let expected = session_file_fingerprint(&target_path).expect("target fingerprint");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&target_path)
+            .expect("open target append")
+            .write_all(b"concurrent update\n")
+            .expect("append target");
+
+        let error = replace_session_bytes_if_unchanged(&target_path, b"replacement\n", expected)
+            .expect_err("stale replacement should fail");
+
+        assert!(error.contains("复制过程中发生了更新"));
+        assert_eq!(
+            fs::read_to_string(&target_path).expect("read target after rejection"),
+            "before\nconcurrent update\n"
+        );
+    }
+
+    #[test]
+    fn rejects_copying_session_onto_itself() {
+        let codex = tempdir().expect("codex tempdir");
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let error = store
+            .copy_session_history("same", "same")
+            .expect_err("same session should fail");
+
+        assert!(error.contains("不能相同"));
+    }
+
+    #[test]
     fn lists_and_restores_legacy_trashed_sessions() {
         let codex = tempdir().expect("codex tempdir");
         let sessions_dir = codex.path().join("sessions").join("2026").join("06");
@@ -1662,7 +4649,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_project_name_from_session_metadata_cwd() {
+    fn extracts_project_name_and_path_from_session_metadata_cwd() {
         let codex = tempdir().expect("codex tempdir");
         let sessions_dir = codex.path().join("sessions");
         fs::create_dir_all(&sessions_dir).expect("session dir");
@@ -1676,6 +4663,10 @@ mod tests {
         let sessions = store.list_sessions(None, None).expect("list sessions");
 
         assert_eq!(sessions[0].project_name, "operator-end-cloud");
+        assert_eq!(
+            sessions[0].project_path,
+            "/Users/dalong/Documents/codeDesign/operator-end-cloud"
+        );
     }
 
     #[test]
