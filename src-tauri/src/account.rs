@@ -1935,7 +1935,7 @@ fn read_account_tags(value: &Value) -> Vec<String> {
             .filter_map(|item| item.as_str().map(ToOwned::to_owned))
             .collect(),
         Value::String(text) => text
-            .split(|ch| matches!(ch, ',' | '，' | ';' | '；' | '、'))
+            .split([',', '，', ';', '；', '、'])
             .map(ToOwned::to_owned)
             .collect(),
         _ => Vec::new(),
@@ -3118,6 +3118,14 @@ pub(super) fn write_reader_atomic(path: &Path, mut content: impl Read) -> Result
     }
     drop(tmp_file);
 
+    replace_file_atomic(path, &tmp_path)
+}
+
+pub(super) fn replace_file_atomic(path: &Path, tmp_path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("创建目录失败: {}", error))?;
+    }
+
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -3156,7 +3164,7 @@ pub(super) fn write_reader_atomic(path: &Path, mut content: impl Read) -> Result
         };
         if replaced == 0 {
             let error = std::io::Error::last_os_error();
-            let _ = fs::remove_file(&tmp_path);
+            let _ = fs::remove_file(tmp_path);
             return Err(format!("替换文件失败: {}", error));
         }
         Ok(())
@@ -3164,8 +3172,8 @@ pub(super) fn write_reader_atomic(path: &Path, mut content: impl Read) -> Result
 
     #[cfg(not(windows))]
     {
-        if let Err(error) = fs::rename(&tmp_path, path) {
-            let _ = fs::remove_file(&tmp_path);
+        if let Err(error) = fs::rename(tmp_path, path) {
+            let _ = fs::remove_file(tmp_path);
             return Err(format!("替换文件失败: {}", error));
         }
         Ok(())

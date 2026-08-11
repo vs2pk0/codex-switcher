@@ -18,7 +18,9 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use session::{
-    CodexSessionRecord, CodexSessionTokenStats, CodexSessionTrashSummary,
+    CodexSessionAsset, CodexSessionContentPage, CodexSessionMessageMutationResult,
+    CodexSessionMutationResult, CodexSessionRecord, CodexSessionTokenStats,
+    CodexSessionTrashSummary, CodexSessionTurnMutationResult,
     CodexSessionVisibilityRepairInstanceList, CodexSessionVisibilityRepairProviderList,
     CodexSessionVisibilityRepairSummary, CodexTrashedSessionRecord, SessionStore,
 };
@@ -2404,6 +2406,49 @@ fn codex_get_session_token_stats_across_instances(
 }
 
 #[tauri::command]
+fn codex_list_session_content(
+    session_id: String,
+    cursor: Option<u64>,
+    limit: Option<usize>,
+    direction: Option<String>,
+) -> Result<CodexSessionContentPage, String> {
+    SessionStore::default().list_session_content(&session_id, cursor, limit, direction.as_deref())
+}
+
+#[tauri::command]
+fn codex_get_session_asset(
+    session_id: String,
+    asset_id: String,
+) -> Result<CodexSessionAsset, String> {
+    SessionStore::default().get_session_asset(&session_id, &asset_id)
+}
+
+#[tauri::command]
+fn codex_delete_session_turn(
+    session_id: String,
+    turn_id: String,
+) -> Result<CodexSessionTurnMutationResult, String> {
+    SessionStore::default().delete_session_turn(&session_id, &turn_id)
+}
+
+#[tauri::command]
+fn codex_delete_session_messages(
+    session_id: String,
+    turn_id: String,
+    message_ids: Vec<String>,
+) -> Result<CodexSessionMessageMutationResult, String> {
+    SessionStore::default().delete_session_messages(&session_id, &turn_id, &message_ids)
+}
+
+#[tauri::command]
+fn codex_restore_session_turn_backup(
+    session_id: String,
+    backup_id: String,
+) -> Result<CodexSessionMutationResult, String> {
+    SessionStore::default().restore_session_turn_backup(&session_id, &backup_id)
+}
+
+#[tauri::command]
 fn codex_move_sessions_to_trash_across_instances(
     session_ids: Vec<String>,
 ) -> Result<CodexSessionTrashSummary, String> {
@@ -2421,6 +2466,30 @@ fn codex_restore_sessions_from_trash_across_instances(
     session_ids: Vec<String>,
 ) -> Result<CodexSessionTrashSummary, String> {
     SessionStore::default().restore_from_trash(&session_ids)
+}
+
+#[tauri::command]
+fn codex_copy_session_history_across_instances(
+    source_session_id: String,
+    target_session_id: String,
+) -> Result<CodexSessionMutationResult, String> {
+    SessionStore::default().copy_session_history(&source_session_id, &target_session_id)
+}
+
+#[tauri::command]
+fn codex_rename_session_across_instances(
+    session_id: String,
+    title: String,
+) -> Result<CodexSessionMutationResult, String> {
+    SessionStore::default().rename_session(&session_id, &title)
+}
+
+#[tauri::command]
+fn codex_update_session_working_directory_across_instances(
+    session_id: String,
+    project_path: String,
+) -> Result<CodexSessionMutationResult, String> {
+    SessionStore::default().update_session_working_directory(&session_id, &project_path)
 }
 
 #[tauri::command]
@@ -4429,9 +4498,17 @@ pub fn run() {
             codex_update_pricing_config,
             codex_list_sessions_across_instances,
             codex_get_session_token_stats_across_instances,
+            codex_list_session_content,
+            codex_get_session_asset,
+            codex_delete_session_turn,
+            codex_delete_session_messages,
+            codex_restore_session_turn_backup,
             codex_move_sessions_to_trash_across_instances,
             codex_list_trashed_sessions_across_instances,
             codex_restore_sessions_from_trash_across_instances,
+            codex_copy_session_history_across_instances,
+            codex_rename_session_across_instances,
+            codex_update_session_working_directory_across_instances,
             codex_repair_session_visibility_across_instances,
             codex_list_session_visibility_repair_instances,
             codex_list_session_visibility_repair_providers,
