@@ -1486,6 +1486,14 @@ fn switches_api_key_account_to_codex_auth_and_config() {
     assert!(config_toml.contains("base_url = \"https://relay.example/v1\""));
     assert!(config_toml.contains("experimental_bearer_token = \"sk-test-123456\""));
     assert!(!config_toml.contains("env_key = \"OPENAI_API_KEY\""));
+    let document = config_toml
+        .parse::<toml_edit::Document>()
+        .expect("parse config toml");
+    assert_eq!(
+        document["model_providers"]["relay"]["requires_openai_auth"].as_bool(),
+        Some(false),
+        "custom API providers must use their own bearer token instead of OpenAI auth"
+    );
     assert_eq!(
         store
             .current_account()
@@ -1968,7 +1976,7 @@ fn default_model_requires_current_account_and_applies_gpt_5_6_config() {
         document["windows_wsl_setup_acknowledged"].as_bool(),
         Some(true)
     );
-    assert_eq!(document["requires_openai_auth"].as_bool(), Some(true));
+    assert!(document.get("requires_openai_auth").is_none());
     assert_eq!(document["features"]["goals"].as_bool(), Some(true));
     assert_eq!(document["features"]["js_repl"].as_bool(), Some(false));
     assert_eq!(document["features"]["memories"].as_bool(), Some(true));

@@ -340,6 +340,23 @@ struct CodexSwitcherBackupProgressEvent {
     backup_file: Option<CodexSwitcherBackupFile>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexSessionRestoreResult {
+    restored: bool,
+    visibility_repaired: bool,
+    visibility: Option<CodexSessionVisibilityRepairSummary>,
+    warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAccountSwitchResult {
+    account: CodexAccount,
+    synchronized_session_provider_count: usize,
+    warning: Option<String>,
+}
+
 #[tauri::command]
 fn list_codex_accounts() -> Result<Vec<CodexAccount>, String> {
     AccountStore::default().list_accounts()
@@ -1570,7 +1587,7 @@ fn delete_codex_account(account_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn switch_codex_account(account_id: String) -> Result<CodexAccount, String> {
+async fn switch_codex_account(account_id: String) -> Result<CodexAccountSwitchResult, String> {
     let accounts = AccountStore::default().list_accounts()?;
     let target = accounts
         .iter()
@@ -1585,12 +1602,87 @@ async fn switch_codex_account(account_id: String) -> Result<CodexAccount, String
         token_keeper::ensure_fresh_access_token(&oauth_account_id, "切换账号前 Token 需要续期")
             .await?;
     }
-    AccountStore::default().switch_account(&account_id)
+    let account_store = AccountStore::default();
+    let session_store = SessionStore::default();
+    with_codex_desktop_stopped(|| {
+        switch_account_and_sync_session_provider(&account_store, &session_store, &account_id)
+    })
+}
+
+fn switch_account_and_sync_session_provider(
+    account_store: &AccountStore,
+    session_store: &SessionStore,
+    account_id: &str,
+) -> Result<CodexAccountSwitchResult, String> {
+    let account = account_store.switch_account(account_id)?;
+    let provider = session_store.read_target_provider()?;
+    let (synchronized_session_provider_count, warning) =
+        match session_store.synchronize_model_provider(&provider) {
+            Ok(updated) => (updated, None),
+            Err(error) => (
+                0,
+                Some(format!(
+                "账号已切换，但同步已有会话 provider 失败：{}。请在会话页点击“修复可见性”后重试",
+                error
+            )),
+            ),
+        };
+    Ok(CodexAccountSwitchResult {
+        account,
+        synchronized_session_provider_count,
+        warning,
+    })
 }
 
 #[tauri::command]
 fn restart_codex_app() -> Result<String, String> {
     AccountStore::default().restart_codex_app()
+}
+
+fn run_with_codex_desktop_restart<T, Stop, Action, Start>(
+    stop: Stop,
+    action: Action,
+    start: Start,
+) -> Result<T, String>
+where
+    Stop: FnOnce() -> Result<(), String>,
+    Action: FnOnce() -> Result<T, String>,
+    Start: FnOnce() -> Result<String, String>,
+{
+    stop()?;
+    let action_result = action();
+    let start_result = start();
+    match (action_result, start_result) {
+        (Ok(value), Ok(_)) => Ok(value),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(action_error), Err(start_error)) => Err(format!(
+            "{}；同时未能重新启动 ChatGPT/Codex：{}",
+            action_error, start_error
+        )),
+    }
+}
+
+fn with_codex_desktop_stopped<T>(action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let account_store = AccountStore::default();
+    run_with_codex_desktop_restart(
+        || account_store.stop_codex_app(),
+        action,
+        || account_store.start_codex_app(),
+    )
+}
+
+fn mark_visibility_desktop_reloaded(summary: &mut CodexSessionVisibilityRepairSummary) {
+    summary.desktop_reload_required = false;
+    summary.desktop_reload_performed = true;
+    let pending_suffix = "；需要重载 ChatGPT/Codex 才会刷新当前侧栏";
+    if let Some(message) = summary.message.strip_suffix(pending_suffix) {
+        summary.message = format!("{}；已重启 ChatGPT/Codex 并重新加载侧栏", message);
+    } else {
+        summary
+            .message
+            .push_str("；已重启 ChatGPT/Codex 并重新加载侧栏");
+    }
 }
 
 #[tauri::command]
@@ -2211,7 +2303,7 @@ fn restore_codex_switcher_backup(
     backup_path: String,
 ) -> Result<Vec<CodexAccount>, String> {
     let path = validate_backup_zip_path(&backup_path)?;
-    let file = std::fs::File::open(&path).map_err(|error| format!("打开备份失败: {}", error))?;
+    let file = std::fs::File::open(path).map_err(|error| format!("打开备份失败: {}", error))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|error| format!("读取 ZIP 备份失败: {}", error))?;
     let mut backup_json = String::new();
@@ -2256,15 +2348,55 @@ fn restore_codex_switcher_backup(
 }
 
 #[tauri::command]
-fn restore_codex_switcher_session_backup(backup_path: String) -> Result<(), String> {
+fn restore_codex_switcher_session_backup(
+    backup_path: String,
+) -> Result<CodexSessionRestoreResult, String> {
     let path = validate_session_backup_zip_path(&backup_path)
         .or_else(|_| validate_backup_zip_path(&backup_path))?;
-    let file = std::fs::File::open(&path).map_err(|error| format!("打开备份失败: {}", error))?;
+    let codex_home = default_codex_home();
+    let mut result = with_codex_desktop_stopped(|| {
+        restore_codex_switcher_session_backup_to(&path, &codex_home)
+    })?;
+    if let Some(visibility) = result.visibility.as_mut() {
+        mark_visibility_desktop_reloaded(visibility);
+    }
+    Ok(result)
+}
+
+fn restore_codex_switcher_session_backup_to(
+    path: &Path,
+    codex_home: &Path,
+) -> Result<CodexSessionRestoreResult, String> {
+    let file = std::fs::File::open(path).map_err(|error| format!("打开备份失败: {}", error))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|error| format!("读取 ZIP 备份失败: {}", error))?;
-    let prepared =
-        prepare_backup_archive_files_with(&mut archive, backup_session_entry_restore_target)?;
-    apply_prepared_backup_archive(&prepared)
+    let prepared = prepare_backup_archive_files_with(&mut archive, |name| {
+        backup_session_entry_restore_target_for(codex_home, name)
+    })?;
+    apply_prepared_backup_archive(&prepared)?;
+    match SessionStore::new(codex_home.to_path_buf()).repair_visibility_with_options(
+        Some("quick"),
+        None,
+        None,
+        None,
+        None,
+    ) {
+        Ok(visibility) => Ok(CodexSessionRestoreResult {
+            restored: true,
+            visibility_repaired: visibility.remaining_invisible_session_count == 0,
+            visibility: Some(visibility),
+            warning: None,
+        }),
+        Err(error) => Ok(CodexSessionRestoreResult {
+            restored: true,
+            visibility_repaired: false,
+            visibility: None,
+            warning: Some(format!(
+                "会话文件已恢复，但自动修复 Codex 列表失败：{}。请点击“修复可见性”重试",
+                error
+            )),
+        }),
+    }
 }
 
 #[tauri::command]
@@ -2502,13 +2634,17 @@ fn codex_repair_session_visibility_across_instances(
     session_ids: Option<Vec<String>>,
 ) -> Result<CodexSessionVisibilityRepairSummary, String> {
     let _ = run_id;
-    SessionStore::default().repair_visibility_with_options(
-        mode.as_deref(),
-        target_provider,
-        target_instance_id,
-        repair_instance_ids,
-        session_ids,
-    )
+    let mut summary = with_codex_desktop_stopped(|| {
+        SessionStore::default().repair_visibility_with_options(
+            mode.as_deref(),
+            target_provider,
+            target_instance_id,
+            repair_instance_ids,
+            session_ids,
+        )
+    })?;
+    mark_visibility_desktop_reloaded(&mut summary);
+    Ok(summary)
 }
 
 #[tauri::command]
@@ -2786,7 +2922,16 @@ fn add_codex_sessions_to_backup_zip(
     progress: &mut impl FnMut(u8, &str),
 ) -> Result<(), String> {
     let codex_home = default_codex_home();
-    migrate_legacy_session_trash(&codex_home);
+    add_codex_sessions_to_backup_zip_from(zip, options, progress, &codex_home)
+}
+
+fn add_codex_sessions_to_backup_zip_from(
+    zip: &mut zip::ZipWriter<std::fs::File>,
+    options: zip::write::FileOptions,
+    progress: &mut impl FnMut(u8, &str),
+    codex_home: &Path,
+) -> Result<(), String> {
+    migrate_legacy_session_trash(codex_home);
     progress(55, "正在备份会话文件...");
     add_directory_to_backup_zip(
         zip,
@@ -2796,8 +2941,17 @@ fn add_codex_sessions_to_backup_zip(
         &[],
         options,
     )?;
-    progress(82, "正在备份会话回收站...");
-    let session_trash_dir = codex_session_trash_dir(&codex_home);
+    progress(75, "正在备份会话生成图片...");
+    add_directory_to_backup_zip(
+        zip,
+        &codex_home.join("generated_images"),
+        &codex_home.join("generated_images"),
+        "codex/generated_images",
+        &[],
+        options,
+    )?;
+    progress(84, "正在备份会话回收站...");
+    let session_trash_dir = codex_session_trash_dir(codex_home);
     add_directory_to_backup_zip(
         zip,
         &session_trash_dir,
@@ -2808,13 +2962,13 @@ fn add_codex_sessions_to_backup_zip(
     )?;
     add_directory_to_backup_zip_skipping_shadow(
         zip,
-        &legacy_session_trash_dir(&codex_home),
-        &legacy_session_trash_dir(&codex_home),
+        &legacy_session_trash_dir(codex_home),
+        &legacy_session_trash_dir(codex_home),
         &session_trash_dir,
         "codex/session-trash",
         options,
     )?;
-    progress(88, "正在备份会话索引...");
+    progress(89, "正在备份会话索引...");
     for filename in ["session_index.jsonl", "session_index.jsonl.bak"] {
         add_file_to_backup_zip(
             zip,
@@ -2831,6 +2985,7 @@ fn codex_session_backup_summary(codex_home: &Path) -> Value {
     serde_json::json!({
         "sessionsDir": codex_home.join("sessions").to_string_lossy().to_string(),
         "sessionFiles": count_files_under(&codex_home.join("sessions")),
+        "generatedImageFiles": count_files_under(&codex_home.join("generated_images")),
         "trashedSessionFiles": count_session_trash_backup_files(codex_home),
         "includesSessionIndex": codex_home.join("session_index.jsonl").is_file(),
     })
@@ -2957,10 +3112,13 @@ struct PreparedBackupArchive {
     entries: Vec<PreparedBackupEntry>,
 }
 
-fn prepare_backup_archive_files_with(
+fn prepare_backup_archive_files_with<F>(
     archive: &mut zip::ZipArchive<std::fs::File>,
-    restore_target: fn(&str) -> Option<PathBuf>,
-) -> Result<PreparedBackupArchive, String> {
+    restore_target: F,
+) -> Result<PreparedBackupArchive, String>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
     let staging_dir =
         tempfile::tempdir().map_err(|error| format!("创建恢复临时目录失败: {}", error))?;
     let mut entries = Vec::new();
@@ -3116,6 +3274,10 @@ fn backup_entry_restore_target(name: &str) -> Option<PathBuf> {
 }
 
 fn backup_session_entry_restore_target(name: &str) -> Option<PathBuf> {
+    backup_session_entry_restore_target_for(&default_codex_home(), name)
+}
+
+fn backup_session_entry_restore_target_for(codex_home: &Path, name: &str) -> Option<PathBuf> {
     let normalized = name.replace('\\', "/");
     let path = Path::new(&normalized);
     if path.is_absolute()
@@ -3125,14 +3287,18 @@ fn backup_session_entry_restore_target(name: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    let codex_home = default_codex_home();
     normalized
         .strip_prefix("codex/sessions/")
         .map(|relative| codex_home.join("sessions").join(relative))
         .or_else(|| {
             normalized
+                .strip_prefix("codex/generated_images/")
+                .map(|relative| codex_home.join("generated_images").join(relative))
+        })
+        .or_else(|| {
+            normalized
                 .strip_prefix("codex/session-trash/")
-                .map(|relative| codex_session_trash_dir(&codex_home).join(relative))
+                .map(|relative| codex_session_trash_dir(codex_home).join(relative))
         })
         .or_else(|| {
             ["session_index.jsonl", "session_index.jsonl.bak"]
@@ -3763,13 +3929,86 @@ mod tests {
         backup_entry_restore_target, codex_config_backup_path, codex_session_trash_dir,
         default_codex_home, format_codex_config_content, parse_codex_api_key_models,
         parse_codex_quota, prepare_backup_archive_files_with, read_codex_config_file_from,
-        rollback_file_on_error, switcher_account_dir, switcher_data_dir,
-        validate_prepared_switcher_backup, write_codex_config_file_to, CodexApiKeyModel,
-        CodexConfigFileKind,
+        rollback_file_on_error, run_with_codex_desktop_restart,
+        switch_account_and_sync_session_provider, switcher_account_dir, switcher_data_dir,
+        validate_prepared_switcher_backup, write_codex_config_file_to, AccountStore,
+        CodexApiKeyModel, CodexConfigFileKind, SessionStore,
     };
     use serde_json::json;
     use std::io::Write;
     use tempfile::tempdir;
+
+    #[test]
+    fn desktop_repair_restarts_codex_even_when_the_repair_fails() {
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let result = run_with_codex_desktop_restart(
+            || {
+                calls.borrow_mut().push("stop");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("repair");
+                Err::<(), _>("repair failed".to_string())
+            },
+            || {
+                calls.borrow_mut().push("start");
+                Ok("started".to_string())
+            },
+        );
+
+        assert_eq!(result, Err("repair failed".to_string()));
+        assert_eq!(*calls.borrow(), vec!["stop", "repair", "start"]);
+    }
+
+    #[test]
+    fn account_switch_synchronizes_existing_session_provider_before_restart() {
+        let storage = tempdir().expect("storage tempdir");
+        let codex = tempdir().expect("codex tempdir");
+        let state =
+            rusqlite::Connection::open(codex.path().join("state_5.sqlite")).expect("state db");
+        state
+            .execute_batch(
+                r#"
+                    CREATE TABLE threads (
+                        id TEXT PRIMARY KEY,
+                        model_provider TEXT NOT NULL
+                    );
+                    INSERT INTO threads (id, model_provider) VALUES ('existing-session', 'openai');
+                "#,
+            )
+            .expect("state schema");
+        drop(state);
+        let account_store =
+            AccountStore::new(storage.path().to_path_buf(), codex.path().to_path_buf());
+        let session_store = SessionStore::new(codex.path().to_path_buf());
+        let account = account_store
+            .add_api_key_account(
+                "sk-local-proxy-test".to_string(),
+                Some("http://127.0.0.1:17877/v1".to_string()),
+                Some("CLIProxyAPI".to_string()),
+                None,
+                None,
+            )
+            .expect("add api account");
+
+        let result =
+            switch_account_and_sync_session_provider(&account_store, &session_store, &account.id)
+                .expect("switch and synchronize");
+
+        assert_eq!(result.account.id, account.id);
+        assert_eq!(result.synchronized_session_provider_count, 1);
+        assert!(result.warning.is_none());
+        let provider = rusqlite::Connection::open(codex.path().join("state_5.sqlite"))
+            .expect("reopen state db")
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id = 'existing-session'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read synchronized provider");
+        assert_eq!(provider, "cliproxyapi");
+    }
 
     #[test]
     fn successful_reset_credit_consume_keeps_refresh_failure_as_warning() {
@@ -4173,6 +4412,16 @@ mod tests {
             Some(codex_session_trash_dir(&default_codex_home()).join("session.jsonl"))
         );
         assert_eq!(
+            backup_entry_restore_target(
+                "codex/generated_images/session-id/exec-11111111-2222-4333-8444-555555555555.png"
+            ),
+            Some(
+                default_codex_home().join(
+                    "generated_images/session-id/exec-11111111-2222-4333-8444-555555555555.png"
+                )
+            )
+        );
+        assert_eq!(
             backup_entry_restore_target("data/accounts.json"),
             Some(switcher_data_dir().join("accounts.json"))
         );
@@ -4184,6 +4433,135 @@ mod tests {
             backup_entry_restore_target("data/statistics/usage.sqlite"),
             Some(switcher_data_dir().join("statistics/usage.sqlite"))
         );
+    }
+
+    #[test]
+    fn session_backup_restore_automatically_repairs_desktop_visibility() {
+        let codex = tempdir().expect("codex tempdir");
+        std::fs::create_dir_all(codex.path().join("sqlite")).expect("sqlite dir");
+        std::fs::write(
+            codex.path().join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .expect("write config");
+        let state =
+            rusqlite::Connection::open(codex.path().join("state_5.sqlite")).expect("state db");
+        state
+            .execute_batch(
+                r#"
+                    CREATE TABLE threads (
+                        id TEXT PRIMARY KEY,
+                        rollout_path TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        source TEXT NOT NULL,
+                        model_provider TEXT NOT NULL,
+                        cwd TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        sandbox_policy TEXT NOT NULL,
+                        approval_mode TEXT NOT NULL,
+                        has_user_event INTEGER NOT NULL DEFAULT 0,
+                        preview TEXT NOT NULL DEFAULT '',
+                        archived INTEGER NOT NULL DEFAULT 0
+                    );
+                "#,
+            )
+            .expect("state schema");
+        drop(state);
+        let catalog = rusqlite::Connection::open(codex.path().join("sqlite/codex-dev.db"))
+            .expect("catalog db");
+        catalog
+            .execute_batch(
+                r#"
+                    CREATE TABLE local_thread_catalog (
+                        host_id TEXT NOT NULL,
+                        thread_id TEXT NOT NULL,
+                        display_title TEXT NOT NULL,
+                        source_created_at REAL NOT NULL,
+                        source_updated_at REAL NOT NULL,
+                        cwd TEXT NOT NULL,
+                        source_kind TEXT NOT NULL,
+                        source_detail TEXT,
+                        model_provider TEXT NOT NULL,
+                        git_branch TEXT,
+                        observation_sequence INTEGER NOT NULL,
+                        missing_candidate INTEGER NOT NULL DEFAULT 0,
+                        thread_source TEXT,
+                        source_recency_at REAL NOT NULL DEFAULT 0,
+                        pending_observed_title INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (host_id, thread_id)
+                    );
+                    CREATE TABLE local_thread_catalog_hosts (
+                        host_id TEXT PRIMARY KEY,
+                        host_kind TEXT NOT NULL
+                    );
+                    CREATE TABLE local_thread_catalog_metadata (
+                        id INTEGER PRIMARY KEY,
+                        catalog_revision INTEGER NOT NULL DEFAULT 0
+                    );
+                    INSERT INTO local_thread_catalog_metadata (id, catalog_revision) VALUES (1, 0);
+                    CREATE TABLE local_thread_catalog_sync_state (
+                        host_id TEXT PRIMARY KEY,
+                        observation_sequence INTEGER NOT NULL DEFAULT 0
+                    );
+                "#,
+            )
+            .expect("catalog schema");
+        drop(catalog);
+
+        let archive_dir = tempdir().expect("archive tempdir");
+        let zip_path = archive_dir.path().join("sessions.zip");
+        let file = std::fs::File::create(&zip_path).expect("create session zip");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        zip.start_file(
+            "codex/sessions/2026/07/01/rollout-session-restored.jsonl",
+            options,
+        )
+        .expect("start session entry");
+        zip.write_all(
+            concat!(
+                r#"{"timestamp":"2026-07-01T08:30:00Z","type":"session_meta","payload":{"id":"session-restored","timestamp":"2026-07-01T08:30:00Z","cwd":"/tmp/demo","cli_version":"0.130.0","source":"vscode","model_provider":"legacy"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-07-01T08:31:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"恢复后自动显示"}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .expect("write session entry");
+        zip.finish().expect("finish session zip");
+
+        let result = super::restore_codex_switcher_session_backup_to(&zip_path, codex.path())
+            .expect("restore and repair");
+
+        assert!(result.restored);
+        assert!(result.visibility_repaired);
+        assert!(result.warning.is_none());
+        let visibility = result.visibility.expect("visibility summary");
+        assert_eq!(visibility.verified_visible_session_count, 1);
+        assert!(visibility.desktop_reload_required);
+        let state = rusqlite::Connection::open(codex.path().join("state_5.sqlite"))
+            .expect("open repaired state");
+        let state_count = state
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = 'session-restored' AND model_provider = 'openai' AND preview <> ''",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .expect("state count");
+        assert_eq!(state_count, 1);
+        let catalog = rusqlite::Connection::open(codex.path().join("sqlite/codex-dev.db"))
+            .expect("open repaired catalog");
+        let catalog_count = catalog
+            .query_row(
+                "SELECT COUNT(*) FROM local_thread_catalog WHERE host_id = 'local' AND thread_id = 'session-restored' AND missing_candidate = 0",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .expect("catalog count");
+        assert_eq!(catalog_count, 1);
     }
 
     #[test]
@@ -4285,6 +4663,39 @@ mod tests {
     }
 
     #[test]
+    fn codex_generated_images_are_included_in_session_backup() {
+        let codex = tempdir().expect("codex tempdir");
+        let image = codex
+            .path()
+            .join("generated_images/session-id/exec-image.png");
+        std::fs::create_dir_all(image.parent().expect("image parent")).expect("image dir");
+        std::fs::write(&image, b"png").expect("image file");
+        let zip_dir = tempdir().expect("zip tempdir");
+        let zip_path = zip_dir.path().join("backup.zip");
+        let file = std::fs::File::create(&zip_path).expect("create zip");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        let mut progress = |_: u8, _: &str| {};
+
+        super::add_codex_sessions_to_backup_zip_from(
+            &mut zip,
+            options,
+            &mut progress,
+            codex.path(),
+        )
+        .expect("backup sessions and images");
+        zip.finish().expect("finish zip");
+
+        let file = std::fs::File::open(zip_path).expect("open zip");
+        let mut archive = zip::ZipArchive::new(file).expect("read zip");
+        assert!(archive
+            .by_name("codex/generated_images/session-id/exec-image.png")
+            .is_ok());
+    }
+
+    #[test]
     fn codex_session_backup_summary_counts_legacy_trash_fallback_files() {
         let codex = tempdir().expect("codex tempdir");
         let primary = codex_session_trash_dir(codex.path());
@@ -4306,6 +4717,12 @@ mod tests {
                 .get("trashedSessionFiles")
                 .and_then(serde_json::Value::as_u64),
             Some(4)
+        );
+        assert_eq!(
+            summary
+                .get("generatedImageFiles")
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
         );
         assert!(primary.join("moved.jsonl").is_file());
     }
