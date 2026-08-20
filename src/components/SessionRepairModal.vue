@@ -45,7 +45,7 @@ defineEmits<{
           <span class="modal-eyebrow">{{ t("会话恢复") }}</span>
           <h3>{{ t("把切号后消失的会话重新挂回列表") }}</h3>
           <p>
-            {{ t("会同步整理 Codex 本地索引与状态库，让侧边栏重新识别已有会话；适合 OAuth 和 API Key 之间切换后使用。") }}
+            {{ t("会同步整理 Codex 本地索引、项目分组、生成图片与状态库，并自动重启 ChatGPT/Codex 让当前侧栏重新加载；请先等待正在运行的任务结束。") }}
           </p>
         </div>
         <div class="repair-summary-card">
@@ -150,6 +150,39 @@ defineEmits<{
         </span>
         <span v-if="repairResult.addedSessionIndexEntryCount">
           session_index {{ repairResult.addedSessionIndexEntryCount }} {{ t("条") }}
+        </span>
+        <span v-if="repairResult.updatedCatalogRowCount !== undefined">
+          {{ t("侧栏目录") }} {{ repairResult.updatedCatalogRowCount }} {{ t("条") }}
+        </span>
+        <span v-if="repairResult.verifiedVisibleSessionCount !== undefined">
+          {{ t("目录校验") }} {{ repairResult.verifiedVisibleSessionCount }} {{ t("条") }}
+        </span>
+        <span v-if="repairResult.skippedNonSidebarSessionCount">
+          {{ t("跳过子代理") }} {{ repairResult.skippedNonSidebarSessionCount }} {{ t("条") }}
+        </span>
+        <span v-if="repairResult.createdLocalProjectCount !== undefined">
+          {{ t("新建项目") }} {{ repairResult.createdLocalProjectCount }} {{ t("个") }}
+        </span>
+        <span v-if="repairResult.assignedLocalProjectSessionCount !== undefined">
+          {{ t("会话归组") }} {{ repairResult.assignedLocalProjectSessionCount }} {{ t("条") }}
+        </span>
+        <span v-if="repairResult.verifiedLocalProjectCount !== undefined">
+          {{ t("项目校验") }} {{ repairResult.verifiedLocalProjectCount }} {{ t("个") }}
+        </span>
+        <span v-if="repairResult.recreatedGeneratedImageCount !== undefined">
+          {{ t("重建图片") }} {{ repairResult.recreatedGeneratedImageCount }} {{ t("张") }}
+        </span>
+        <span v-if="repairResult.verifiedGeneratedImageCount !== undefined">
+          {{ t("图片校验") }} {{ repairResult.verifiedGeneratedImageCount }} {{ t("张") }}
+        </span>
+        <span v-if="repairResult.invalidGeneratedImageCount" class="repair-result-error">
+          {{ t("无效图片") }} {{ repairResult.invalidGeneratedImageCount }} {{ t("张") }}
+        </span>
+        <span v-if="repairResult.desktopReloadPerformed">
+          {{ t("侧栏已重载") }}
+        </span>
+        <span v-if="repairResult.remainingInvisibleSessionCount" class="repair-result-error">
+          {{ t("仍不可见") }} {{ repairResult.remainingInvisibleSessionCount }} {{ t("条") }}
         </span>
       </div>
 

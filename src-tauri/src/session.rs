@@ -1,4 +1,5 @@
 use crate::account::{replace_file_atomic, write_bytes_atomic};
+use base64::{engine::general_purpose, Engine as _};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -160,6 +161,19 @@ pub struct CodexSessionVisibilityRepairSummary {
     pub updated_sqlite_timestamp_row_count: usize,
     pub added_session_index_entry_count: usize,
     pub updated_session_index_entry_count: usize,
+    pub updated_catalog_row_count: usize,
+    pub verified_visible_session_count: usize,
+    pub skipped_non_sidebar_session_count: usize,
+    pub remaining_invisible_session_count: usize,
+    pub created_local_project_count: usize,
+    pub assigned_local_project_session_count: usize,
+    pub verified_local_project_count: usize,
+    pub skipped_local_project_session_count: usize,
+    pub recreated_generated_image_count: usize,
+    pub verified_generated_image_count: usize,
+    pub invalid_generated_image_count: usize,
+    pub desktop_reload_required: bool,
+    pub desktop_reload_performed: bool,
     pub backup_dirs: Vec<String>,
     pub items: Vec<CodexSessionVisibilityRepairItem>,
     pub message: String,
@@ -211,6 +225,32 @@ struct SessionRepairRecord {
     title: String,
     path: PathBuf,
     updated_at: i64,
+}
+
+#[derive(Debug, Default)]
+struct DesktopCatalogRepairResult {
+    updated: usize,
+    verified: usize,
+    skipped: usize,
+    missing_ids: Vec<String>,
+    backup_dir: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct DesktopProjectRepairResult {
+    created: usize,
+    updated_assignments: usize,
+    verified_projects: usize,
+    verified_assignments: usize,
+    skipped: usize,
+    backup_dir: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct GeneratedImageRepairResult {
+    recreated: usize,
+    verified: usize,
+    invalid: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +316,115 @@ impl SessionStore {
     #[allow(dead_code)]
     pub fn repair_visibility(&self) -> Result<CodexSessionVisibilityRepairSummary, String> {
         self.repair_visibility_with_options(None, None, None, None, None)
+    }
+
+    pub fn synchronize_model_provider(&self, target_provider: &str) -> Result<usize, String> {
+        let target_provider = target_provider.trim();
+        if target_provider.is_empty() {
+            return Err("Codex model_provider 不能为空".to_string());
+        }
+        let mut updated = 0usize;
+        for db_path in self.sqlite_candidate_paths() {
+            let connection = Connection::open(&db_path).map_err(|error| {
+                format!(
+                    "打开 Codex 会话数据库失败 ({}): {}",
+                    db_path.display(),
+                    error
+                )
+            })?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| format!("设置 Codex 会话数据库等待时间失败: {}", error))?;
+            let threads_columns = sqlite_table_columns_with_connection(&connection, "threads")?;
+            let catalog_columns =
+                sqlite_table_columns_with_connection(&connection, "local_thread_catalog")?;
+            let thread_count = if threads_columns.contains("model_provider") {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM threads WHERE COALESCE(model_provider, '') <> ?1",
+                        params![target_provider],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .map_err(|error| format!("检查 Codex 会话 provider 失败: {}", error))?
+            } else {
+                0
+            };
+            let catalog_count = if catalog_columns.contains("model_provider") {
+                let local_only = if catalog_columns.contains("host_id") {
+                    " AND host_id = 'local'"
+                } else {
+                    ""
+                };
+                connection
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM local_thread_catalog WHERE COALESCE(model_provider, '') <> ?1{local_only}"
+                        ),
+                        params![target_provider],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .map_err(|error| format!("检查 Codex 侧栏 provider 失败: {}", error))?
+            } else {
+                0
+            };
+            if thread_count == 0 && catalog_count == 0 {
+                continue;
+            }
+            drop(connection);
+            backup_sqlite_file(&db_path)?;
+
+            let mut connection = Connection::open(&db_path).map_err(|error| {
+                format!(
+                    "重新打开 Codex 会话数据库失败 ({}): {}",
+                    db_path.display(),
+                    error
+                )
+            })?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| format!("设置 Codex 会话数据库等待时间失败: {}", error))?;
+            let transaction = connection
+                .transaction()
+                .map_err(|error| format!("开启 Codex provider 同步事务失败: {}", error))?;
+            if thread_count > 0 {
+                updated += transaction
+                    .execute(
+                        "UPDATE threads SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
+                        params![target_provider],
+                    )
+                    .map_err(|error| format!("同步 Codex 会话 provider 失败: {}", error))?;
+            }
+            if catalog_count > 0 {
+                let local_only = if catalog_columns.contains("host_id") {
+                    " AND host_id = 'local'"
+                } else {
+                    ""
+                };
+                updated += transaction
+                    .execute(
+                        &format!(
+                            "UPDATE local_thread_catalog SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1{local_only}"
+                        ),
+                        params![target_provider],
+                    )
+                    .map_err(|error| format!("同步 Codex 侧栏 provider 失败: {}", error))?;
+                if sqlite_table_exists_with_connection(
+                    &transaction,
+                    "local_thread_catalog_metadata",
+                )? {
+                    transaction
+                        .execute(
+                            "UPDATE local_thread_catalog_metadata SET catalog_revision = catalog_revision + 1 WHERE id = 1",
+                            [],
+                        )
+                        .map_err(|error| format!("更新 Codex 侧栏目录版本失败: {}", error))?;
+                }
+            }
+            transaction
+                .commit()
+                .map_err(|error| format!("提交 Codex provider 同步失败: {}", error))?;
+        }
+        Ok(updated)
     }
 
     pub fn list_sessions(
@@ -821,6 +970,19 @@ impl SessionStore {
                 updated_sqlite_timestamp_row_count: 0,
                 added_session_index_entry_count: 0,
                 updated_session_index_entry_count: 0,
+                updated_catalog_row_count: 0,
+                verified_visible_session_count: 0,
+                skipped_non_sidebar_session_count: 0,
+                remaining_invisible_session_count: 0,
+                created_local_project_count: 0,
+                assigned_local_project_session_count: 0,
+                verified_local_project_count: 0,
+                skipped_local_project_session_count: 0,
+                recreated_generated_image_count: 0,
+                verified_generated_image_count: 0,
+                invalid_generated_image_count: 0,
+                desktop_reload_required: false,
+                desktop_reload_performed: false,
                 backup_dirs: Vec::new(),
                 items: Vec::new(),
                 message: "没有匹配到需要修复的 Codex 实例".to_string(),
@@ -862,9 +1024,31 @@ impl SessionStore {
         } else {
             0
         };
-        let repaired = changed_rollout_files + updated_rows + added_index_entries;
+        let catalog = self.repair_desktop_catalog(&target_provider, &repair_records)?;
+        if !catalog.missing_ids.is_empty() {
+            return Err(format!(
+                "Codex 侧栏目录校验失败，仍有 {} 条主会话不可见：{}",
+                catalog.missing_ids.len(),
+                catalog.missing_ids.join(", ")
+            ));
+        }
+        let projects = self.repair_desktop_projects(&repair_records)?;
+        let generated_images = self.repair_generated_images(&repair_records)?;
+        let repaired = changed_rollout_files
+            + updated_rows
+            + added_index_entries
+            + catalog.updated
+            + projects.created
+            + projects.updated_assignments
+            + generated_images.recreated;
         let mut all_backup_dirs = rollout_backup_dirs;
         all_backup_dirs.extend(backup_dirs);
+        if let Some(backup_dir) = catalog.backup_dir.clone() {
+            all_backup_dirs.push(backup_dir);
+        }
+        if let Some(backup_dir) = projects.backup_dir.clone() {
+            all_backup_dirs.push(backup_dir);
+        }
         all_backup_dirs.sort();
         all_backup_dirs.dedup();
         let repair_marker_path = visibility_repair_marker_path();
@@ -879,6 +1063,18 @@ impl SessionStore {
                 "repaired": repaired,
                 "targetProvider": target_provider,
                 "mode": if deep { "deep" } else { "quick" },
+                "updatedCatalogRows": catalog.updated,
+                "verifiedVisible": catalog.verified,
+                "skippedNonSidebar": catalog.skipped,
+                "remainingInvisible": catalog.missing_ids.len(),
+                "createdLocalProjects": projects.created,
+                "assignedLocalProjectSessions": projects.verified_assignments,
+                "verifiedLocalProjects": projects.verified_projects,
+                "skippedLocalProjectSessions": projects.skipped,
+                "recreatedGeneratedImages": generated_images.recreated,
+                "verifiedGeneratedImages": generated_images.verified,
+                "invalidGeneratedImages": generated_images.invalid,
+                "desktopReloadRequired": !sessions.is_empty(),
                 "updatedAt": now_timestamp()
             }))
             .unwrap_or_default(),
@@ -894,6 +1090,19 @@ impl SessionStore {
             updated_sqlite_timestamp_row_count: 0,
             added_session_index_entry_count: added_index_entries,
             updated_session_index_entry_count: 0,
+            updated_catalog_row_count: catalog.updated,
+            verified_visible_session_count: catalog.verified,
+            skipped_non_sidebar_session_count: catalog.skipped,
+            remaining_invisible_session_count: catalog.missing_ids.len(),
+            created_local_project_count: projects.created,
+            assigned_local_project_session_count: projects.verified_assignments,
+            verified_local_project_count: projects.verified_projects,
+            skipped_local_project_session_count: projects.skipped,
+            recreated_generated_image_count: generated_images.recreated,
+            verified_generated_image_count: generated_images.verified,
+            invalid_generated_image_count: generated_images.invalid,
+            desktop_reload_required: !sessions.is_empty(),
+            desktop_reload_performed: false,
             backup_dirs: all_backup_dirs.clone(),
             items: vec![CodexSessionVisibilityRepairItem {
                 instance_id: "__default__".to_string(),
@@ -908,10 +1117,487 @@ impl SessionStore {
                 running: false,
             }],
             message: format!(
-                "已为 1 个实例修复会话可见性：校正 {} 个会话文件，更新 {} 条 SQLite 可见性记录，校正 0 条 SQLite 时间记录",
-                changed_rollout_files, updated_rows
+                "已修复 Codex 会话、项目目录与图片：校正 {} 个会话文件，更新 {} 条线程记录，同步 {} 条侧栏目录，目录校验通过 {} 条；创建 {} 个本地项目，归组 {} 条会话，项目校验通过 {} 个，重建 {} 张生成图片、校验 {} 张，跳过 {} 条非侧栏或无效目录会话；需要重载 ChatGPT/Codex 才会刷新当前侧栏",
+                changed_rollout_files,
+                updated_rows,
+                catalog.updated,
+                catalog.verified,
+                projects.created,
+                projects.verified_assignments,
+                projects.verified_projects,
+                generated_images.recreated,
+                generated_images.verified,
+                projects.skipped
             ),
         })
+    }
+
+    fn repair_desktop_catalog(
+        &self,
+        target_provider: &str,
+        sessions: &[SessionRepairRecord],
+    ) -> Result<DesktopCatalogRepairResult, String> {
+        let db_path = self.codex_home.join("sqlite").join("codex-dev.db");
+        if !db_path.exists() || sessions.is_empty() {
+            return Ok(DesktopCatalogRepairResult::default());
+        }
+        let mut connection = Connection::open(&db_path).map_err(|error| {
+            format!("打开 Codex 侧栏目录失败 ({}): {}", db_path.display(), error)
+        })?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| format!("设置 Codex 侧栏目录等待时间失败: {}", error))?;
+        let columns = sqlite_table_columns_with_connection(&connection, "local_thread_catalog")?;
+        let required = [
+            "host_id",
+            "thread_id",
+            "display_title",
+            "source_created_at",
+            "source_updated_at",
+            "cwd",
+            "source_kind",
+            "model_provider",
+            "observation_sequence",
+            "missing_candidate",
+            "source_recency_at",
+        ];
+        if required.iter().any(|column| !columns.contains(*column)) {
+            return Ok(DesktopCatalogRepairResult::default());
+        }
+
+        let mut eligible = Vec::new();
+        let mut skipped = 0usize;
+        for session in sessions {
+            let metadata = sqlite_metadata_for_session(session);
+            let Some(source_kind) = sidebar_source_kind(&metadata.source) else {
+                skipped += 1;
+                continue;
+            };
+            eligible.push((session, metadata, source_kind));
+        }
+        if eligible.is_empty() {
+            return Ok(DesktopCatalogRepairResult {
+                skipped,
+                ..Default::default()
+            });
+        }
+
+        let backup_dir = backup_sqlite_file(&db_path)?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("开启 Codex 侧栏目录事务失败: {}", error))?;
+        let observation_sequence = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(observation_sequence), 0) + 1 FROM local_thread_catalog",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("读取 Codex 侧栏目录序号失败: {}", error))?;
+
+        if sqlite_table_exists_with_connection(&transaction, "local_thread_catalog_hosts")? {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO local_thread_catalog_hosts (host_id, host_kind) VALUES ('local', 'local')",
+                    [],
+                )
+                .map_err(|error| format!("登记 Codex 本地目录失败: {}", error))?;
+        }
+
+        let has_source_detail = columns.contains("source_detail");
+        let has_git_branch = columns.contains("git_branch");
+        let has_thread_source = columns.contains("thread_source");
+        let has_pending_title = columns.contains("pending_observed_title");
+        let mut updated = 0usize;
+        for (session, metadata, source_kind) in &eligible {
+            let mut names = vec![
+                "host_id",
+                "thread_id",
+                "display_title",
+                "source_created_at",
+                "source_updated_at",
+                "cwd",
+                "source_kind",
+                "model_provider",
+                "observation_sequence",
+                "missing_candidate",
+                "source_recency_at",
+            ];
+            let mut placeholders = vec![
+                "?1", "?2", "?3", "?4", "?5", "?6", "?7", "?8", "?9", "0", "?5",
+            ];
+            if has_source_detail {
+                names.push("source_detail");
+                placeholders.push("NULL");
+            }
+            if has_git_branch {
+                names.push("git_branch");
+                placeholders.push("NULL");
+            }
+            if has_thread_source {
+                names.push("thread_source");
+                placeholders.push("'user'");
+            }
+            if has_pending_title {
+                names.push("pending_observed_title");
+                placeholders.push("0");
+            }
+            let updates = names
+                .iter()
+                .filter(|name| **name != "host_id" && **name != "thread_id")
+                .map(|name| format!("{name} = excluded.{name}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT INTO local_thread_catalog ({}) VALUES ({}) \
+                 ON CONFLICT(host_id, thread_id) DO UPDATE SET {}",
+                names.join(", "),
+                placeholders.join(", "),
+                updates
+            );
+            updated += transaction
+                .execute(
+                    &sql,
+                    params![
+                        "local",
+                        session.id,
+                        session.title,
+                        metadata.created_at,
+                        session.updated_at,
+                        metadata.cwd,
+                        source_kind,
+                        target_provider,
+                        observation_sequence,
+                    ],
+                )
+                .map_err(|error| format!("同步 Codex 侧栏目录失败 ({}): {}", session.id, error))?;
+        }
+
+        if sqlite_table_exists_with_connection(&transaction, "local_thread_catalog_metadata")? {
+            transaction
+                .execute(
+                    "INSERT INTO local_thread_catalog_metadata (id, catalog_revision) VALUES (1, 1) \
+                     ON CONFLICT(id) DO UPDATE SET catalog_revision = catalog_revision + 1",
+                    [],
+                )
+                .map_err(|error| format!("更新 Codex 侧栏目录版本失败: {}", error))?;
+        }
+        if sqlite_table_exists_with_connection(&transaction, "local_thread_catalog_sync_state")? {
+            let sync_columns = sqlite_table_columns_with_connection(
+                &transaction,
+                "local_thread_catalog_sync_state",
+            )?;
+            if sync_columns.contains("host_id") && sync_columns.contains("observation_sequence") {
+                transaction
+                    .execute(
+                        "INSERT INTO local_thread_catalog_sync_state (host_id, observation_sequence) VALUES ('local', ?1) \
+                         ON CONFLICT(host_id) DO UPDATE SET observation_sequence = MAX(observation_sequence, excluded.observation_sequence)",
+                        params![observation_sequence],
+                    )
+                    .map_err(|error| format!("更新 Codex 侧栏同步状态失败: {}", error))?;
+            }
+        }
+
+        let mut missing_ids = Vec::new();
+        for (session, _, _) in &eligible {
+            let visible = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM local_thread_catalog \
+                     WHERE host_id = 'local' AND thread_id = ?1 AND missing_candidate = 0",
+                    params![session.id],
+                    |row| row.get::<_, usize>(0),
+                )
+                .map_err(|error| format!("校验 Codex 侧栏目录失败: {}", error))?;
+            if visible != 1 {
+                missing_ids.push(session.id.clone());
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("提交 Codex 侧栏目录修复失败: {}", error))?;
+        Ok(DesktopCatalogRepairResult {
+            updated,
+            verified: eligible.len().saturating_sub(missing_ids.len()),
+            skipped,
+            missing_ids,
+            backup_dir: Some(backup_dir),
+        })
+    }
+
+    fn repair_desktop_projects(
+        &self,
+        sessions: &[SessionRepairRecord],
+    ) -> Result<DesktopProjectRepairResult, String> {
+        if sessions.is_empty() {
+            return Ok(DesktopProjectRepairResult::default());
+        }
+        let mut candidates = Vec::new();
+        let mut skipped = 0usize;
+        for session in sessions {
+            let metadata = sqlite_metadata_for_session(session);
+            if sidebar_source_kind(&metadata.source).is_none() {
+                skipped += 1;
+                continue;
+            }
+            let cwd = metadata.cwd.trim();
+            if cwd.is_empty() || cwd == "/" || cwd == "~" || !Path::new(cwd).is_dir() {
+                skipped += 1;
+                continue;
+            }
+            candidates.push((session.id.clone(), cwd.to_string()));
+        }
+        if candidates.is_empty() {
+            return Ok(DesktopProjectRepairResult {
+                skipped,
+                ..Default::default()
+            });
+        }
+
+        let state_path = self.codex_home.join(".codex-global-state.json");
+        let mut state = if state_path.is_file() {
+            let bytes = fs::read(&state_path).map_err(|error| {
+                format!(
+                    "读取 Codex 项目状态失败 ({}): {}",
+                    state_path.display(),
+                    error
+                )
+            })?;
+            serde_json::from_slice::<Value>(&bytes).map_err(|error| {
+                format!(
+                    "解析 Codex 项目状态失败 ({}): {}",
+                    state_path.display(),
+                    error
+                )
+            })?
+        } else {
+            serde_json::json!({})
+        };
+        let state_object = state
+            .as_object_mut()
+            .ok_or_else(|| "Codex 项目状态不是 JSON 对象，已停止修复以避免覆盖".to_string())?;
+        let local_projects = state_object
+            .entry("local-projects".to_string())
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| "Codex local-projects 状态格式无效".to_string())?;
+        let mut project_id_by_root = HashMap::new();
+        for (project_id, project) in local_projects.iter() {
+            let Some(root_paths) = project.get("rootPaths").and_then(Value::as_array) else {
+                continue;
+            };
+            for root in root_paths.iter().filter_map(Value::as_str) {
+                if !root.trim().is_empty() {
+                    project_id_by_root
+                        .entry(root.to_string())
+                        .or_insert_with(|| project_id.clone());
+                }
+            }
+        }
+
+        let now_ms = now_timestamp().saturating_mul(1_000);
+        let mut created = 0usize;
+        for (_, cwd) in &candidates {
+            if project_id_by_root.contains_key(cwd) {
+                continue;
+            }
+            let mut project_id = desktop_project_id(cwd);
+            let mut collision_index = 0usize;
+            while local_projects.contains_key(&project_id) {
+                collision_index += 1;
+                project_id = desktop_project_id(&format!("{cwd}#{collision_index}"));
+            }
+            let name = project_name_for_path(cwd).unwrap_or_else(|| "Project".to_string());
+            local_projects.insert(
+                project_id.clone(),
+                serde_json::json!({
+                    "id": project_id,
+                    "name": name,
+                    "rootPaths": [cwd],
+                    "createdAt": now_ms,
+                    "updatedAt": now_ms
+                }),
+            );
+            project_id_by_root.insert(cwd.clone(), project_id);
+            created += 1;
+        }
+
+        let mut project_order = state_object
+            .get("project-order")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut ordered_project_ids = project_order
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        for (_, cwd) in &candidates {
+            let Some(project_id) = project_id_by_root.get(cwd) else {
+                continue;
+            };
+            if ordered_project_ids.insert(project_id.clone()) {
+                project_order.push(Value::String(project_id.clone()));
+            }
+        }
+        state_object.insert("project-order".to_string(), Value::Array(project_order));
+
+        let assignments = state_object
+            .entry("thread-project-assignments".to_string())
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| "Codex thread-project-assignments 状态格式无效".to_string())?;
+        let mut updated_assignments = 0usize;
+        for (session_id, cwd) in &candidates {
+            let Some(project_id) = project_id_by_root.get(cwd) else {
+                continue;
+            };
+            let assignment = serde_json::json!({
+                "projectKind": "local",
+                "projectId": project_id
+            });
+            if assignments.get(session_id) != Some(&assignment) {
+                assignments.insert(session_id.clone(), assignment);
+                updated_assignments += 1;
+            }
+        }
+        let verified_projects = candidates
+            .iter()
+            .map(|(_, cwd)| cwd)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter(|cwd| project_id_by_root.contains_key(*cwd))
+            .count();
+        let verified_assignments = candidates
+            .iter()
+            .filter(|(session_id, cwd)| {
+                let Some(project_id) = project_id_by_root.get(cwd) else {
+                    return false;
+                };
+                assignments
+                    .get(session_id)
+                    .and_then(|assignment| assignment.get("projectId"))
+                    .and_then(Value::as_str)
+                    == Some(project_id.as_str())
+            })
+            .count();
+        let assigned_ids = candidates
+            .iter()
+            .map(|(session_id, _)| session_id.as_str())
+            .collect::<HashSet<_>>();
+        if let Some(projectless) = state_object
+            .get_mut("projectless-thread-ids")
+            .and_then(Value::as_array_mut)
+        {
+            projectless.retain(|value| {
+                value
+                    .as_str()
+                    .is_none_or(|session_id| !assigned_ids.contains(session_id))
+            });
+        }
+        let serialized = serde_json::to_vec(&state)
+            .map_err(|error| format!("序列化 Codex 项目状态失败: {}", error))?;
+        let backup_dir = if state_path.is_file() {
+            let backup_dir = visibility_backup_dir();
+            fs::create_dir_all(&backup_dir)
+                .map_err(|error| format!("创建项目状态备份目录失败: {}", error))?;
+            fs::copy(&state_path, backup_dir.join(".codex-global-state.json"))
+                .map_err(|error| format!("备份 Codex 项目状态失败: {}", error))?;
+            Some(backup_dir.to_string_lossy().to_string())
+        } else {
+            None
+        };
+        write_bytes_atomic(
+            &state_path.with_file_name(".codex-global-state.json.bak"),
+            &serialized,
+        )
+        .map_err(|error| format!("写入 Codex 项目状态备份失败: {}", error))?;
+        write_bytes_atomic(&state_path, &serialized)
+            .map_err(|error| format!("写入 Codex 项目状态失败: {}", error))?;
+
+        Ok(DesktopProjectRepairResult {
+            created,
+            updated_assignments,
+            verified_projects,
+            verified_assignments,
+            skipped,
+            backup_dir,
+        })
+    }
+
+    fn repair_generated_images(
+        &self,
+        sessions: &[SessionRepairRecord],
+    ) -> Result<GeneratedImageRepairResult, String> {
+        let mut result = GeneratedImageRepairResult::default();
+        let mut handled = HashSet::new();
+        for session in sessions {
+            if !safe_generated_image_id(&session.id) {
+                result.invalid += 1;
+                continue;
+            }
+            let file = match fs::File::open(&session.path) {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
+            for line in BufReader::new(file).lines() {
+                let line = match line {
+                    Ok(line) => line,
+                    Err(_) => continue,
+                };
+                let value: Value = match serde_json::from_str(&line) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let Some((image_id, encoded)) = generated_image_payload(&value) else {
+                    continue;
+                };
+                if !handled.insert((session.id.clone(), image_id.to_string())) {
+                    continue;
+                }
+                if !safe_generated_image_id(image_id) {
+                    result.invalid += 1;
+                    continue;
+                }
+                if let Some(extension) = encoded_generated_image_extension(encoded) {
+                    let image_path = self
+                        .codex_home
+                        .join("generated_images")
+                        .join(&session.id)
+                        .join(format!("{image_id}.{extension}"));
+                    if generated_image_extension_from_file(&image_path) == Some(extension) {
+                        result.verified += 1;
+                        continue;
+                    }
+                }
+                let Some((bytes, extension)) = decode_generated_image(encoded) else {
+                    result.invalid += 1;
+                    continue;
+                };
+                let image_path = self
+                    .codex_home
+                    .join("generated_images")
+                    .join(&session.id)
+                    .join(format!("{image_id}.{extension}"));
+                let already_valid =
+                    generated_image_extension_from_file(&image_path) == Some(extension);
+                if !already_valid {
+                    if let Some(parent) = image_path.parent() {
+                        fs::create_dir_all(parent).map_err(|error| {
+                            format!("创建生成图片恢复目录失败 ({}): {}", parent.display(), error)
+                        })?;
+                    }
+                    write_bytes_atomic(&image_path, &bytes).map_err(|error| {
+                        format!("恢复生成图片失败 ({}): {}", image_path.display(), error)
+                    })?;
+                    result.recreated += 1;
+                }
+                if generated_image_extension_from_file(&image_path) == Some(extension) {
+                    result.verified += 1;
+                } else {
+                    result.invalid += 1;
+                }
+            }
+        }
+        Ok(result)
     }
 
     pub fn list_visibility_repair_instances(
@@ -1181,7 +1867,7 @@ impl SessionStore {
         migrate_directory_files(&self.legacy_trash_dir(), &self.trash_dir());
     }
 
-    fn read_target_provider(&self) -> Result<String, String> {
+    pub(crate) fn read_target_provider(&self) -> Result<String, String> {
         let config_path = self.codex_home.join("config.toml");
         if !config_path.exists() {
             return Ok("openai".to_string());
@@ -1436,8 +2122,18 @@ fn sqlite_thread_columns(db_path: &Path) -> Result<HashSet<String>, String> {
 fn sqlite_thread_columns_with_connection(
     connection: &Connection,
 ) -> Result<HashSet<String>, String> {
+    sqlite_table_columns_with_connection(connection, "threads")
+}
+
+fn sqlite_table_columns_with_connection(
+    connection: &Connection,
+    table: &str,
+) -> Result<HashSet<String>, String> {
     let mut statement = connection
-        .prepare("SELECT name FROM pragma_table_info('threads')")
+        .prepare(&format!(
+            "SELECT name FROM pragma_table_info({})",
+            sql_quote(table)
+        ))
         .map_err(|error| format!("读取会话 SQLite 表结构失败: {}", error))?;
     let columns = statement
         .query_map([], |row| row.get::<_, String>(0))
@@ -1447,20 +2143,69 @@ fn sqlite_thread_columns_with_connection(
         .map_err(|error| format!("解析会话 SQLite 表结构失败: {}", error))
 }
 
+fn sqlite_table_exists_with_connection(
+    connection: &Connection,
+    table: &str,
+) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get::<_, usize>(0),
+        )
+        .map(|count| count == 1)
+        .map_err(|error| format!("检查会话 SQLite 表失败: {}", error))
+}
+
+fn sidebar_source_kind(source: &str) -> Option<String> {
+    let source = source.trim();
+    if source.is_empty() || source.starts_with('{') || source.starts_with('[') {
+        return None;
+    }
+    Some(source.trim_matches('"').to_string())
+}
+
 fn sqlite_repair_set_clause(columns: &HashSet<String>, escaped_provider: &str) -> String {
     let mut assignments = Vec::new();
     if columns.contains("model_provider") {
         assignments.push(format!("model_provider = {escaped_provider}"));
     }
+    if columns.contains("first_user_message") && columns.contains("title") {
+        assignments.push(
+            "first_user_message = CASE WHEN COALESCE(first_user_message, '') = '' THEN COALESCE(title, '') ELSE first_user_message END".to_string(),
+        );
+    }
+    if columns.contains("preview") && columns.contains("title") {
+        assignments.push(
+            "preview = CASE WHEN COALESCE(preview, '') = '' THEN COALESCE(title, '') ELSE preview END"
+                .to_string(),
+        );
+    }
     if columns.contains("has_user_event") && columns.contains("first_user_message") {
         assignments.push(
-            "has_user_event = CASE WHEN COALESCE(first_user_message, '') <> '' THEN 1 ELSE has_user_event END".to_string(),
+            if columns.contains("title") {
+                "has_user_event = CASE WHEN COALESCE(first_user_message, '') <> '' OR COALESCE(title, '') <> '' THEN 1 ELSE has_user_event END"
+            } else {
+                "has_user_event = CASE WHEN COALESCE(first_user_message, '') <> '' THEN 1 ELSE has_user_event END"
+            }
+            .to_string(),
         );
     }
     if columns.contains("thread_source") && columns.contains("first_user_message") {
         assignments.push(
-            "thread_source = CASE WHEN COALESCE(thread_source, '') = '' AND COALESCE(first_user_message, '') <> '' THEN 'user' ELSE thread_source END".to_string(),
+            if columns.contains("title") {
+                "thread_source = CASE WHEN COALESCE(thread_source, '') = '' AND (COALESCE(first_user_message, '') <> '' OR COALESCE(title, '') <> '') THEN 'user' ELSE thread_source END"
+            } else {
+                "thread_source = CASE WHEN COALESCE(thread_source, '') = '' AND COALESCE(first_user_message, '') <> '' THEN 'user' ELSE thread_source END"
+            }
+            .to_string(),
         );
+    }
+    if columns.contains("archived") {
+        assignments.push("archived = 0".to_string());
+    }
+    if columns.contains("archived_at") {
+        assignments.push("archived_at = NULL".to_string());
     }
     assignments.join(", ")
 }
@@ -1476,17 +2221,39 @@ fn sqlite_repair_where_clause(
             "COALESCE(model_provider, '') <> {escaped_provider}"
         ));
     }
-    if columns.contains("has_user_event") && columns.contains("first_user_message") {
+    if columns.contains("first_user_message") && columns.contains("title") {
         predicates.push(
-            "(COALESCE(first_user_message, '') <> '' AND COALESCE(has_user_event, 0) <> 1)"
-                .to_string(),
+            "(COALESCE(first_user_message, '') = '' AND COALESCE(title, '') <> '')".to_string(),
         );
     }
+    if columns.contains("preview") && columns.contains("title") {
+        predicates.push("(COALESCE(preview, '') = '' AND COALESCE(title, '') <> '')".to_string());
+    }
+    if columns.contains("has_user_event") && columns.contains("first_user_message") {
+        let user_text = if columns.contains("title") {
+            "(COALESCE(first_user_message, '') <> '' OR COALESCE(title, '') <> '')"
+        } else {
+            "COALESCE(first_user_message, '') <> ''"
+        };
+        predicates.push(format!(
+            "({user_text} AND COALESCE(has_user_event, 0) <> 1)"
+        ));
+    }
     if columns.contains("thread_source") && columns.contains("first_user_message") {
-        predicates.push(
-            "(COALESCE(first_user_message, '') <> '' AND COALESCE(thread_source, '') = '')"
-                .to_string(),
-        );
+        let user_text = if columns.contains("title") {
+            "(COALESCE(first_user_message, '') <> '' OR COALESCE(title, '') <> '')"
+        } else {
+            "COALESCE(first_user_message, '') <> ''"
+        };
+        predicates.push(format!(
+            "({user_text} AND COALESCE(thread_source, '') = '')"
+        ));
+    }
+    if columns.contains("archived") {
+        predicates.push("COALESCE(archived, 0) <> 0".to_string());
+    }
+    if columns.contains("archived_at") {
+        predicates.push("archived_at IS NOT NULL".to_string());
     }
     let base = predicates.join(" OR ");
     let Some(sessions) = sessions else {
@@ -3718,6 +4485,129 @@ fn short_hash(value: &str) -> String {
         .collect()
 }
 
+fn desktop_project_id(root: &str) -> String {
+    let mut bytes = Sha256::digest(format!("codex-switcher-project:{root}").as_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
+
+const MAX_GENERATED_IMAGE_BYTES: usize = 100 * 1024 * 1024;
+
+fn generated_image_payload(value: &Value) -> Option<(&str, &str)> {
+    let record_type = value.get("type").and_then(Value::as_str)?;
+    let payload = value.get("payload")?.as_object()?;
+    let payload_type = payload.get("type").and_then(Value::as_str)?;
+    let completed = payload
+        .get("status")
+        .and_then(Value::as_str)
+        .is_none_or(|status| !matches!(status, "failed" | "cancelled" | "canceled"));
+    if !completed {
+        return None;
+    }
+    let image_id = match (record_type, payload_type) {
+        ("event_msg", "image_generation_end") => payload.get("call_id"),
+        ("response_item", "image_generation_call") => payload.get("id"),
+        _ => return None,
+    }
+    .and_then(Value::as_str)?;
+    let encoded = payload.get("result").and_then(Value::as_str)?;
+    Some((image_id, encoded))
+}
+
+fn safe_generated_image_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn decode_generated_image(encoded: &str) -> Option<(Vec<u8>, &'static str)> {
+    let encoded = encoded.trim();
+    let payload = if encoded.starts_with("data:image/") {
+        let (metadata, payload) = encoded.split_once(',')?;
+        if !metadata.ends_with(";base64") {
+            return None;
+        }
+        payload
+    } else {
+        encoded
+    };
+    if payload.is_empty() || payload.len() > MAX_GENERATED_IMAGE_BYTES.saturating_mul(2) {
+        return None;
+    }
+    let bytes = general_purpose::STANDARD.decode(payload).ok()?;
+    if bytes.len() > MAX_GENERATED_IMAGE_BYTES {
+        return None;
+    }
+    let extension = generated_image_extension(&bytes)?;
+    Some((bytes, extension))
+}
+
+fn encoded_generated_image_extension(encoded: &str) -> Option<&'static str> {
+    let encoded = encoded.trim();
+    let payload = if encoded.starts_with("data:image/") {
+        let (metadata, payload) = encoded.split_once(',')?;
+        if !metadata.ends_with(";base64") {
+            return None;
+        }
+        payload
+    } else {
+        encoded
+    };
+    if payload.starts_with("iVBORw0KGgo") {
+        Some("png")
+    } else if payload.starts_with("/9j/") {
+        Some("jpg")
+    } else if payload.starts_with("R0lGOD") {
+        Some("gif")
+    } else if payload.starts_with("UklGR") {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
+fn generated_image_extension_from_file(path: &Path) -> Option<&'static str> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut header = [0_u8; 16];
+    let read = file.read(&mut header).ok()?;
+    generated_image_extension(&header[..read])
+}
+
+fn generated_image_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("jpg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
 fn now_timestamp() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -3726,7 +4616,8 @@ fn now_timestamp() -> i64 {
 mod tests {
     use super::{
         extract_title, find_task_started_offsets_reverse, replace_session_bytes_if_unchanged,
-        restore_session_file_if_unchanged, session_file_fingerprint, SessionStore,
+        restore_session_file_if_unchanged, session_file_fingerprint, sql_quote,
+        SessionRepairRecord, SessionStore,
     };
     use serde_json::{json, Value};
     use std::fs;
@@ -4817,6 +5708,422 @@ mod tests {
             "SELECT rollout_path FROM threads WHERE id = 'session-required';",
         );
         assert_eq!(rollout_path.trim(), session_path.to_string_lossy());
+    }
+
+    #[test]
+    fn repair_visibility_rebuilds_and_verifies_desktop_catalog() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let primary_session_path = sessions_dir.join("session-catalog.jsonl");
+        fs::write(
+            &primary_session_path,
+            concat!(
+                r#"{"timestamp":"2026-07-01T08:30:00Z","type":"session_meta","payload":{"id":"session-catalog","timestamp":"2026-07-01T08:30:00Z","cwd":"/tmp/demo","cli_version":"0.130.0","source":"vscode","model_provider":"openai"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-07-01T08:31:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"恢复桌面列表"}]}}"#,
+                "\n"
+            ),
+        )
+        .expect("write session");
+        fs::write(
+            sessions_dir.join("session-subagent.jsonl"),
+            concat!(
+                r#"{"timestamp":"2026-07-01T08:32:00Z","type":"session_meta","payload":{"id":"session-subagent","timestamp":"2026-07-01T08:32:00Z","cwd":"/tmp/demo","cli_version":"0.130.0","source":{"subagent":{"other":"guardian"}},"model_provider":"openai"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-07-01T08:33:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"内部检查"}]}}"#,
+                "\n"
+            ),
+        )
+        .expect("write subagent session");
+        fs::write(
+            codex.path().join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .expect("write config");
+        let state_db = codex.path().join("state_5.sqlite");
+        run_sqlite_test(
+            &state_db,
+            r#"
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    model_provider TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    sandbox_policy TEXT NOT NULL,
+                    approval_mode TEXT NOT NULL,
+                    has_user_event INTEGER NOT NULL DEFAULT 0,
+                    first_user_message TEXT NOT NULL DEFAULT '',
+                    preview TEXT NOT NULL DEFAULT '',
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    archived_at INTEGER,
+                    thread_source TEXT
+                );
+            "#,
+        );
+        run_sqlite_test(
+            &state_db,
+            &format!(
+                "INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, has_user_event, first_user_message, preview, archived, archived_at) VALUES ('session-catalog', {}, 1, 1, 'vscode', 'legacy', '/tmp/demo', '恢复桌面列表', 'danger-full-access', 'never', 0, '', '', 1, 123);",
+                sql_quote(&primary_session_path.to_string_lossy())
+            ),
+        );
+        let catalog_db = codex.path().join("sqlite").join("codex-dev.db");
+        fs::create_dir_all(catalog_db.parent().expect("catalog parent")).expect("catalog dir");
+        run_sqlite_test(
+            &catalog_db,
+            r#"
+                CREATE TABLE local_thread_catalog (
+                    host_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    display_title TEXT NOT NULL,
+                    source_created_at REAL NOT NULL,
+                    source_updated_at REAL NOT NULL,
+                    cwd TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    source_detail TEXT,
+                    model_provider TEXT NOT NULL,
+                    git_branch TEXT,
+                    observation_sequence INTEGER NOT NULL,
+                    missing_candidate INTEGER NOT NULL DEFAULT 0,
+                    thread_source TEXT,
+                    source_recency_at REAL NOT NULL DEFAULT 0,
+                    pending_observed_title INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (host_id, thread_id)
+                );
+                CREATE TABLE local_thread_catalog_hosts (
+                    host_id TEXT PRIMARY KEY,
+                    host_kind TEXT NOT NULL
+                );
+                CREATE TABLE local_thread_catalog_metadata (
+                    id INTEGER PRIMARY KEY,
+                    catalog_revision INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO local_thread_catalog_metadata (id, catalog_revision) VALUES (1, 0);
+                CREATE TABLE local_thread_catalog_sync_state (
+                    host_id TEXT PRIMARY KEY,
+                    observation_sequence INTEGER NOT NULL DEFAULT 0
+                );
+            "#,
+        );
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let summary = store.repair_visibility().expect("repair");
+
+        let catalog_row = run_sqlite_test_output(
+            &catalog_db,
+            "SELECT display_title || '|' || source_kind || '|' || model_provider || '|' || missing_candidate FROM local_thread_catalog WHERE host_id = 'local' AND thread_id = 'session-catalog';",
+        );
+        assert_eq!(catalog_row.trim(), "恢复桌面列表|vscode|openai|0");
+        assert_eq!(summary.verified_visible_session_count, 1);
+        assert_eq!(summary.skipped_non_sidebar_session_count, 1);
+        assert!(summary.desktop_reload_required);
+        let state_row = run_sqlite_test_output(
+            &state_db,
+            "SELECT model_provider || '|' || first_user_message || '|' || preview || '|' || has_user_event || '|' || archived || '|' || (archived_at IS NULL) || '|' || thread_source FROM threads WHERE id = 'session-catalog';",
+        );
+        assert_eq!(
+            state_row.trim(),
+            "openai|恢复桌面列表|恢复桌面列表|1|0|1|user"
+        );
+        let subagent_count = run_sqlite_test_output(
+            &catalog_db,
+            "SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id = 'session-subagent';",
+        );
+        assert_eq!(subagent_count.trim(), "0");
+    }
+
+    #[test]
+    fn account_switch_syncs_persisted_thread_and_catalog_provider_without_rewriting_rollout() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir");
+        let rollout_path = sessions_dir.join("session-provider.jsonl");
+        let rollout = concat!(
+            r#"{"type":"session_meta","payload":{"id":"session-provider","model_provider":"openai","cwd":"/tmp/demo","source":"vscode"}}"#,
+            "\n"
+        );
+        fs::write(&rollout_path, rollout).expect("write rollout");
+
+        let state_db = codex.path().join("state_5.sqlite");
+        run_sqlite_test(
+            &state_db,
+            r#"
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    model_provider TEXT NOT NULL
+                );
+                INSERT INTO threads (id, model_provider) VALUES ('session-provider', 'openai');
+            "#,
+        );
+        let catalog_db = codex.path().join("sqlite/codex-dev.db");
+        fs::create_dir_all(catalog_db.parent().expect("catalog parent")).expect("catalog dir");
+        run_sqlite_test(
+            &catalog_db,
+            r#"
+                CREATE TABLE local_thread_catalog (
+                    host_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    model_provider TEXT NOT NULL,
+                    PRIMARY KEY (host_id, thread_id)
+                );
+                INSERT INTO local_thread_catalog (host_id, thread_id, model_provider)
+                VALUES ('local', 'session-provider', 'openai');
+                INSERT INTO local_thread_catalog (host_id, thread_id, model_provider)
+                VALUES ('remote-host', 'remote-session', 'openai');
+            "#,
+        );
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let updated = store
+            .synchronize_model_provider("cliproxyapi")
+            .expect("synchronize provider");
+
+        assert_eq!(updated, 2);
+        assert_eq!(
+            run_sqlite_test_output(
+                &state_db,
+                "SELECT model_provider FROM threads WHERE id = 'session-provider';"
+            )
+            .trim(),
+            "cliproxyapi"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &catalog_db,
+                "SELECT model_provider FROM local_thread_catalog WHERE host_id = 'local' AND thread_id = 'session-provider';"
+            )
+            .trim(),
+            "cliproxyapi"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &catalog_db,
+                "SELECT model_provider FROM local_thread_catalog WHERE host_id = 'remote-host' AND thread_id = 'remote-session';"
+            )
+            .trim(),
+            "openai"
+        );
+        assert_eq!(
+            fs::read_to_string(rollout_path).expect("read rollout"),
+            rollout
+        );
+    }
+
+    #[test]
+    fn repair_visibility_rebuilds_local_projects_and_thread_assignments() {
+        let codex = tempdir().expect("codex tempdir");
+        let alpha = codex.path().join("alpha");
+        let beta = codex.path().join("beta");
+        fs::create_dir_all(&alpha).expect("alpha project");
+        fs::create_dir_all(&beta).expect("beta project");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir");
+        let alpha_session = sessions_dir.join("alpha.jsonl");
+        let beta_session = sessions_dir.join("beta.jsonl");
+        let subagent_session = sessions_dir.join("subagent.jsonl");
+        write_jsonl(
+            &alpha_session,
+            &[json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "session-alpha",
+                    "cwd": alpha,
+                    "source": "vscode",
+                    "model_provider": "openai"
+                }
+            })],
+        );
+        write_jsonl(
+            &beta_session,
+            &[json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "session-beta",
+                    "cwd": beta,
+                    "source": "vscode",
+                    "model_provider": "openai"
+                }
+            })],
+        );
+        write_jsonl(
+            &subagent_session,
+            &[json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "session-subagent",
+                    "cwd": beta,
+                    "source": { "subagent": { "other": "guardian" } },
+                    "model_provider": "openai"
+                }
+            })],
+        );
+        let existing_project_id = "existing-alpha";
+        fs::write(
+            codex.path().join(".codex-global-state.json"),
+            serde_json::to_vec(&json!({
+                "unrelated-setting": true,
+                "local-projects": {
+                    existing_project_id: {
+                        "id": existing_project_id,
+                        "name": "Alpha custom name",
+                        "rootPaths": [alpha],
+                        "createdAt": 10,
+                        "updatedAt": 10
+                    }
+                },
+                "project-order": [existing_project_id],
+                "thread-project-assignments": {
+                    "unrelated-thread": {
+                        "projectKind": "local",
+                        "projectId": existing_project_id
+                    }
+                },
+                "projectless-thread-ids": ["session-alpha", "session-beta", "keep-projectless"]
+            }))
+            .expect("serialize global state"),
+        )
+        .expect("write global state");
+        let records = vec![
+            SessionRepairRecord {
+                id: "session-alpha".to_string(),
+                title: "Alpha task".to_string(),
+                path: alpha_session,
+                updated_at: 10,
+            },
+            SessionRepairRecord {
+                id: "session-beta".to_string(),
+                title: "Beta task".to_string(),
+                path: beta_session,
+                updated_at: 20,
+            },
+            SessionRepairRecord {
+                id: "session-subagent".to_string(),
+                title: "Internal".to_string(),
+                path: subagent_session,
+                updated_at: 30,
+            },
+        ];
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let result = store
+            .repair_desktop_projects(&records)
+            .expect("repair desktop projects");
+
+        assert_eq!(result.created, 1);
+        assert_eq!(result.verified_projects, 2);
+        assert_eq!(result.verified_assignments, 2);
+        assert_eq!(result.skipped, 1);
+        let state: Value = serde_json::from_slice(
+            &fs::read(codex.path().join(".codex-global-state.json"))
+                .expect("read repaired global state"),
+        )
+        .expect("parse repaired global state");
+        assert_eq!(state["unrelated-setting"], json!(true));
+        assert_eq!(
+            state["local-projects"]
+                .as_object()
+                .expect("local projects")
+                .len(),
+            2
+        );
+        assert_eq!(
+            state["thread-project-assignments"]["session-alpha"]["projectId"],
+            existing_project_id
+        );
+        let beta_project_id = state["thread-project-assignments"]["session-beta"]["projectId"]
+            .as_str()
+            .expect("beta project id");
+        assert_eq!(
+            state["local-projects"][beta_project_id]["rootPaths"][0],
+            beta.to_string_lossy().as_ref()
+        );
+        assert!(state["thread-project-assignments"]
+            .get("session-subagent")
+            .is_none());
+        assert_eq!(state["projectless-thread-ids"], json!(["keep-projectless"]));
+        assert!(codex.path().join(".codex-global-state.json.bak").is_file());
+    }
+
+    #[test]
+    fn repair_visibility_recreates_missing_generated_images_from_rollout() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir");
+        let session_path = sessions_dir.join("generated-images.jsonl");
+        let png_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        write_jsonl(
+            &session_path,
+            &[
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "session-images",
+                        "cwd": codex.path(),
+                        "source": "vscode",
+                        "model_provider": "openai"
+                    }
+                }),
+                json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "image_generation_end",
+                        "call_id": "exec-11111111-2222-4333-8444-555555555555",
+                        "status": "completed",
+                        "result": png_base64
+                    }
+                }),
+                json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "image_generation_end",
+                        "call_id": "../unsafe",
+                        "status": "completed",
+                        "result": png_base64
+                    }
+                }),
+            ],
+        );
+        let records = vec![SessionRepairRecord {
+            id: "session-images".to_string(),
+            title: "Generated images".to_string(),
+            path: session_path,
+            updated_at: 10,
+        }];
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let result = store
+            .repair_generated_images(&records)
+            .expect("repair generated images");
+
+        assert_eq!(result.recreated, 1);
+        assert_eq!(result.verified, 1);
+        assert_eq!(result.invalid, 1);
+        let image_path = codex
+            .path()
+            .join("generated_images/session-images/exec-11111111-2222-4333-8444-555555555555.png");
+        assert_eq!(
+            &fs::read(image_path).expect("read recreated image")[..8],
+            b"\x89PNG\r\n\x1a\n"
+        );
+        assert!(!codex.path().join("unsafe.png").exists());
+
+        let unsafe_records = vec![SessionRepairRecord {
+            id: "../unsafe-session".to_string(),
+            title: "Unsafe generated images".to_string(),
+            path: records[0].path.clone(),
+            updated_at: 10,
+        }];
+        let unsafe_result = store
+            .repair_generated_images(&unsafe_records)
+            .expect("reject unsafe session id");
+        assert_eq!(unsafe_result.recreated, 0);
+        assert_eq!(unsafe_result.verified, 0);
+        assert_eq!(unsafe_result.invalid, 1);
     }
 
     #[test]

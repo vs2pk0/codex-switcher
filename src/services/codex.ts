@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { CodexAccount } from "../types/codex";
+import type { CodexSessionVisibilityRepairSummary } from "./session";
 
 export type CodexExportFormat = "cockpit_tools" | "sub2api" | "cpa";
 
@@ -94,6 +95,27 @@ export interface CodexSwitcherBackupProgressEvent {
   progress: number;
   message: string;
   backupFile?: CodexSwitcherBackupFile | null;
+}
+
+export interface CodexSessionRestoreResult {
+  restored: boolean;
+  visibilityRepaired: boolean;
+  visibility?: CodexSessionVisibilityRepairSummary | null;
+  warning?: string | null;
+}
+
+export interface CodexAccountSwitchResult {
+  account: CodexAccount;
+  synchronizedSessionProviderCount: number;
+  warning?: string | null;
+}
+
+export async function reloadCodexAfterSessionVisibilityRepair(
+  summary: Pick<CodexSessionVisibilityRepairSummary, "desktopReloadRequired">,
+  restart: () => Promise<string> = restartCodexApp,
+): Promise<string | null> {
+  if (summary.desktopReloadRequired !== true) return null;
+  return restart();
 }
 
 export function listCodexAccounts(): Promise<CodexAccount[]> {
@@ -265,7 +287,7 @@ export function deleteCodexAccount(accountId: string): Promise<void> {
   return invoke("delete_codex_account", { accountId });
 }
 
-export function switchCodexAccount(accountId: string): Promise<CodexAccount> {
+export function switchCodexAccount(accountId: string): Promise<CodexAccountSwitchResult> {
   return invoke("switch_codex_account", { accountId });
 }
 
@@ -331,7 +353,7 @@ export function restoreCodexSwitcherBackup(backupPath: string): Promise<CodexAcc
   return invoke("restore_codex_switcher_backup", { backupPath });
 }
 
-export function restoreCodexSwitcherSessionBackup(backupPath: string): Promise<void> {
+export function restoreCodexSwitcherSessionBackup(backupPath: string): Promise<CodexSessionRestoreResult> {
   return invoke("restore_codex_switcher_session_backup", { backupPath });
 }
 

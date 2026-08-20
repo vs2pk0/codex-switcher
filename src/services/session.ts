@@ -110,6 +110,19 @@ export interface CodexSessionVisibilityRepairSummary {
   updatedSqliteTimestampRowCount?: number;
   addedSessionIndexEntryCount?: number;
   updatedSessionIndexEntryCount?: number;
+  updatedCatalogRowCount?: number;
+  verifiedVisibleSessionCount?: number;
+  skippedNonSidebarSessionCount?: number;
+  remainingInvisibleSessionCount?: number;
+  createdLocalProjectCount?: number;
+  assignedLocalProjectSessionCount?: number;
+  verifiedLocalProjectCount?: number;
+  skippedLocalProjectSessionCount?: number;
+  recreatedGeneratedImageCount?: number;
+  verifiedGeneratedImageCount?: number;
+  invalidGeneratedImageCount?: number;
+  desktopReloadRequired?: boolean;
+  desktopReloadPerformed?: boolean;
   backupDirs?: string[];
   items?: CodexSessionVisibilityRepairItem[];
 }

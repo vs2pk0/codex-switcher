@@ -74,6 +74,7 @@ import {
   importCodexFromJson,
   importCodexFromLocal,
   readCodexConfigFile,
+  reloadCodexAfterSessionVisibilityRepair,
   listCodexSwitcherBackups,
   listCodexSwitcherSessionBackups,
   listCodexAccounts,
@@ -83,7 +84,6 @@ import {
   resetCodexConfigToml,
   restoreCodexSwitcherBackup,
   restoreCodexSwitcherSessionBackup,
-  restartCodexApp,
   startCodexSwitcherBackup,
   startCodexSwitcherSessionBackup,
   startCodexOAuthLogin,
@@ -2498,17 +2498,17 @@ async function handleSwitch(account: CodexAccount): Promise<void> {
   if (switchingId.value) return;
   switchingId.value = account.id;
   try {
-    currentAccount.value = await switchCodexAccount(account.id);
-    let restartMessage = "已请求重启 ChatGPT/Codex";
-    try {
-      restartMessage = await restartCodexApp();
-    } catch (restartError) {
-      Message.warning(`账号已切换，但启动 ChatGPT/Codex 失败：${errorText(restartError)}`);
-      await loadAccounts();
-      return;
-    }
+    const result = await switchCodexAccount(account.id);
+    currentAccount.value = result.account;
     await loadAccounts();
-    Message.success(`已切换到 ${displayName(account)}，${restartMessage}`);
+    if (result.warning) {
+      Message.warning(result.warning);
+    } else {
+      const synchronized = result.synchronizedSessionProviderCount
+        ? `，同步 ${result.synchronizedSessionProviderCount} 条已有会话`
+        : "";
+      Message.success(`已切换到 ${displayName(account)}${synchronized}，已重启 ChatGPT/Codex`);
+    }
   } catch (error) {
     Message.error(`切换失败：${errorText(error)}`);
   } finally {
@@ -3619,8 +3619,19 @@ async function runRepairSessions(): Promise<void> {
         effectiveRepairSessionScope.value === "selected" ? selectedSessionIdList.value : null,
     });
     repairResult.value = summary;
-    Message.success(summary.message);
     await loadSessions();
+    if (summary.desktopReloadRequired) {
+      try {
+        const restartMessage = await reloadCodexAfterSessionVisibilityRepair(summary);
+        Message.success(`${summary.message}；${restartMessage}`);
+      } catch (restartError) {
+        Message.warning(
+          `${summary.message}；自动重启失败：${errorText(restartError)}，请手动退出并重新打开 ChatGPT/Codex`,
+        );
+      }
+    } else {
+      Message.success(summary.message);
+    }
   } catch (error) {
     Message.error(`会话修复失败：${errorText(error)}`);
   } finally {
@@ -3907,8 +3918,26 @@ function handleRestoreSessionBackup(backup: CodexSwitcherBackupFile): void {
         "正在恢复会话数据",
         "正在准备恢复 Codex 会话数据...",
         async () => {
-          await restoreCodexSwitcherSessionBackup(backup.path);
-          return "已恢复会话数据";
+          const result = await restoreCodexSwitcherSessionBackup(backup.path);
+          if (result.warning) {
+            Message.warning(result.warning);
+          }
+          if (result.visibilityRepaired && result.visibility) {
+            let restartSuffix = result.visibility.desktopReloadPerformed
+              ? "，已重启 ChatGPT/Codex 并重新加载侧栏"
+              : "";
+            if (result.visibility.desktopReloadRequired) {
+              try {
+                restartSuffix = `，${await reloadCodexAfterSessionVisibilityRepair(result.visibility)}`;
+              } catch (restartError) {
+                Message.warning(
+                  `会话目录已修复，但自动重启失败：${errorText(restartError)}，请手动退出并重新打开 ChatGPT/Codex`,
+                );
+              }
+            }
+            return `已恢复会话数据，并校验 ${result.visibility.verifiedVisibleSessionCount ?? 0} 条侧栏会话、${result.visibility.verifiedLocalProjectCount ?? 0} 个项目目录、${result.visibility.verifiedGeneratedImageCount ?? 0} 张生成图片${restartSuffix}`;
+          }
+          return "已恢复会话数据；自动修复未完成，可点击“修复可见性”重试";
         },
         async () => {
           await Promise.all([loadSessions(), loadSessionBackups()]);

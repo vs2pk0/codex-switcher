@@ -1399,6 +1399,14 @@ impl AccountStore {
         restart_codex_app()
     }
 
+    pub fn stop_codex_app(&self) -> Result<(), String> {
+        stop_codex_app()
+    }
+
+    pub fn start_codex_app(&self) -> Result<String, String> {
+        start_codex_app()
+    }
+
     fn database_path(&self) -> PathBuf {
         self.storage_dir.join("accounts.json")
     }
@@ -1743,12 +1751,24 @@ pub fn codex_restart_delay_ms() -> u64 {
 }
 
 fn restart_codex_app() -> Result<String, String> {
-    let (stop_program, stop_args, start_program, start_args) = codex_restart_commands();
+    stop_codex_app()?;
+    start_codex_app()
+}
+
+fn stop_codex_app() -> Result<(), String> {
+    let (stop_program, stop_args, _, _) = codex_restart_commands();
     let mut stop_command = Command::new(stop_program);
     stop_command.args(stop_args);
     hide_command_window(&mut stop_command);
-    let _ = stop_command.status();
+    let _ = stop_command
+        .status()
+        .map_err(|error| format!("关闭 ChatGPT/Codex 失败: {}", error))?;
     thread::sleep(Duration::from_millis(codex_restart_delay_ms()));
+    Ok(())
+}
+
+fn start_codex_app() -> Result<String, String> {
+    let (_, _, start_program, start_args) = codex_restart_commands();
     let mut start_command = Command::new(start_program);
     start_command.args(start_args);
     hide_command_window(&mut start_command);
@@ -2819,7 +2839,7 @@ fn write_api_key_provider_config(
         document["disable_response_storage"] = value(true);
         document["network_access"] = value("enabled");
         document["windows_wsl_setup_acknowledged"] = value(true);
-        document["requires_openai_auth"] = value(true);
+        document.as_table_mut().remove("requires_openai_auth");
         document["features"]["goals"] = value(true);
         document["features"]["js_repl"] = value(false);
         document["features"]["memories"] = value(true);
@@ -2834,7 +2854,7 @@ fn write_api_key_provider_config(
     provider["name"] = value(provider_name);
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
-    provider["requires_openai_auth"] = value(true);
+    provider["requires_openai_auth"] = value(false);
     provider["experimental_bearer_token"] = value(api_key);
     if let Some(table) = provider.as_table_like_mut() {
         table.remove("env_key");
@@ -2949,8 +2969,11 @@ fn apply_managed_model_transition(
 fn managed_gpt_5_6_root_value_is_unchanged(document: &Document, key: &str) -> bool {
     match key {
         "model_reasoning_effort" => document.get(key).and_then(Item::as_str) == Some("high"),
-        "disable_response_storage" | "windows_wsl_setup_acknowledged" | "requires_openai_auth" => {
+        "disable_response_storage" | "windows_wsl_setup_acknowledged" => {
             document.get(key).and_then(Item::as_bool) == Some(true)
+        }
+        "requires_openai_auth" => {
+            document.get(key).is_none() || document.get(key).and_then(Item::as_bool) == Some(true)
         }
         "network_access" => document.get(key).and_then(Item::as_str) == Some("enabled"),
         "supports_websockets" | "websocket_v2" => document.get(key).is_none(),
