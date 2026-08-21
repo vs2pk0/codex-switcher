@@ -764,6 +764,36 @@ fn updates_account_profile_tags_and_normalizes_duplicates() {
 }
 
 #[test]
+fn updates_account_profile_visibility_and_preserves_it_in_export() {
+    let (_storage, _codex, store) = test_store();
+    let account = store
+        .import_from_json(
+            &json!({
+                "email": "hidden@example.com",
+                "tokens": {
+                    "id_token": "id-token",
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import account")
+        .remove(0);
+
+    let updated = store
+        .update_account_profile_with_visibility(&account.id, None, None, Some(true))
+        .expect("enable hidden mode");
+    assert!(updated.is_hidden);
+
+    let exported = store
+        .export_accounts(std::slice::from_ref(&account.id), None)
+        .expect("export hidden account");
+    let value: serde_json::Value = serde_json::from_str(&exported).expect("parse export");
+    assert_eq!(value["accounts"][0]["is_hidden"], true);
+}
+
+#[test]
 fn saves_oauth_tokens_as_account() {
     let (_storage, _codex, store) = test_store();
 

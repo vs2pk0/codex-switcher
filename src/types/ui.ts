@@ -6,6 +6,7 @@ export type ActiveView =
   | "sessions"
   | "usage"
   | "apiService"
+  | "openCodex"
   | "settings"
   | "pushSettings"
   | "about";

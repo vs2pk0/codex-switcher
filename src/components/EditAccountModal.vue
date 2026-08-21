@@ -10,6 +10,7 @@ defineProps<{
   editForm: {
     accountName: string;
     tags: string[];
+    isHidden: boolean;
     apiKey: string;
     apiBaseUrl: string;
     apiProviderName: string;
@@ -57,6 +58,11 @@ defineEmits<{
                   {{ tag }}
                 </a-option>
               </a-select>
+            </a-form-item>
+            <a-form-item>
+              <a-switch v-model="editForm.isHidden" />
+              <span class="edit-account-visibility-label">{{ t('隐身模式') }}</span>
+              <template #extra>{{ t('隐身账号不会出现在 API 服务和 OpenCodex 的账号选择列表中') }}</template>
             </a-form-item>
             <a-form-item v-if="editingAccount && isApiKeyAccount(editingAccount)" :label="t('供应商')">
               <a-input v-model="editForm.apiProviderName" placeholder="OpenAI Official" />

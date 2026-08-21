@@ -2,6 +2,7 @@ mod account;
 mod api_service;
 mod app_update;
 mod oauth;
+mod opencodex;
 mod push;
 mod reset;
 mod session;
@@ -30,7 +31,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
@@ -1039,8 +1040,14 @@ fn update_codex_account_profile(
     account_id: String,
     account_name: Option<String>,
     tags: Option<Vec<String>>,
+    is_hidden: Option<bool>,
 ) -> Result<CodexAccount, String> {
-    AccountStore::default().update_account_profile(&account_id, account_name, tags)
+    AccountStore::default().update_account_profile_with_visibility(
+        &account_id,
+        account_name,
+        tags,
+        is_hidden,
+    )
 }
 
 #[tauri::command]
@@ -4819,6 +4826,9 @@ pub fn run() {
         .manage(app_update::AppUpdateDownloadState::default())
         .manage(push::PushRuntimeState::default())
         .setup(|app| {
+            let opencodex_backend = opencodex::OpenCodexBackend::new(app.handle().clone())
+                .map_err(std::io::Error::other)?;
+            app.manage(Arc::new(opencodex_backend));
             start_startup_maintenance(app.handle().clone());
             push::start_push_scheduler(app.handle().clone());
             token_keeper::start_token_keeper(app.handle().clone());
@@ -4929,6 +4939,17 @@ pub fn run() {
             codex_repair_session_visibility_across_instances,
             codex_list_session_visibility_repair_instances,
             codex_list_session_visibility_repair_providers,
+            opencodex::opencodex_get_system_snapshot,
+            opencodex::opencodex_run_action,
+            opencodex::opencodex_write_command_input,
+            opencodex::opencodex_open_dashboard_window,
+            opencodex::opencodex_open_dashboard_browser,
+            opencodex::opencodex_read_manager_logs,
+            opencodex::opencodex_scan_switcher_accounts,
+            opencodex::opencodex_import_switcher_accounts,
+            opencodex::opencodex_get_engine_update_catalog,
+            opencodex::opencodex_install_engine_version,
+            opencodex::opencodex_activate_bundled_engine,
         ])
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {

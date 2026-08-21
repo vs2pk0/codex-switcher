@@ -80,6 +80,8 @@ pub struct CodexAccount {
     pub email: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_name: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_hidden: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -421,6 +423,7 @@ impl AccountStore {
             account.id = existing.id;
             account.account_name = existing.account_name;
             account.tags = existing.tags;
+            account.is_hidden = existing.is_hidden;
             account.bound_phone = existing.bound_phone;
             account.created_at = existing.created_at;
             account.last_used = existing.last_used;
@@ -812,11 +815,22 @@ impl AccountStore {
         Ok(changed)
     }
 
+    #[cfg(test)]
     pub fn update_account_profile(
         &self,
         account_id: &str,
         account_name: Option<String>,
         tags: Option<Vec<String>>,
+    ) -> Result<CodexAccount, String> {
+        self.update_account_profile_with_visibility(account_id, account_name, tags, None)
+    }
+
+    pub fn update_account_profile_with_visibility(
+        &self,
+        account_id: &str,
+        account_name: Option<String>,
+        tags: Option<Vec<String>>,
+        is_hidden: Option<bool>,
     ) -> Result<CodexAccount, String> {
         let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
@@ -828,6 +842,9 @@ impl AccountStore {
         account.account_name = normalize_optional(account_name.as_deref());
         if let Some(tags) = tags {
             account.tags = normalize_account_tags(tags);
+        }
+        if let Some(is_hidden) = is_hidden {
+            account.is_hidden = is_hidden;
         }
         let updated = account.clone();
         self.write_database(&database)?;
@@ -957,6 +974,9 @@ impl AccountStore {
                 old_account.subscription_query_last_error.clone();
         }
         apply_import_metadata(&mut updated, import_value);
+        if read_bool(import_value, &["is_hidden", "isHidden", "hidden", "隐身"]).is_none() {
+            updated.is_hidden = old_account.is_hidden;
+        }
 
         if updated.auth_mode.as_deref() == Some("apikey") {
             updated.default_model = updated
@@ -1543,6 +1563,8 @@ impl AccountStore {
                 .unwrap_or_else(|| build_oauth_account_id(&email, &access_token)),
             email,
             account_name: read_string(value, &["account_name", "name"]),
+            is_hidden: read_bool(value, &["is_hidden", "isHidden", "hidden", "隐身"])
+                .unwrap_or(false),
             tags: read_account_tags(value),
             auth_mode: None,
             openai_api_key: None,
@@ -1926,6 +1948,10 @@ fn normalize_optional(value: Option<&str>) -> Option<String> {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn normalize_account_tags(tags: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::new();
     for tag in tags {
@@ -2119,6 +2145,7 @@ fn build_api_key_account_record(
         email: build_api_key_email(&api_key),
         account_name: normalize_optional(account_name.as_deref())
             .or_else(|| normalize_optional(api_provider_name.as_deref())),
+        is_hidden: false,
         tags: Vec::new(),
         auth_mode: Some("apikey".to_string()),
         openai_api_key: Some(api_key),
@@ -2228,6 +2255,8 @@ fn apply_import_metadata(account: &mut CodexAccount, value: &Value) {
     if !tags.is_empty() {
         account.tags = tags;
     }
+    account.is_hidden =
+        read_bool(value, &["is_hidden", "isHidden", "hidden", "隐身"]).unwrap_or(account.is_hidden);
     account.plan_type = read_string(
         value,
         &[
@@ -2470,6 +2499,9 @@ fn portable_token_storage(account: &CodexAccount) -> Value {
 }
 
 fn insert_account_metadata(payload: &mut serde_json::Map<String, Value>, account: &CodexAccount) {
+    if account.is_hidden {
+        payload.insert("is_hidden".to_string(), Value::Bool(true));
+    }
     if let Some(provider) = account
         .api_provider_name
         .as_deref()

@@ -51,6 +51,11 @@ const en: Record<string, string> = {
   "当前": "Current",
   "读取当前账号": "Detect Current",
   "已隐藏": "Hidden",
+  "隐身模式": "Incognito mode",
+  "隐身模式：不会进入 API 服务和 OpenCodex": "Incognito mode: excluded from API service and OpenCodex selections",
+  "隐身账号不会出现在 API 服务和 OpenCodex 的账号选择列表中":
+    "Incognito accounts are excluded from API service and OpenCodex account selectors",
+  "已导入 OpenCodex": "Imported into OpenCodex",
   "隐私": "Privacy",
   "徽章样式": "Badge Style",
   "徽章图标样式": "Badge Icon Style",
@@ -1012,6 +1017,11 @@ const ru: Record<string, string> = {
   "当前": "Текущий",
   "读取当前账号": "Определить текущий",
   "已隐藏": "Скрыто",
+  "隐身模式": "Режим инкогнито",
+  "隐身模式：不会进入 API 服务和 OpenCodex": "Режим инкогнито: аккаунт исключен из выбора API-сервиса и OpenCodex",
+  "隐身账号不会出现在 API 服务和 OpenCodex 的账号选择列表中":
+    "Аккаунты в режиме инкогнито исключены из списков выбора API-сервиса и OpenCodex",
+  "已导入 OpenCodex": "Импортирован в OpenCodex",
   "隐私": "Приватность",
   "徽章样式": "Стиль бейджа",
   "徽章图标样式": "Стиль значков бейджа",

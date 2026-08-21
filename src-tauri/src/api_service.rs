@@ -679,6 +679,12 @@ pub async fn api_service_bind_accounts(
             .find(|account| account.id == id)
             .cloned()
             .ok_or_else(|| format!("账号不存在: {id}"))?;
+        if account.is_hidden {
+            return Err(format!(
+                "账号“{}”已启用隐身模式，不能绑定到 API 服务",
+                api_service_account_label(&account)
+            ));
+        }
         selected.push(account);
     }
 

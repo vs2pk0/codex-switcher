@@ -40,6 +40,7 @@ jobs:
           set -euo pipefail
           version="$(node -p "require('./package.json').version")"
           tag="v${version}"
+          notes_file="docs/releases/${tag}.zh-CN.md"
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
 
           if gh release view "${tag}" >/dev/null 2>&1; then
@@ -48,7 +49,7 @@ jobs:
             gh release create "${tag}" \
               --draft \
               --title "Codex Switcher ${tag}" \
-              --notes "Desktop builds are in progress for ${GITHUB_SHA}" \
+              --notes-file "${notes_file}" \
               --target "${GITHUB_SHA}"
           fi
 
@@ -200,6 +201,9 @@ jobs:
       - macos
 
     steps:
+      - name: Checkout release notes
+        uses: actions/checkout@v7
+
       - name: Publish release
         shell: bash
         env:
@@ -212,5 +216,5 @@ jobs:
             --draft=false \
             --latest \
             --title "Codex Switcher ${RELEASE_TAG}" \
-            --notes "Automated Windows and macOS build for ${GITHUB_SHA}" \
+            --notes-file "docs/releases/${RELEASE_TAG}.zh-CN.md" \
             --target "${GITHUB_SHA}"

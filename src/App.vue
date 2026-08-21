@@ -107,9 +107,11 @@ import {
   type CodexSwitcherPaths,
   type CodexSwitcherSettings,
 } from "./services/codex";
+import { scanOpenCodexSwitcherAccounts } from "./opencodex/service";
 import {
   API_SERVICE_AUTO_UPDATE_EVENT,
   bindApiServiceAccounts,
+  deleteApiServiceBoundAccounts,
   getApiServiceState,
   isCurrentApiServiceAccount,
   listApiServiceBoundAccounts,
@@ -165,6 +167,9 @@ import type { ActiveView, SessionGroup } from "./types/ui";
 
 const ApiServicePanel = defineAsyncComponent(() => import("./components/ApiServicePanel.vue"));
 const UsagePanel = defineAsyncComponent(() => import("./components/UsagePanel.vue"));
+const OpenCodexPanel = defineAsyncComponent(
+  () => import("./opencodex/OpenCodexPanel.vue"),
+);
 
 const activeView = ref<ActiveView>("accounts");
 const appVersion = ref("0.1.0");
@@ -179,8 +184,10 @@ const appUpdateCancelling = ref(false);
 const appUpdateOpening = ref(false);
 const usagePanelMounted = ref(false);
 const apiServicePanelMounted = ref(false);
+const openCodexPanelMounted = ref(false);
 const apiServiceAutoUpdateEvent = ref<ApiServiceAutoUpdateEvent | null>(null);
 const apiServiceAccountIds = ref<Set<string>>(new Set());
+const openCodexAccountIds = ref<Set<string>>(new Set());
 const accounts = ref<CodexAccount[]>([]);
 const currentAccount = ref<CodexAccount | null>(null);
 const loading = ref(false);
@@ -315,6 +322,7 @@ const editJsonText = ref("");
 const editForm = reactive({
   accountName: "",
   tags: [] as string[],
+  isHidden: false,
   apiKey: "",
   apiBaseUrl: "",
   apiProviderName: "",
@@ -2597,9 +2605,10 @@ async function confirmBindSelectedToApiService(): Promise<void> {
   const selected = selectedAccountIdList.value
     .map((id) => accounts.value.find((account) => account.id === id))
     .filter((account): account is CodexAccount => Boolean(account))
+    .filter((account) => !account.is_hidden)
     .filter((account) => !isCurrentApiServiceAccount(account, serviceState));
   if (!selected.length) {
-    Message.warning("所选账号指向当前 API 服务，不能绑定服务自身");
+    Message.warning("所选账号均为隐身账号或指向当前 API 服务，不能绑定");
     return;
   }
   const oauthCount = selected.filter((account) => !isApiKeyAccount(account)).length;
@@ -3123,6 +3132,7 @@ async function openEdit(account: CodexAccount): Promise<void> {
   editJsonText.value = JSON.stringify(account, null, 2);
   editForm.accountName = account.account_name ?? "";
   editForm.tags = accountTags(account);
+  editForm.isHidden = Boolean(account.is_hidden);
   editForm.apiKey = account.openai_api_key ?? account.openaiApiKey ?? "";
   editForm.apiBaseUrl = account.api_base_url ?? account.apiBaseUrl ?? "https://api.openai.com/v1";
   editForm.apiProviderName = account.api_provider_name ?? account.apiProviderName ?? "OpenAI Official";
@@ -3172,6 +3182,7 @@ async function handleEditSave(): Promise<void> {
         accountId: account.id,
         accountName: editForm.accountName.trim(),
         tags: editForm.tags,
+        isHidden: editForm.isHidden,
       });
       if (isApiKeyAccount(account)) {
         updated = await updateCodexApiKeyCredentials({
@@ -3183,10 +3194,33 @@ async function handleEditSave(): Promise<void> {
         });
       }
     }
+    let hiddenServiceBindingRemoved = false;
+    if (updated.is_hidden) {
+      try {
+        const bound = await listApiServiceBoundAccounts();
+        const boundIds = bound
+          .filter((item) =>
+            item.accountId === updated.id ||
+            item.email?.trim().toLocaleLowerCase() === updated.email.trim().toLocaleLowerCase(),
+          )
+          .map((item) => item.id);
+        if (boundIds.length) {
+          await deleteApiServiceBoundAccounts(boundIds);
+          hiddenServiceBindingRemoved = true;
+        }
+        await refreshApiServiceAccountIds();
+      } catch (error) {
+        Message.warning(`账号已设为隐身，但移除 API 服务绑定失败：${errorText(error)}`);
+      }
+    }
     editVisible.value = false;
     await loadAccounts();
     const quotaFailures = await refreshAccountsAfterMutation([updated]);
-    Message.success(`已更新 ${displayName(updated)}`);
+    Message.success(
+      hiddenServiceBindingRemoved
+        ? `已更新 ${displayName(updated)}，并移除 API 服务绑定`
+        : `已更新 ${displayName(updated)}`,
+    );
     warnQuotaRefreshFailures(quotaFailures);
   } catch (error) {
     Message.error(`保存失败：${errorText(error)}`);
@@ -4022,6 +4056,10 @@ function switchView(view: ActiveView): void {
   if (view === "apiService") {
     apiServicePanelMounted.value = true;
   }
+  if (view === "openCodex") {
+    openCodexPanelMounted.value = true;
+    void refreshOpenCodexAccountIds();
+  }
   if (viewLoadTimer) {
     window.clearTimeout(viewLoadTimer);
     viewLoadTimer = undefined;
@@ -4037,6 +4075,17 @@ function switchView(view: ActiveView): void {
       }
     }, 0);
   });
+}
+
+async function refreshOpenCodexAccountIds(): Promise<void> {
+  try {
+    const scan = await scanOpenCodexSwitcherAccounts();
+    openCodexAccountIds.value = new Set(
+      scan.accounts.filter((account) => account.status === "already_imported").map((account) => account.sourceId),
+    );
+  } catch {
+    openCodexAccountIds.value = new Set();
+  }
 }
 
 function syncExpandedLayout(): void {
@@ -4136,6 +4185,7 @@ onMounted(() => {
   void initializeResetState();
   void loadAccounts();
   void refreshApiServiceAccountIds();
+  void refreshOpenCodexAccountIds();
   void loadSettings({ includeStorage: false });
   void listen<OAuthCallbackEvent>("codex-oauth-callback-received", async (event) => {
     const payload = event.payload;
@@ -4244,6 +4294,7 @@ onUnmounted(() => {
         :privacy-masked="privacyMasked"
         :status-clock-ms="accountStatusClockMs"
         :api-service-account-ids="apiServiceAccountIds"
+        :open-codex-account-ids="openCodexAccountIds"
         @toggle-account="toggleAccount"
         @toggle-pin="toggleAccountPin"
         @drag-start="handleDragStart"
@@ -4422,6 +4473,13 @@ onUnmounted(() => {
       :auto-update-event="apiServiceAutoUpdateEvent"
       @account-added="handleApiServiceAccountAdded"
       @bound-accounts-changed="refreshApiServiceAccountIds"
+    />
+
+    <OpenCodexPanel
+      v-if="openCodexPanelMounted"
+      v-show="activeView === 'openCodex'"
+      :active="activeView === 'openCodex'"
+      @accounts-refreshed="refreshOpenCodexAccountIds"
     />
 
     <SettingsPanel
