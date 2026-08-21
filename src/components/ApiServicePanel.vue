@@ -154,7 +154,7 @@ const serviceStatusText = computed(() => {
 const apiBaseUrl = computed(() => `http://127.0.0.1:${form.port || 17877}/v1`);
 const firstApiKey = computed(() => form.apiKeys.find((key) => key.trim())?.trim() || "");
 const bindableAccounts = computed(() =>
-  props.accounts.filter((account) => !isCurrentApiServiceAccount(account, state.value)),
+  props.accounts.filter((account) => !account.is_hidden && !isCurrentApiServiceAccount(account, state.value)),
 );
 const filteredBindableAccounts = computed(() => {
   const keyword = bindSearchKeyword.value.trim().toLocaleLowerCase();

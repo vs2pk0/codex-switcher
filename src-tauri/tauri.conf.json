@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Codex Switcher",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "identifier": "com.codex.switcher",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run opencodex:prepare && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -35,6 +35,9 @@
     },
     "macOS": {
       "signingIdentity": "-"
+    },
+    "resources": {
+      "../opencodex-engine": "opencodex-engine"
     },
     "icon": [
       "icons/16x16.png",

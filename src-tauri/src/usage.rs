@@ -272,7 +272,8 @@ struct ParsedUsageEvent {
     after_owned_task_start: bool,
 }
 
-const USAGE_CACHE_VERSION: u32 = 4;
+const PROVENANCE_USAGE_CACHE_VERSION: u32 = 4;
+const USAGE_CACHE_VERSION: u32 = 5;
 const PRICING_DEFAULTS_VERSION: u32 = 1;
 const GPT_56_DEFAULT_MODEL_IDS: [&str; 3] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 static USAGE_DATA_LOCK: Mutex<()> = Mutex::new(());
@@ -510,7 +511,8 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
                         && task_started_at(payload)
                             .zip(state.session_started_at)
                             .is_some_and(|(task_at, session_at)| {
-                                (session_at..=session_at.saturating_add(1)).contains(&task_at)
+                                (session_at.saturating_sub(1)..=session_at.saturating_add(1))
+                                    .contains(&task_at)
                             })
                     {
                         state.owned_task_started = true;
@@ -1173,7 +1175,7 @@ fn migrate_usage_json_cache_from_path_if_needed(
     }
     let existing_version =
         read_usage_meta(conn, "version")?.and_then(|value| value.parse::<u32>().ok());
-    if existing_version.is_some_and(|version| version >= USAGE_CACHE_VERSION) {
+    if existing_version.is_some_and(|version| version >= PROVENANCE_USAGE_CACHE_VERSION) {
         // A v4 database already uses provenance-aware rollout IDs. Re-importing a changed
         // legacy JSON cache would add non-conflicting codex_session IDs and double-count it.
         write_usage_meta(conn, "jsonMigrated", &marker)?;
@@ -1291,7 +1293,7 @@ fn merge_usage_logs(
     parsed_rollout_ids: &HashSet<String>,
 ) -> Vec<ParsedUsageLog> {
     let current_logs = dedupe_usage_logs_preferred(current_logs);
-    if previous_version != Some(USAGE_CACHE_VERSION) {
+    if previous_version.unwrap_or_default() < PROVENANCE_USAGE_CACHE_VERSION {
         // Versions before v4 keyed every rollout by session_id:event_index and did not
         // persist provenance. Previous-only rows therefore cannot be distinguished from
         // fork replay pollution. Rebuild exclusively from source JSONL once during the
@@ -3395,7 +3397,7 @@ mod tests {
 
         let logs = merge_usage_logs(
             Some(vec![historical]),
-            Some(USAGE_CACHE_VERSION - 1),
+            Some(PROVENANCE_USAGE_CACHE_VERSION - 1),
             vec![updated.clone()],
             &HashSet::from(["active".to_string()]),
         );
@@ -3422,7 +3424,7 @@ mod tests {
 
         let logs = merge_usage_logs(
             Some(vec![stale]),
-            Some(USAGE_CACHE_VERSION - 1),
+            Some(PROVENANCE_USAGE_CACHE_VERSION - 1),
             vec![fresh],
             &HashSet::from(["active".to_string()]),
         );
@@ -3458,7 +3460,7 @@ mod tests {
 
         let logs = merge_usage_logs(
             Some(vec![stale, missing.clone()]),
-            Some(USAGE_CACHE_VERSION),
+            Some(PROVENANCE_USAGE_CACHE_VERSION),
             vec![current.clone()],
             &HashSet::from(["active".to_string()]),
         );
@@ -3573,6 +3575,30 @@ mod tests {
         assert!(!logs.iter().any(|log| {
             log.request_id == "codex_rollout:child:1" || log.request_id == "codex_rollout:child:2"
         }));
+    }
+
+    #[test]
+    fn legacy_fork_accepts_task_started_one_second_before_session_meta() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let child = temp.path().join("child.jsonl");
+        let session_at = parse_rfc3339_timestamp("2026-08-03T07:16:22Z").unwrap();
+        fs::write(
+            &child,
+            [
+                usage_meta("2026-08-03T07:16:22.015Z", "session", "child", None),
+                task_started("2026-08-03T07:16:22.016Z", session_at - 1),
+                token_event(Some("2026-08-03T07:16:23Z"), (100, 20, 5), (100, 20, 5)),
+            ]
+            .join("\n"),
+        )
+        .expect("write legacy fork");
+
+        let (logs, replace_ids, errors) = parse_codex_usage_files(&[child]);
+        assert!(errors.is_empty());
+        assert!(replace_ids.contains("child"));
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].rollout_id, "child");
+        assert_eq!(logs[0].source_kind, UsageLogSourceKind::Fork);
     }
 
     #[test]
@@ -3923,7 +3949,7 @@ mod tests {
         );
         let logs = merge_usage_logs(
             Some(vec![polluted]),
-            Some(USAGE_CACHE_VERSION - 1),
+            Some(PROVENANCE_USAGE_CACHE_VERSION - 1),
             vec![root.clone()],
             &HashSet::from(["root".to_string()]),
         );
@@ -4145,7 +4171,7 @@ mod tests {
         fs::write(
             &json_path,
             serde_json::to_string(&UsageCache {
-                version: USAGE_CACHE_VERSION - 1,
+                version: PROVENANCE_USAGE_CACHE_VERSION - 1,
                 updated_at: 0,
                 files: Vec::new(),
                 logs: vec![legacy],

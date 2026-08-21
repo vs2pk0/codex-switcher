@@ -1,0 +1,9 @@
+{
+  "name": "opencodex-manager-bundled-engine",
+  "private": true,
+  "version": "2.27.0",
+  "description": "Pinned OpenCodex Engine bundled into the desktop client",
+  "dependencies": {
+    "@bitkyc08/opencodex": "2.27.0"
+  }
+}

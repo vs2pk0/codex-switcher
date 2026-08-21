@@ -29,6 +29,7 @@ const props = defineProps<{
   privacyMasked: boolean;
   statusClockMs: number;
   apiServiceAccountIds: Set<string>;
+  openCodexAccountIds: Set<string>;
 }>();
 
 const emit = defineEmits<{
@@ -150,6 +151,14 @@ function isApiKeyAccount(account: CodexAccount): boolean {
 
 function isApiServiceAccount(account: CodexAccount): boolean {
   return props.apiServiceAccountIds.has(account.id);
+}
+
+function isOpenCodexAccount(account: CodexAccount): boolean {
+  return props.openCodexAccountIds.has(account.id);
+}
+
+function isHiddenAccount(account: CodexAccount): boolean {
+  return Boolean(account.is_hidden);
 }
 
 function displayName(account: CodexAccount): string {
@@ -830,6 +839,7 @@ function formatTime(value?: number | null): string {
           active: account.id === currentId,
           pinned: isPinned(account),
           'api-key-account': isApiKeyAccount(account),
+          'has-source-watermark': isApiServiceAccount(account) || isHiddenAccount(account) || isOpenCodexAccount(account),
           draggable: settings.sortMode === 'custom',
           'drag-over': dragOverAccountId === account.id,
         }"
@@ -882,13 +892,21 @@ function formatTime(value?: number | null): string {
                     </span>
                   </span>
                 </a-tooltip>
-                <a-tooltip v-if="isApiServiceAccount(account)" :content="t('加入了 API 服务')">
-                  <span class="api-service-pill" :title="t('加入了 API 服务')">A</span>
-                </a-tooltip>
                 <PlanBadge :label="planLabel(account)" :badge-class="planClass(account)" />
               </div>
             </div>
           </div>
+        </div>
+        <div v-if="isApiServiceAccount(account) || isHiddenAccount(account) || isOpenCodexAccount(account)" class="account-source-watermark" aria-label="账号来源标识">
+          <a-tooltip v-if="isHiddenAccount(account)" :content="t('隐身模式：不会进入 API 服务和 OpenCodex')">
+            <span class="source-watermark-mark hidden-account-pill" :title="t('隐身模式')">隐</span>
+          </a-tooltip>
+          <a-tooltip v-if="isApiServiceAccount(account)" :content="t('加入了 API 服务')">
+            <span class="source-watermark-mark api-service-pill" :title="t('加入了 API 服务')">A</span>
+          </a-tooltip>
+          <a-tooltip v-if="isOpenCodexAccount(account)" :content="t('已导入 OpenCodex')">
+            <span class="source-watermark-mark open-codex-pill" :title="t('已导入 OpenCodex')">O</span>
+          </a-tooltip>
         </div>
 
         <div v-if="isApiKeyAccount(account)" class="account-summary api-key-summary">
@@ -1212,6 +1230,7 @@ function formatTime(value?: number | null): string {
         :class="{
           active: account.id === currentId,
           pinned: isPinned(account),
+          'has-source-watermark': isApiServiceAccount(account) || isHiddenAccount(account) || isOpenCodexAccount(account),
           draggable: settings.sortMode === 'custom',
           'drag-over': dragOverAccountId === account.id,
         }"
@@ -1247,9 +1266,6 @@ function formatTime(value?: number | null): string {
             </span>
           </span>
         </a-tooltip>
-        <a-tooltip v-if="isApiServiceAccount(account)" :content="t('加入了 API 服务')">
-          <span class="api-service-pill compact-api-service-pill" :title="t('加入了 API 服务')">A</span>
-        </a-tooltip>
         <a-tooltip v-if="isApiKeyAccount(account)" :content="apiKeyBalanceTooltip(account)">
           <button
             class="compact-api-balance"
@@ -1264,7 +1280,18 @@ function formatTime(value?: number | null): string {
             <icon-refresh class="api-balance-refresh-icon" />
           </button>
         </a-tooltip>
-        <span v-else-if="shouldShowQuota(account) && account.quota" class="compact-quota-pair">
+        <div v-if="isApiServiceAccount(account) || isHiddenAccount(account) || isOpenCodexAccount(account)" class="account-source-watermark compact-source-watermark" aria-label="账号来源标识">
+          <a-tooltip v-if="isHiddenAccount(account)" :content="t('隐身模式：不会进入 API 服务和 OpenCodex')">
+            <span class="source-watermark-mark hidden-account-pill" :title="t('隐身模式')">隐</span>
+          </a-tooltip>
+          <a-tooltip v-if="isApiServiceAccount(account)" :content="t('加入了 API 服务')">
+            <span class="source-watermark-mark api-service-pill" :title="t('加入了 API 服务')">A</span>
+          </a-tooltip>
+          <a-tooltip v-if="isOpenCodexAccount(account)" :content="t('已导入 OpenCodex')">
+            <span class="source-watermark-mark open-codex-pill" :title="t('已导入 OpenCodex')">O</span>
+          </a-tooltip>
+        </div>
+        <span v-if="shouldShowQuota(account) && account.quota" class="compact-quota-pair">
           <span v-if="hasQuotaWindow(account.quota, 'hourly')">
             <i :style="quotaDotStyle(account.quota.hourly_percentage)" />
             {{ quotaPercentLabel(account.quota.hourly_percentage) }}
@@ -1274,10 +1301,10 @@ function formatTime(value?: number | null): string {
             {{ quotaPercentLabel(account.quota.weekly_percentage) }}
           </span>
         </span>
-        <span v-else-if="shouldShowQuotaError(account)" class="compact-quota-error">
+        <span v-if="shouldShowQuotaError(account)" class="compact-quota-error">
           {{ t("异常") }}
         </span>
-        <span v-else class="compact-quota-pair muted">
+        <span v-if="!shouldShowQuota(account) && !shouldShowQuotaError(account)" class="compact-quota-pair muted">
           <span><i />--</span>
           <span><i />--</span>
         </span>
@@ -1350,6 +1377,7 @@ function formatTime(value?: number | null): string {
             :key="account.id"
             :class="{
               active: account.id === currentId,
+              'has-source-watermark': isApiServiceAccount(account) || isHiddenAccount(account) || isOpenCodexAccount(account),
               draggable: settings.sortMode === 'custom',
               'drag-over': dragOverAccountId === account.id,
             }"
@@ -1382,14 +1410,19 @@ function formatTime(value?: number | null): string {
                   <template v-if="accountTags(account).length">
                     · {{ t("标签") }}: {{ accountTagsTitle(account) }}
                   </template>
-                  <template v-if="isApiServiceAccount(account)">
-                    ·
-                    <a-tooltip :content="t('加入了 API 服务')">
-                      <span class="api-service-pill table-api-service-pill" :title="t('加入了 API 服务')">A</span>
-                    </a-tooltip>
-                  </template>
                 </span>
                 <small>{{ t("用户 ID") }}: {{ shortAccountId(account) }}</small>
+                <div v-if="isApiServiceAccount(account) || isHiddenAccount(account) || isOpenCodexAccount(account)" class="account-source-watermark table-source-watermark" aria-label="账号来源标识">
+                  <a-tooltip v-if="isHiddenAccount(account)" :content="t('隐身模式：不会进入 API 服务和 OpenCodex')">
+                    <span class="source-watermark-mark hidden-account-pill" :title="t('隐身模式')">隐</span>
+                  </a-tooltip>
+                  <a-tooltip v-if="isApiServiceAccount(account)" :content="t('加入了 API 服务')">
+                    <span class="source-watermark-mark api-service-pill" :title="t('加入了 API 服务')">A</span>
+                  </a-tooltip>
+                  <a-tooltip v-if="isOpenCodexAccount(account)" :content="t('已导入 OpenCodex')">
+                    <span class="source-watermark-mark open-codex-pill" :title="t('已导入 OpenCodex')">O</span>
+                  </a-tooltip>
+                </div>
               </div>
             </td>
             <td>

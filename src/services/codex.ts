@@ -236,11 +236,13 @@ export function updateCodexAccountProfile(input: {
   accountId: string;
   accountName?: string;
   tags?: string[];
+  isHidden?: boolean;
 }): Promise<CodexAccount> {
   return invoke("update_codex_account_profile", {
     accountId: input.accountId,
     accountName: input.accountName || null,
     tags: input.tags || [],
+    isHidden: Boolean(input.isHidden),
   });
 }
 
