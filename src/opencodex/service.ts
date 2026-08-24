@@ -6,8 +6,10 @@ import type {
   OpenCodexCommandLogEvent,
   OpenCodexCommandStarted,
   OpenCodexEngineCatalog,
+  OpenCodexEngineDeleteResult,
   OpenCodexEngineInstallResult,
   OpenCodexSwitcherAccountScan,
+  OpenCodexSwitcherDeleteResult,
   OpenCodexSwitcherImportResult,
   OpenCodexSystemSnapshot,
 } from "./types";
@@ -55,6 +57,10 @@ export function activateBundledOpenCodexEngine(): Promise<OpenCodexEngineInstall
   return invoke("opencodex_activate_bundled_engine");
 }
 
+export function deleteOpenCodexEngine(version: string): Promise<OpenCodexEngineDeleteResult> {
+  return invoke("opencodex_delete_engine_version", { request: { version } });
+}
+
 export function scanOpenCodexSwitcherAccounts(): Promise<OpenCodexSwitcherAccountScan> {
   return invoke("opencodex_scan_switcher_accounts");
 }
@@ -63,6 +69,12 @@ export function importOpenCodexSwitcherAccounts(
   sourceIds: string[],
 ): Promise<OpenCodexSwitcherImportResult> {
   return invoke("opencodex_import_switcher_accounts", { request: { sourceIds } });
+}
+
+export function deleteOpenCodexSwitcherAccount(
+  sourceId: string,
+): Promise<OpenCodexSwitcherDeleteResult> {
+  return invoke("opencodex_delete_switcher_account", { request: { sourceId } });
 }
 
 export async function subscribeOpenCodexEvents(

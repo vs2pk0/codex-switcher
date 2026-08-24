@@ -82,6 +82,8 @@ pub struct CodexAccount {
     pub account_name: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_hidden: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden_cleanup_pending: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -142,6 +144,20 @@ pub struct ApiKeyAccountBindingInput {
     pub account_name: Option<String>,
     pub bound_oauth_account_id: Option<String>,
     pub bound_oauth_use_local_gateway: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyAccountUpdateInput {
+    pub account_id: String,
+    pub api_key: String,
+    pub api_base_url: Option<String>,
+    pub api_provider_name: Option<String>,
+    #[serde(alias = "apiOfficialURL", alias = "api_official_url")]
+    pub api_official_url: Option<String>,
+    pub account_name: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub is_hidden: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -653,21 +669,18 @@ impl AccountStore {
 
     pub fn update_api_key_credentials(
         &self,
-        account_id: &str,
-        api_key: String,
-        api_base_url: Option<String>,
-        api_provider_name: Option<String>,
-        api_official_url: Option<String>,
+        input: ApiKeyAccountUpdateInput,
     ) -> Result<CodexAccount, String> {
         let (api_key, api_base_url) =
-            validate_api_key_credentials(&api_key, api_base_url.as_deref())?;
-        let api_official_url = validate_optional_url(api_official_url.as_deref(), "官网地址")?;
+            validate_api_key_credentials(&input.api_key, input.api_base_url.as_deref())?;
+        let api_official_url =
+            validate_optional_url(input.api_official_url.as_deref(), "官网地址")?;
         let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         let account = database
             .accounts
             .iter_mut()
-            .find(|account| account.id == account_id)
+            .find(|account| account.id == input.account_id)
             .ok_or_else(|| "账号不存在".to_string())?;
 
         if account.auth_mode.as_deref() != Some("apikey") {
@@ -676,8 +689,16 @@ impl AccountStore {
 
         account.openai_api_key = Some(api_key);
         account.api_base_url = api_base_url;
-        account.api_provider_name = normalize_optional(api_provider_name.as_deref());
+        account.api_provider_name = normalize_optional(input.api_provider_name.as_deref());
         account.api_official_url = api_official_url;
+        account.account_name = normalize_optional(input.account_name.as_deref());
+        if let Some(tags) = input.tags {
+            account.tags = normalize_account_tags(tags);
+        }
+        if let Some(is_hidden) = input.is_hidden {
+            account.hidden_cleanup_pending = is_hidden;
+            account.is_hidden = is_hidden;
+        }
         account.last_used = now_timestamp();
         let updated = account.clone();
         self.write_database(&database)?;
@@ -844,8 +865,29 @@ impl AccountStore {
             account.tags = normalize_account_tags(tags);
         }
         if let Some(is_hidden) = is_hidden {
+            account.hidden_cleanup_pending = is_hidden;
             account.is_hidden = is_hidden;
         }
+        let updated = account.clone();
+        self.write_database(&database)?;
+        Ok(updated)
+    }
+
+    pub fn complete_hidden_account_cleanup(
+        &self,
+        account_id: &str,
+    ) -> Result<CodexAccount, String> {
+        let _database_guard = lock_account_database_mutation()?;
+        let mut database = self.read_database()?;
+        let account = database
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| "账号不存在".to_string())?;
+        if !account.is_hidden {
+            return Err("账号未启用隐身模式".to_string());
+        }
+        account.hidden_cleanup_pending = false;
         let updated = account.clone();
         self.write_database(&database)?;
         Ok(updated)
@@ -977,6 +1019,7 @@ impl AccountStore {
         if read_bool(import_value, &["is_hidden", "isHidden", "hidden", "隐身"]).is_none() {
             updated.is_hidden = old_account.is_hidden;
         }
+        updated.hidden_cleanup_pending = updated.is_hidden;
 
         if updated.auth_mode.as_deref() == Some("apikey") {
             updated.default_model = updated
@@ -1565,6 +1608,7 @@ impl AccountStore {
             account_name: read_string(value, &["account_name", "name"]),
             is_hidden: read_bool(value, &["is_hidden", "isHidden", "hidden", "隐身"])
                 .unwrap_or(false),
+            hidden_cleanup_pending: false,
             tags: read_account_tags(value),
             auth_mode: None,
             openai_api_key: None,
@@ -2146,6 +2190,7 @@ fn build_api_key_account_record(
         account_name: normalize_optional(account_name.as_deref())
             .or_else(|| normalize_optional(api_provider_name.as_deref())),
         is_hidden: false,
+        hidden_cleanup_pending: false,
         tags: Vec::new(),
         auth_mode: Some("apikey".to_string()),
         openai_api_key: Some(api_key),

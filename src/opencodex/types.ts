@@ -82,11 +82,17 @@ export interface OpenCodexEngineCatalog {
   latestPreview?: OpenCodexEngineRelease | null;
   releases: OpenCodexEngineRelease[];
   installedVersions: string[];
+  remoteError?: string | null;
 }
 
 export interface OpenCodexEngineInstallResult {
   version: string;
   source: string;
+  message: string;
+}
+
+export interface OpenCodexEngineDeleteResult {
+  version: string;
   message: string;
 }
 
@@ -97,6 +103,7 @@ export interface OpenCodexSwitcherAccount {
   plan?: string | null;
   current: boolean;
   eligible: boolean;
+  deletable: boolean;
   status: string;
   reason: string;
 }
@@ -113,6 +120,13 @@ export interface OpenCodexSwitcherImportResult {
   skippedCount: number;
   imported: OpenCodexSwitcherAccount[];
   skipped: Array<{ sourceId: string; reason: string }>;
+}
+
+export interface OpenCodexSwitcherDeleteResult {
+  sourceId: string;
+  targetAccountId: string;
+  deleted: boolean;
+  message: string;
 }
 
 export interface OpenCodexSettings {

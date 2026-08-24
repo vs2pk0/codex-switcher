@@ -74,7 +74,12 @@ impl CommandAction {
             Self::Restart => vec!["restart".into()],
             Self::Status => vec!["status".into()],
             Self::Doctor => vec!["doctor".into()],
-            Self::Sync => vec!["sync".into()],
+            // `ocx sync` deliberately leaves Codex config untouched when the
+            // durable Codex integration switch is OFF. The desktop action is
+            // expected to reconnect Codex as well as refresh its models, so use
+            // the Engine's official reverse-restore flow: it persists the ON
+            // state and then performs the same config/catalog injection.
+            Self::Sync => vec!["restore".into(), "back".into()],
             Self::ServiceInstall => vec!["service".into(), "install".into()],
             Self::ServiceUninstall => vec!["service".into(), "uninstall".into()],
             Self::Restore => vec!["restore".into()],
@@ -101,6 +106,11 @@ mod tests {
             CommandAction::ServiceUninstall.argv(15800),
             ["service", "uninstall"]
         );
+    }
+
+    #[test]
+    fn sync_reenables_codex_before_writing_its_configuration() {
+        assert_eq!(CommandAction::Sync.argv(15800), ["restore", "back"]);
     }
 }
 
@@ -147,6 +157,7 @@ pub struct SwitcherAccountSummary {
     pub plan: Option<String>,
     pub current: bool,
     pub eligible: bool,
+    pub deletable: bool,
     pub status: String,
     pub reason: String,
 }
@@ -164,6 +175,21 @@ pub struct SwitcherAccountScan {
 #[serde(rename_all = "camelCase")]
 pub struct ImportSwitcherAccountsRequest {
     pub source_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteSwitcherAccountRequest {
+    pub source_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitcherDeleteResult {
+    pub source_id: String,
+    pub target_account_id: String,
+    pub deleted: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +234,7 @@ pub struct EngineUpdateCatalog {
     pub latest_preview: Option<EngineRelease>,
     pub releases: Vec<EngineRelease>,
     pub installed_versions: Vec<String>,
+    pub remote_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -216,11 +243,24 @@ pub struct InstallEngineVersionRequest {
     pub version: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteEngineVersionRequest {
+    pub version: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineInstallResult {
     pub version: String,
     pub source: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineDeleteResult {
+    pub version: String,
     pub message: String,
 }
 

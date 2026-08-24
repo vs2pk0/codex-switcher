@@ -4011,57 +4011,105 @@ textarea {
     transform 0.2s ease;
 }
 
-.account-card.has-source-watermark .account-card-body,
-.account-card.has-source-watermark .arco-card-body {
-  padding-right: 34px;
-}
-
 .account-source-watermark {
   position: absolute;
-  top: 12px;
-  right: 8px;
-  bottom: 12px;
+  top: calc(176px + var(--additional-quota-height, 0px));
+  right: 22px;
   z-index: 2;
   display: flex;
-  width: 24px;
-  flex-direction: column;
+  width: 122px;
+  height: 76px;
   align-items: center;
-  justify-content: center;
-  gap: 6px;
-  pointer-events: auto;
-  opacity: 0.7;
+  justify-content: flex-end;
+  pointer-events: none;
 }
 
 .source-watermark-mark {
-  width: 23px;
-  height: 23px;
-  border-width: 1px;
-  box-shadow: 0 3px 10px rgba(28, 45, 74, 0.08);
-  font-size: 10px;
-  opacity: 0.84;
-  transform: rotate(-4deg);
+  position: relative;
+  display: inline-grid;
+  width: 66px;
+  height: 66px;
+  place-items: center;
+  border: 2px solid rgb(var(--stamp-rgb) / 0.18);
+  border-radius: 50%;
+  color: rgb(var(--stamp-rgb) / 0.32);
+  background: radial-gradient(
+    circle,
+    rgb(var(--stamp-rgb) / 0.055) 0%,
+    rgb(var(--stamp-rgb) / 0.035) 68%,
+    transparent 70%
+  );
+  font-size: 29px;
+  font-weight: 860;
+  line-height: 1;
+  pointer-events: auto;
+  user-select: none;
 }
 
-.account-card:hover .account-source-watermark,
-.account-compact-row:hover .account-source-watermark {
-  opacity: 1;
+.source-watermark-slot {
+  display: inline-flex;
+  flex: 0 0 auto;
+  pointer-events: auto;
 }
 
-.compact-source-watermark {
-  position: static;
-  display: flex;
-  width: 22px;
-  flex: 0 0 22px;
-  flex-direction: column;
+.source-watermark-mark::after {
+  position: absolute;
+  inset: 5px;
+  border: 1px solid rgb(var(--stamp-rgb) / 0.13);
+  border-radius: inherit;
+  content: "";
+}
+
+.source-watermark-hidden {
+  --stamp-rgb: 100 116 139;
+  transform: rotate(-6deg);
+}
+
+.source-watermark-api {
+  --stamp-rgb: 124 110 230;
+  transform: translateY(-7px) rotate(-8deg);
+}
+
+.source-watermark-open {
+  --stamp-rgb: 60 174 158;
+  margin-left: -15px;
+  transform: translateY(8px) rotate(7deg);
+}
+
+.account-source-status {
+  display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
-  justify-content: center;
-  gap: 2px;
-  opacity: 0.78;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 8px;
+  background: rgba(248, 250, 252, 0.88);
+  box-shadow: 0 4px 12px rgba(28, 45, 74, 0.06);
 }
 
-.compact-source-watermark .source-watermark-mark {
-  width: 18px;
-  height: 18px;
+.source-status-mark {
+  display: inline-grid;
+  width: 21px;
+  height: 21px;
+  place-items: center;
+  border-left: 1px solid rgba(148, 163, 184, 0.2);
+  font-size: 10px;
+  font-weight: 850;
+  line-height: 1;
+}
+
+.source-status-mark:first-child {
+  border-left: 0;
+}
+
+.compact-source-status {
+  margin-left: 2px;
+}
+
+.compact-source-status .source-status-mark,
+.table-source-status .source-status-mark {
+  width: 19px;
+  height: 19px;
   font-size: 9px;
 }
 
@@ -4202,13 +4250,17 @@ textarea {
 }
 
 .footer-meta .account-last-used {
-  flex: 0 0 auto;
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
   color: #7b8aa0;
   font-family:
     "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
   font-size: 13px;
   font-weight: 720;
   line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .account-head-actions {
@@ -4310,69 +4362,36 @@ textarea {
   white-space: nowrap;
 }
 
-.api-service-pill {
-  display: inline-grid;
-  width: 25px;
-  height: 25px;
-  place-items: center;
-  border: 1px solid rgba(79, 70, 229, 0.22);
-  border-radius: 999px;
+.source-status-mark.api-service-pill {
   color: #4338ca;
-  background: linear-gradient(180deg, rgba(245, 243, 255, 0.96), rgba(224, 231, 255, 0.72));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.78);
-  font-size: 12px;
-  font-weight: 860;
-  line-height: 1;
+  background: rgba(237, 233, 254, 0.72);
 }
 
-.hidden-account-pill,
-.open-codex-pill {
-  display: inline-grid;
-  width: 25px;
-  height: 25px;
-  place-items: center;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 860;
-  line-height: 1;
-}
-
-.hidden-account-pill {
-  border: 1px solid rgba(100, 116, 139, 0.3);
+.source-status-mark.hidden-account-pill {
   color: #475569;
-  background: linear-gradient(180deg, rgba(241, 245, 249, .98), rgba(226, 232, 240, .88));
+  background: rgba(226, 232, 240, 0.78);
 }
 
-.open-codex-pill {
-  border: 1px solid rgba(13, 148, 136, 0.3);
+.source-status-mark.open-codex-pill {
   color: #0f766e;
-  background: linear-gradient(180deg, rgba(240, 253, 250, .98), rgba(204, 251, 241, .88));
+  background: rgba(204, 251, 241, 0.76);
 }
 
-.compact-account-row .hidden-account-pill,
-.compact-account-row .open-codex-pill {
-  width: 23px;
-  height: 23px;
+.account-grid.columns-5.expanded .account-source-watermark {
+  top: calc(154px + var(--additional-quota-height, 0px));
+  right: 12px;
+  width: 104px;
+  height: 66px;
 }
 
-.table-account-main .hidden-account-pill,
-.table-account-main .open-codex-pill {
-  width: 20px;
-  height: 20px;
-  vertical-align: middle;
-  font-size: 10px;
+.account-grid.columns-5.expanded .source-watermark-mark {
+  width: 56px;
+  height: 56px;
+  font-size: 24px;
 }
 
-.compact-api-service-pill {
-  width: 23px;
-  height: 23px;
-}
-
-.table-api-service-pill {
-  width: 20px;
-  height: 20px;
-  vertical-align: middle;
-  font-size: 11px;
+.account-grid.columns-5.expanded .source-watermark-open {
+  margin-left: -12px;
 }
 
 .pin-button {
@@ -4926,19 +4945,8 @@ textarea {
   position: relative;
 }
 
-.table-source-watermark {
-  position: static;
-  width: 22px;
-  flex-direction: row;
-  justify-content: flex-start;
-  gap: 3px;
-  opacity: 0.78;
-}
-
-.table-source-watermark .source-watermark-mark {
-  width: 20px;
-  height: 20px;
-  font-size: 9px;
+.table-source-status {
+  width: fit-content;
 }
 
 .table-account-main button {
@@ -4967,14 +4975,6 @@ textarea {
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.table-account-main .account-source-watermark,
-.table-account-main .source-watermark-mark {
-  overflow: visible;
-  color: inherit;
-  font-size: inherit;
-  white-space: normal;
 }
 
 .table-api-balance {
@@ -8413,8 +8413,8 @@ textarea {
 .footer-meta {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
+  justify-content: flex-start;
+  gap: 7px;
   min-height: 32px;
   padding: 2px 0 3px;
   color: var(--text-soft);

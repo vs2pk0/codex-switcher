@@ -12,6 +12,7 @@ export interface CodexAccount {
   account_name?: string;
   /** 隐身账号仍显示在 Switcher 主列表，但不会进入外部服务账号选择器。 */
   is_hidden?: boolean;
+  hidden_cleanup_pending?: boolean;
   tags?: string[];
   auth_mode?: CodexAuthMode;
   openai_api_key?: string;

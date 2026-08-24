@@ -79,7 +79,7 @@ function submit(): void {
         <small>{{ source?.projectPath || source?.projectName }}</small>
       </div>
       <a-alert type="warning">
-        {{ t("复制后会保留目标会话的新身份，但目标会话现有内容将被源会话历史覆盖；源会话不会改变，并会自动备份目标会话。") }}
+        {{ t("复制后会保留目标会话的新身份，但目标会话现有内容将被源会话历史覆盖；源会话不会改变，并会自动备份目标会话、重建历史索引及重启 Codex。") }}
       </a-alert>
       <label class="session-copy-target">
         <span>{{ t("目标会话") }}</span>

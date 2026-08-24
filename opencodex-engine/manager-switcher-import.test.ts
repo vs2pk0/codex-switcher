@@ -2,7 +2,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { importSwitcherAccounts, scanSwitcherAccounts } from "./manager-switcher-import.ts";
+import {
+  deleteSwitcherAccount,
+  deleteSwitcherAccountForCurrentRuntime,
+  importSwitcherAccounts,
+  scanSwitcherAccounts,
+} from "./manager-switcher-import.ts";
 
 const temporaryRoots: string[] = [];
 const originalOpenCodexHome = process.env.OPENCODEX_HOME;
@@ -47,7 +52,37 @@ describe("Codex Switcher account import", () => {
     expect(scan.accounts[0]?.reason).toContain("隐身");
   });
 
-  test("shows only redacted summaries and imports selected renewable OAuth accounts", () => {
+  test("does not allow deleting a different OpenCodex account with the same ChatGPT identity", () => {
+    const root = temporaryRoot();
+    const sourcePath = join(root, "accounts.json");
+    const targetDir = join(root, "target");
+    mkdirSync(targetDir, { recursive: true });
+    const accessToken = jwt({
+      email: "member@example.com",
+      "https://api.openai.com/auth": { chatgpt_account_id: "shared-chatgpt-account" },
+    });
+    writeFileSync(sourcePath, JSON.stringify({
+      accounts: [{
+        id: "oauth-source",
+        email: "member@example.com",
+        tokens: { access_token: accessToken, refresh_token: "refresh-secret" },
+      }],
+    }));
+    writeFileSync(join(targetDir, "config.json"), JSON.stringify({
+      codexAccounts: [{ id: "manual-account", email: "member@example.com", isMain: false }],
+    }));
+    writeFileSync(join(targetDir, "codex-accounts.json"), JSON.stringify({
+      "manual-account": {
+        credential: { chatgptAccountId: "shared-chatgpt-account" },
+      },
+    }));
+
+    const scan = scanSwitcherAccounts(sourcePath, targetDir);
+    expect(scan.accounts[0]?.status).toBe("already_imported");
+    expect(scan.accounts[0]?.deletable).toBe(false);
+  });
+
+  test("shows only redacted summaries and imports selected renewable OAuth accounts", async () => {
     const root = temporaryRoot();
     const sourceDir = join(root, "source");
     const targetDir = join(root, "target");
@@ -111,6 +146,7 @@ describe("Codex Switcher account import", () => {
         isMain: false,
       }),
     ]));
+    expect(config.codexSwitcherSources).toEqual({ "switcher-oauth-one": "oauth-one" });
     expect(credentialStore["switcher-oauth-one"]).toEqual(expect.objectContaining({
       generation: 1,
       credential: {
@@ -124,5 +160,140 @@ describe("Codex Switcher account import", () => {
     const rescanned = scanSwitcherAccounts(sourcePath, targetDir);
     expect(rescanned.eligibleCount).toBe(0);
     expect(rescanned.accounts[0]?.status).toBe("already_imported");
+    expect(rescanned.accounts[0]?.deletable).toBe(true);
+
+    const runtimeRequests: Array<{ path: string; method?: string }> = [];
+    await deleteSwitcherAccountForCurrentRuntime("oauth-one", sourcePath, {
+      findLiveProxy: async () => ({ pid: 42, port: 15800, source: "runtime" }),
+      runtimeRequest: async (path, init) => {
+        runtimeRequests.push({ path, method: init.method });
+        return { ok: true };
+      },
+    });
+    expect(runtimeRequests).toEqual([{
+      path: "/api/codex-auth/accounts?id=switcher-oauth-one",
+      method: "DELETE",
+    }]);
+
+    const deleted = deleteSwitcherAccount("oauth-one", sourcePath);
+    expect(deleted.targetAccountId).toBe("switcher-oauth-one");
+    expect(deleted.deleted).toBe(true);
+    expect(JSON.parse(readFileSync(sourcePath, "utf8")).accounts).toHaveLength(2);
+    const configAfterDelete = JSON.parse(readFileSync(join(targetDir, "config.json"), "utf8"));
+    expect(configAfterDelete.codexAccounts).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "switcher-oauth-one" }),
+    ]));
+    const credentialsAfterDelete = JSON.parse(
+      readFileSync(join(targetDir, "codex-accounts.json"), "utf8"),
+    );
+    expect(credentialsAfterDelete["switcher-oauth-one"]?.credential).toBeUndefined();
+
+    const scanAfterDelete = scanSwitcherAccounts(sourcePath, targetDir);
+    expect(scanAfterDelete.accounts[0]?.status).toBe("ready");
+    expect(scanAfterDelete.accounts[0]?.eligible).toBe(true);
+    expect(scanAfterDelete.accounts[0]?.deletable).toBe(false);
+    const deletedAgain = deleteSwitcherAccount("oauth-one", sourcePath);
+    expect(deletedAgain.deleted).toBe(false);
+  });
+
+  test("does not mark a same-ID manual account as deletable", () => {
+    const root = temporaryRoot();
+    const sourcePath = join(root, "accounts.json");
+    const targetDir = join(root, "target");
+    mkdirSync(targetDir, { recursive: true });
+    const accessToken = jwt({
+      email: "manual@example.com",
+      "https://api.openai.com/auth": { chatgpt_account_id: "manual-chatgpt" },
+    });
+    writeFileSync(sourcePath, JSON.stringify({
+      accounts: [{
+        id: "oauth-one",
+        email: "manual@example.com",
+        tokens: { access_token: accessToken, refresh_token: "refresh-secret" },
+      }],
+    }));
+    writeFileSync(join(targetDir, "config.json"), JSON.stringify({
+      codexAccounts: [{ id: "switcher-oauth-one", email: "manual@example.com", isMain: false }],
+    }));
+    writeFileSync(join(targetDir, "codex-accounts.json"), JSON.stringify({
+      "switcher-oauth-one": { credential: { chatgptAccountId: "manual-chatgpt" } },
+    }));
+
+    const scan = scanSwitcherAccounts(sourcePath, targetDir);
+    expect(scan.accounts[0]?.status).toBe("already_imported");
+    expect(scan.accounts[0]?.deletable).toBe(false);
+    expect(deleteSwitcherAccount("oauth-one", sourcePath)).toEqual(expect.objectContaining({
+      deleted: false,
+    }));
+  });
+
+  test("recognizes and deletes legacy Switcher imports after provenance migration is initialized", () => {
+    const root = temporaryRoot();
+    const sourcePath = join(root, "accounts.json");
+    const targetDir = join(root, "target");
+    mkdirSync(targetDir, { recursive: true });
+    process.env.OPENCODEX_HOME = targetDir;
+    const accessToken = jwt({
+      email: "legacy@example.com",
+      "https://api.openai.com/auth": { chatgpt_account_id: "legacy-chatgpt" },
+    });
+    writeFileSync(sourcePath, JSON.stringify({
+      accounts: [{
+        id: "legacy-one",
+        email: "legacy@example.com",
+        tokens: { access_token: accessToken, refresh_token: "refresh-secret" },
+      }],
+    }));
+    writeFileSync(join(targetDir, "config.json"), JSON.stringify({
+      codexAccounts: [{ id: "switcher-legacy-one", email: "legacy@example.com", isMain: false }],
+      codexSwitcherSources: { "switcher-legacy-sibling": "legacy-sibling" },
+    }));
+    writeFileSync(join(targetDir, "codex-accounts.json"), JSON.stringify({
+      "switcher-legacy-one": { credential: { chatgptAccountId: "legacy-chatgpt" } },
+      "switcher-legacy-sibling": { credential: { chatgptAccountId: "legacy-sibling-chatgpt" } },
+    }));
+
+    const scan = scanSwitcherAccounts(sourcePath, targetDir);
+    expect(scan.accounts[0]).toEqual(expect.objectContaining({
+      status: "already_imported",
+      deletable: true,
+    }));
+    expect(deleteSwitcherAccount("legacy-one", sourcePath)).toEqual(expect.objectContaining({
+      deleted: true,
+    }));
+    expect(JSON.parse(readFileSync(join(targetDir, "config.json"), "utf8")).codexAccounts).toEqual([]);
+  });
+
+  test("legacy fallback still rejects a deterministic ID with the wrong identity", () => {
+    const root = temporaryRoot();
+    const sourcePath = join(root, "accounts.json");
+    const targetDir = join(root, "target");
+    mkdirSync(targetDir, { recursive: true });
+    process.env.OPENCODEX_HOME = targetDir;
+    const accessToken = jwt({
+      email: "source@example.com",
+      "https://api.openai.com/auth": { chatgpt_account_id: "source-chatgpt" },
+    });
+    writeFileSync(sourcePath, JSON.stringify({
+      accounts: [{
+        id: "legacy-one",
+        email: "source@example.com",
+        tokens: { access_token: accessToken, refresh_token: "refresh-secret" },
+      }],
+    }));
+    writeFileSync(join(targetDir, "config.json"), JSON.stringify({
+      codexAccounts: [{ id: "switcher-legacy-one", email: "manual@example.com", isMain: false }],
+      codexSwitcherSources: {},
+    }));
+    writeFileSync(join(targetDir, "codex-accounts.json"), JSON.stringify({
+      "switcher-legacy-one": { credential: { chatgptAccountId: "manual-chatgpt" } },
+    }));
+
+    const scan = scanSwitcherAccounts(sourcePath, targetDir);
+    expect(scan.accounts[0]?.deletable).toBe(false);
+    expect(deleteSwitcherAccount("legacy-one", sourcePath)).toEqual(expect.objectContaining({
+      deleted: false,
+      message: expect.stringContaining("身份不匹配"),
+    }));
   });
 });

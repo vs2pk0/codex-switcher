@@ -349,6 +349,7 @@ mod tests {
             email: "owner@example.com".to_string(),
             account_name: None,
             is_hidden: false,
+            hidden_cleanup_pending: false,
             tags: Vec::new(),
             auth_mode: None,
             openai_api_key: None,

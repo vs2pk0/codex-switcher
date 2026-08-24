@@ -13,6 +13,9 @@ import {
   removeCodexAccountCredential,
   saveCodexAccountCredential,
 } from "./node_modules/@bitkyc08/opencodex/src/codex/account-store.ts";
+import { deleteCodexAccount } from "./node_modules/@bitkyc08/opencodex/src/codex/account-lifecycle.ts";
+import { runtimeRequest } from "./node_modules/@bitkyc08/opencodex/src/cli/runtime-api.ts";
+import { findLiveProxy } from "./node_modules/@bitkyc08/opencodex/src/server/proxy-liveness.ts";
 import { isValidCodexAccountId } from "./node_modules/@bitkyc08/opencodex/src/codex/account-id.ts";
 import { withCodexAccountLogLabel } from "./node_modules/@bitkyc08/opencodex/src/codex/account-label.ts";
 import { appendDefaultCodexAccountNamespace } from "./node_modules/@bitkyc08/opencodex/src/codex/account-namespaces.ts";
@@ -55,6 +58,9 @@ interface SwitcherStore {
 
 interface ExistingState {
   accountIds: Set<string>;
+  accountIdentityByTargetId: Map<string, { email?: string; chatgptAccountId?: string }>;
+  switcherSourceByTargetId: Map<string, string>;
+  legacySwitcherMigrationEnabled: boolean;
   chatgptAccountIds: Set<string>;
 }
 
@@ -73,6 +79,7 @@ export interface SwitcherAccountSummary {
   plan: string | null;
   current: boolean;
   eligible: boolean;
+  deletable: boolean;
   status: "ready" | "already_imported" | "unsupported" | "invalid";
   reason: string;
 }
@@ -89,6 +96,18 @@ export interface SwitcherImportResult {
   skippedCount: number;
   imported: SwitcherAccountSummary[];
   skipped: Array<{ sourceId: string; reason: string }>;
+}
+
+export interface SwitcherDeleteResult {
+  sourceId: string;
+  targetAccountId: string;
+  deleted: boolean;
+  message: string;
+}
+
+interface SwitcherDeleteRuntimeDeps {
+  findLiveProxy?: typeof findLiveProxy;
+  runtimeRequest?: typeof runtimeRequest;
 }
 
 function text(value: unknown): string | undefined {
@@ -137,34 +156,84 @@ function existingStateFromRaw(configDir: string): ExistingState {
   const config = readJsonObject(join(configDir, "config.json"));
   const credentials = readJsonObject(join(configDir, "codex-accounts.json"));
   const accountIds = new Set<string>();
+  const accountIdentityByTargetId = new Map<string, { email?: string; chatgptAccountId?: string }>();
+  const switcherSourceByTargetId = new Map<string, string>();
+  const sourceMap = config.codexSwitcherSources;
+  if (sourceMap && typeof sourceMap === "object" && !Array.isArray(sourceMap)) {
+    for (const [targetId, sourceId] of Object.entries(sourceMap as Record<string, unknown>)) {
+      const normalized = text(sourceId);
+      if (normalized) switcherSourceByTargetId.set(targetId, normalized);
+    }
+  }
   const chatgptAccountIds = new Set<string>();
 
   if (Array.isArray(config.codexAccounts)) {
     for (const account of config.codexAccounts) {
       if (account && typeof account === "object" && !Array.isArray(account)) {
         const id = text((account as { id?: unknown }).id);
-        if (id) accountIds.add(id);
+        if (id) {
+          accountIds.add(id);
+          accountIdentityByTargetId.set(id, {
+            email: text((account as { email?: unknown }).email)?.toLowerCase(),
+          });
+        }
       }
     }
   }
   for (const [id, record] of Object.entries(credentials)) {
-    accountIds.add(id);
     if (!record || typeof record !== "object" || Array.isArray(record)) continue;
     const credential = (record as { credential?: unknown }).credential;
     if (!credential || typeof credential !== "object" || Array.isArray(credential)) continue;
+    accountIds.add(id);
     const chatgptAccountId = text((credential as { chatgptAccountId?: unknown }).chatgptAccountId);
     if (chatgptAccountId) chatgptAccountIds.add(chatgptAccountId);
+    const identity = accountIdentityByTargetId.get(id) ?? {};
+    if (chatgptAccountId) identity.chatgptAccountId = chatgptAccountId;
+    accountIdentityByTargetId.set(id, identity);
   }
-  return { accountIds, chatgptAccountIds };
+  const legacySwitcherMigrationEnabled = accountIds.size > 0
+    && [...accountIds].filter(id => id.startsWith("switcher-")).length >= 2;
+  return {
+    accountIds,
+    accountIdentityByTargetId,
+    switcherSourceByTargetId,
+    legacySwitcherMigrationEnabled,
+    chatgptAccountIds,
+  };
 }
 
 function existingStateFromConfig(config: OcxConfig): ExistingState {
   const credentials = loadCodexAccountStore();
+  const configuredAccounts = config.codexAccounts ?? [];
+  const configuredAccountIds = configuredAccounts.map(account => account.id);
+  const accountIdentityByTargetId = new Map(
+    configuredAccounts.map(account => [account.id, {
+      email: account.email?.trim().toLowerCase(),
+      chatgptAccountId: credentials[account.id]?.chatgptAccountId?.trim(),
+    }]),
+  );
+  const switcherSourceByTargetId = new Map<string, string>();
+  const sourceMap = (config as OcxConfig & { codexSwitcherSources?: unknown }).codexSwitcherSources;
+  if (sourceMap && typeof sourceMap === "object" && !Array.isArray(sourceMap)) {
+    for (const [targetId, sourceId] of Object.entries(sourceMap as Record<string, unknown>)) {
+      const normalized = text(sourceId);
+      if (normalized) switcherSourceByTargetId.set(targetId, normalized);
+    }
+  }
+  const legacySwitcherMigrationEnabled = new Set([
+    ...configuredAccountIds,
+    ...Object.keys(credentials),
+  ]).size > 0
+    && [...new Set([...configuredAccountIds, ...Object.keys(credentials)])]
+      .filter(id => id.startsWith("switcher-")).length >= 2;
   return {
     accountIds: new Set([
-      ...(config.codexAccounts ?? []).map(account => account.id),
+      ...configuredAccountIds,
       ...Object.keys(credentials),
     ]),
+    accountIdentityByTargetId,
+    switcherSourceByTargetId,
+    legacySwitcherMigrationEnabled,
     chatgptAccountIds: new Set(
       Object.values(credentials)
         .map(credential => credential.chatgptAccountId?.trim())
@@ -186,6 +255,20 @@ function targetAccountId(sourceId: string): string {
   const direct = `switcher-${sourceId}`;
   if (isValidCodexAccountId(direct)) return direct;
   return `switcher-${createHash("sha256").update(sourceId).digest("hex").slice(0, 24)}`;
+}
+
+function exactSwitcherMigrationExistsInRawState(
+  sourceAccount: SwitcherAccount | undefined,
+  sourceId: string,
+  configDir = getConfigDir(),
+): boolean {
+  if (!sourceAccount) return false;
+  return inspectAccount(
+    sourceAccount,
+    undefined,
+    existingStateFromRaw(configDir),
+    new Set<string>(),
+  ).summary.deletable;
 }
 
 function expiresAtMs(account: SwitcherAccount, accessToken: string): number {
@@ -218,6 +301,7 @@ function inspectAccount(
     email: email ? maskEmail(email) : "未提供邮箱",
     plan,
     current: !!sourceId && sourceId === currentAccountId,
+    deletable: false,
   };
   const reject = (
     status: SwitcherAccountSummary["status"],
@@ -227,7 +311,26 @@ function inspectAccount(
   });
 
   if (!sourceId || !targetId) return reject("invalid", "账号 ID 无效");
-  if (existing.accountIds.has(targetId)) return reject("already_imported", "已经导入过此 Switcher 账号");
+  if (existing.accountIds.has(targetId)) {
+    const identity = existing.accountIdentityByTargetId.get(targetId);
+    const mappedSourceId = existing.switcherSourceByTargetId.get(targetId);
+    const sourceChatgptAccountId = extractAccountId(idToken, accessToken);
+    const provenanceMatches = mappedSourceId === sourceId
+      || (!mappedSourceId && existing.legacySwitcherMigrationEnabled);
+    return {
+      summary: {
+        ...base,
+        eligible: false,
+        deletable: provenanceMatches
+          && !!identity
+          && !!sourceChatgptAccountId
+          && identity.email === email
+          && identity.chatgptAccountId === sourceChatgptAccountId,
+        status: "already_imported",
+        reason: "已经导入过此 Switcher 账号",
+      },
+    };
+  }
   if (account.is_hidden === true) return reject("unsupported", "账号已启用隐身模式，不能导入 OpenCodex");
   if (!accessToken) {
     return text(account.openai_api_key) || text(account.auth_mode)
@@ -337,6 +440,9 @@ export function importSwitcherAccounts(
       }, accounts);
       accounts.push(account);
       config.codexAccounts = accounts;
+      const sourceMap = ((config as OcxConfig & { codexSwitcherSources?: Record<string, string> }).codexSwitcherSources
+        ??= {});
+      sourceMap[material.targetAccountId] = material.sourceId;
       if (config.codexAccountNamespaces && Object.keys(config.codexAccountNamespaces).length > 0) {
         appendDefaultCodexAccountNamespace(config, account);
       }
@@ -348,6 +454,7 @@ export function importSwitcherAccounts(
         plan: material.plan ?? null,
         current: false,
         eligible: false,
+        deletable: true,
         status: "already_imported",
         reason: "导入成功",
       });
@@ -375,6 +482,87 @@ export function importSwitcherAccounts(
   });
 }
 
+export function deleteSwitcherAccount(
+  sourceIdInput: unknown,
+  sourcePath = defaultSourcePath(),
+): SwitcherDeleteResult {
+  if (typeof sourceIdInput !== "string" || sourceIdInput.length === 0 || sourceIdInput.length > 128) {
+    throw new Error("删除请求包含无效账号 ID");
+  }
+  const sourceId = sourceIdInput;
+  const store = readSwitcherStore(sourcePath);
+  const sourceAccount = store.accounts.find(account => text(account.id) === sourceId);
+
+  const targetId = targetAccountId(sourceId);
+  const targetExists = exactSwitcherMigrationExistsInRawState(sourceAccount, sourceId);
+  const config = loadConfig();
+  if (!targetExists) {
+    const conflictingTargetExists = (config.codexAccounts ?? [])
+      .some(account => !account.isMain && account.id === targetId)
+      || !!loadCodexAccountStore()[targetId];
+    return {
+      sourceId,
+      targetAccountId: targetId,
+      deleted: false,
+      message: conflictingTargetExists
+        ? "检测到同 ID 的 OpenCodex 账号，但身份不匹配，已阻止删除"
+        : "OpenCodex 中没有此 Switcher 迁移账号",
+    };
+  }
+
+  deleteCodexAccount(config, targetId);
+  return {
+    sourceId,
+    targetAccountId: targetId,
+    deleted: true,
+    message: "已从 OpenCodex 删除账号，Switcher 原账号仍保留",
+  };
+}
+
+export async function deleteSwitcherAccountForCurrentRuntime(
+  sourceIdInput: unknown,
+  sourcePath = defaultSourcePath(),
+  deps: SwitcherDeleteRuntimeDeps = {},
+): Promise<SwitcherDeleteResult> {
+  if (typeof sourceIdInput !== "string" || sourceIdInput.length === 0 || sourceIdInput.length > 128) {
+    throw new Error("删除请求包含无效账号 ID");
+  }
+  const sourceId = sourceIdInput;
+  const store = readSwitcherStore(sourcePath);
+  const sourceAccount = store.accounts.find(account => text(account.id) === sourceId);
+  const targetId = targetAccountId(sourceId);
+  const targetExists = exactSwitcherMigrationExistsInRawState(sourceAccount, sourceId);
+  const config = loadConfig();
+  if (!targetExists) {
+    const conflictingTargetExists = (config.codexAccounts ?? [])
+      .some(account => !account.isMain && account.id === targetId)
+      || !!loadCodexAccountStore()[targetId];
+    return {
+      sourceId,
+      targetAccountId: targetId,
+      deleted: false,
+      message: conflictingTargetExists
+        ? "检测到同 ID 的 OpenCodex 账号，但身份不匹配，已阻止删除"
+        : "OpenCodex 中没有此 Switcher 迁移账号",
+    };
+  }
+
+  if (await (deps.findLiveProxy ?? findLiveProxy)()) {
+    await (deps.runtimeRequest ?? runtimeRequest)(
+      `/api/codex-auth/accounts?id=${encodeURIComponent(targetId)}`,
+      { method: "DELETE" },
+    );
+  } else {
+    return deleteSwitcherAccount(sourceId, sourcePath);
+  }
+  return {
+    sourceId,
+    targetAccountId: targetId,
+    deleted: true,
+    message: "已从 OpenCodex 删除账号，Switcher 原账号仍保留",
+  };
+}
+
 async function readStdin(): Promise<string> {
   return await new Response(Bun.stdin.stream()).text();
 }
@@ -388,6 +576,11 @@ async function main() {
   if (command === "import") {
     const input = JSON.parse(await readStdin()) as { sourceIds?: unknown };
     console.log(JSON.stringify(importSwitcherAccounts(input.sourceIds)));
+    return;
+  }
+  if (command === "delete") {
+    const input = JSON.parse(await readStdin()) as { sourceId?: unknown };
+    console.log(JSON.stringify(await deleteSwitcherAccountForCurrentRuntime(input.sourceId)));
     return;
   }
   throw new Error("未知的 Switcher 导入命令");
