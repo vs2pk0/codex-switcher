@@ -11,8 +11,8 @@ mod token_keeper;
 mod usage;
 
 use account::{
-    write_bytes_atomic, write_reader_atomic, AccountStore, ApiKeyAccountBindingInput, CodexAccount,
-    CodexQuota, CodexResetCredit,
+    write_bytes_atomic, write_reader_atomic, AccountStore, ApiKeyAccountBindingInput,
+    ApiKeyAccountUpdateInput, CodexAccount, CodexQuota, CodexResetCredit,
 };
 use oauth::CodexOAuthLoginStartResponse;
 use rand::Rng;
@@ -20,18 +20,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use session::{
     CodexSessionAsset, CodexSessionContentPage, CodexSessionMessageMutationResult,
-    CodexSessionMutationResult, CodexSessionRecord, CodexSessionTokenStats,
-    CodexSessionTrashSummary, CodexSessionTurnMutationResult,
+    CodexSessionModelCompatibilityRepairSummary, CodexSessionMutationResult, CodexSessionRecord,
+    CodexSessionTokenStats, CodexSessionTrashSummary, CodexSessionTurnMutationResult,
     CodexSessionVisibilityRepairInstanceList, CodexSessionVisibilityRepairProviderList,
     CodexSessionVisibilityRepairSummary, CodexTrashedSessionRecord, SessionStore,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, MutexGuard,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
@@ -48,6 +51,8 @@ struct CodexOAuthCallbackEvent {
     ok: bool,
     message: String,
 }
+
+static OAUTH_CALLBACK_LISTENER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -406,19 +411,9 @@ fn add_codex_account_with_api_key(
 
 #[tauri::command]
 fn update_codex_api_key_credentials(
-    account_id: String,
-    api_key: String,
-    api_base_url: Option<String>,
-    api_provider_name: Option<String>,
-    api_official_url: Option<String>,
+    input: ApiKeyAccountUpdateInput,
 ) -> Result<CodexAccount, String> {
-    AccountStore::default().update_api_key_credentials(
-        &account_id,
-        api_key,
-        api_base_url,
-        api_provider_name,
-        api_official_url,
-    )
+    AccountStore::default().update_api_key_credentials(input)
 }
 
 fn codex_models_endpoint(base_url: Option<&str>) -> Result<String, String> {
@@ -1051,6 +1046,11 @@ fn update_codex_account_profile(
 }
 
 #[tauri::command]
+fn complete_codex_hidden_account_cleanup(account_id: String) -> Result<CodexAccount, String> {
+    AccountStore::default().complete_hidden_account_cleanup(&account_id)
+}
+
+#[tauri::command]
 fn update_codex_api_key_bound_oauth_account(
     account_id: String,
     bound_oauth_account_id: Option<String>,
@@ -1087,7 +1087,10 @@ fn export_codex_accounts(
 #[tauri::command]
 fn codex_oauth_login_start(app_handle: AppHandle) -> Result<CodexOAuthLoginStartResponse, String> {
     let response = oauth::start_oauth_login()?;
-    start_oauth_callback_listener(app_handle, response.login_id.clone())?;
+    if let Err(error) = start_oauth_callback_listener(app_handle, response.login_id.clone()) {
+        let _ = oauth::cancel_oauth_login(Some(&response.login_id));
+        return Err(error);
+    }
     Ok(response)
 }
 
@@ -1140,6 +1143,7 @@ fn open_path_in_file_manager(path: String) -> Result<(), String> {
 }
 
 fn start_oauth_callback_listener(app_handle: AppHandle, login_id: String) -> Result<(), String> {
+    let listener_generation = OAUTH_CALLBACK_LISTENER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let listener = bind_oauth_callback_listener()?;
     listener
         .set_nonblocking(true)
@@ -1150,6 +1154,7 @@ fn start_oauth_callback_listener(app_handle: AppHandle, login_id: String) -> Res
         let mut callback_received = false;
         let mut close_deadline: Option<Instant> = None;
         while Instant::now() < deadline
+            && OAUTH_CALLBACK_LISTENER_GENERATION.load(Ordering::SeqCst) == listener_generation
             && (oauth::is_login_active(&login_id) || close_deadline.is_some())
         {
             if close_deadline.is_some_and(|target| Instant::now() >= target) {
@@ -1484,30 +1489,63 @@ fn oauth_callback_html(success: bool, title: &str, description: &str) -> String 
 }
 
 fn bind_oauth_callback_listener() -> Result<TcpListener, String> {
+    match bind_tcp_listener_with_retries(oauth::CALLBACK_PORT, 10) {
+        Ok(listener) => return Ok(listener),
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
+        Err(error) => return Err(format_oauth_callback_bind_error(error)),
+    }
+
+    reclaim_oauth_callback_port()?;
+    bind_tcp_listener_with_retries(oauth::CALLBACK_PORT, 40)
+        .map_err(format_oauth_callback_bind_error)
+}
+
+fn bind_tcp_listener_with_retries(port: u16, attempts: usize) -> io::Result<TcpListener> {
     let mut last_error = None;
-    for _ in 0..20 {
-        match TcpListener::bind(("127.0.0.1", oauth::CALLBACK_PORT)) {
+    for attempt in 0..attempts.max(1) {
+        match TcpListener::bind(("127.0.0.1", port)) {
             Ok(listener) => return Ok(listener),
             Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
                 last_error = Some(error);
-                thread::sleep(Duration::from_millis(50));
+                if attempt + 1 < attempts.max(1) {
+                    thread::sleep(Duration::from_millis(50));
+                }
             }
-            Err(error) => {
-                return Err(format!(
-                    "OAuth 回调端口 {} 启动失败: {}",
-                    oauth::CALLBACK_PORT,
-                    error
-                ));
-            }
+            Err(error) => return Err(error),
         }
     }
-    Err(format!(
+    Err(last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrInUse, "端口被占用")))
+}
+
+fn format_oauth_callback_bind_error(error: io::Error) -> String {
+    format!(
         "OAuth 回调端口 {} 启动失败: {}",
         oauth::CALLBACK_PORT,
-        last_error
-            .map(|error| error.to_string())
-            .unwrap_or_else(|| "端口被占用".to_string())
-    ))
+        error
+    )
+}
+
+fn reclaim_oauth_callback_port() -> Result<(), String> {
+    let port = oauth::CALLBACK_PORT;
+    let Some(pid) = api_service::listener_pid_on_port(port)? else {
+        return Err(format!(
+            "OAuth 回调端口 {} 被占用，但无法识别占用进程，请稍后重试",
+            port
+        ));
+    };
+
+    if pid == std::process::id() {
+        // A previous authorization listener belongs to this app. Its generation has already
+        // been invalidated and the retry loop will wait for that thread to release the port.
+        return Ok(());
+    }
+
+    api_service::terminate_pid(pid).map_err(|error| {
+        format!(
+            "OAuth 回调端口 {} 被进程 PID {} 占用，自动清理失败: {}",
+            port, pid, error
+        )
+    })
 }
 
 fn open_path_with_system(path: &PathBuf) -> Result<(), String> {
@@ -1644,6 +1682,16 @@ fn switch_account_and_sync_session_provider(
 #[tauri::command]
 fn restart_codex_app() -> Result<String, String> {
     AccountStore::default().restart_codex_app()
+}
+
+#[tauri::command]
+fn repair_codex_session_model_compatibility(
+) -> Result<CodexSessionModelCompatibilityRepairSummary, String> {
+    let session_store = SessionStore::default();
+    with_codex_desktop_stopped(|| {
+        let target_provider = session_store.read_target_provider()?;
+        session_store.repair_model_compatibility(&target_provider)
+    })
 }
 
 fn run_with_codex_desktop_restart<T, Stop, Action, Start>(
@@ -1933,6 +1981,42 @@ fn write_codex_config_file_to(
     read_codex_config_file_from(codex_home, kind)
 }
 
+#[cfg(target_os = "macos")]
+const DEFAULT_CODEX_CONFIG_TEMPLATE: &str = include_str!("../resources/default-codex-config.toml");
+
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_CODEX_CONFIG_TEMPLATE: &str = "model_provider = \"openai\"\n";
+
+fn default_codex_config_content(codex_home: &Path) -> Result<String, String> {
+    let escaped_codex_home = codex_home
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace('"', "\\\"");
+    let content = DEFAULT_CODEX_CONFIG_TEMPLATE.replace("__CODEX_HOME__", &escaped_codex_home);
+    validate_codex_config_content(CodexConfigFileKind::ConfigToml, &content)?;
+    Ok(content)
+}
+
+fn reset_codex_config_toml_in(codex_home: &Path) -> Result<CodexConfigFileContent, String> {
+    let content = default_codex_config_content(codex_home)?;
+    write_codex_config_file_to(codex_home, CodexConfigFileKind::ConfigToml, &content)
+}
+
+fn delete_codex_config_toml_from(codex_home: &Path) -> Result<bool, String> {
+    let path = codex_home.join("config.toml");
+    if !path.exists() {
+        return Ok(false);
+    }
+    std::fs::remove_file(&path).map_err(|error| {
+        format!(
+            "删除 Codex config.toml 失败 ({}): {}",
+            path.display(),
+            error
+        )
+    })?;
+    Ok(true)
+}
+
 #[tauri::command]
 fn read_codex_config_file(file_kind: String) -> Result<CodexConfigFileContent, String> {
     let kind = CodexConfigFileKind::parse(&file_kind)?;
@@ -1969,27 +2053,31 @@ fn write_codex_config_file(
 }
 
 #[tauri::command]
-fn reset_codex_config_toml() -> Result<bool, String> {
-    let path = default_codex_home().join("config.toml");
+fn reset_codex_config_toml() -> Result<CodexConfigFileContent, String> {
+    let codex_home = default_codex_home();
+    let path = codex_home.join("config.toml");
     let snapshot = read_file_snapshot(&path)?;
-    let removed = if path.exists() {
-        std::fs::remove_file(&path).map_err(|error| {
-            format!(
-                "删除 Codex config.toml 失败 ({}): {}",
-                path.display(),
-                error
-            )
-        })?;
-        true
-    } else {
-        false
-    };
+    let restored = reset_codex_config_toml_in(&codex_home)?;
     rollback_file_on_error(
         AccountStore::default().release_current_api_key_default_model(),
         &path,
         snapshot.as_deref(),
     )?;
-    Ok(removed)
+    Ok(restored)
+}
+
+#[tauri::command]
+fn delete_codex_config_toml() -> Result<bool, String> {
+    let codex_home = default_codex_home();
+    let path = codex_home.join("config.toml");
+    let snapshot = read_file_snapshot(&path)?;
+    let deleted = delete_codex_config_toml_from(&codex_home)?;
+    rollback_file_on_error(
+        AccountStore::default().release_current_api_key_default_model(),
+        &path,
+        snapshot.as_deref(),
+    )?;
+    Ok(deleted)
 }
 
 #[tauri::command]
@@ -2612,7 +2700,9 @@ fn codex_copy_session_history_across_instances(
     source_session_id: String,
     target_session_id: String,
 ) -> Result<CodexSessionMutationResult, String> {
-    SessionStore::default().copy_session_history(&source_session_id, &target_session_id)
+    with_codex_desktop_stopped(|| {
+        SessionStore::default().copy_session_history(&source_session_id, &target_session_id)
+    })
 }
 
 #[tauri::command]
@@ -3934,16 +4024,41 @@ fn compact_http_body(body: &str) -> String {
 mod tests {
     use super::{
         backup_entry_restore_target, codex_config_backup_path, codex_session_trash_dir,
-        default_codex_home, format_codex_config_content, parse_codex_api_key_models,
-        parse_codex_quota, prepare_backup_archive_files_with, read_codex_config_file_from,
-        rollback_file_on_error, run_with_codex_desktop_restart,
-        switch_account_and_sync_session_provider, switcher_account_dir, switcher_data_dir,
-        validate_prepared_switcher_backup, write_codex_config_file_to, AccountStore,
-        CodexApiKeyModel, CodexConfigFileKind, SessionStore,
+        default_codex_home, delete_codex_config_toml_from, format_codex_config_content,
+        parse_codex_api_key_models, parse_codex_quota, prepare_backup_archive_files_with,
+        read_codex_config_file_from, reset_codex_config_toml_in, rollback_file_on_error,
+        run_with_codex_desktop_restart, switch_account_and_sync_session_provider,
+        switcher_account_dir, switcher_data_dir, validate_prepared_switcher_backup,
+        write_codex_config_file_to, AccountStore, CodexApiKeyModel, CodexConfigFileKind,
+        SessionStore,
     };
     use serde_json::json;
     use std::io::Write;
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn tcp_listener_retry_succeeds_after_previous_listener_releases_port() {
+        let previous = TcpListener::bind(("127.0.0.1", 0)).expect("bind previous listener");
+        let port = previous
+            .local_addr()
+            .expect("previous listener address")
+            .port();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            drop(previous);
+        });
+
+        let listener = super::bind_tcp_listener_with_retries(port, 10)
+            .expect("bind succeeds after previous listener exits");
+        assert_eq!(
+            listener.local_addr().expect("listener address").port(),
+            port
+        );
+        release.join().expect("release thread");
+    }
 
     #[test]
     fn desktop_repair_restarts_codex_even_when_the_repair_fails() {
@@ -4370,6 +4485,33 @@ mod tests {
             std::fs::read_to_string(codex.path().join("config.toml")).expect("read config"),
             config
         );
+    }
+
+    #[test]
+    fn codex_config_reset_restores_baseline_and_delete_removes_file() {
+        let codex = tempdir().expect("codex tempdir");
+        let config_path = codex.path().join("config.toml");
+        std::fs::write(&config_path, "model_provider = \"custom\"\n").expect("write custom config");
+
+        let restored = reset_codex_config_toml_in(codex.path()).expect("restore baseline config");
+        let content = std::fs::read_to_string(&config_path).expect("read restored config");
+        assert!(restored.exists);
+        assert_eq!(restored.content, content);
+        assert!(content.contains("model_provider = \"openai\""));
+        #[cfg(target_os = "macos")]
+        {
+            let normalized_home = codex.path().to_string_lossy().replace('\\', "/");
+            assert!(content.contains("[plugins.\"browser@openai-bundled\"]"));
+            assert!(content.contains(&format!("CODEX_HOME = \"{}\"", normalized_home)));
+            assert!(!content.contains("__CODEX_HOME__"));
+        }
+        content
+            .parse::<toml_edit::Document>()
+            .expect("restored baseline remains valid TOML");
+
+        assert!(delete_codex_config_toml_from(codex.path()).expect("delete restored config"));
+        assert!(!config_path.exists());
+        assert!(!delete_codex_config_toml_from(codex.path()).expect("delete missing config"));
     }
 
     #[test]
@@ -4849,6 +4991,7 @@ pub fn run() {
             api_service::api_service_bind_accounts,
             api_service::api_service_list_bound_accounts,
             api_service::api_service_delete_bound_accounts,
+            api_service::api_service_delete_account_binding,
             app_update::app_update_check,
             app_update::app_update_download,
             app_update::app_update_cancel_download,
@@ -4873,6 +5016,7 @@ pub fn run() {
             check_codex_api_key_model_access,
             set_codex_api_key_default_model,
             update_codex_account_profile,
+            complete_codex_hidden_account_cleanup,
             update_codex_account_from_json,
             update_codex_api_key_bound_oauth_account,
             update_codex_account_phone,
@@ -4886,6 +5030,7 @@ pub fn run() {
             delete_codex_account,
             switch_codex_account,
             restart_codex_app,
+            repair_codex_session_model_compatibility,
             get_codex_switcher_settings,
             update_codex_switcher_settings,
             get_codex_reset_state,
@@ -4902,6 +5047,7 @@ pub fn run() {
             format_codex_config_file,
             write_codex_config_file,
             reset_codex_config_toml,
+            delete_codex_config_toml,
             get_codex_switcher_paths,
             export_codex_switcher_backup,
             start_codex_switcher_backup,
@@ -4947,9 +5093,11 @@ pub fn run() {
             opencodex::opencodex_read_manager_logs,
             opencodex::opencodex_scan_switcher_accounts,
             opencodex::opencodex_import_switcher_accounts,
+            opencodex::opencodex_delete_switcher_account,
             opencodex::opencodex_get_engine_update_catalog,
             opencodex::opencodex_install_engine_version,
             opencodex::opencodex_activate_bundled_engine,
+            opencodex::opencodex_delete_engine_version,
         ])
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {

@@ -1,5 +1,5 @@
 use crate::{
-    account::{write_bytes_atomic, AccountStore, CodexAccount},
+    account::{chatgpt_account_id, write_bytes_atomic, AccountStore, CodexAccount},
     fetch_codex_api_key_models_for_account,
 };
 use flate2::read::GzDecoder;
@@ -206,6 +206,7 @@ pub struct ApiServiceAccountSyncSummary {
 pub struct ApiServiceBoundAccount {
     id: String,
     account_id: Option<String>,
+    account_id_exact: bool,
     kind: String,
     label: String,
     email: Option<String>,
@@ -731,10 +732,21 @@ pub async fn api_service_bind_accounts(
         .filter(|account| !is_api_key_account(account))
     {
         let content = store.export_accounts(std::slice::from_ref(&account.id), Some("cpa"))?;
-        let value: serde_json::Value = serde_json::from_str(&content)
+        let mut value: serde_json::Value = serde_json::from_str(&content)
             .map_err(|error| format!("解析 CPA 导出数据失败: {}", error))?;
-        let email = cpa_email_from_value(&value).unwrap_or_else(|| account.email.clone());
-        let file_name = format!("codex-switcher-{}.json", safe_auth_file_stem(&email));
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| "CPA 单账号导出格式无效".to_string())?;
+        object.insert(
+            "codex_switcher_account_id".to_string(),
+            serde_json::Value::String(account.id.clone()),
+        );
+        let content = serde_json::to_string(&value)
+            .map_err(|error| format!("生成 CPA 认证文件失败: {error}"))?;
+        let file_name = format!(
+            "codex-switcher-{}.json",
+            &api_service_hash(&account.id)[..32]
+        );
         oauth_bindings.push((file_name, content));
     }
 
@@ -752,16 +764,42 @@ pub async fn api_service_bind_accounts(
     }
 
     let auth_dir = api_auth_dir(&dirs);
-    fs::create_dir_all(&auth_dir)
-        .map_err(|error| format!("创建 API 服务认证目录失败: {}", error))?;
-    clear_api_service_bound_accounts(&dirs, &auth_dir)?;
-    if !api_key_bindings.is_empty() {
-        bind_managed_api_key_accounts(&dirs, &api_key_bindings)?;
+    fs::create_dir_all(&dirs.base_dir)
+        .map_err(|error| format!("创建 API 服务目录失败: {}", error))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".auth-staging-")
+        .tempdir_in(&dirs.base_dir)
+        .map_err(|error| format!("创建认证临时目录失败: {error}"))?;
+    for (file_name, content) in &oauth_bindings {
+        write_bytes_atomic(&staging.path().join(file_name), content.as_bytes())
+            .map_err(|error| format!("准备 API 服务认证文件失败: {error}"))?;
     }
 
-    for (file_name, content) in &oauth_bindings {
-        write_bytes_atomic(&auth_dir.join(file_name), content.as_bytes())
-            .map_err(|error| format!("写入 API 服务认证文件失败: {error}"))?;
+    let config_path = dirs.workspace_dir.join("config.yaml");
+    let manifest_path = managed_api_key_bindings_path(&dirs);
+    let config_snapshot = read_optional_file(&config_path)?;
+    let manifest_snapshot = read_optional_file(&manifest_path)?;
+    let update_result = (|| {
+        clear_managed_api_key_bindings(&dirs)?;
+        if !api_key_bindings.is_empty() {
+            bind_managed_api_key_accounts(&dirs, &api_key_bindings)?;
+        }
+        replace_auth_directory(&auth_dir, staging.path())
+    })();
+    if let Err(error) = update_result {
+        let config_rollback = restore_optional_file(&config_path, config_snapshot.as_deref());
+        let manifest_rollback = restore_optional_file(&manifest_path, manifest_snapshot.as_deref());
+        let rollback_errors = [config_rollback.err(), manifest_rollback.err()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if !rollback_errors.is_empty() {
+            return Err(format!(
+                "{error}；回滚 API Key 配置失败: {}",
+                rollback_errors.join("；")
+            ));
+        }
+        return Err(error);
     }
 
     let oauth_count = oauth_bindings.len();
@@ -812,6 +850,80 @@ pub fn api_service_delete_bound_accounts(
             oauth_count += 1;
         }
     }
+    let api_key_count = delete_managed_api_key_bindings(&dirs, &targets)?;
+    Ok(ApiServiceAccountSyncSummary {
+        count: oauth_count + api_key_count,
+        auth_dir: display_path(&auth_dir),
+        oauth_count,
+        api_key_count,
+    })
+}
+
+#[tauri::command]
+pub fn api_service_delete_account_binding(
+    operation: State<'_, ApiServiceOperationState>,
+    account_id: String,
+) -> Result<ApiServiceAccountSyncSummary, String> {
+    let account_id = account_id.trim();
+    if account_id.is_empty() || account_id.len() > 128 {
+        return Err("账号 ID 无效".to_string());
+    }
+    let _guard = lock_operation(&operation)?;
+    ensure_not_shutting_down(&operation)?;
+    let dirs = ApiServiceDirs::new()?;
+    ensure_auth_dir_config(&dirs)?;
+    let store = AccountStore::default();
+    let local_accounts = store.list_accounts()?;
+    let source = local_accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .ok_or_else(|| "账号不存在".to_string())?;
+    let duplicate_email_count = local_accounts
+        .iter()
+        .filter(|account| account.email.eq_ignore_ascii_case(&source.email))
+        .count();
+    let source_chatgpt_account_id = chatgpt_account_id(source);
+    let auth_dir = api_auth_dir(&dirs);
+    let mut matched_paths = Vec::new();
+    let mut ambiguous_legacy_binding = false;
+    for account in list_bound_auth_accounts(&auth_dir)? {
+        let content = match fs::read_to_string(&account.path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let value: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if api_auth_matches_source_account(
+            &value,
+            account_id,
+            &source.email,
+            source_chatgpt_account_id.as_deref(),
+            duplicate_email_count,
+        ) {
+            matched_paths.push(PathBuf::from(&account.path));
+        } else if duplicate_email_count > 1
+            && cpa_switcher_account_id_from_value(&value).is_none()
+            && cpa_chatgpt_account_id_from_value(&value).is_none()
+            && account
+                .email
+                .as_deref()
+                .is_some_and(|email| email.eq_ignore_ascii_case(&source.email))
+        {
+            ambiguous_legacy_binding = true;
+        }
+    }
+    if ambiguous_legacy_binding {
+        return Err(
+            "检测到同邮箱的旧版 API 服务认证文件，但缺少账号身份字段，已阻止删除".to_string(),
+        );
+    }
+    for path in &matched_paths {
+        fs::remove_file(path).map_err(|error| format!("删除认证文件失败: {error}"))?;
+    }
+    let oauth_count = matched_paths.len();
+    let targets = HashSet::from([format!("apikey:{account_id}")]);
     let api_key_count = delete_managed_api_key_bindings(&dirs, &targets)?;
     Ok(ApiServiceAccountSyncSummary {
         count: oauth_count + api_key_count,
@@ -2023,21 +2135,7 @@ fn bind_managed_api_key_accounts(
     persist_managed_api_key_config(dirs, &entries, &managed)
 }
 
-fn clear_api_service_bound_accounts(dirs: &ApiServiceDirs, auth_dir: &Path) -> Result<(), String> {
-    if auth_dir.exists() {
-        for entry in fs::read_dir(auth_dir)
-            .map_err(|error| format!("读取 API 服务认证目录失败: {}", error))?
-        {
-            let path = entry
-                .map_err(|error| format!("读取认证文件失败: {}", error))?
-                .path();
-            if path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("json") {
-                fs::remove_file(&path)
-                    .map_err(|error| format!("清空 API 服务认证文件失败: {}", error))?;
-            }
-        }
-    }
-
+fn clear_managed_api_key_bindings(dirs: &ApiServiceDirs) -> Result<(), String> {
     let config_path = dirs.workspace_dir.join("config.yaml");
     let mut entries = read_codex_api_key_entries(&config_path)?;
     let managed = read_managed_api_key_bindings(dirs)?;
@@ -2053,17 +2151,69 @@ fn clear_api_service_bound_accounts(dirs: &ApiServiceDirs, auth_dir: &Path) -> R
     persist_managed_api_key_config(dirs, &entries, &ManagedApiKeyBindings::default())
 }
 
+fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("读取 {} 失败: {error}", display_path(path))),
+    }
+}
+
+fn restore_optional_file(path: &Path, content: Option<&[u8]>) -> Result<(), String> {
+    match content {
+        Some(content) => write_bytes_atomic(path, content),
+        None => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("删除 {} 失败: {error}", display_path(path))),
+        },
+    }
+}
+
+fn replace_auth_directory(auth_dir: &Path, staging_dir: &Path) -> Result<(), String> {
+    let parent = auth_dir
+        .parent()
+        .ok_or_else(|| "API 服务认证目录无父目录".to_string())?;
+    let backup = parent.join(format!(
+        ".auth-backup-{}-{}",
+        std::process::id(),
+        unix_timestamp()?
+    ));
+    let had_existing = auth_dir.exists();
+    if had_existing {
+        fs::rename(auth_dir, &backup)
+            .map_err(|error| format!("备份 API 服务认证目录失败: {error}"))?;
+    }
+    if let Err(error) = fs::rename(staging_dir, auth_dir) {
+        if had_existing {
+            if let Err(restore_error) = fs::rename(&backup, auth_dir) {
+                return Err(format!(
+                    "替换 API 服务认证目录失败: {error}；恢复旧认证目录失败: {restore_error}"
+                ));
+            }
+        }
+        return Err(format!("替换 API 服务认证目录失败: {error}"));
+    }
+    if had_existing {
+        // 新目录已经完整就位；残留备份不影响服务，下次同步可继续使用。
+        let _ = fs::remove_dir_all(&backup);
+    }
+    Ok(())
+}
+
 fn list_all_bound_accounts(dirs: &ApiServiceDirs) -> Result<Vec<ApiServiceBoundAccount>, String> {
     let auth_dir = api_auth_dir(dirs);
     let local_accounts = AccountStore::default().list_accounts()?;
     let mut bound = list_bound_auth_accounts(&auth_dir)?;
     for item in &mut bound {
-        item.account_id = item.email.as_deref().and_then(|email| {
-            local_accounts
-                .iter()
-                .find(|account| account.email.eq_ignore_ascii_case(email))
-                .map(|account| account.id.clone())
-        });
+        if item.account_id.is_none() {
+            item.account_id = item.email.as_deref().and_then(|email| {
+                local_accounts
+                    .iter()
+                    .find(|account| account.email.eq_ignore_ascii_case(email))
+                    .map(|account| account.id.clone())
+            });
+        }
     }
 
     let config_path = dirs.workspace_dir.join("config.yaml");
@@ -2087,6 +2237,7 @@ fn list_all_bound_accounts(dirs: &ApiServiceDirs) -> Result<Vec<ApiServiceBoundA
         bound.push(ApiServiceBoundAccount {
             id: format!("apikey:{}", binding.account_id),
             account_id: Some(binding.account_id.clone()),
+            account_id_exact: true,
             kind: "apikey".to_string(),
             label: source
                 .map(api_service_account_label)
@@ -2165,9 +2316,11 @@ fn list_bound_auth_accounts(auth_dir: &Path) -> Result<Vec<ApiServiceBoundAccoun
             .and_then(|metadata| metadata.modified().ok())
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs());
+        let account_id = cpa_switcher_account_id_from_value(&value);
         accounts.push(ApiServiceBoundAccount {
             id: format!("oauth:{}", api_service_short_hash(&display_path(&path))),
-            account_id: None,
+            account_id_exact: account_id.is_some(),
+            account_id,
             kind: "oauth".to_string(),
             label: email.clone(),
             email: Some(email),
@@ -2197,21 +2350,58 @@ fn cpa_email_from_value(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn safe_auth_file_stem(value: &str) -> String {
-    let mut stem = value
-        .chars()
-        .map(|char| {
-            if char.is_ascii_alphanumeric() || matches!(char, '-' | '_' | '.') {
-                char
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if stem.trim_matches(['.', '_', '-']).is_empty() {
-        stem = "account".to_string();
+fn cpa_switcher_account_id_from_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Array(items) => {
+            items.iter().find_map(cpa_switcher_account_id_from_value)
+        }
+        serde_json::Value::Object(map) => map
+            .get("codex_switcher_account_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|account_id| !account_id.is_empty() && account_id.len() <= 128)
+            .map(ToString::to_string),
+        _ => None,
     }
-    stem
+}
+
+fn cpa_chatgpt_account_id_from_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Array(items) => items.iter().find_map(cpa_chatgpt_account_id_from_value),
+        serde_json::Value::Object(map) => map
+            .get("account_id")
+            .or_else(|| map.get("chatgpt_account_id"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|account_id| !account_id.is_empty() && account_id.len() <= 256)
+            .map(ToString::to_string),
+        _ => None,
+    }
+}
+
+fn api_auth_matches_source_account(
+    value: &serde_json::Value,
+    source_id: &str,
+    source_email: &str,
+    source_chatgpt_account_id: Option<&str>,
+    duplicate_email_count: usize,
+) -> bool {
+    let switcher_account_id = cpa_switcher_account_id_from_value(value);
+    let chatgpt_account_id = cpa_chatgpt_account_id_from_value(value);
+    if switcher_account_id.as_deref() == Some(source_id) {
+        return true;
+    }
+    if source_chatgpt_account_id.is_some()
+        && chatgpt_account_id.as_deref() == source_chatgpt_account_id
+    {
+        return true;
+    }
+    switcher_account_id.is_none()
+        && chatgpt_account_id.is_none()
+        && duplicate_email_count == 1
+        && cpa_email_from_value(value)
+            .as_deref()
+            .is_some_and(|email| email.eq_ignore_ascii_case(source_email))
 }
 
 fn emit_download_progress(
@@ -2827,7 +3017,7 @@ fn process_pid(process: &State<'_, ApiServiceProcessState>) -> Result<Option<u32
 }
 
 #[cfg(unix)]
-fn listener_pid_on_port(port: u16) -> Result<Option<u32>, String> {
+pub(crate) fn listener_pid_on_port(port: u16) -> Result<Option<u32>, String> {
     let output = Command::new("lsof")
         .arg("-nP")
         .arg(format!("-iTCP:{port}"))
@@ -2851,7 +3041,7 @@ fn listener_pid_on_port(port: u16) -> Result<Option<u32>, String> {
 }
 
 #[cfg(windows)]
-fn listener_pid_on_port(port: u16) -> Result<Option<u32>, String> {
+pub(crate) fn listener_pid_on_port(port: u16) -> Result<Option<u32>, String> {
     let script = format!(
         "$c = Get-NetTCPConnection -LocalPort {} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -ne $c) {{ [Console]::Out.Write($c.OwningProcess) }}",
         port
@@ -2870,7 +3060,7 @@ fn listener_pid_on_port(port: u16) -> Result<Option<u32>, String> {
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn listener_pid_on_port(_port: u16) -> Result<Option<u32>, String> {
+pub(crate) fn listener_pid_on_port(_port: u16) -> Result<Option<u32>, String> {
     Ok(None)
 }
 
@@ -2945,14 +3135,14 @@ fn pid_is_running(_pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn terminate_pid(pid: u32) -> Result<(), String> {
+pub(crate) fn terminate_pid(pid: u32) -> Result<(), String> {
     let status = Command::new("kill")
         .arg("-TERM")
         .arg(pid.to_string())
         .status()
-        .map_err(|error| format!("停止 API 服务失败: {}", error))?;
+        .map_err(|error| format!("停止端口占用进程失败: {}", error))?;
     if !status.success() {
-        return Err(format!("停止 API 服务失败: kill -TERM {}", pid));
+        return Err(format!("停止端口占用进程失败: kill -TERM {}", pid));
     }
     for _ in 0..20 {
         if !pid_is_running(pid) {
@@ -2964,24 +3154,24 @@ fn terminate_pid(pid: u32) -> Result<(), String> {
         .arg("-KILL")
         .arg(pid.to_string())
         .status()
-        .map_err(|error| format!("强制停止 API 服务失败: {}", error))?;
+        .map_err(|error| format!("强制停止端口占用进程失败: {}", error))?;
     status
         .success()
         .then_some(())
-        .ok_or_else(|| format!("强制停止 API 服务失败: kill -KILL {}", pid))
+        .ok_or_else(|| format!("强制停止端口占用进程失败: kill -KILL {}", pid))
 }
 
 #[cfg(windows)]
-fn terminate_pid(pid: u32) -> Result<(), String> {
+pub(crate) fn terminate_pid(pid: u32) -> Result<(), String> {
     let pid_text = pid.to_string();
     let mut command = Command::new("taskkill");
     command.args(["/PID", &pid_text, "/T", "/F"]);
     hide_command_window(&mut command);
     let status = command
         .status()
-        .map_err(|error| format!("停止 API 服务失败: {}", error))?;
+        .map_err(|error| format!("停止端口占用进程失败: {}", error))?;
     if !status.success() && pid_is_running(pid) {
-        return Err(format!("停止 API 服务失败: taskkill /PID {}", pid));
+        return Err(format!("停止端口占用进程失败: taskkill /PID {}", pid));
     }
     for _ in 0..20 {
         if !pid_is_running(pid) {
@@ -2989,11 +3179,11 @@ fn terminate_pid(pid: u32) -> Result<(), String> {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    Err(format!("停止 API 服务超时: PID {}", pid))
+    Err(format!("停止端口占用进程超时: PID {}", pid))
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn terminate_pid(_pid: u32) -> Result<(), String> {
+pub(crate) fn terminate_pid(_pid: u32) -> Result<(), String> {
     Ok(())
 }
 
@@ -3532,6 +3722,82 @@ struct RuntimeInfoInternal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpa_switcher_account_id_metadata_is_strictly_validated() {
+        let valid = serde_json::json!({
+            "email": "member@example.com",
+            "codex_switcher_account_id": "oauth-member"
+        });
+        assert_eq!(
+            cpa_switcher_account_id_from_value(&valid).as_deref(),
+            Some("oauth-member")
+        );
+        assert!(cpa_switcher_account_id_from_value(
+            &serde_json::json!({ "codex_switcher_account_id": " " })
+        )
+        .is_none());
+        assert!(cpa_switcher_account_id_from_value(
+            &serde_json::json!({ "codex_switcher_account_id": "x".repeat(129) })
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn hidden_account_cleanup_matches_exact_or_legacy_identity_without_email_collisions() {
+        let exact = serde_json::json!({
+            "email": "shared@example.com",
+            "account_id": "different-chatgpt",
+            "codex_switcher_account_id": "source-one"
+        });
+        assert!(api_auth_matches_source_account(
+            &exact,
+            "source-one",
+            "shared@example.com",
+            Some("source-chatgpt"),
+            2,
+        ));
+
+        let legacy = serde_json::json!({
+            "email": "shared@example.com",
+            "account_id": "source-chatgpt"
+        });
+        assert!(api_auth_matches_source_account(
+            &legacy,
+            "source-one",
+            "shared@example.com",
+            Some("source-chatgpt"),
+            2,
+        ));
+
+        let other_identity = serde_json::json!({
+            "email": "shared@example.com",
+            "account_id": "other-chatgpt"
+        });
+        assert!(!api_auth_matches_source_account(
+            &other_identity,
+            "source-one",
+            "shared@example.com",
+            Some("source-chatgpt"),
+            2,
+        ));
+
+        let identity_free = serde_json::json!({ "email": "shared@example.com" });
+        assert!(!api_auth_matches_source_account(
+            &identity_free,
+            "source-one",
+            "shared@example.com",
+            None,
+            2,
+        ));
+        assert!(api_auth_matches_source_account(
+            &identity_free,
+            "source-one",
+            "shared@example.com",
+            None,
+            1,
+        ));
+    }
 
     fn test_runtime(version: &str, target: &str, installed_at: u64) -> RuntimeInfo {
         let id = format!("{version}_{target}");
@@ -4102,52 +4368,46 @@ mod tests {
     }
 
     #[test]
-    fn clearing_api_service_bound_accounts_removes_auth_files_and_managed_upstreams() {
+    fn replacing_auth_directory_swaps_complete_contents() {
         let (_temporary, dirs) = test_dirs();
-        fs::create_dir_all(&dirs.workspace_dir).unwrap();
         let auth_dir = api_auth_dir(&dirs);
         fs::create_dir_all(&auth_dir).unwrap();
-        fs::write(
-            auth_dir.join("codex-switcher-old@example.com.json"),
-            r#"{"email":"old@example.com"}"#,
-        )
-        .unwrap();
-        let config_path = dirs.workspace_dir.join("config.yaml");
-        fs::write(
-            &config_path,
-            concat!(
-                "port: 17877\n",
-                "codex-api-key:\n",
-                "  - api-key: manual-key\n",
-                "    base-url: https://manual.example/v1\n",
-                "  - api-key: managed-key\n",
-                "    base-url: https://managed.example/v1\n",
-            ),
-        )
-        .unwrap();
-        write_json(
-            &managed_api_key_bindings_path(&dirs),
-            &ManagedApiKeyBindings {
-                bindings: vec![ManagedApiKeyBinding {
-                    account_id: "api_managed".to_string(),
-                    api_key_hash: api_service_hash("managed-key"),
-                    base_url: "https://managed.example/v1".to_string(),
-                    label: "Managed Provider".to_string(),
-                    owns_config_entry: true,
-                }],
-            },
-        )
-        .unwrap();
+        fs::write(auth_dir.join("old.json"), b"old").unwrap();
+        let staging = dirs.base_dir.join("staging-auth");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("new.json"), b"new").unwrap();
 
-        clear_api_service_bound_accounts(&dirs, &auth_dir).unwrap();
+        replace_auth_directory(&auth_dir, &staging).unwrap();
 
-        assert!(fs::read_dir(&auth_dir).unwrap().next().is_none());
-        let entries = read_codex_api_key_entries(&config_path).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].api_key, "manual-key");
-        assert!(read_managed_api_key_bindings(&dirs)
-            .unwrap()
-            .bindings
-            .is_empty());
+        assert!(!auth_dir.join("old.json").exists());
+        assert_eq!(fs::read(auth_dir.join("new.json")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn replacing_auth_directory_restores_existing_directory_on_failure() {
+        let (_temporary, dirs) = test_dirs();
+        let auth_dir = api_auth_dir(&dirs);
+        fs::create_dir_all(&auth_dir).unwrap();
+        fs::write(auth_dir.join("old.json"), b"old").unwrap();
+
+        let error = replace_auth_directory(&auth_dir, &dirs.base_dir.join("missing-staging"))
+            .expect_err("missing staging must fail");
+
+        assert!(error.contains("替换 API 服务认证目录失败"));
+        assert_eq!(fs::read(auth_dir.join("old.json")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn oauth_binding_file_hashes_are_distinct_and_bounded() {
+        let first = format!("codex-switcher-{}.json", &api_service_hash("a/b")[..32]);
+        let second = format!("codex-switcher-{}.json", &api_service_hash("a?b")[..32]);
+        let long = format!(
+            "codex-switcher-{}.json",
+            &api_service_hash(&"account".repeat(10_000))[..32]
+        );
+
+        assert_ne!(first, second);
+        assert_eq!(first.len(), "codex-switcher-".len() + 32 + ".json".len());
+        assert_eq!(long.len(), first.len());
     }
 }

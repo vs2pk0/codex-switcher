@@ -1,8 +1,9 @@
 use super::models::{
     BackgroundServiceState, CommandAction, CommandFinishedEvent, CommandLogEvent, CommandStarted,
+    DeleteEngineVersionRequest, DeleteSwitcherAccountRequest, EngineDeleteResult,
     EngineInstallResult, EngineRelease, EngineUpdateCatalog, HealthBody,
     ImportSwitcherAccountsRequest, InstallEngineVersionRequest, RunActionRequest,
-    SwitcherAccountScan, SwitcherImportResult, SystemSnapshot,
+    SwitcherAccountScan, SwitcherDeleteResult, SwitcherImportResult, SystemSnapshot,
 };
 use chrono::Utc;
 use once_cell::sync::Lazy;
@@ -25,6 +26,7 @@ use tauri::{AppHandle, Emitter, Manager as _, WebviewUrl, WebviewWindowBuilder};
 const DEFAULT_PORT: u16 = 15800;
 const START_TIMEOUT: Duration = Duration::from_secs(35);
 const HTTP_TIMEOUT: Duration = Duration::from_millis(750);
+const MANAGED_ENGINE_HISTORY_LIMIT: usize = 3;
 
 static SECRET_FIELD: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password)(\s*[:=]\s*)([^\s,;]+)")
@@ -296,6 +298,20 @@ impl Backend {
         versions
     }
 
+    fn prune_managed_engine_history(&self, active_version: &str) -> Result<Vec<String>, String> {
+        let installed = self.installed_managed_versions();
+        let removable =
+            managed_versions_to_remove(&installed, active_version, MANAGED_ENGINE_HISTORY_LIMIT);
+        let mut removed = Vec::new();
+        for version in removable {
+            let directory = self.managed_engine_root().join(&version);
+            fs::remove_dir_all(&directory)
+                .map_err(|error| format!("清理旧 Engine v{version} 失败：{error}"))?;
+            removed.push(version);
+        }
+        Ok(removed)
+    }
+
     fn bundled_engine_dir(&self) -> Result<PathBuf, String> {
         if let Ok(resource_dir) = self.app.path().resource_dir() {
             let bundled = resource_dir.join("opencodex-engine");
@@ -349,10 +365,16 @@ impl Backend {
             .map_or("missing", |item| item.source)
             .to_string();
         let installed = launcher.is_some();
-        let initialized = config_dir().is_some_and(|directory| config_is_initialized(&directory));
+        let configuration = config_dir();
+        let initialized = configuration.as_deref().is_some_and(config_is_initialized);
+        let codex_integration_enabled = configuration
+            .as_deref()
+            .is_none_or(codex_integration_is_enabled);
         let running = health.is_some();
         let integration_status = if !initialized {
             "等待初始化"
+        } else if !codex_integration_enabled {
+            "集成已关闭"
         } else if ready {
             "连接正常"
         } else if running {
@@ -781,41 +803,51 @@ impl Backend {
         result
     }
 
+    pub fn delete_codex_switcher_account(
+        &self,
+        request: DeleteSwitcherAccountRequest,
+    ) -> Result<SwitcherDeleteResult, String> {
+        if request.source_id.is_empty() || request.source_id.len() > 128 {
+            return Err("删除请求包含无效账号 ID".to_string());
+        }
+        self.begin_mutation()?;
+        let result = (|| {
+            let input = serde_json::to_vec(&request)
+                .map_err(|error| format!("无法生成删除请求：{error}"))?;
+            self.run_switcher_helper::<SwitcherDeleteResult>("delete", Some(&input))
+        })();
+        self.finish_mutation();
+        if let Ok(deleted) = &result {
+            if deleted.deleted {
+                self.persist_log(
+                    "system",
+                    &format!("已从 OpenCodex 删除 Switcher 账号 {}", deleted.source_id),
+                );
+            }
+        }
+        result
+    }
+
     pub fn get_engine_update_catalog(&self) -> Result<EngineUpdateCatalog, String> {
-        let remote: RemoteEngineCatalog = self.run_engine_update_helper("catalog", None)?;
         let launcher = self.active_launcher().ok();
         let current_version = launcher.as_ref().and_then(|item| item.version.clone());
         let current_source = launcher
             .as_ref()
             .map_or("missing", |item| item.source)
             .to_string();
-        let current_semver = current_version
-            .as_deref()
-            .and_then(|value| Version::parse(value).ok());
         let bundled_version = self
             .bundled_package_root()
             .ok()
             .and_then(|package| package_version(&package));
         let installed_versions = self.installed_managed_versions();
-        let mut releases = remote.releases;
-        for release in &mut releases {
-            release.newer_than_current = current_semver.as_ref().is_none_or(|current| {
-                Version::parse(&release.version).is_ok_and(|next| next > *current)
-            });
-            release.installed = installed_versions.contains(&release.version)
-                || bundled_version.as_deref() == Some(release.version.as_str());
-            release.active = current_version.as_deref() == Some(release.version.as_str());
-        }
-        let latest_stable = releases.iter().find(|release| !release.prerelease).cloned();
-        let latest_preview = releases.iter().find(|release| release.prerelease).cloned();
-        Ok(EngineUpdateCatalog {
+        let remote = self.run_engine_update_helper::<RemoteEngineCatalog>("catalog", None);
+        Ok(build_engine_update_catalog(
             current_version,
             current_source,
-            latest_stable,
-            latest_preview,
-            releases,
+            bundled_version,
             installed_versions,
-        })
+            remote,
+        ))
     }
 
     pub fn install_engine_version(
@@ -831,6 +863,14 @@ impl Backend {
             let bundled_version = package_version(&self.bundled_package_root()?);
             if bundled_version.as_deref() == Some(version.as_str()) {
                 self.write_active_engine(None)?;
+                match self.prune_managed_engine_history("") {
+                    Ok(removed) if !removed.is_empty() => self.persist_log(
+                        "system",
+                        &format!("已清理旧 Engine 版本：{}", removed.join("、")),
+                    ),
+                    Err(error) => self.persist_log("stderr", &error),
+                    _ => {}
+                }
                 return Ok(EngineInstallResult {
                     version,
                     source: "bundled".to_string(),
@@ -854,6 +894,14 @@ impl Backend {
                 validate_managed_package(&package, &version)?;
             }
             self.write_active_engine(Some(&version))?;
+            match self.prune_managed_engine_history(&version) {
+                Ok(removed) if !removed.is_empty() => self.persist_log(
+                    "system",
+                    &format!("已清理旧 Engine 版本：{}", removed.join("、")),
+                ),
+                Err(error) => self.persist_log("stderr", &error),
+                _ => {}
+            }
             Ok(EngineInstallResult {
                 version: version.clone(),
                 source: "managed".to_string(),
@@ -862,6 +910,37 @@ impl Backend {
                 } else {
                     format!("Engine v{version} 下载、校验并激活完成")
                 },
+            })
+        })();
+        self.finish_mutation();
+        if let Ok(value) = &result {
+            self.persist_log("system", &value.message);
+        }
+        result
+    }
+
+    pub fn delete_engine_version(
+        &self,
+        request: DeleteEngineVersionRequest,
+    ) -> Result<EngineDeleteResult, String> {
+        let version = validate_engine_version(&request.version)?;
+        self.begin_mutation()?;
+        let result = (|| {
+            if open_codex_service_running() {
+                return Err("删除 Engine 版本前请先停止 OpenCodex 服务".to_string());
+            }
+            if self.active_managed_version().as_deref() == Some(version.as_str()) {
+                return Err("当前正在使用的 Engine 版本不能删除，请先切换到其他版本".to_string());
+            }
+            let directory = self.managed_engine_root().join(&version);
+            if !validate_managed_package(&self.managed_package_root(&version), &version).is_ok() {
+                return Err(format!("本地未安装 Engine v{version}"));
+            }
+            fs::remove_dir_all(&directory)
+                .map_err(|error| format!("删除 Engine v{version} 失败：{error}"))?;
+            Ok(EngineDeleteResult {
+                version: version.clone(),
+                message: format!("已删除本地 Engine v{version}"),
             })
         })();
         self.finish_mutation();
@@ -880,6 +959,14 @@ impl Backend {
             let version = package_version(&self.bundled_package_root()?)
                 .ok_or_else(|| "无法读取客户端内置 Engine 版本".to_string())?;
             self.write_active_engine(None)?;
+            match self.prune_managed_engine_history("") {
+                Ok(removed) if !removed.is_empty() => self.persist_log(
+                    "system",
+                    &format!("已清理旧 Engine 版本：{}", removed.join("、")),
+                ),
+                Err(error) => self.persist_log("stderr", &error),
+                _ => {}
+            }
             Ok(EngineInstallResult {
                 version: version.clone(),
                 source: "bundled".to_string(),
@@ -1001,6 +1088,41 @@ impl Backend {
         }
         serde_json::from_slice(&output.stdout)
             .map_err(|error| format!("Switcher 转换器返回了无效结果：{error}"))
+    }
+}
+
+fn build_engine_update_catalog(
+    current_version: Option<String>,
+    current_source: String,
+    bundled_version: Option<String>,
+    installed_versions: Vec<String>,
+    remote: Result<RemoteEngineCatalog, String>,
+) -> EngineUpdateCatalog {
+    let current_semver = current_version
+        .as_deref()
+        .and_then(|value| Version::parse(value).ok());
+    let (mut releases, remote_error) = match remote {
+        Ok(remote) => (remote.releases, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    for release in &mut releases {
+        release.newer_than_current = current_semver.as_ref().is_none_or(|current| {
+            Version::parse(&release.version).is_ok_and(|next| next > *current)
+        });
+        release.installed = installed_versions.contains(&release.version)
+            || bundled_version.as_deref() == Some(release.version.as_str());
+        release.active = current_version.as_deref() == Some(release.version.as_str());
+    }
+    let latest_stable = releases.iter().find(|release| !release.prerelease).cloned();
+    let latest_preview = releases.iter().find(|release| release.prerelease).cloned();
+    EngineUpdateCatalog {
+        current_version,
+        current_source,
+        latest_stable,
+        latest_preview,
+        releases,
+        installed_versions,
+        remote_error,
     }
 }
 
@@ -1135,6 +1257,19 @@ fn validate_managed_package(package_root: &Path, expected_version: &str) -> Resu
     Ok(())
 }
 
+fn managed_versions_to_remove(
+    installed_versions: &[String],
+    active_version: &str,
+    history_limit: usize,
+) -> Vec<String> {
+    installed_versions
+        .iter()
+        .filter(|version| version.as_str() != active_version)
+        .skip(history_limit)
+        .cloned()
+        .collect()
+}
+
 fn config_dir() -> Option<PathBuf> {
     if let Some(raw) = std::env::var_os("OPENCODEX_HOME") {
         let path = PathBuf::from(raw);
@@ -1177,6 +1312,23 @@ fn config_is_initialized(directory: &Path) -> bool {
         .get("providers")
         .and_then(Value::as_object)
         .is_some_and(|providers| providers.contains_key(default_provider))
+}
+
+fn codex_integration_is_enabled(directory: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(directory.join("config.json")) else {
+        // Keep the Engine's backward-compatible default: an absent setting is
+        // ON, and initialization validation reports a missing file separately.
+        return true;
+    };
+    let Ok(config) = serde_json::from_str::<Value>(&text) else {
+        return true;
+    };
+    config
+        .get("clientIntegrations")
+        .and_then(Value::as_object)
+        .and_then(|integrations| integrations.get("codex"))
+        .and_then(Value::as_bool)
+        != Some(false)
 }
 
 fn request_json(port: u16, path: &str) -> Option<(u16, HealthBody)> {
@@ -1241,8 +1393,9 @@ fn display_action(action: &CommandAction) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        config_is_initialized, package_version, validate_engine_version, validate_managed_package,
-        validate_port, RemoteEngineCatalog, DEFAULT_PORT,
+        build_engine_update_catalog, codex_integration_is_enabled, config_is_initialized,
+        managed_versions_to_remove, package_version, validate_engine_version,
+        validate_managed_package, validate_port, RemoteEngineCatalog, DEFAULT_PORT,
     };
     use chrono::Utc;
     use std::{
@@ -1282,6 +1435,23 @@ mod tests {
             .join("@bitkyc08")
             .join("opencodex");
         assert_eq!(package_version(&package).as_deref(), Some("2.27.0"));
+    }
+
+    #[test]
+    fn remote_catalog_failure_preserves_local_engine_versions() {
+        let catalog = build_engine_update_catalog(
+            Some("2.31.0".to_string()),
+            "managed".to_string(),
+            Some("2.27.0".to_string()),
+            vec!["2.31.0".to_string(), "2.30.0".to_string()],
+            Err("GitHub unavailable".to_string()),
+        );
+
+        assert_eq!(catalog.current_version.as_deref(), Some("2.31.0"));
+        assert_eq!(catalog.current_source, "managed");
+        assert_eq!(catalog.installed_versions, ["2.31.0", "2.30.0"]);
+        assert!(catalog.releases.is_empty());
+        assert_eq!(catalog.remote_error.as_deref(), Some("GitHub unavailable"));
     }
 
     #[test]
@@ -1334,6 +1504,25 @@ mod tests {
     }
 
     #[test]
+    fn retains_the_active_engine_and_three_recent_history_versions() {
+        let installed = ["2.32.0", "2.31.0", "2.30.0", "2.29.0", "2.28.0"].map(ToString::to_string);
+        assert_eq!(
+            managed_versions_to_remove(&installed, "2.32.0", 3),
+            ["2.28.0"]
+        );
+        assert_eq!(
+            managed_versions_to_remove(&installed, "2.30.0", 3),
+            ["2.28.0"]
+        );
+    }
+
+    #[test]
+    fn retains_three_recent_managed_versions_when_using_bundled_engine() {
+        let installed = ["2.32.0", "2.31.0", "2.30.0", "2.29.0"].map(ToString::to_string);
+        assert_eq!(managed_versions_to_remove(&installed, "", 3), ["2.29.0"]);
+    }
+
+    #[test]
     fn validates_non_privileged_ports() {
         assert!(validate_port(DEFAULT_PORT).is_ok());
         assert!(validate_port(1024).is_ok());
@@ -1367,6 +1556,35 @@ mod tests {
         assert!(config_is_initialized(&directory));
 
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn reads_the_durable_codex_integration_switch_with_absent_meaning_on() {
+        let directory = std::env::temp_dir().join(format!(
+            "opencodex-manager-integration-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        fs::create_dir_all(&directory).expect("create integration test directory");
+
+        fs::write(
+            directory.join("config.json"),
+            r#"{"clientIntegrations":{"codex":false}}"#,
+        )
+        .expect("write disabled integration config");
+        assert!(!codex_integration_is_enabled(&directory));
+
+        fs::write(
+            directory.join("config.json"),
+            r#"{"clientIntegrations":{}}"#,
+        )
+        .expect("write default integration config");
+        assert!(codex_integration_is_enabled(&directory));
+
+        fs::write(directory.join("config.json"), r#"{}"#).expect("write legacy integration config");
+        assert!(codex_integration_is_enabled(&directory));
+
+        fs::remove_dir_all(directory).expect("remove integration test directory");
     }
 
     #[cfg(unix)]

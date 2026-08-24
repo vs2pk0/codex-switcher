@@ -4,6 +4,8 @@ import { Message, Modal } from "@arco-design/web-vue";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   activateBundledOpenCodexEngine,
+  deleteOpenCodexSwitcherAccount,
+  deleteOpenCodexEngine,
   getOpenCodexEngineCatalog,
   getOpenCodexSnapshot,
   importOpenCodexSwitcherAccounts,
@@ -49,6 +51,7 @@ const accountScan = ref<OpenCodexSwitcherAccountScan | null>(null);
 const accountScanLoading = ref(false);
 const selectedAccountIds = ref<string[]>([]);
 const importingAccounts = ref(false);
+const deletingAccountId = ref("");
 let unlistenEvents: UnlistenFn | undefined;
 const answeredPortPrompts = new Set<string>();
 
@@ -67,6 +70,12 @@ const recentLogs = computed(() => logs.value.slice(-14));
 const selectedRelease = computed(
   () => catalog.value?.releases.find((release) => release.version === selectedVersion.value) ?? null,
 );
+const selectedImportAccountIds = computed(() => selectedAccountIds.value.filter((sourceId) =>
+  accountScan.value?.accounts.some((account) => account.sourceId === sourceId && account.eligible),
+));
+const selectedDeleteAccounts = computed(() => (accountScan.value?.accounts ?? []).filter((account) =>
+  selectedAccountIds.value.includes(account.sourceId) && account.deletable,
+));
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -183,6 +192,9 @@ async function checkVersions(): Promise<void> {
       catalog.value.latestStable?.version ||
       catalog.value.releases[0]?.version ||
       "";
+    if (catalog.value.remoteError) {
+      Message.warning(`GitHub 版本暂时不可用，本地 Engine 仍可管理：${catalog.value.remoteError}`);
+    }
   } catch (error) {
     Message.error(`检测 OpenCodex Engine 版本失败：${errorText(error)}`);
   } finally {
@@ -224,6 +236,45 @@ async function rollbackEngine(): Promise<void> {
   }
 }
 
+async function switchInstalledVersion(version: string): Promise<void> {
+  if (snapshot.value?.running) {
+    Message.warning("请先停止 OpenCodex 服务，再切换 Engine");
+    return;
+  }
+  busy.value = true;
+  try {
+    const result = await installOpenCodexEngine(version);
+    Message.success(result.message);
+    await Promise.all([refreshSnapshot(false), checkVersions()]);
+  } catch (error) {
+    Message.error(`切换 Engine 失败：${errorText(error)}`);
+  } finally {
+    busy.value = false;
+  }
+}
+
+function confirmDeleteInstalledVersion(version: string): void {
+  Modal.warning({
+    title: "删除本地 Engine",
+    content: `确认删除本地 Engine v${version}？删除后仍可从 GitHub 版本列表重新下载安装。`,
+    okText: "删除",
+    cancelText: "取消",
+    hideCancel: false,
+    async onOk() {
+      busy.value = true;
+      try {
+        const result = await deleteOpenCodexEngine(version);
+        Message.success(result.message);
+        await checkVersions();
+      } catch (error) {
+        Message.error(`删除 Engine 失败：${errorText(error)}`);
+      } finally {
+        busy.value = false;
+      }
+    },
+  });
+}
+
 function saveSettings(): void {
   if (!Number.isInteger(settings.value.port) || settings.value.port < 1024 || settings.value.port > 65535) {
     Message.warning("端口必须在 1024–65535 之间");
@@ -251,13 +302,13 @@ async function scanAccounts(): Promise<void> {
 }
 
 async function importAccounts(): Promise<void> {
-  if (!selectedAccountIds.value.length) {
+  if (!selectedImportAccountIds.value.length) {
     Message.warning("请至少选择一个可导入账号");
     return;
   }
   importingAccounts.value = true;
   try {
-    const result = await importOpenCodexSwitcherAccounts(selectedAccountIds.value);
+    const result = await importOpenCodexSwitcherAccounts(selectedImportAccountIds.value);
     Message.success(`已导入 ${result.importedCount} 个账号，跳过 ${result.skippedCount} 个`);
     emit("accounts-refreshed");
     await scanAccounts();
@@ -266,6 +317,79 @@ async function importAccounts(): Promise<void> {
   } finally {
     importingAccounts.value = false;
   }
+}
+
+function confirmDeleteSelectedAccounts(): void {
+  const selected = [...selectedDeleteAccounts.value];
+  if (!selected.length || deletingAccountId.value) {
+    Message.warning("请至少选择一个已导入且可删除的账号");
+    return;
+  }
+  if (snapshot.value?.running) {
+    Message.warning("请先停止 OpenCodex 服务，再删除账号");
+    return;
+  }
+  Modal.warning({
+    title: "批量删除 OpenCodex 账号",
+    content: `确认从 OpenCodex 删除所选 ${selected.length} 个账号？Switcher 账号总览中的原账号会保留。`,
+    okText: "删除",
+    cancelText: "取消",
+    hideCancel: false,
+    onOk: async () => {
+      deletingAccountId.value = "__selected__";
+      try {
+        const results = [];
+        for (const account of selected) {
+          results.push(await deleteOpenCodexSwitcherAccount(account.sourceId));
+        }
+        const deletedCount = results.filter((result) => result.deleted).length;
+        const failures = results.filter((result) => !result.deleted && /身份|不匹配|无法确认/.test(result.message));
+        if (failures.length) {
+          Message.warning(`已删除 ${deletedCount} 个账号，${failures.length} 个账号因身份校验失败而保留`);
+        } else {
+          Message.success(`已从 OpenCodex 删除 ${deletedCount} 个账号`);
+        }
+        emit("accounts-refreshed");
+        await scanAccounts();
+      } catch (error) {
+        Message.error(`批量删除 OpenCodex 账号失败：${errorText(error)}`);
+        throw error;
+      } finally {
+        deletingAccountId.value = "";
+      }
+    },
+  });
+}
+
+function confirmDeleteMigratedAccount(
+  account: OpenCodexSwitcherAccountScan["accounts"][number],
+): void {
+  if (!account.deletable || deletingAccountId.value) return;
+  if (snapshot.value?.running) {
+    Message.warning("请先停止 OpenCodex 服务，再删除账号");
+    return;
+  }
+  Modal.warning({
+    title: "删除 OpenCodex 账号",
+    content: `确认从 OpenCodex 删除 ${account.email || account.sourceId}？Switcher 账号总览中的原账号会保留。`,
+    okText: "删除",
+    cancelText: "取消",
+    hideCancel: false,
+    onOk: async () => {
+      deletingAccountId.value = account.sourceId;
+      try {
+        const result = await deleteOpenCodexSwitcherAccount(account.sourceId);
+        Message.success(result.message);
+        emit("accounts-refreshed");
+        await scanAccounts();
+      } catch (error) {
+        Message.error(`删除 OpenCodex 账号失败：${errorText(error)}`);
+        throw error;
+      } finally {
+        deletingAccountId.value = "";
+      }
+    },
+  });
 }
 
 function formatLogTime(value: string): string {
@@ -290,7 +414,7 @@ function accountStatusLabel(status: string): string {
 }
 
 function toggleMigrationAccount(account: OpenCodexSwitcherAccountScan["accounts"][number]): void {
-  if (!account.eligible) return;
+  if (!account.eligible && !account.deletable) return;
   selectedAccountIds.value = selectedAccountIds.value.includes(account.sourceId)
     ? selectedAccountIds.value.filter((id) => id !== account.sourceId)
     : [...selectedAccountIds.value, account.sourceId];
@@ -508,12 +632,31 @@ onUnmounted(() => unlistenEvents?.());
             <div><a-tag :color="catalog.latestStable.newerThanCurrent ? 'orange' : 'green'">{{ catalog.latestStable.newerThanCurrent ? "发现新版本" : "已是最新稳定版" }}</a-tag><h3>OpenCodex Engine v{{ catalog.latestStable.version }}</h3><p>内置版本始终保留，可随时安全回退。</p></div>
             <a-button type="primary" :disabled="busy || snapshot?.running || !catalog.latestStable.newerThanCurrent" @click="applyRelease(catalog.latestStable)">更新到最新版</a-button>
           </div>
+          <div class="local-version-section">
+            <div class="local-version-heading">
+              <div><h3>本地版本</h3><p>保留当前版本和最近 3 个历史版本，可随时切换或删除非当前版本。</p></div>
+              <a-tag color="blue">{{ catalog?.installedVersions.length || 0 }} 个本地版本</a-tag>
+            </div>
+            <div v-if="catalog?.installedVersions.length" class="local-version-list">
+              <div v-for="version in catalog.installedVersions" :key="version" class="local-version-row">
+                <div><strong>Engine v{{ version }}</strong><span>{{ catalog.currentVersion === version ? "当前使用" : "本地已安装" }}</span></div>
+                <div class="local-version-actions">
+                  <a-button size="small" :disabled="busy || snapshot?.running || catalog.currentVersion === version" @click="switchInstalledVersion(version)">切换</a-button>
+                  <a-button size="small" status="danger" :disabled="busy || snapshot?.running || catalog.currentVersion === version" @click="confirmDeleteInstalledVersion(version)"><template #icon><icon-delete /></template>删除</a-button>
+                </div>
+              </div>
+            </div>
+            <a-empty v-else description="暂无本地历史版本" />
+          </div>
+          <div class="github-version-section">
+            <div class="local-version-heading"><div><h3>GitHub 版本</h3><p>选择官方 Release；未安装时下载并使用，已安装时直接切换。</p></div></div>
           <div class="release-picker">
             <a-select v-model="selectedVersion" placeholder="选择 Engine 版本" :loading="catalogLoading">
               <a-option v-for="release in catalog?.releases || []" :key="release.version" :value="release.version">v{{ release.version }}{{ release.prerelease ? " · 预览" : " · 稳定" }}{{ release.active ? " · 当前" : release.installed ? " · 已安装" : "" }}</a-option>
             </a-select>
             <a-button :disabled="busy || !selectedRelease || selectedRelease.active || snapshot?.running" @click="selectedRelease && applyRelease(selectedRelease)">{{ selectedRelease?.installed ? "切换版本" : "下载并使用" }}</a-button>
             <a-button v-if="snapshot?.engineSource === 'managed'" :disabled="busy || snapshot?.running" @click="rollbackEngine"><template #icon><icon-undo /></template>回退内置版本</a-button>
+          </div>
           </div>
         </section>
       </template>
@@ -557,12 +700,12 @@ onUnmounted(() => unlistenEvents?.());
                 :class="{
                   selected: selectedAccountIds.includes(account.sourceId),
                   current: account.current,
-                  unavailable: !account.eligible,
+                  unavailable: !account.eligible && !account.deletable,
                 }"
-                :role="account.eligible ? 'checkbox' : undefined"
-                :aria-checked="account.eligible ? selectedAccountIds.includes(account.sourceId) : undefined"
-                :aria-disabled="!account.eligible"
-                :tabindex="account.eligible ? 0 : -1"
+                :role="account.eligible || account.deletable ? 'checkbox' : undefined"
+                :aria-checked="account.eligible || account.deletable ? selectedAccountIds.includes(account.sourceId) : undefined"
+                :aria-disabled="!account.eligible && !account.deletable"
+                :tabindex="account.eligible || account.deletable ? 0 : -1"
                 @click="toggleMigrationAccount(account)"
                 @keydown.space.prevent="toggleMigrationAccount(account)"
                 @keydown.enter.prevent="toggleMigrationAccount(account)"
@@ -570,7 +713,7 @@ onUnmounted(() => unlistenEvents?.());
                 <span class="migration-check" @click.stop>
                   <a-checkbox
                     :model-value="selectedAccountIds.includes(account.sourceId)"
-                    :disabled="!account.eligible"
+                    :disabled="!account.eligible && !account.deletable"
                     @change="toggleMigrationAccount(account)"
                   />
                 </span>
@@ -584,12 +727,32 @@ onUnmounted(() => unlistenEvents?.());
                   <small>账号 ID：{{ shortSourceId(account.sourceId) }}</small>
                   <span class="migration-reason">{{ account.reason }}</span>
                 </span>
-                <span :class="['migration-status-pill', account.status]">
-                  {{ accountStatusLabel(account.status) }}
+                <span class="migration-card-actions">
+                  <span :class="['migration-status-pill', account.status]">
+                    {{ accountStatusLabel(account.status) }}
+                  </span>
+                  <a-tooltip v-if="account.deletable" content="从 OpenCodex 删除，保留 Switcher 原账号">
+                    <a-button
+                      class="migration-delete-button"
+                      size="mini"
+                      status="danger"
+                      :loading="deletingAccountId === account.sourceId"
+                      :disabled="Boolean(deletingAccountId) || snapshot?.running"
+                      aria-label="删除 OpenCodex 账号"
+                      @click.stop="confirmDeleteMigratedAccount(account)"
+                      @keydown.stop
+                    >
+                      <template #icon><icon-delete /></template>
+                      删除
+                    </a-button>
+                  </a-tooltip>
                 </span>
               </article>
             </div>
-            <a-button v-if="accountScan" type="primary" :loading="importingAccounts" :disabled="!selectedAccountIds.length || snapshot?.running" @click="importAccounts"><template #icon><icon-import /></template>导入所选账号</a-button>
+            <div v-if="accountScan" class="migration-batch-actions">
+              <a-button type="primary" :loading="importingAccounts" :disabled="!selectedImportAccountIds.length || snapshot?.running" @click="importAccounts"><template #icon><icon-import /></template>导入所选（{{ selectedImportAccountIds.length }}）</a-button>
+              <a-button status="danger" :loading="deletingAccountId === '__selected__'" :disabled="!selectedDeleteAccounts.length || Boolean(deletingAccountId) || snapshot?.running" @click="confirmDeleteSelectedAccounts"><template #icon><icon-delete /></template>删除所选（{{ selectedDeleteAccounts.length }}）</a-button>
+            </div>
             <a-alert v-if="snapshot?.running" type="warning" show-icon>导入前请先停止 OpenCodex 服务，避免配置被运行中的 Engine 覆盖。</a-alert>
           </article>
           <article class="settings-card danger-card">
@@ -623,6 +786,7 @@ onUnmounted(() => unlistenEvents?.());
 .console-output { overflow: auto; max-height: 280px; min-height: 150px; padding: 15px; border-radius: 12px; background: #111821; color: #b9f69b; font: 12.5px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }.console-line { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 8px; }.console-line time { color: #64748b; }.console-line.stderr span { color: #fda4af; }.console-line.system span { color: #93c5fd; }.console-empty { display: grid; min-height: 120px; place-items: center; color: #64748b; }.interactive-input { display: flex; gap: 10px; margin-top: 12px; }
 .web-management-card { display: grid; justify-items: center; padding: 58px 28px; text-align: center; }.web-orb { display: grid; width: 82px; height: 82px; place-items: center; margin-bottom: 18px; border-radius: 26px; color: #0f766e; background: #e3f6f1; font-size: 34px; }.web-management-card h2 { margin: 14px 0 6px; font-size: 28px; }.web-management-card > p { color: #66758c; font: 16px ui-monospace, SFMono-Regular, Menlo, monospace; }.web-actions { display: flex; gap: 12px; margin: 24px 0; }
 .version-header-card { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; border: 1px solid rgba(85, 113, 156, .17); border-radius: 16px; background: rgba(255, 255, 255, .82); }.version-header-card > div { display: grid; gap: 6px; padding: 22px; }.version-header-card > div + div { border-left: 1px solid rgba(85, 113, 156, .14); }.version-header-card small, .version-header-card span { color: #718096; }.version-header-card strong { font-size: 26px; }.latest-release { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 20px; border-radius: 14px; background: linear-gradient(135deg, #effaf7, #eef6ff); }.release-icon { display: grid; width: 58px; height: 58px; place-items: center; border-radius: 18px; color: #0f766e; background: #fff; font-size: 24px; }.latest-release h3 { margin: 8px 0 4px; font-size: 21px; }.latest-release p { margin: 0; color: #66758c; }.release-picker { display: flex; gap: 10px; margin-top: 14px; }.release-picker .arco-select { flex: 1; }
+.local-version-section, .github-version-section { margin-top: 18px; padding-top: 18px; border-top: 1px solid rgba(85, 113, 156, .14); }.local-version-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; }.local-version-heading h3 { margin: 0; font-size: 16px; }.local-version-heading p { margin: 4px 0 0; color: #718096; }.local-version-list { display: grid; gap: 8px; margin-top: 12px; }.local-version-row { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 12px; border: 1px solid rgba(85, 113, 156, .14); border-radius: 10px; background: rgba(248, 251, 255, .86); }.local-version-row > div:first-child { display: grid; gap: 3px; min-width: 0; }.local-version-row span { color: #718096; font-size: 12px; }.local-version-actions { display: flex; flex: 0 0 auto; gap: 6px; }
 .full-log { max-height: calc(100vh - 330px); min-height: 420px; }.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }.settings-card { padding: 20px; }.settings-card :deep(.arco-input-number) { width: 100%; }.danger-card { grid-column: 1 / -1; border-color: rgba(245, 158, 11, .28); }.danger-actions { display: flex; gap: 10px; }
 .scan-summary { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; color: #52637b; }.scan-summary > span { display: inline-flex; height: 28px; align-items: center; gap: 4px; padding: 0 10px; border: 1px solid rgba(85, 113, 156, .16); border-radius: 999px; background: rgba(248, 250, 252, .9); font-size: 12px; }.scan-summary .scan-ready { color: #047857; border-color: rgba(16, 185, 129, .2); background: rgba(236, 253, 245, .92); }
 .migration-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: 340px; gap: 10px; overflow: auto; margin: 14px 0; padding: 3px 6px 3px 3px; scrollbar-gutter: stable; }
@@ -631,7 +795,9 @@ onUnmounted(() => unlistenEvents?.());
 .migration-check { display: inline-flex; width: 28px; height: 36px; align-items: center; justify-content: center; }.migration-avatar { display: grid; width: 42px; height: 42px; place-items: center; border-radius: 13px; color: #0f766e; background: linear-gradient(145deg, #dcf7ef, #e7f3ff); font-size: 15px; font-weight: 850; box-shadow: inset 0 0 0 1px rgba(15, 118, 110, .08); }.migration-account-card.selected .migration-avatar { color: #fff; background: linear-gradient(145deg, #2563eb, #0f766e); }
 .migration-identity { display: grid; min-width: 0; gap: 5px; }.migration-account-title { display: flex; min-width: 0; align-items: center; gap: 6px; }.migration-account-title > strong { overflow: hidden; min-width: 0; color: #172033; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }.migration-identity > small { overflow: hidden; color: #6b7a90; font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }.migration-reason { overflow: hidden; color: #718096; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .migration-current-pill, .migration-plan-pill, .migration-status-pill { display: inline-flex; flex: 0 0 auto; height: 22px; align-items: center; justify-content: center; padding: 0 8px; border-radius: 999px; font-size: 10px; font-weight: 800; line-height: 1; }.migration-current-pill { color: #1d4ed8; border: 1px solid rgba(37, 99, 235, .2); background: #eff6ff; }.migration-plan-pill { max-width: 74px; overflow: hidden; color: #0369a1; border: 1px solid rgba(14, 165, 233, .2); background: #f0f9ff; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }.migration-status-pill { color: #475569; background: #f1f5f9; }.migration-status-pill.ready { color: #047857; background: #ecfdf5; }.migration-status-pill.already_imported { color: #1d4ed8; background: #eff6ff; }.migration-status-pill.unsupported { color: #b45309; background: #fffbeb; }.migration-status-pill.invalid { color: #be123c; background: #fff1f2; }
+.migration-card-actions { display: grid; min-width: 82px; justify-items: end; gap: 8px; }.migration-delete-button { color: #be123c; border-color: transparent; background: rgba(255, 241, 242, .94); }.migration-delete-button:hover:not(:disabled) { color: #fff; background: #e11d48; }
+.migration-batch-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 @media (max-width: 1080px) { .opencodex-hero { align-items: flex-start; flex-direction: column; }.opencodex-status-strip { width: 100%; overflow-x: auto; }.overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 900px) { .migration-list { grid-template-columns: 1fr; } }
-@media (max-width: 760px) { .opencodex-tabs { overflow-x: auto; }.opencodex-tabs button { flex: 0 0 auto; }.overview-grid, .quick-grid, .settings-grid, .version-header-card { grid-template-columns: 1fr; }.version-header-card > div + div { border-top: 1px solid rgba(85, 113, 156, .14); border-left: 0; }.latest-release { grid-template-columns: 1fr; }.release-picker, .web-actions { align-items: stretch; flex-direction: column; }.migration-account-card { grid-template-columns: auto auto minmax(0, 1fr); }.migration-status-pill { grid-column: 2 / -1; justify-self: start; } }
+@media (max-width: 760px) { .opencodex-tabs { overflow-x: auto; }.opencodex-tabs button { flex: 0 0 auto; }.overview-grid, .quick-grid, .settings-grid, .version-header-card { grid-template-columns: 1fr; }.version-header-card > div + div { border-top: 1px solid rgba(85, 113, 156, .14); border-left: 0; }.latest-release { grid-template-columns: 1fr; }.release-picker, .web-actions { align-items: stretch; flex-direction: column; }.local-version-row, .local-version-heading { align-items: stretch; flex-direction: column; }.local-version-actions { justify-content: flex-end; }.migration-account-card { grid-template-columns: auto auto minmax(0, 1fr); }.migration-card-actions { grid-column: 2 / -1; display: flex; min-width: 0; align-items: center; justify-content: space-between; } }
 </style>

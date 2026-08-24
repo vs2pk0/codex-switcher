@@ -3,9 +3,10 @@ mod models;
 
 use backend::Backend;
 use models::{
-    CommandStarted, EngineInstallResult, EngineUpdateCatalog, ImportSwitcherAccountsRequest,
-    InstallEngineVersionRequest, RunActionRequest, SwitcherAccountScan, SwitcherImportResult,
-    SystemSnapshot,
+    CommandStarted, DeleteEngineVersionRequest, DeleteSwitcherAccountRequest, EngineDeleteResult,
+    EngineInstallResult, EngineUpdateCatalog, ImportSwitcherAccountsRequest,
+    InstallEngineVersionRequest, RunActionRequest, SwitcherAccountScan, SwitcherDeleteResult,
+    SwitcherImportResult, SystemSnapshot,
 };
 use std::sync::Arc;
 use tauri::State;
@@ -74,6 +75,14 @@ pub fn opencodex_import_switcher_accounts(
 }
 
 #[tauri::command]
+pub fn opencodex_delete_switcher_account(
+    backend: State<'_, Arc<OpenCodexBackend>>,
+    request: DeleteSwitcherAccountRequest,
+) -> Result<SwitcherDeleteResult, String> {
+    backend.delete_codex_switcher_account(request)
+}
+
+#[tauri::command]
 pub fn opencodex_get_engine_update_catalog(
     backend: State<'_, Arc<OpenCodexBackend>>,
 ) -> Result<EngineUpdateCatalog, String> {
@@ -93,4 +102,12 @@ pub fn opencodex_activate_bundled_engine(
     backend: State<'_, Arc<OpenCodexBackend>>,
 ) -> Result<EngineInstallResult, String> {
     backend.activate_bundled_engine()
+}
+
+#[tauri::command]
+pub fn opencodex_delete_engine_version(
+    backend: State<'_, Arc<OpenCodexBackend>>,
+    request: DeleteEngineVersionRequest,
+) -> Result<EngineDeleteResult, String> {
+    backend.delete_engine_version(request)
 }

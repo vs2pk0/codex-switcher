@@ -110,6 +110,17 @@ export interface CodexAccountSwitchResult {
   warning?: string | null;
 }
 
+export interface CodexSessionModelCompatibilityRepairSummary {
+  targetProvider: string;
+  repairedRolloutFileCount: number;
+  rewrittenRolloutModelFieldCount: number;
+  synchronizedRolloutProviderCount: number;
+  repairedThreadCount: number;
+  synchronizedCatalogRowCount: number;
+  repairedDatabaseCount: number;
+  backupDirs: string[];
+}
+
 export async function reloadCodexAfterSessionVisibilityRepair(
   summary: Pick<CodexSessionVisibilityRepairSummary, "desktopReloadRequired">,
   restart: () => Promise<string> = restartCodexApp,
@@ -192,15 +203,21 @@ export function updateCodexApiKeyCredentials(input: {
   apiBaseUrl?: string;
   apiProviderName?: string;
   apiOfficialUrl?: string;
+  accountName?: string;
+  tags?: string[];
+  isHidden?: boolean;
 }): Promise<CodexAccount> {
   return invoke("update_codex_api_key_credentials", {
-    accountId: input.accountId,
-    apiKey: input.apiKey,
-    apiBaseUrl: input.apiBaseUrl || null,
-    apiProviderName: input.apiProviderName || null,
-    apiOfficialUrl: input.apiOfficialUrl || null,
-    apiOfficialURL: input.apiOfficialUrl || null,
-    api_official_url: input.apiOfficialUrl || null,
+    input: {
+      accountId: input.accountId,
+      apiKey: input.apiKey,
+      apiBaseUrl: input.apiBaseUrl || null,
+      apiProviderName: input.apiProviderName || null,
+      apiOfficialUrl: input.apiOfficialUrl || null,
+      accountName: input.accountName || null,
+      tags: input.tags || [],
+      isHidden: Boolean(input.isHidden),
+    },
   });
 }
 
@@ -244,6 +261,10 @@ export function updateCodexAccountProfile(input: {
     tags: input.tags || [],
     isHidden: Boolean(input.isHidden),
   });
+}
+
+export function completeCodexHiddenAccountCleanup(accountId: string): Promise<CodexAccount> {
+  return invoke("complete_codex_hidden_account_cleanup", { accountId });
 }
 
 export function updateCodexAccountFromJson(input: {
@@ -295,6 +316,10 @@ export function switchCodexAccount(accountId: string): Promise<CodexAccountSwitc
 
 export function restartCodexApp(): Promise<string> {
   return invoke("restart_codex_app");
+}
+
+export function repairCodexSessionModelCompatibility(): Promise<CodexSessionModelCompatibilityRepairSummary> {
+  return invoke("repair_codex_session_model_compatibility");
 }
 
 export function getCodexSwitcherSettings(): Promise<CodexSwitcherSettings> {
@@ -379,6 +404,10 @@ export function refreshAllCodexQuotas(): Promise<number> {
   return invoke("refresh_all_codex_quotas");
 }
 
-export function resetCodexConfigToml(): Promise<boolean> {
+export function resetCodexConfigToml(): Promise<CodexConfigFileContent> {
   return invoke("reset_codex_config_toml");
+}
+
+export function deleteCodexConfigToml(): Promise<boolean> {
+  return invoke("delete_codex_config_toml");
 }

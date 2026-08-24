@@ -124,7 +124,7 @@ function handleCardClick(event: MouseEvent, account: CodexAccount): void {
 
 function isInteractiveClick(event: MouseEvent): boolean {
   const target = event.target;
-  if (!(target instanceof HTMLElement)) return false;
+  if (!(target instanceof Element)) return false;
   return Boolean(
     target.closest(
       [
@@ -839,7 +839,6 @@ function formatTime(value?: number | null): string {
           active: account.id === currentId,
           pinned: isPinned(account),
           'api-key-account': isApiKeyAccount(account),
-          'has-source-watermark': isApiServiceAccount(account) || isHiddenAccount(account) || isOpenCodexAccount(account),
           draggable: settings.sortMode === 'custom',
           'drag-over': dragOverAccountId === account.id,
         }"
@@ -897,18 +896,27 @@ function formatTime(value?: number | null): string {
             </div>
           </div>
         </div>
-        <div v-if="isApiServiceAccount(account) || isHiddenAccount(account) || isOpenCodexAccount(account)" class="account-source-watermark" aria-label="账号来源标识">
-          <a-tooltip v-if="isHiddenAccount(account)" :content="t('隐身模式：不会进入 API 服务和 OpenCodex')">
-            <span class="source-watermark-mark hidden-account-pill" :title="t('隐身模式')">隐</span>
-          </a-tooltip>
-          <a-tooltip v-if="isApiServiceAccount(account)" :content="t('加入了 API 服务')">
-            <span class="source-watermark-mark api-service-pill" :title="t('加入了 API 服务')">A</span>
-          </a-tooltip>
-          <a-tooltip v-if="isOpenCodexAccount(account)" :content="t('已导入 OpenCodex')">
-            <span class="source-watermark-mark open-codex-pill" :title="t('已导入 OpenCodex')">O</span>
-          </a-tooltip>
+        <div
+          v-if="isApiServiceAccount(account) || isHiddenAccount(account) || isOpenCodexAccount(account)"
+          class="account-source-watermark"
+          :aria-label="t('账号服务状态')"
+        >
+          <span v-if="isHiddenAccount(account)" class="source-watermark-slot source-watermark-hidden">
+            <a-tooltip :content="t('隐身模式：不会进入 API 服务和 OpenCodex')">
+              <span class="source-watermark-mark hidden-account-pill" :title="t('隐身模式')">隐</span>
+            </a-tooltip>
+          </span>
+          <span v-if="isApiServiceAccount(account)" class="source-watermark-slot source-watermark-api">
+            <a-tooltip :content="t('加入了 API 服务')">
+              <span class="source-watermark-mark api-service-pill" :title="t('加入了 API 服务')">A</span>
+            </a-tooltip>
+          </span>
+          <span v-if="isOpenCodexAccount(account)" class="source-watermark-slot source-watermark-open">
+            <a-tooltip :content="t('已导入 OpenCodex')">
+              <span class="source-watermark-mark open-codex-pill" :title="t('已导入 OpenCodex')">O</span>
+            </a-tooltip>
+          </span>
         </div>
-
         <div v-if="isApiKeyAccount(account)" class="account-summary api-key-summary">
           <div class="chip-line api-bind-line">
             <a-button class="soft-chip api-bind-chip" size="mini" @click.stop="emit('open-binding', account)">
@@ -1230,7 +1238,6 @@ function formatTime(value?: number | null): string {
         :class="{
           active: account.id === currentId,
           pinned: isPinned(account),
-          'has-source-watermark': isApiServiceAccount(account) || isHiddenAccount(account) || isOpenCodexAccount(account),
           draggable: settings.sortMode === 'custom',
           'drag-over': dragOverAccountId === account.id,
         }"
@@ -1280,15 +1287,15 @@ function formatTime(value?: number | null): string {
             <icon-refresh class="api-balance-refresh-icon" />
           </button>
         </a-tooltip>
-        <div v-if="isApiServiceAccount(account) || isHiddenAccount(account) || isOpenCodexAccount(account)" class="account-source-watermark compact-source-watermark" aria-label="账号来源标识">
+        <div v-if="isApiServiceAccount(account) || isHiddenAccount(account) || isOpenCodexAccount(account)" class="account-source-status compact-source-status" :aria-label="t('账号服务状态')">
           <a-tooltip v-if="isHiddenAccount(account)" :content="t('隐身模式：不会进入 API 服务和 OpenCodex')">
-            <span class="source-watermark-mark hidden-account-pill" :title="t('隐身模式')">隐</span>
+            <span class="source-status-mark hidden-account-pill" :title="t('隐身模式')">隐</span>
           </a-tooltip>
           <a-tooltip v-if="isApiServiceAccount(account)" :content="t('加入了 API 服务')">
-            <span class="source-watermark-mark api-service-pill" :title="t('加入了 API 服务')">A</span>
+            <span class="source-status-mark api-service-pill" :title="t('加入了 API 服务')">A</span>
           </a-tooltip>
           <a-tooltip v-if="isOpenCodexAccount(account)" :content="t('已导入 OpenCodex')">
-            <span class="source-watermark-mark open-codex-pill" :title="t('已导入 OpenCodex')">O</span>
+            <span class="source-status-mark open-codex-pill" :title="t('已导入 OpenCodex')">O</span>
           </a-tooltip>
         </div>
         <span v-if="shouldShowQuota(account) && account.quota" class="compact-quota-pair">
@@ -1377,7 +1384,6 @@ function formatTime(value?: number | null): string {
             :key="account.id"
             :class="{
               active: account.id === currentId,
-              'has-source-watermark': isApiServiceAccount(account) || isHiddenAccount(account) || isOpenCodexAccount(account),
               draggable: settings.sortMode === 'custom',
               'drag-over': dragOverAccountId === account.id,
             }"
@@ -1412,15 +1418,15 @@ function formatTime(value?: number | null): string {
                   </template>
                 </span>
                 <small>{{ t("用户 ID") }}: {{ shortAccountId(account) }}</small>
-                <div v-if="isApiServiceAccount(account) || isHiddenAccount(account) || isOpenCodexAccount(account)" class="account-source-watermark table-source-watermark" aria-label="账号来源标识">
+                <div v-if="isApiServiceAccount(account) || isHiddenAccount(account) || isOpenCodexAccount(account)" class="account-source-status table-source-status" :aria-label="t('账号服务状态')">
                   <a-tooltip v-if="isHiddenAccount(account)" :content="t('隐身模式：不会进入 API 服务和 OpenCodex')">
-                    <span class="source-watermark-mark hidden-account-pill" :title="t('隐身模式')">隐</span>
+                    <span class="source-status-mark hidden-account-pill" :title="t('隐身模式')">隐</span>
                   </a-tooltip>
                   <a-tooltip v-if="isApiServiceAccount(account)" :content="t('加入了 API 服务')">
-                    <span class="source-watermark-mark api-service-pill" :title="t('加入了 API 服务')">A</span>
+                    <span class="source-status-mark api-service-pill" :title="t('加入了 API 服务')">A</span>
                   </a-tooltip>
                   <a-tooltip v-if="isOpenCodexAccount(account)" :content="t('已导入 OpenCodex')">
-                    <span class="source-watermark-mark open-codex-pill" :title="t('已导入 OpenCodex')">O</span>
+                    <span class="source-status-mark open-codex-pill" :title="t('已导入 OpenCodex')">O</span>
                   </a-tooltip>
                 </div>
               </div>

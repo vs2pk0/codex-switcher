@@ -92,6 +92,7 @@ export interface ApiServiceAccountSyncSummary {
 export interface ApiServiceBoundAccount {
   id: string;
   accountId?: string | null;
+  accountIdExact: boolean;
   kind: "oauth" | "apikey" | string;
   label: string;
   email?: string | null;
@@ -187,4 +188,8 @@ export function listApiServiceBoundAccounts(): Promise<ApiServiceBoundAccount[]>
 
 export function deleteApiServiceBoundAccounts(boundIds: string[]): Promise<ApiServiceAccountSyncSummary> {
   return invoke("api_service_delete_bound_accounts", { boundIds });
+}
+
+export function deleteApiServiceAccountBinding(accountId: string): Promise<ApiServiceAccountSyncSummary> {
+  return invoke("api_service_delete_account_binding", { accountId });
 }

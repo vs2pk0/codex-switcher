@@ -179,6 +179,19 @@ pub struct CodexSessionVisibilityRepairSummary {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionModelCompatibilityRepairSummary {
+    pub target_provider: String,
+    pub repaired_rollout_file_count: usize,
+    pub rewritten_rollout_model_field_count: usize,
+    pub synchronized_rollout_provider_count: usize,
+    pub repaired_thread_count: usize,
+    pub synchronized_catalog_row_count: usize,
+    pub repaired_database_count: usize,
+    pub backup_dirs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexSessionVisibilityRepairInstanceOption {
@@ -425,6 +438,213 @@ impl SessionStore {
                 .map_err(|error| format!("提交 Codex provider 同步失败: {}", error))?;
         }
         Ok(updated)
+    }
+
+    pub fn repair_model_compatibility(
+        &self,
+        target_provider: &str,
+    ) -> Result<CodexSessionModelCompatibilityRepairSummary, String> {
+        let target_provider = target_provider.trim();
+        if target_provider.is_empty() {
+            return Err("Codex model_provider 不能为空".to_string());
+        }
+
+        let mut summary = CodexSessionModelCompatibilityRepairSummary {
+            target_provider: target_provider.to_string(),
+            repaired_rollout_file_count: 0,
+            rewritten_rollout_model_field_count: 0,
+            synchronized_rollout_provider_count: 0,
+            repaired_thread_count: 0,
+            synchronized_catalog_row_count: 0,
+            repaired_database_count: 0,
+            backup_dirs: Vec::new(),
+        };
+
+        for path in collect_jsonl_files(&self.sessions_dir())? {
+            let Some((tmp_path, rewritten_model_fields, synchronized_providers)) =
+                prepare_rollout_model_compatibility_rewrite(&path, target_provider)?
+            else {
+                continue;
+            };
+            let backup_path = match self.backup_session_file(&path, "model-compatibility") {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = replace_file_atomic(&path, &tmp_path) {
+                return Err(format!(
+                    "写入会话模型修复结果失败 ({}): {}",
+                    path.display(),
+                    error
+                ));
+            }
+            let _ = Command::new("touch")
+                .arg("-r")
+                .arg(&backup_path)
+                .arg(&path)
+                .output();
+            if let Some(backup_dir) = backup_path.parent() {
+                let backup_dir = backup_dir.to_string_lossy().to_string();
+                if !summary.backup_dirs.contains(&backup_dir) {
+                    summary.backup_dirs.push(backup_dir);
+                }
+            }
+            summary.repaired_rollout_file_count += 1;
+            summary.rewritten_rollout_model_field_count += rewritten_model_fields;
+            summary.synchronized_rollout_provider_count += synchronized_providers;
+        }
+
+        for db_path in self.sqlite_candidate_paths() {
+            let connection = Connection::open(&db_path).map_err(|error| {
+                format!(
+                    "打开 Codex 会话数据库失败 ({}): {}",
+                    db_path.display(),
+                    error
+                )
+            })?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| format!("设置 Codex 会话数据库等待时间失败: {}", error))?;
+
+            let thread_columns = sqlite_table_columns_with_connection(&connection, "threads")?;
+            let catalog_columns =
+                sqlite_table_columns_with_connection(&connection, "local_thread_catalog")?;
+            let has_thread_provider = thread_columns.contains("model_provider");
+            let has_thread_model = thread_columns.contains("model");
+            let has_thread_effort = thread_columns.contains("reasoning_effort");
+
+            let mut thread_predicates = Vec::new();
+            if has_thread_provider {
+                thread_predicates.push("COALESCE(model_provider, '') <> ?1");
+            }
+            if has_thread_model {
+                thread_predicates.push("COALESCE(model, '') <> ''");
+            }
+            if has_thread_effort {
+                thread_predicates.push("COALESCE(reasoning_effort, '') <> ''");
+            }
+            let thread_count = if thread_predicates.is_empty() {
+                0
+            } else {
+                let sql = format!(
+                    "SELECT COUNT(*) FROM threads WHERE {}",
+                    thread_predicates.join(" OR ")
+                );
+                if has_thread_provider {
+                    connection
+                        .query_row(&sql, params![target_provider], |row| row.get::<_, usize>(0))
+                        .map_err(|error| format!("检查 Codex 会话模型兼容性失败: {}", error))?
+                } else {
+                    connection
+                        .query_row(&sql, [], |row| row.get::<_, usize>(0))
+                        .map_err(|error| format!("检查 Codex 会话模型兼容性失败: {}", error))?
+                }
+            };
+
+            let catalog_count = if catalog_columns.contains("model_provider") {
+                let local_only = if catalog_columns.contains("host_id") {
+                    " AND host_id = 'local'"
+                } else {
+                    ""
+                };
+                connection
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM local_thread_catalog WHERE COALESCE(model_provider, '') <> ?1{local_only}"
+                        ),
+                        params![target_provider],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .map_err(|error| format!("检查 Codex 侧栏 provider 失败: {}", error))?
+            } else {
+                0
+            };
+
+            if thread_count == 0 && catalog_count == 0 {
+                continue;
+            }
+            drop(connection);
+
+            let backup_dir = backup_sqlite_file(&db_path)?;
+            if !summary.backup_dirs.contains(&backup_dir) {
+                summary.backup_dirs.push(backup_dir);
+            }
+
+            let mut connection = Connection::open(&db_path).map_err(|error| {
+                format!(
+                    "重新打开 Codex 会话数据库失败 ({}): {}",
+                    db_path.display(),
+                    error
+                )
+            })?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| format!("设置 Codex 会话数据库等待时间失败: {}", error))?;
+            let transaction = connection
+                .transaction()
+                .map_err(|error| format!("开启 Codex 会话模型修复事务失败: {}", error))?;
+
+            if thread_count > 0 {
+                let mut assignments = Vec::new();
+                if has_thread_provider {
+                    assignments.push("model_provider = ?1");
+                }
+                if has_thread_model {
+                    assignments.push("model = NULL");
+                }
+                if has_thread_effort {
+                    assignments.push("reasoning_effort = NULL");
+                }
+                let sql = format!(
+                    "UPDATE threads SET {} WHERE {}",
+                    assignments.join(", "),
+                    thread_predicates.join(" OR ")
+                );
+                let updated = if has_thread_provider {
+                    transaction.execute(&sql, params![target_provider])
+                } else {
+                    transaction.execute(&sql, [])
+                }
+                .map_err(|error| format!("修复 Codex 会话模型兼容性失败: {}", error))?;
+                summary.repaired_thread_count += updated;
+            }
+
+            if catalog_count > 0 {
+                let local_only = if catalog_columns.contains("host_id") {
+                    " AND host_id = 'local'"
+                } else {
+                    ""
+                };
+                summary.synchronized_catalog_row_count += transaction
+                    .execute(
+                        &format!(
+                            "UPDATE local_thread_catalog SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1{local_only}"
+                        ),
+                        params![target_provider],
+                    )
+                    .map_err(|error| format!("同步 Codex 侧栏 provider 失败: {}", error))?;
+                if sqlite_table_exists_with_connection(
+                    &transaction,
+                    "local_thread_catalog_metadata",
+                )? {
+                    transaction
+                        .execute(
+                            "UPDATE local_thread_catalog_metadata SET catalog_revision = catalog_revision + 1 WHERE id = 1",
+                            [],
+                        )
+                        .map_err(|error| format!("更新 Codex 侧栏目录版本失败: {}", error))?;
+                }
+            }
+
+            transaction
+                .commit()
+                .map_err(|error| format!("提交 Codex 会话模型修复失败: {}", error))?;
+            summary.repaired_database_count += 1;
+        }
+
+        Ok(summary)
     }
 
     pub fn list_sessions(
@@ -716,6 +936,18 @@ impl SessionStore {
             let _ = fs::remove_file(&backup_path);
             return Err(error);
         }
+        if let Err(projection_error) = self.reset_thread_history_projection(target_session_id) {
+            let rollback_result = fs::read(&backup_path)
+                .map_err(|error| format!("读取目标会话复制备份失败: {}", error))
+                .and_then(|content| write_bytes_atomic(target_path, &content));
+            return match rollback_result {
+                Ok(()) => Err(projection_error),
+                Err(rollback_error) => Err(format!(
+                    "{}；同时回滚目标会话失败：{}",
+                    projection_error, rollback_error
+                )),
+            };
+        }
 
         let mut warnings = Vec::new();
         if let Err(error) = self.write_session_title(target_session_id, &source.title) {
@@ -732,6 +964,67 @@ impl SessionStore {
             backup_path: Some(backup_path.to_string_lossy().to_string()),
             warnings,
         })
+    }
+
+    fn reset_thread_history_projection(&self, session_id: &str) -> Result<Option<String>, String> {
+        let db_path = self.codex_home.join("thread_history_1.sqlite");
+        if !db_path.is_file() {
+            return Ok(None);
+        }
+        let mut connection = Connection::open(&db_path).map_err(|error| {
+            format!(
+                "打开 Codex 会话历史投影失败 ({}): {}",
+                db_path.display(),
+                error
+            )
+        })?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| format!("设置 Codex 会话历史投影等待时间失败: {}", error))?;
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(FULL);")
+            .map_err(|error| format!("同步 Codex 会话历史投影失败: {}", error))?;
+
+        let tables = [
+            "thread_items",
+            "thread_turns",
+            "thread_history_projection_state",
+        ];
+        let mut existing_tables = Vec::new();
+        let mut projected_row_count = 0usize;
+        for table in tables {
+            if !sqlite_table_exists_with_connection(&connection, table)? {
+                continue;
+            }
+            projected_row_count += connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE thread_id = ?1"),
+                    params![session_id],
+                    |row| row.get::<_, usize>(0),
+                )
+                .map_err(|error| format!("检查 Codex 会话历史投影失败: {}", error))?;
+            existing_tables.push(table);
+        }
+        if projected_row_count == 0 {
+            return Ok(None);
+        }
+
+        let backup_dir = backup_sqlite_file(&db_path)?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("开启 Codex 会话历史投影重建事务失败: {}", error))?;
+        for table in existing_tables {
+            transaction
+                .execute(
+                    &format!("DELETE FROM {table} WHERE thread_id = ?1"),
+                    params![session_id],
+                )
+                .map_err(|error| format!("清理 Codex 会话历史投影失败: {}", error))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("提交 Codex 会话历史投影重建失败: {}", error))?;
+        Ok(Some(backup_dir))
     }
 
     pub fn rename_session(
@@ -1933,9 +2226,12 @@ impl SessionStore {
                 Ok(content) => content,
                 Err(_) => continue,
             };
-            let Some(next) =
-                rewrite_session_meta_provider(&content, target_provider, rewrite_all_meta)?
-            else {
+            let provider_rewrite =
+                rewrite_session_meta_provider(&content, target_provider, rewrite_all_meta)?;
+            let ordinal_rewrite = normalize_paginated_rollout_ordinals(
+                provider_rewrite.as_deref().unwrap_or(&content),
+            )?;
+            let Some(next) = ordinal_rewrite.or(provider_rewrite) else {
                 continue;
             };
             if !backup_created {
@@ -2665,6 +2961,205 @@ fn should_repair_default_instance(
         .as_deref()
         .map(is_default)
         .unwrap_or(true)
+}
+
+fn prepare_rollout_model_compatibility_rewrite(
+    path: &Path,
+    target_provider: &str,
+) -> Result<Option<(PathBuf, usize, usize)>, String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("session.jsonl");
+    let tmp_path = parent.join(format!(
+        ".{file_name}.model-compatibility-{:016x}.tmp",
+        rand::random::<u64>()
+    ));
+    let input = fs::File::open(path)
+        .map_err(|error| format!("读取会话模型状态失败 ({}): {}", path.display(), error))?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let output = options.open(&tmp_path).map_err(|error| {
+        format!(
+            "创建会话模型修复临时文件失败 ({}): {}",
+            path.display(),
+            error
+        )
+    })?;
+    let mut reader = BufReader::new(input);
+    let mut writer = BufWriter::new(output);
+    let mut line = Vec::new();
+    let mut rewritten_model_fields = 0usize;
+    let mut synchronized_providers = 0usize;
+    let result = (|| -> Result<(), String> {
+        loop {
+            line.clear();
+            let read = reader
+                .read_until(b'\n', &mut line)
+                .map_err(|error| format!("读取会话模型状态失败 ({}): {}", path.display(), error))?;
+            if read == 0 {
+                break;
+            }
+
+            let may_contain_model = line
+                .windows(b"\"model\"".len())
+                .any(|window| window == b"\"model\"");
+            let may_contain_provider = line
+                .windows(b"\"model_provider\"".len())
+                .any(|window| window == b"\"model_provider\"");
+            let may_be_session_meta = line
+                .windows(b"session_meta".len())
+                .any(|window| window == b"session_meta");
+            if !may_contain_model && !may_contain_provider && !may_be_session_meta {
+                writer.write_all(&line).map_err(|error| {
+                    format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
+                })?;
+                continue;
+            }
+
+            let mut value = match serde_json::from_slice::<Value>(&line) {
+                Ok(value) => value,
+                Err(_) => {
+                    writer.write_all(&line).map_err(|error| {
+                        format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
+                    })?;
+                    continue;
+                }
+            };
+            let (model_changes, provider_changes) =
+                rewrite_rollout_model_compatibility_value(&mut value, target_provider);
+            if model_changes == 0 && provider_changes == 0 {
+                writer.write_all(&line).map_err(|error| {
+                    format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
+                })?;
+                continue;
+            }
+
+            let ending = if line.ends_with(b"\r\n") {
+                b"\r\n".as_slice()
+            } else if line.ends_with(b"\n") {
+                b"\n".as_slice()
+            } else {
+                b"".as_slice()
+            };
+            serde_json::to_writer(&mut writer, &value).map_err(|error| {
+                format!("序列化会话模型修复结果失败 ({}): {}", path.display(), error)
+            })?;
+            writer.write_all(ending).map_err(|error| {
+                format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
+            })?;
+            rewritten_model_fields += model_changes;
+            synchronized_providers += provider_changes;
+        }
+        writer
+            .flush()
+            .map_err(|error| format!("刷新会话模型修复结果失败 ({}): {}", path.display(), error))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| format!("同步会话模型修复结果失败 ({}): {}", path.display(), error))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        drop(writer);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    drop(writer);
+    if rewritten_model_fields == 0 && synchronized_providers == 0 {
+        let _ = fs::remove_file(&tmp_path);
+        return Ok(None);
+    }
+    Ok(Some((
+        tmp_path,
+        rewritten_model_fields,
+        synchronized_providers,
+    )))
+}
+
+fn rewrite_rollout_model_compatibility_value(
+    value: &mut Value,
+    target_provider: &str,
+) -> (usize, usize) {
+    let record_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut model_changes = 0usize;
+    let mut provider_changes = 0usize;
+
+    if record_type == "session_meta" {
+        if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+            let needs_update = payload
+                .get("model_provider")
+                .and_then(Value::as_str)
+                .map(|current| current != target_provider)
+                .unwrap_or(true);
+            if needs_update {
+                payload.insert(
+                    "model_provider".to_string(),
+                    Value::String(target_provider.to_string()),
+                );
+                provider_changes += 1;
+            }
+        }
+    }
+
+    let model_paths: &[&str] = match record_type.as_str() {
+        "turn_context" => &[
+            "/payload/model",
+            "/payload/collaboration_mode/model",
+            "/payload/collaboration_mode/settings/model",
+        ],
+        "event_msg" => &[
+            "/payload/thread_settings/model",
+            "/payload/thread_settings/collaboration_mode/model",
+            "/payload/thread_settings/collaboration_mode/settings/model",
+        ],
+        "world_state" => &[
+            "/payload/state/model",
+            "/payload/state/collaboration_mode/model",
+            "/payload/state/collaboration_mode/settings/model",
+            "/payload/state/personality/model",
+        ],
+        _ => &[],
+    };
+    for pointer in model_paths {
+        let Some(model) = value.pointer_mut(pointer) else {
+            continue;
+        };
+        let Some(current) = model.as_str() else {
+            continue;
+        };
+        let Some(normalized) = normalize_qualified_model_for_provider(current, target_provider)
+        else {
+            continue;
+        };
+        *model = Value::String(normalized);
+        model_changes += 1;
+    }
+    (model_changes, provider_changes)
+}
+
+fn normalize_qualified_model_for_provider(model: &str, target_provider: &str) -> Option<String> {
+    let (current_provider, model_id) = model.split_once('/')?;
+    if current_provider.is_empty() || model_id.is_empty() || model_id.contains('/') {
+        return None;
+    }
+    if target_provider == "openai" {
+        return Some(model_id.to_string());
+    }
+    if current_provider == target_provider {
+        return None;
+    }
+    Some(format!("{target_provider}/{model_id}"))
 }
 
 fn rewrite_session_meta_provider(
@@ -4098,7 +4593,7 @@ fn copy_history_onto_target(source: &str, target: &str) -> Result<String, String
         .ok_or_else(|| "目标会话缺少 session_meta，不能安全复制".to_string())?;
     let source_history = source
         .lines()
-        .filter(|line| !is_session_meta_line(line))
+        .filter(|line| !line.trim().is_empty() && !is_session_meta_line(line))
         .collect::<Vec<_>>();
     if source_history.is_empty() {
         return Err("源会话没有可复制的历史数据".to_string());
@@ -4107,51 +4602,439 @@ fn copy_history_onto_target(source: &str, target: &str) -> Result<String, String
     output.push_str(target_meta);
     output.push('\n');
     let mut response_item_ids = HashMap::new();
+    let mut next_ordinal = rollout_line_ordinal(target_meta).map(|value| value.saturating_add(1));
+    let mut copied_history_count = 0usize;
     for line in source_history {
-        output.push_str(&rewrite_copied_history_line(line, &mut response_item_ids)?);
+        let Some(rewritten) = rewrite_copied_history_line(line, &mut response_item_ids)? else {
+            continue;
+        };
+        output.push_str(&align_rollout_line_ordinal(&rewritten, next_ordinal)?);
         output.push('\n');
+        if let Some(ordinal) = next_ordinal.as_mut() {
+            *ordinal = ordinal.saturating_add(1);
+        }
+        copied_history_count = copied_history_count.saturating_add(1);
     }
+    if copied_history_count == 0 {
+        return Err("源会话只有不可跨会话使用的加密历史，无法安全复制".to_string());
+    }
+    let target_session_id = extract_session_id(target_meta)
+        .ok_or_else(|| "目标会话缺少有效 ID，不能重建可见历史".to_string())?;
+    append_portable_history_projection(&mut output, source, &target_session_id, &mut next_ordinal)?;
     Ok(output)
+}
+
+fn append_portable_history_projection(
+    output: &mut String,
+    source: &str,
+    target_session_id: &str,
+    next_ordinal: &mut Option<u64>,
+) -> Result<(), String> {
+    let messages = portable_history_messages(source);
+    let turns = portable_history_turns(messages);
+    if turns.is_empty() {
+        return Err("源会话没有可显示的用户与助手消息".to_string());
+    }
+
+    let context_messages = turns
+        .iter()
+        .flat_map(|turn| turn.iter())
+        .collect::<Vec<_>>();
+    let desired_context_start = context_messages.len().saturating_sub(40);
+    let context_start = context_messages[..=desired_context_start]
+        .iter()
+        .rposition(|message| message.role == "user")
+        .or_else(|| {
+            context_messages
+                .iter()
+                .position(|message| message.role == "user")
+        })
+        .unwrap_or(context_messages.len());
+    let replacement_history = context_messages[context_start..]
+        .iter()
+        .map(|message| portable_response_message_payload(message))
+        .collect::<Vec<_>>();
+    let compacted_timestamp = context_messages
+        .last()
+        .map(|message| message.timestamp.clone())
+        .filter(|timestamp| !timestamp.is_empty())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    append_rollout_value(
+        output,
+        json_value_with_type(
+            &compacted_timestamp,
+            "compacted",
+            serde_json::json!({
+                "message": "",
+                "replacement_history": replacement_history,
+            }),
+        ),
+        next_ordinal,
+    )?;
+
+    for turn in turns {
+        let Some(user_message) = turn.first() else {
+            continue;
+        };
+        let user_timestamp = user_message.timestamp.clone();
+        let turn_id = new_local_response_item_id();
+        let started_at_ms = portable_timestamp_millis(&user_timestamp);
+        append_rollout_value(
+            output,
+            json_value_with_type(
+                &user_timestamp,
+                "event_msg",
+                serde_json::json!({
+                    "type": "task_started",
+                    "turn_id": turn_id,
+                    "started_at": started_at_ms / 1_000,
+                    "model_context_window": 258_400,
+                    "collaboration_mode_kind": "default",
+                }),
+            ),
+            next_ordinal,
+        )?;
+
+        let mut last_agent_message = String::new();
+        let mut completed_at_ms = started_at_ms;
+        for message in turn {
+            completed_at_ms = portable_timestamp_millis(&message.timestamp).max(completed_at_ms);
+            let item = if message.role == "user" {
+                serde_json::json!({
+                    "type": "UserMessage",
+                    "id": new_local_response_item_id(),
+                    "client_id": new_local_response_item_id(),
+                    "content": [{
+                        "type": "text",
+                        "text": portable_message_text(&message),
+                        "text_elements": [],
+                    }],
+                })
+            } else {
+                last_agent_message = portable_message_text(&message);
+                serde_json::json!({
+                    "type": "AgentMessage",
+                    "id": new_local_response_item_id(),
+                    "content": [{
+                        "type": "Text",
+                        "text": last_agent_message,
+                    }],
+                    "phase": if message.phase.is_empty() { "final_answer" } else { message.phase.as_str() },
+                })
+            };
+            append_rollout_value(
+                output,
+                json_value_with_type(
+                    &message.timestamp,
+                    "event_msg",
+                    serde_json::json!({
+                        "type": "item_completed",
+                        "thread_id": target_session_id,
+                        "turn_id": turn_id,
+                        "item": item,
+                        "started_at_ms": portable_timestamp_millis(&message.timestamp),
+                        "completed_at_ms": portable_timestamp_millis(&message.timestamp),
+                    }),
+                ),
+                next_ordinal,
+            )?;
+        }
+
+        append_rollout_value(
+            output,
+            json_value_with_type(
+                &user_timestamp,
+                "event_msg",
+                serde_json::json!({
+                    "type": "task_complete",
+                    "turn_id": turn_id,
+                    "last_agent_message": last_agent_message,
+                    "started_at": started_at_ms / 1_000,
+                    "completed_at": completed_at_ms / 1_000,
+                    "duration_ms": completed_at_ms.saturating_sub(started_at_ms),
+                }),
+            ),
+            next_ordinal,
+        )?;
+    }
+    Ok(())
+}
+
+fn portable_history_messages(source: &str) -> Vec<CodexSessionMessage> {
+    let mut messages = Vec::new();
+    let mut line_offset = 0u64;
+    for segment in source.split_inclusive('\n') {
+        let body = segment.trim_end_matches(['\r', '\n']);
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
+            if let Some(mut message) = parse_response_message(&value, line_offset) {
+                if message.text.trim().is_empty() {
+                    message.text = value
+                        .get("payload")
+                        .and_then(|payload| payload.get("content"))
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|item| item.get("text").and_then(Value::as_str))
+                        .filter(|text| !text.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                }
+                if should_display_session_message(&message) {
+                    messages.push(message);
+                }
+            }
+        }
+        line_offset = line_offset.saturating_add(segment.len() as u64);
+    }
+    messages
+}
+
+fn portable_history_turns(messages: Vec<CodexSessionMessage>) -> Vec<Vec<CodexSessionMessage>> {
+    let mut turns = Vec::<Vec<CodexSessionMessage>>::new();
+    for message in messages {
+        if message.role == "user" {
+            turns.push(vec![message]);
+        } else if let Some(turn) = turns.last_mut() {
+            turn.push(message);
+        }
+    }
+    turns
+}
+
+fn portable_response_message_payload(message: &CodexSessionMessage) -> Value {
+    let content_type = if message.role == "user" {
+        "input_text"
+    } else {
+        "output_text"
+    };
+    serde_json::json!({
+        "type": "message",
+        "id": new_local_response_item_id(),
+        "role": message.role,
+        "content": [{
+            "type": content_type,
+            "text": portable_message_text(message),
+        }],
+    })
+}
+
+fn portable_message_text(message: &CodexSessionMessage) -> String {
+    if !message.text.trim().is_empty() {
+        return message.text.clone();
+    }
+    if message.attachments.is_empty() {
+        String::new()
+    } else {
+        format!("[{} 个附件]", message.attachments.len())
+    }
+}
+
+fn portable_timestamp_millis(timestamp: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.timestamp_millis())
+        .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis())
+}
+
+fn json_value_with_type(timestamp: &str, record_type: &str, payload: Value) -> Value {
+    let timestamp = if timestamp.trim().is_empty() {
+        chrono::Utc::now().to_rfc3339()
+    } else {
+        timestamp.to_string()
+    };
+    serde_json::json!({
+        "timestamp": timestamp,
+        "type": record_type,
+        "payload": payload,
+    })
+}
+
+fn append_rollout_value(
+    output: &mut String,
+    mut value: Value,
+    next_ordinal: &mut Option<u64>,
+) -> Result<(), String> {
+    if let (Some(ordinal), Some(object)) = (*next_ordinal, value.as_object_mut()) {
+        object.insert("ordinal".to_string(), Value::Number(ordinal.into()));
+    }
+    output.push_str(
+        &serde_json::to_string(&value)
+            .map_err(|error| format!("生成可见会话历史失败: {}", error))?,
+    );
+    output.push('\n');
+    if let Some(ordinal) = next_ordinal.as_mut() {
+        *ordinal = ordinal.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn rollout_line_ordinal(line: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(line)
+        .ok()?
+        .get("ordinal")?
+        .as_u64()
+}
+
+fn align_rollout_line_ordinal(line: &str, ordinal: Option<u64>) -> Result<String, String> {
+    let mut value = match serde_json::from_str::<Value>(line) {
+        Ok(value) => value,
+        Err(_) if ordinal.is_some() => {
+            return Err("源会话包含无法写入分页记录的无效 JSON".to_string())
+        }
+        Err(_) => return Ok(line.to_string()),
+    };
+    let Some(object) = value.as_object_mut() else {
+        if ordinal.is_some() {
+            return Err("源会话包含非对象格式的分页记录".to_string());
+        }
+        return Ok(line.to_string());
+    };
+    let changed = match ordinal {
+        Some(ordinal) => {
+            if object.get("ordinal").and_then(Value::as_u64) == Some(ordinal) {
+                false
+            } else {
+                object.insert("ordinal".to_string(), Value::Number(ordinal.into()));
+                true
+            }
+        }
+        None => object.remove("ordinal").is_some(),
+    };
+    if !changed {
+        return Ok(line.to_string());
+    }
+    serde_json::to_string(&value).map_err(|error| format!("重写会话分页序号失败: {}", error))
+}
+
+fn normalize_paginated_rollout_ordinals(content: &str) -> Result<Option<String>, String> {
+    let Some(first_record) = content.lines().find(|line| !line.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let Ok(first_value) = serde_json::from_str::<Value>(first_record) else {
+        return Ok(None);
+    };
+    if first_value.get("type").and_then(Value::as_str) != Some("session_meta")
+        || first_value.get("ordinal").and_then(Value::as_u64).is_none()
+    {
+        return Ok(None);
+    }
+
+    let mut output = String::with_capacity(content.len());
+    let mut expected_ordinal = 0u64;
+    let mut changed = false;
+    for segment in content.split_inclusive('\n') {
+        let (body, ending) = if let Some(body) = segment.strip_suffix("\r\n") {
+            (body, "\r\n")
+        } else if let Some(body) = segment.strip_suffix('\n') {
+            (body, "\n")
+        } else {
+            (segment, "")
+        };
+        if body.trim().is_empty() {
+            output.push_str(segment);
+            continue;
+        }
+        let mut value = serde_json::from_str::<Value>(body).map_err(|error| {
+            format!(
+                "分页会话第 {} 条记录不是有效 JSON: {}",
+                expected_ordinal, error
+            )
+        })?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| format!("分页会话第 {} 条记录不是 JSON 对象", expected_ordinal))?;
+        if object.get("ordinal").and_then(Value::as_u64) == Some(expected_ordinal) {
+            output.push_str(segment);
+        } else {
+            object.insert(
+                "ordinal".to_string(),
+                Value::Number(expected_ordinal.into()),
+            );
+            output.push_str(
+                &serde_json::to_string(&value)
+                    .map_err(|error| format!("序列化会话分页记录失败: {}", error))?,
+            );
+            output.push_str(ending);
+            changed = true;
+        }
+        expected_ordinal = expected_ordinal.saturating_add(1);
+    }
+    Ok(changed.then_some(output))
 }
 
 fn rewrite_copied_history_line(
     line: &str,
     response_item_ids: &mut HashMap<String, String>,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     let Ok(mut value) = serde_json::from_str::<Value>(line) else {
-        return Ok(line.to_string());
+        return Ok(Some(line.to_string()));
     };
-    let changed = match value.get("type").and_then(Value::as_str) {
-        Some("response_item") => value
-            .get_mut("payload")
-            .is_some_and(|payload| rewrite_copied_payload_id(payload, response_item_ids)),
-        Some("compacted") => value
-            .get_mut("payload")
-            .and_then(|payload| payload.get_mut("replacement_history"))
-            .and_then(Value::as_array_mut)
-            .map(|history| {
-                let mut changed = false;
-                for item in history {
-                    changed |= rewrite_copied_payload_id(item, response_item_ids);
+    let mut changed = false;
+    let mut removed_opaque_compaction = false;
+    match value.get("type").and_then(Value::as_str) {
+        Some("response_item") => {
+            let Some(payload) = value.get_mut("payload") else {
+                return Ok(Some(line.to_string()));
+            };
+            if copied_payload_is_opaque_compaction(payload) {
+                return Ok(None);
+            }
+            changed |= rewrite_copied_payload(payload, response_item_ids);
+        }
+        Some("compacted") => {
+            if let Some(history) = value
+                .get_mut("payload")
+                .and_then(|payload| payload.get_mut("replacement_history"))
+                .and_then(Value::as_array_mut)
+            {
+                let original_len = history.len();
+                history.retain_mut(|item| {
+                    if copied_payload_is_opaque_compaction(item) {
+                        return false;
+                    }
+                    changed |= rewrite_copied_payload(item, response_item_ids);
+                    true
+                });
+                if history.len() != original_len {
+                    changed = true;
+                    removed_opaque_compaction = true;
                 }
-                changed
-            })
-            .unwrap_or(false),
-        _ => false,
-    };
-    if !changed {
-        return Ok(line.to_string());
+            }
+        }
+        _ => {}
     }
-    serde_json::to_string(&value).map_err(|error| format!("重写会话响应 ID 失败: {}", error))
+    if removed_opaque_compaction
+        && value.get("type").and_then(Value::as_str) == Some("compacted")
+        && value
+            .get("payload")
+            .and_then(|payload| payload.get("replacement_history"))
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+    {
+        return Ok(None);
+    }
+    if !changed {
+        return Ok(Some(line.to_string()));
+    }
+    serde_json::to_string(&value)
+        .map(Some)
+        .map_err(|error| format!("重写会话响应 ID 失败: {}", error))
 }
 
-fn rewrite_copied_payload_id(
+fn copied_payload_is_opaque_compaction(payload: &Value) -> bool {
+    payload.get("type").and_then(Value::as_str) == Some("compaction")
+}
+
+fn rewrite_copied_payload(
     payload: &mut Value,
     response_item_ids: &mut HashMap<String, String>,
 ) -> bool {
     let Some(payload) = payload.as_object_mut() else {
         return false;
     };
+    // Encrypted reasoning is bound to the original response item and, for switched accounts,
+    // may also be bound to the source account. Once the item receives a local ID, replaying the
+    // original ciphertext makes the Responses API reject the entire copied conversation.
+    let removed_encrypted_content = payload.remove("encrypted_content").is_some();
     let source_id = payload
         .get("id")
         .and_then(Value::as_str)
@@ -4163,7 +5046,7 @@ fn rewrite_copied_payload_id(
         .and_then(Value::as_str)
         .unwrap_or_default();
     if source_id.is_none() && !response_item_type_supports_id(item_type) {
-        return false;
+        return removed_encrypted_content;
     }
     let local_id = match source_id {
         Some(source_id) => response_item_ids
@@ -4615,9 +5498,9 @@ fn now_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_title, find_task_started_offsets_reverse, replace_session_bytes_if_unchanged,
-        restore_session_file_if_unchanged, session_file_fingerprint, sql_quote,
-        SessionRepairRecord, SessionStore,
+        copy_history_onto_target, extract_title, find_task_started_offsets_reverse,
+        replace_session_bytes_if_unchanged, restore_session_file_if_unchanged,
+        session_file_fingerprint, sql_quote, SessionRepairRecord, SessionStore,
     };
     use serde_json::{json, Value};
     use std::fs;
@@ -5320,7 +6203,9 @@ mod tests {
             concat!(
                 r#"{"type":"session_meta","payload":{"id":"source","session_id":"source","model_provider":"old"}}"#,
                 "\n",
-                r#"{"type":"response_item","payload":{"type":"reasoning","id":"rs_resp_stale_0","summary":[],"content":[],"encrypted_content":null}}"#,
+                r#"{"type":"response_item","payload":{"type":"reasoning","id":"rs_resp_stale_0","summary":[],"content":[],"encrypted_content":"ocx1:source-reasoning"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"compaction","id":"cmp_resp_stale_0","encrypted_content":"ocx1:source-compaction"}}"#,
                 "\n",
                 r#"{"type":"response_item","payload":{"type":"message","id":"msg_resp_stale_0","role":"user","content":[{"text":"需要复制的历史"}]}}"#,
                 "\n",
@@ -5332,18 +6217,37 @@ mod tests {
                 "\n",
                 r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"历史回复"}]}}"#,
                 "\n",
-                r#"{"type":"compacted","payload":{"replacement_history":[{"type":"reasoning","id":"rs_resp_stale_0","summary":[],"content":[],"encrypted_content":null},{"type":"message","id":"msg_resp_stale_0","role":"user","content":[{"text":"需要复制的历史"}]},{"type":"function_call","id":"fc_call_stale_0","name":"shell","arguments":"{}","call_id":"call_pair"},{"type":"function_call_output","id":"fco_call_stale_0","call_id":"call_pair","output":"ok"}],"message":""}}"#,
+                r#"{"type":"compacted","payload":{"replacement_history":[{"type":"reasoning","id":"rs_resp_stale_0","summary":[],"content":[],"encrypted_content":"ocx1:nested-reasoning"},{"type":"message","id":"msg_resp_stale_0","role":"user","content":[{"text":"需要复制的历史"}]},{"type":"function_call","id":"fc_call_stale_0","name":"shell","arguments":"{}","call_id":"call_pair"},{"type":"function_call_output","id":"fco_call_stale_0","call_id":"call_pair","output":"ok"},{"type":"compaction","id":"cmp_nested_stale_0","encrypted_content":"ocx1:nested-compaction"}],"message":""}}"#,
                 "\n"
             ),
         )
         .expect("write source");
         let original_target = concat!(
-            r#"{"type":"session_meta","payload":{"id":"target","session_id":"target","model_provider":"current"}}"#,
+            r#"{"type":"session_meta","payload":{"id":"target","session_id":"target","model_provider":"current"},"ordinal":0}"#,
             "\n",
             r#"{"type":"response_item","payload":{"role":"user","content":[{"text":"占位内容"}]}}"#,
             "\n"
         );
         fs::write(&target_path, original_target).expect("write target");
+        let history_db = codex.path().join("thread_history_1.sqlite");
+        run_sqlite_test(
+            &history_db,
+            r#"
+                CREATE TABLE thread_items (thread_id TEXT NOT NULL, item_id TEXT NOT NULL);
+                CREATE TABLE thread_turns (thread_id TEXT NOT NULL, turn_id TEXT NOT NULL);
+                CREATE TABLE thread_history_projection_state (
+                    thread_id TEXT PRIMARY KEY,
+                    next_rollout_byte_offset INTEGER NOT NULL,
+                    next_rollout_ordinal INTEGER NOT NULL
+                );
+                INSERT INTO thread_items (thread_id, item_id) VALUES ('target', 'old-item');
+                INSERT INTO thread_items (thread_id, item_id) VALUES ('unrelated', 'keep-item');
+                INSERT INTO thread_turns (thread_id, turn_id) VALUES ('target', 'old-turn');
+                INSERT INTO thread_history_projection_state
+                    (thread_id, next_rollout_byte_offset, next_rollout_ordinal)
+                VALUES ('target', 1234, 9);
+            "#,
+        );
         let store = SessionStore::new(codex.path().to_path_buf());
 
         let result = store
@@ -5356,12 +6260,26 @@ mod tests {
         assert!(copied.contains("需要复制的历史"));
         assert!(copied.contains("历史回复"));
         assert!(!copied.contains(r#""id":"source""#));
+        assert!(!copied.contains("encrypted_content"));
+        assert!(!copied.contains("ocx1:"));
+        let copied_ordinals = copied
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("valid copied record")
+                    ["ordinal"]
+                    .as_u64()
+                    .expect("copied record ordinal")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(copied_ordinals, (0..13).collect::<Vec<_>>());
         for stale_id in [
             "rs_resp_stale_0",
             "msg_resp_stale_0",
             "fc_call_stale_0",
             "fco_call_stale_0",
             "future_resp_stale_0",
+            "cmp_resp_stale_0",
+            "cmp_nested_stale_0",
         ] {
             assert!(!copied.contains(stale_id));
         }
@@ -5413,6 +6331,37 @@ mod tests {
                 .expect("matching top-level response item");
             assert_eq!(local_id, top_level_id);
         }
+        let copied_values = copied
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("copied value"))
+            .collect::<Vec<_>>();
+        let final_compaction_index = copied_values
+            .iter()
+            .rposition(|value| value["type"].as_str() == Some("compacted"))
+            .expect("portable final compaction");
+        assert_eq!(
+            copied_values[final_compaction_index]["payload"]["replacement_history"]
+                .as_array()
+                .expect("portable replacement history")
+                .len(),
+            2
+        );
+        let visible_items_after_compaction = copied_values[final_compaction_index + 1..]
+            .iter()
+            .filter(|value| {
+                value["type"].as_str() == Some("event_msg")
+                    && value["payload"]["type"].as_str() == Some("item_completed")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible_items_after_compaction.len(), 2);
+        assert_eq!(
+            visible_items_after_compaction[0]["payload"]["item"]["type"].as_str(),
+            Some("UserMessage")
+        );
+        assert_eq!(
+            visible_items_after_compaction[1]["payload"]["item"]["type"].as_str(),
+            Some("AgentMessage")
+        );
         assert_eq!(result.session_id, "target");
         assert_eq!(result.title, "需要复制的历史");
         let backup_path = result.backup_path.expect("backup path");
@@ -5420,6 +6369,211 @@ mod tests {
             fs::read_to_string(backup_path).expect("read backup"),
             original_target
         );
+        assert_eq!(
+            run_sqlite_test_output(
+                &history_db,
+                "SELECT COUNT(*) FROM thread_items WHERE thread_id = 'target';"
+            )
+            .trim(),
+            "0"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &history_db,
+                "SELECT COUNT(*) FROM thread_turns WHERE thread_id = 'target';"
+            )
+            .trim(),
+            "0"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &history_db,
+                "SELECT COUNT(*) FROM thread_history_projection_state WHERE thread_id = 'target';"
+            )
+            .trim(),
+            "0"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &history_db,
+                "SELECT COUNT(*) FROM thread_items WHERE thread_id = 'unrelated';"
+            )
+            .trim(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn copy_history_rolls_back_target_when_projection_reset_fails() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let source_path = sessions_dir.join("source-rollback.jsonl");
+        let target_path = sessions_dir.join("target-rollback.jsonl");
+        fs::write(
+            &source_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"source-rollback"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"源历史"}]}}"#,
+                "\n"
+            ),
+        )
+        .expect("write source");
+        let original_target = concat!(
+            r#"{"type":"session_meta","payload":{"id":"target-rollback"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"目标占位"}]}}"#,
+            "\n"
+        );
+        fs::write(&target_path, original_target).expect("write target");
+        let history_db = codex.path().join("thread_history_1.sqlite");
+        run_sqlite_test(
+            &history_db,
+            r#"
+                CREATE TABLE thread_items (thread_id TEXT NOT NULL, item_id TEXT NOT NULL);
+                INSERT INTO thread_items (thread_id, item_id)
+                VALUES ('target-rollback', 'old-item');
+                CREATE TRIGGER block_target_projection_delete
+                BEFORE DELETE ON thread_items
+                WHEN OLD.thread_id = 'target-rollback'
+                BEGIN
+                    SELECT RAISE(ABORT, 'blocked projection reset');
+                END;
+            "#,
+        );
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let error = store
+            .copy_session_history("source-rollback", "target-rollback")
+            .expect_err("projection reset should fail");
+
+        assert!(error.contains("清理 Codex 会话历史投影失败"));
+        assert_eq!(
+            fs::read_to_string(target_path).expect("read rolled back target"),
+            original_target
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &history_db,
+                "SELECT COUNT(*) FROM thread_items WHERE thread_id = 'target-rollback';"
+            )
+            .trim(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn copy_history_ignores_an_empty_opaque_compaction_snapshot() {
+        let source = concat!(
+            r#"{"type":"session_meta","payload":{"id":"source"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","id":"msg_source","role":"user","content":[{"text":"保留压缩前的可见历史"}]}}"#,
+            "\n",
+            r#"{"type":"compacted","payload":{"replacement_history":[{"type":"compaction","id":"cmp_source","encrypted_content":"ocx1:opaque"}],"message":""}}"#,
+            "\n"
+        );
+        let target = concat!(
+            r#"{"type":"session_meta","payload":{"id":"target"},"ordinal":0}"#,
+            "\n"
+        );
+
+        let copied = copy_history_onto_target(source, target).expect("copy portable history");
+
+        assert!(copied.contains("保留压缩前的可见历史"));
+        assert_eq!(copied.matches(r#""type":"compacted""#).count(), 1);
+        assert!(!copied.contains("encrypted_content"));
+        let ordinals = copied
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("valid copied record")
+                    ["ordinal"]
+                    .as_u64()
+                    .expect("copied record ordinal")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ordinals, (0..6).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn copy_history_materializes_every_visible_message_after_the_final_compaction() {
+        let source = concat!(
+            r#"{"timestamp":"2026-08-01T00:00:00Z","type":"session_meta","payload":{"id":"source"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"source-turn-1"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"第一问"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"第一答"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T00:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"source-turn-1"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T00:00:05Z","type":"compacted","payload":{"replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"第一问"}]}],"message":"旧压缩"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T00:00:06Z","type":"event_msg","payload":{"type":"task_started","turn_id":"source-turn-2"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T00:00:07Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"第二问"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T00:00:08Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"第二答"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T00:00:09Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"source-turn-2"}}"#,
+            "\n"
+        );
+        let target = concat!(
+            r#"{"timestamp":"2026-08-02T00:00:00Z","type":"session_meta","payload":{"id":"target"},"ordinal":0}"#,
+            "\n"
+        );
+
+        let copied = copy_history_onto_target(source, target).expect("copy history");
+        let values = copied
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("copied value"))
+            .collect::<Vec<_>>();
+        let final_compaction = values
+            .iter()
+            .rposition(|value| value["type"].as_str() == Some("compacted"))
+            .expect("final compaction");
+        assert_eq!(
+            values[final_compaction]["payload"]["replacement_history"]
+                .as_array()
+                .expect("replacement history")
+                .len(),
+            4
+        );
+        assert!(values[final_compaction + 1..]
+            .iter()
+            .all(|value| value["type"].as_str() != Some("compacted")));
+        let visible_text = values[final_compaction + 1..]
+            .iter()
+            .filter(|value| {
+                value["type"].as_str() == Some("event_msg")
+                    && value["payload"]["type"].as_str() == Some("item_completed")
+            })
+            .filter_map(|value| {
+                value["payload"]["item"]["content"][0]["text"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible_text, vec!["第一问", "第一答", "第二问", "第二答"]);
+    }
+
+    #[test]
+    fn copy_history_rejects_a_source_with_only_opaque_compaction() {
+        let source = concat!(
+            r#"{"type":"session_meta","payload":{"id":"source"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"compaction","id":"cmp_source","encrypted_content":"ocx1:opaque"}}"#,
+            "\n"
+        );
+        let target = concat!(
+            r#"{"type":"session_meta","payload":{"id":"target"},"ordinal":0}"#,
+            "\n"
+        );
+
+        let error = copy_history_onto_target(source, target).expect_err("reject opaque history");
+
+        assert!(error.contains("不可跨会话使用的加密历史"));
     }
 
     #[test]
@@ -5915,6 +7069,134 @@ mod tests {
     }
 
     #[test]
+    fn model_compatibility_repair_resets_local_thread_choices_and_preserves_history() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir");
+        let rollout_path = sessions_dir.join("session-model.jsonl");
+        let rollout = concat!(
+            r#"{"type":"session_meta","payload":{"id":"session-model","model_provider":"zbc","cwd":"/tmp/demo","source":"vscode"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"zbc/gpt-5.6-sol","effort":"high","collaboration_mode":{"settings":{"model":"zhangbo-codex/gpt-5.6-sol"}}}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"thread_settings","thread_settings":{"model":"zbc/gpt-5.6-sol","collaboration_mode":{"settings":{"model":"zbc/gpt-5.6-sol"}}}}}"#,
+            "\n",
+            r#"{"type":"world_state","payload":{"state":{"model":"zbc/gpt-5.6-sol","collaboration_mode":{"model":"zhangbo-codex/gpt-5.6-sol"},"personality":{"model":"zbc/gpt-5.6-sol"}}}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"保留正文中的 zbc/gpt-5.6-sol，不要全局替换"}]}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.5","effort":"medium"}}"#,
+            "\n"
+        );
+        fs::write(&rollout_path, rollout).expect("write rollout");
+
+        let state_db = codex.path().join("state_5.sqlite");
+        run_sqlite_test(
+            &state_db,
+            r#"
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    model_provider TEXT NOT NULL,
+                    model TEXT,
+                    reasoning_effort TEXT
+                );
+                INSERT INTO threads (id, model_provider, model, reasoning_effort)
+                VALUES ('session-model', 'zbc', 'gpt-5.6-sol', 'high');
+                INSERT INTO threads (id, model_provider, model, reasoning_effort)
+                VALUES ('session-current-choice', 'openai', 'gpt-5.5', 'medium');
+                INSERT INTO threads (id, model_provider, model, reasoning_effort)
+                VALUES ('session-current-default', 'openai', NULL, NULL);
+            "#,
+        );
+        let catalog_db = codex.path().join("sqlite/codex-dev.db");
+        fs::create_dir_all(catalog_db.parent().expect("catalog parent")).expect("catalog dir");
+        run_sqlite_test(
+            &catalog_db,
+            r#"
+                CREATE TABLE local_thread_catalog (
+                    host_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    model_provider TEXT NOT NULL,
+                    PRIMARY KEY (host_id, thread_id)
+                );
+                CREATE TABLE local_thread_catalog_metadata (
+                    id INTEGER PRIMARY KEY,
+                    catalog_revision INTEGER NOT NULL
+                );
+                INSERT INTO local_thread_catalog_metadata (id, catalog_revision) VALUES (1, 0);
+                INSERT INTO local_thread_catalog (host_id, thread_id, model_provider)
+                VALUES ('local', 'session-model', 'zbc');
+                INSERT INTO local_thread_catalog (host_id, thread_id, model_provider)
+                VALUES ('remote-host', 'remote-session', 'zbc');
+            "#,
+        );
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let summary = store
+            .repair_model_compatibility("openai")
+            .expect("repair model compatibility");
+
+        assert_eq!(summary.target_provider, "openai");
+        assert_eq!(summary.repaired_rollout_file_count, 1);
+        assert_eq!(summary.rewritten_rollout_model_field_count, 7);
+        assert_eq!(summary.synchronized_rollout_provider_count, 1);
+        assert_eq!(summary.repaired_thread_count, 2);
+        assert_eq!(summary.synchronized_catalog_row_count, 1);
+        assert_eq!(summary.repaired_database_count, 2);
+        assert!(!summary.backup_dirs.is_empty());
+        assert_eq!(
+            run_sqlite_test_output(
+                &state_db,
+                "SELECT model_provider || '|' || (model IS NULL) || '|' || (reasoning_effort IS NULL) FROM threads WHERE id = 'session-model';"
+            )
+            .trim(),
+            "openai|1|1"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &state_db,
+                "SELECT model_provider || '|' || (model IS NULL) || '|' || (reasoning_effort IS NULL) FROM threads WHERE id = 'session-current-choice';"
+            )
+            .trim(),
+            "openai|1|1"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &catalog_db,
+                "SELECT model_provider FROM local_thread_catalog WHERE host_id = 'local' AND thread_id = 'session-model';"
+            )
+            .trim(),
+            "openai"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &catalog_db,
+                "SELECT model_provider FROM local_thread_catalog WHERE host_id = 'remote-host' AND thread_id = 'remote-session';"
+            )
+            .trim(),
+            "zbc"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &catalog_db,
+                "SELECT catalog_revision FROM local_thread_catalog_metadata WHERE id = 1;"
+            )
+            .trim(),
+            "1"
+        );
+        let repaired_rollout = fs::read_to_string(rollout_path).expect("read rollout");
+        assert!(repaired_rollout.contains(r#""model_provider":"openai""#));
+        assert_eq!(
+            repaired_rollout.matches(r#""model":"gpt-5.6-sol""#).count(),
+            7
+        );
+        assert!(repaired_rollout.contains(r#""model":"gpt-5.5""#));
+        assert!(repaired_rollout.contains(r#""text":"保留正文中的 zbc/gpt-5.6-sol，不要全局替换""#));
+        assert!(!repaired_rollout.contains(r#""model":"zbc/gpt-5.6-sol""#));
+        assert!(!repaired_rollout.contains(r#""model":"zhangbo-codex/gpt-5.6-sol""#));
+    }
+
+    #[test]
     fn repair_visibility_rebuilds_local_projects_and_thread_assignments() {
         let codex = tempdir().expect("codex tempdir");
         let alpha = codex.path().join("alpha");
@@ -6155,6 +7437,50 @@ mod tests {
         let content = fs::read_to_string(session_path).expect("read session");
         assert!(content.contains(r#""model_provider":"api-key-provider""#));
         assert!(content.contains(r#""text":"hello""#));
+    }
+
+    #[test]
+    fn repair_visibility_fills_missing_paginated_rollout_ordinals() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-paginated.jsonl");
+        fs::write(
+            &session_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"session-paginated","model_provider":"openai","cwd":"/tmp/demo"},"ordinal":0}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"missing ordinal"}]}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_complete"},"ordinal":99}"#,
+                "\n"
+            ),
+        )
+        .expect("write paginated session");
+        let records = vec![SessionRepairRecord {
+            id: "session-paginated".to_string(),
+            title: "Paginated".to_string(),
+            path: session_path.clone(),
+            updated_at: 10,
+        }];
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let (changed, _) = store
+            .repair_rollout_visibility("openai", &records, false)
+            .expect("repair paginated rollout");
+
+        assert_eq!(changed, 1);
+        let ordinals = fs::read_to_string(session_path)
+            .expect("read repaired rollout")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("valid repaired record")
+                    ["ordinal"]
+                    .as_u64()
+                    .expect("repaired record ordinal")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ordinals, vec![0, 1, 2]);
     }
 
     fn run_sqlite_test(db_path: &std::path::Path, sql: &str) {

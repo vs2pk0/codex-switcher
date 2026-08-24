@@ -50,6 +50,7 @@ import {
 } from "./i18n";
 import { additionalQuotaWindows, hasQuotaWindow, quotaWindowForMinutes } from "./quota";
 import { resolveResetScheduleEntry } from "./services/resetScheduleEntry";
+import { shouldCleanupHiddenAccount } from "./services/accountVisibility";
 import {
   beginPendingItem,
   finishPendingItem,
@@ -60,8 +61,10 @@ import {
   cancelCodexOAuthLogin,
   checkCodexApiKeyModelAccess,
   completeCodexOAuthLogin,
+  completeCodexHiddenAccountCleanup,
   consumeCodexResetCredit,
   deleteCodexAccount,
+  deleteCodexConfigToml,
   deleteCodexSwitcherBackup,
   detectCurrentCodexAccount,
   exportCodexAccounts,
@@ -74,6 +77,7 @@ import {
   importCodexFromJson,
   importCodexFromLocal,
   readCodexConfigFile,
+  repairCodexSessionModelCompatibility,
   reloadCodexAfterSessionVisibilityRepair,
   listCodexSwitcherBackups,
   listCodexSwitcherSessionBackups,
@@ -107,11 +111,15 @@ import {
   type CodexSwitcherPaths,
   type CodexSwitcherSettings,
 } from "./services/codex";
-import { scanOpenCodexSwitcherAccounts } from "./opencodex/service";
+import {
+  deleteOpenCodexSwitcherAccount,
+  scanOpenCodexSwitcherAccounts,
+} from "./opencodex/service";
 import {
   API_SERVICE_AUTO_UPDATE_EVENT,
   bindApiServiceAccounts,
   deleteApiServiceBoundAccounts,
+  deleteApiServiceAccountBinding,
   getApiServiceState,
   isCurrentApiServiceAccount,
   listApiServiceBoundAccounts,
@@ -247,6 +255,7 @@ const configEditorContent = ref("");
 const configEditorLoading = ref(false);
 const configEditorSaving = ref(false);
 const configEditorFormatting = ref(false);
+const sessionModelRepairing = ref(false);
 const appPaths = ref<CodexSwitcherPaths | null>(null);
 const backupFiles = ref<CodexSwitcherBackupFile[]>([]);
 const backupLoading = ref(false);
@@ -3177,6 +3186,17 @@ async function handleEditSave(): Promise<void> {
         accountId: account.id,
         jsonContent: editJsonText.value.trim(),
       });
+    } else if (isApiKeyAccount(account)) {
+      updated = await updateCodexApiKeyCredentials({
+        accountId: account.id,
+        apiKey: editForm.apiKey.trim(),
+        apiBaseUrl: editForm.apiBaseUrl.trim(),
+        apiProviderName: editForm.apiProviderName.trim(),
+        apiOfficialUrl: editForm.apiOfficialUrl.trim(),
+        accountName: editForm.accountName.trim(),
+        tags: editForm.tags,
+        isHidden: editForm.isHidden,
+      });
     } else {
       updated = await updateCodexAccountProfile({
         accountId: account.id,
@@ -3184,43 +3204,51 @@ async function handleEditSave(): Promise<void> {
         tags: editForm.tags,
         isHidden: editForm.isHidden,
       });
-      if (isApiKeyAccount(account)) {
-        updated = await updateCodexApiKeyCredentials({
-          accountId: account.id,
-          apiKey: editForm.apiKey.trim(),
-          apiBaseUrl: editForm.apiBaseUrl.trim(),
-          apiProviderName: editForm.apiProviderName.trim(),
-          apiOfficialUrl: editForm.apiOfficialUrl.trim(),
-        });
-      }
     }
-    let hiddenServiceBindingRemoved = false;
-    if (updated.is_hidden) {
+    const cleanupHiddenAccount = shouldCleanupHiddenAccount({
+      previousHidden: account.is_hidden,
+      nextHidden: updated.is_hidden,
+      previousPending: account.hidden_cleanup_pending,
+      nextPending: updated.hidden_cleanup_pending,
+    });
+    const hiddenCleanupTargets: string[] = [];
+    const hiddenCleanupFailures: string[] = [];
+    if (cleanupHiddenAccount) {
       try {
-        const bound = await listApiServiceBoundAccounts();
-        const boundIds = bound
-          .filter((item) =>
-            item.accountId === updated.id ||
-            item.email?.trim().toLocaleLowerCase() === updated.email.trim().toLocaleLowerCase(),
-          )
-          .map((item) => item.id);
-        if (boundIds.length) {
-          await deleteApiServiceBoundAccounts(boundIds);
-          hiddenServiceBindingRemoved = true;
+        const result = await deleteApiServiceAccountBinding(account.id);
+        if (result.count) {
+          hiddenCleanupTargets.push("API 服务");
         }
         await refreshApiServiceAccountIds();
       } catch (error) {
-        Message.warning(`账号已设为隐身，但移除 API 服务绑定失败：${errorText(error)}`);
+        hiddenCleanupFailures.push(`API 服务：${errorText(error)}`);
+      }
+      try {
+        const result = await deleteOpenCodexSwitcherAccount(account.id);
+        if (result.deleted) {
+          hiddenCleanupTargets.push("OpenCodex");
+        } else if (/身份|不匹配|无法确认/.test(result.message)) {
+          hiddenCleanupFailures.push(`OpenCodex：${result.message}`);
+        }
+        await refreshOpenCodexAccountIds();
+      } catch (error) {
+        hiddenCleanupFailures.push(`OpenCodex：${errorText(error)}`);
+      }
+      if (!hiddenCleanupFailures.length) {
+        updated = await completeCodexHiddenAccountCleanup(updated.id);
       }
     }
     editVisible.value = false;
     await loadAccounts();
     const quotaFailures = await refreshAccountsAfterMutation([updated]);
-    Message.success(
-      hiddenServiceBindingRemoved
-        ? `已更新 ${displayName(updated)}，并移除 API 服务绑定`
-        : `已更新 ${displayName(updated)}`,
-    );
+    const cleanupSummary = hiddenCleanupTargets.length
+      ? `，并从 ${hiddenCleanupTargets.join("、")} 删除账号`
+      : "";
+    if (hiddenCleanupFailures.length) {
+      Message.warning(`账号已保持隐身，部分清理失败；下次保存会自动重试：${hiddenCleanupFailures.join("；")}`);
+    } else {
+      Message.success(`已更新 ${displayName(updated)}${cleanupSummary}`);
+    }
     warnQuotaRefreshFailures(quotaFailures);
   } catch (error) {
     Message.error(`保存失败：${errorText(error)}`);
@@ -3557,7 +3585,7 @@ async function handleCopySession(targetSessionId: string): Promise<void> {
     const result = await copySessionHistoryAcrossInstances(source.id, targetSessionId);
     sessionCopyVisible.value = false;
     sessionCopySource.value = null;
-    Message.success(t("会话数据已复制，目标会话可以继续使用"));
+    Message.success(t("会话数据已复制并重建历史，Codex 已自动重启"));
     if (result.warnings.length) {
       Message.warning(`${t("会话已复制，但部分索引同步失败")}：${result.warnings.join("；")}`);
     }
@@ -3734,17 +3762,70 @@ async function saveConfigEditorContent(): Promise<void> {
 function confirmResetConfig(): void {
   Modal.warning({
     title: "重置 config.toml",
-    content: "确认删除本机 Codex 目录下的 config.toml？删除后 Codex 会按默认配置重新生成或使用默认设置。",
-    okText: "删除",
+    content: "确认将本机 Codex 目录下的 config.toml 恢复为内置基础配置？当前文件会先自动备份。",
+    okText: "恢复基础配置",
     cancelText: "取消",
     hideCancel: false,
     onOk: async () => {
       try {
-        const deleted = await resetCodexConfigToml();
+        await resetCodexConfigToml();
         await loadAccounts();
-        Message.success(deleted ? "已删除 config.toml" : "config.toml 不存在，无需重置");
+        Message.success("已将 config.toml 恢复为基础配置");
       } catch (error) {
         Message.error(`重置失败：${errorText(error)}`);
+      }
+    },
+  });
+}
+
+function confirmRepairSessionModels(): void {
+  if (sessionModelRepairing.value) return;
+  Modal.warning({
+    title: t("修复会话模型"),
+    content: t(
+      "将按当前账号清理本地会话中残留的旧 Provider 模型前缀，重置显式模型与推理强度，并同步 Provider。修复前会备份会话文件和数据库，不会删除会话内容。修复期间 ChatGPT/Codex 会自动重启。",
+    ),
+    okText: t("开始修复"),
+    cancelText: t("取消"),
+    hideCancel: false,
+    onOk: async () => {
+      sessionModelRepairing.value = true;
+      try {
+        const summary = await repairCodexSessionModelCompatibility();
+        if (
+          summary.repairedRolloutFileCount === 0 &&
+          summary.repairedThreadCount === 0 &&
+          summary.synchronizedCatalogRowCount === 0
+        ) {
+          Message.success(t("当前会话模型配置无需修复"));
+        } else {
+          Message.success(
+            `${t("会话模型修复完成")}：${summary.repairedThreadCount} ${t("条会话")}，${summary.repairedRolloutFileCount} ${t("个会话文件")}`,
+          );
+        }
+      } catch (error) {
+        Message.error(`${t("修复会话模型失败")}：${errorText(error)}`);
+      } finally {
+        sessionModelRepairing.value = false;
+      }
+    },
+  });
+}
+
+function confirmDeleteConfig(): void {
+  Modal.warning({
+    title: "删除 config.toml",
+    content: "确认永久删除本机 Codex 目录下的 config.toml？此操作只删除当前配置文件，不会自动恢复基础配置。",
+    okText: "确认删除",
+    cancelText: "取消",
+    hideCancel: false,
+    onOk: async () => {
+      try {
+        const deleted = await deleteCodexConfigToml();
+        await loadAccounts();
+        Message.success(deleted ? "已删除 config.toml" : "config.toml 不存在，无需删除");
+      } catch (error) {
+        Message.error(`删除失败：${errorText(error)}`);
       }
     },
   });
@@ -4492,10 +4573,13 @@ onUnmounted(() => {
       :backup-loading="backupLoading"
       :backup-working="backupWorking"
       :backup-progress="backupProgress"
+      :session-model-repairing="sessionModelRepairing"
       @save="saveSettings"
       @open-path="openSessionFolder"
       @edit-codex-file="openConfigEditor"
+      @repair-session-models="confirmRepairSessionModels"
       @reset-config="confirmResetConfig"
+      @delete-config="confirmDeleteConfig"
       @export-backup="handleExportBackup"
       @refresh-backups="loadBackups"
       @restore-backup="handleRestoreBackup"

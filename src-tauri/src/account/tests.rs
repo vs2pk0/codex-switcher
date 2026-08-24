@@ -1,7 +1,7 @@
 use super::{
     codex_restart_commands, codex_restart_delay_ms, remove_legacy_managed_gpt_5_6_values,
-    rollback_config_on_error, AccountStore, ApiKeyAccountBindingInput, CodexAccount, CodexQuota,
-    CodexTokens,
+    rollback_config_on_error, AccountStore, ApiKeyAccountBindingInput, ApiKeyAccountUpdateInput,
+    CodexAccount, CodexQuota, CodexTokens,
 };
 use serde_json::json;
 use std::{
@@ -785,12 +785,97 @@ fn updates_account_profile_visibility_and_preserves_it_in_export() {
         .update_account_profile_with_visibility(&account.id, None, None, Some(true))
         .expect("enable hidden mode");
     assert!(updated.is_hidden);
+    assert!(updated.hidden_cleanup_pending);
 
     let exported = store
         .export_accounts(std::slice::from_ref(&account.id), None)
         .expect("export hidden account");
     let value: serde_json::Value = serde_json::from_str(&exported).expect("parse export");
     assert_eq!(value["accounts"][0]["is_hidden"], true);
+}
+
+#[test]
+fn hidden_cleanup_pending_retries_until_completed() {
+    let (_storage, _codex, store) = test_store();
+    let account = store
+        .add_api_key_account(
+            "sk-hidden-retry-123456".to_string(),
+            Some("https://relay.example/v1".to_string()),
+            Some("Relay".to_string()),
+            None,
+            Some("Hidden Retry".to_string()),
+        )
+        .expect("add API key account");
+
+    let hidden = store
+        .update_account_profile_with_visibility(&account.id, None, None, Some(true))
+        .expect("enable hidden mode");
+    assert!(hidden.hidden_cleanup_pending);
+
+    let retried = store
+        .update_account_profile_with_visibility(&account.id, None, None, Some(true))
+        .expect("save hidden mode again");
+    assert!(retried.hidden_cleanup_pending);
+
+    let completed = store
+        .complete_hidden_account_cleanup(&account.id)
+        .expect("complete hidden cleanup");
+    assert!(completed.is_hidden);
+    assert!(!completed.hidden_cleanup_pending);
+
+    let retried_after_completion = store
+        .update_account_profile_with_visibility(&account.id, None, None, Some(true))
+        .expect("save completed hidden mode again");
+    assert!(retried_after_completion.hidden_cleanup_pending);
+
+    let visible = store
+        .update_account_profile_with_visibility(&account.id, None, None, Some(false))
+        .expect("disable hidden mode");
+    assert!(!visible.is_hidden);
+    assert!(!visible.hidden_cleanup_pending);
+}
+
+#[test]
+fn invalid_api_key_edit_does_not_persist_profile_or_visibility_changes() {
+    let (_storage, _codex, store) = test_store();
+    let account = store
+        .add_api_key_account(
+            "sk-original-123456".to_string(),
+            Some("https://relay.example/v1".to_string()),
+            Some("Original Provider".to_string()),
+            Some("https://relay.example".to_string()),
+            Some("Original Name".to_string()),
+        )
+        .expect("add API key account");
+
+    let error = store
+        .update_api_key_credentials(ApiKeyAccountUpdateInput {
+            account_id: account.id.clone(),
+            api_key: "sk-replacement-123456".to_string(),
+            api_base_url: Some("https://replacement.example/v1".to_string()),
+            api_provider_name: Some("Replacement Provider".to_string()),
+            api_official_url: Some("invalid-official-url".to_string()),
+            account_name: Some("Replacement Name".to_string()),
+            tags: Some(vec!["replacement".to_string()]),
+            is_hidden: Some(true),
+        })
+        .expect_err("invalid official URL must reject the whole edit");
+    assert!(error.contains("官网地址"));
+
+    let stored = store
+        .list_accounts()
+        .expect("list accounts")
+        .into_iter()
+        .find(|candidate| candidate.id == account.id)
+        .expect("stored account");
+    assert_eq!(stored.openai_api_key, account.openai_api_key);
+    assert_eq!(stored.api_base_url, account.api_base_url);
+    assert_eq!(stored.api_provider_name, account.api_provider_name);
+    assert_eq!(stored.api_official_url, account.api_official_url);
+    assert_eq!(stored.account_name, account.account_name);
+    assert_eq!(stored.tags, account.tags);
+    assert!(!stored.is_hidden);
+    assert!(!stored.hidden_cleanup_pending);
 }
 
 #[test]
