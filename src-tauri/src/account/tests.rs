@@ -2949,6 +2949,272 @@ fn manual_config_edit_releases_managed_default_model_state() {
 }
 
 #[test]
+fn custom_instance_switch_does_not_overwrite_default_instance_account_state() {
+    let storage = tempdir().expect("storage tempdir");
+    let default_codex = tempdir().expect("default codex tempdir");
+    let custom_codex = tempdir().expect("custom codex tempdir");
+    let default_store = AccountStore::new(
+        storage.path().to_path_buf(),
+        default_codex.path().to_path_buf(),
+    );
+    let custom_store = AccountStore::new_for_instance(
+        storage.path().to_path_buf(),
+        custom_codex.path().to_path_buf(),
+        "instance-work",
+    );
+    let api = default_store
+        .add_api_key_account(
+            "sk-instance-isolation-123456".to_string(),
+            Some("https://isolation.example/v1".to_string()),
+            Some("Isolation Provider".to_string()),
+            None,
+            None,
+        )
+        .expect("add api account");
+    default_store
+        .switch_account(&api.id)
+        .expect("switch default instance to api account");
+    default_store
+        .update_api_key_default_model(&api.id, "gpt-5.6-sol".to_string())
+        .expect("set shared api model preference");
+    let oauth = default_store
+        .import_from_json(
+            &json!({
+                "email": "instance-isolation@example.com",
+                "tokens": {
+                    "id_token": "isolation-id-token",
+                    "access_token": "isolation-access-token",
+                    "refresh_token": "isolation-refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import oauth account")
+        .remove(0);
+
+    custom_store
+        .switch_account(&oauth.id)
+        .expect("switch custom instance to oauth account");
+
+    let persisted_api = default_store
+        .list_accounts()
+        .expect("list accounts")
+        .into_iter()
+        .find(|account| account.id == api.id)
+        .expect("find api account");
+    assert_eq!(persisted_api.default_model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(
+        default_store
+            .current_account()
+            .expect("read default current account")
+            .expect("default current account")
+            .id,
+        api.id
+    );
+    assert_eq!(
+        custom_store
+            .current_account()
+            .expect("read custom current account")
+            .expect("custom current account")
+            .id,
+        oauth.id
+    );
+    let default_config =
+        fs::read_to_string(default_codex.path().join("config.toml")).expect("read default config");
+    let default_config = default_config
+        .parse::<toml_edit::Document>()
+        .expect("parse default config");
+    assert_eq!(default_config["model"].as_str(), Some("gpt-5.6-sol"));
+}
+
+#[test]
+fn switch_repairs_legacy_global_current_account_before_model_transition() {
+    let (storage, _codex, store) = test_store();
+    let actual = store
+        .add_api_key_account(
+            "sk-legacy-actual-123456".to_string(),
+            Some("https://actual.example/v1".to_string()),
+            Some("Actual Provider".to_string()),
+            None,
+            None,
+        )
+        .expect("add actual api account");
+    let stale = store
+        .add_api_key_account(
+            "sk-legacy-stale-123456".to_string(),
+            Some("https://stale.example/v1".to_string()),
+            Some("Stale Provider".to_string()),
+            None,
+            None,
+        )
+        .expect("add stale api account");
+    store
+        .switch_account(&actual.id)
+        .expect("switch actual api account");
+    store
+        .update_api_key_default_model(&actual.id, "gpt-5.6-sol".to_string())
+        .expect("set actual model");
+    let oauth = store
+        .import_from_json(
+            &json!({
+                "email": "legacy-state-oauth@example.com",
+                "tokens": {
+                    "id_token": "legacy-id-token",
+                    "access_token": "legacy-access-token",
+                    "refresh_token": "legacy-refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import oauth account")
+        .remove(0);
+
+    let database_path = storage.path().join("accounts.json");
+    let mut database: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&database_path).expect("read account database"))
+            .expect("parse account database");
+    database["current_account_id"] = json!(stale.id);
+    let stale_record = database["accounts"]
+        .as_array_mut()
+        .expect("account records")
+        .iter_mut()
+        .find(|account| account["id"].as_str() == Some(stale.id.as_str()))
+        .expect("stale account record");
+    stale_record["default_model"] = json!("gpt-5.5");
+    fs::write(
+        &database_path,
+        serde_json::to_string_pretty(&database).expect("serialize account database"),
+    )
+    .expect("write legacy account state");
+
+    store
+        .switch_account(&oauth.id)
+        .expect("switch away from actual projection");
+
+    let persisted_stale = store
+        .list_accounts()
+        .expect("list accounts")
+        .into_iter()
+        .find(|account| account.id == stale.id)
+        .expect("find stale account");
+    assert_eq!(persisted_stale.default_model.as_deref(), Some("gpt-5.5"));
+}
+
+#[test]
+fn releasing_custom_instance_model_does_not_clear_shared_account_preference() {
+    let storage = tempdir().expect("storage tempdir");
+    let default_codex = tempdir().expect("default codex tempdir");
+    let custom_codex = tempdir().expect("custom codex tempdir");
+    let default_store = AccountStore::new(
+        storage.path().to_path_buf(),
+        default_codex.path().to_path_buf(),
+    );
+    let custom_store = AccountStore::new_for_instance(
+        storage.path().to_path_buf(),
+        custom_codex.path().to_path_buf(),
+        "instance-work",
+    );
+    let api = default_store
+        .add_api_key_account(
+            "sk-instance-release-123456".to_string(),
+            Some("https://release.example/v1".to_string()),
+            Some("Release Provider".to_string()),
+            None,
+            None,
+        )
+        .expect("add api account");
+    default_store
+        .switch_account(&api.id)
+        .expect("switch default instance to api account");
+    default_store
+        .update_api_key_default_model(&api.id, "gpt-5.6-sol".to_string())
+        .expect("set shared api model preference");
+    custom_store
+        .switch_account(&api.id)
+        .expect("apply api account to custom instance");
+
+    fs::write(
+        custom_codex.path().join("config.toml"),
+        "model = \"custom-manual-model\"\nnetwork_access = \"restricted\"\n",
+    )
+    .expect("write custom instance config");
+    assert!(custom_store
+        .release_current_api_key_default_model()
+        .expect("release custom instance model state"));
+
+    let persisted_api = default_store
+        .list_accounts()
+        .expect("list accounts")
+        .into_iter()
+        .find(|account| account.id == api.id)
+        .expect("find api account");
+    assert_eq!(persisted_api.default_model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(
+        default_store
+            .current_account()
+            .expect("read default current account")
+            .expect("default current account")
+            .id,
+        api.id
+    );
+}
+
+#[test]
+fn custom_instance_account_reference_follows_rename_and_delete() {
+    let storage = tempdir().expect("storage tempdir");
+    let default_codex = tempdir().expect("default codex tempdir");
+    let custom_codex = tempdir().expect("custom codex tempdir");
+    let default_store = AccountStore::new(
+        storage.path().to_path_buf(),
+        default_codex.path().to_path_buf(),
+    );
+    let custom_store = AccountStore::new_for_instance(
+        storage.path().to_path_buf(),
+        custom_codex.path().to_path_buf(),
+        "instance-work",
+    );
+    let oauth = default_store
+        .import_from_json(
+            &json!({
+                "email": "instance-reference@example.com",
+                "tokens": {
+                    "id_token": "reference-id-token",
+                    "access_token": "reference-access-token",
+                    "refresh_token": "reference-refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import oauth account")
+        .remove(0);
+    custom_store
+        .switch_account(&oauth.id)
+        .expect("switch custom instance");
+
+    let mut editable = serde_json::to_value(&oauth).expect("serialize oauth account");
+    editable["id"] = json!("renamed-instance-reference");
+    let renamed = default_store
+        .update_account_from_json(&oauth.id, &editable.to_string())
+        .expect("rename oauth account");
+    assert_eq!(
+        custom_store
+            .current_account()
+            .expect("read renamed custom account")
+            .expect("renamed custom account")
+            .id,
+        renamed.id
+    );
+
+    default_store
+        .delete_account(&renamed.id)
+        .expect("delete renamed account");
+    assert!(custom_store
+        .current_account()
+        .expect("read deleted custom account")
+        .is_none());
+}
+
+#[test]
 fn model_name_that_only_shares_gpt_5_6_prefix_does_not_enable_compatibility_config() {
     let (_storage, codex, store) = test_store();
     let account = store

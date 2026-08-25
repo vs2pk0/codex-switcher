@@ -25,6 +25,7 @@ Codex Switcher keeps multiple Codex sign-in profiles in one desktop app. It can 
 ## Highlights
 
 - **OAuth and API Key accounts**: add, edit, import, export, filter, sort, and switch between multiple accounts.
+- **Independent Codex instances (macOS)**: launch multiple official desktop instances with separate `CODEX_HOME` and Electron data directories, then target account switching, OpenCodex sync/restore, and configuration editing to a selected instance.
 - **Quota monitoring**: inspect account availability, subscription periods, standard quota windows, and optional GPT 5.3 Codex Spark quota windows.
 - **Session tools**: manage, repair, back up, and restore local Codex sessions.
 - **Usage analytics**: aggregate local token usage, cache activity, model distribution, and estimated cost with configurable pricing rules.
@@ -68,6 +69,14 @@ Then open Codex Switcher again. This command only removes the quarantine attribu
 2. Refresh the account to retrieve its latest quota or balance.
 3. Select an account and switch to it. Codex Switcher updates the local Codex authentication and configuration files.
 4. Use **Sessions**, **Usage**, or **API Service** for session recovery, statistics, and CLIProxyAPI management.
+
+### Multiple Codex desktop instances on macOS
+
+Open **Codex Instances**, create an instance, and optionally choose its Codex home, Electron data directory, workspace, and official app bundle. Empty data paths are generated under `~/.codex_switcher/instances`. The launcher verifies that the installed official app supports isolated desktop data before starting it. Permanently deleting a managed instance first stops it, then removes its Codex home, Electron data, managed profile, session trash, configuration backups, and manually-created session backups that can be attributed to that instance. Workspaces, the official app, the system-default instance, and other instances are protected. Directory-boundary checks reject shared or overlapping data paths before deletion.
+
+When more than one instance exists, switching an account and the OpenCodex sync/restore actions ask which instance to target. Sessions can be browsed and managed per instance, and the copy dialog can create an independent copy in another instance's session store. The Settings page also lets you select the instance whose Codex path and configuration files are displayed or edited.
+
+Default/full backups include sessions from the official default instance only. Managed multi-open instance data is deliberately excluded and must be backed up manually after selecting that instance on the Sessions page.
 
 ## Local data and privacy
 

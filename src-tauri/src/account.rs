@@ -5,14 +5,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
-use std::thread;
-use std::time::Duration;
 use toml_edit::{value, Document, Item};
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CodexTokens {
@@ -164,6 +158,7 @@ pub struct ApiKeyAccountUpdateInput {
 pub struct AccountStore {
     storage_dir: PathBuf,
     codex_home: PathBuf,
+    state_scope: Option<String>,
 }
 
 static ACCOUNT_DATABASE_MUTATION_LOCK: Mutex<()> = Mutex::new(());
@@ -189,6 +184,18 @@ struct AccountDatabase {
     current_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     managed_model_config_backup: Option<ManagedModelConfigBackup>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    instance_states: BTreeMap<String, AccountInstanceState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AccountInstanceState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    current_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_model_config_backup: Option<ManagedModelConfigBackup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_default_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -305,7 +312,104 @@ impl AccountStore {
         Self {
             storage_dir,
             codex_home,
+            state_scope: None,
         }
+    }
+
+    pub fn new_for_instance(storage_dir: PathBuf, codex_home: PathBuf, instance_id: &str) -> Self {
+        let state_scope =
+            normalize_optional(Some(instance_id)).filter(|instance_id| instance_id != "default");
+        Self {
+            storage_dir,
+            codex_home,
+            state_scope,
+        }
+    }
+
+    fn current_account_id<'a>(&self, database: &'a AccountDatabase) -> Option<&'a str> {
+        match self.state_scope.as_deref() {
+            Some(scope) => database
+                .instance_states
+                .get(scope)
+                .and_then(|state| state.current_account_id.as_deref()),
+            None => database.current_account_id.as_deref(),
+        }
+    }
+
+    fn set_current_account_id(&self, database: &mut AccountDatabase, account_id: Option<String>) {
+        match self.state_scope.as_deref() {
+            Some(scope) => {
+                database
+                    .instance_states
+                    .entry(scope.to_string())
+                    .or_default()
+                    .current_account_id = account_id;
+            }
+            None => database.current_account_id = account_id,
+        }
+    }
+
+    fn managed_model_config_backup<'a>(
+        &self,
+        database: &'a AccountDatabase,
+    ) -> Option<&'a ManagedModelConfigBackup> {
+        match self.state_scope.as_deref() {
+            Some(scope) => database
+                .instance_states
+                .get(scope)
+                .and_then(|state| state.managed_model_config_backup.as_ref()),
+            None => database.managed_model_config_backup.as_ref(),
+        }
+    }
+
+    fn set_managed_model_config_backup(
+        &self,
+        database: &mut AccountDatabase,
+        backup: Option<ManagedModelConfigBackup>,
+    ) {
+        match self.state_scope.as_deref() {
+            Some(scope) => {
+                database
+                    .instance_states
+                    .entry(scope.to_string())
+                    .or_default()
+                    .managed_model_config_backup = backup;
+            }
+            None => database.managed_model_config_backup = backup,
+        }
+    }
+
+    fn take_managed_model_config_backup(
+        &self,
+        database: &mut AccountDatabase,
+    ) -> Option<ManagedModelConfigBackup> {
+        match self.state_scope.as_deref() {
+            Some(scope) => database
+                .instance_states
+                .get_mut(scope)
+                .and_then(|state| state.managed_model_config_backup.take()),
+            None => database.managed_model_config_backup.take(),
+        }
+    }
+
+    fn managed_default_model<'a>(&self, database: &'a AccountDatabase) -> Option<&'a str> {
+        self.state_scope.as_deref().and_then(|scope| {
+            database
+                .instance_states
+                .get(scope)
+                .and_then(|state| state.managed_default_model.as_deref())
+        })
+    }
+
+    fn set_managed_default_model(&self, database: &mut AccountDatabase, model: Option<String>) {
+        let Some(scope) = self.state_scope.as_deref() else {
+            return;
+        };
+        database
+            .instance_states
+            .entry(scope.to_string())
+            .or_default()
+            .managed_default_model = model;
     }
 
     pub fn list_accounts(&self) -> Result<Vec<CodexAccount>, String> {
@@ -314,7 +418,7 @@ impl AccountStore {
 
     pub fn current_account(&self) -> Result<Option<CodexAccount>, String> {
         let database = self.read_database()?;
-        let Some(current_id) = database.current_account_id else {
+        let Some(current_id) = self.current_account_id(&database).map(str::to_string) else {
             return Ok(None);
         };
         Ok(database
@@ -333,15 +437,15 @@ impl AccountStore {
         let Some(account) = match_current_account_from_config(&database.accounts, &config) else {
             return Ok(None);
         };
-        if database
-            .managed_model_config_backup
-            .as_ref()
+        if self
+            .managed_model_config_backup(&database)
             .and_then(|backup| backup.managed_account_id.as_deref())
             != Some(account.id.as_str())
         {
-            database.managed_model_config_backup = None;
+            self.set_managed_model_config_backup(&mut database, None);
+            self.set_managed_default_model(&mut database, None);
         }
-        database.current_account_id = Some(account.id.clone());
+        self.set_current_account_id(&mut database, Some(account.id.clone()));
         self.write_database(&database)?;
         Ok(Some(account))
     }
@@ -414,7 +518,7 @@ impl AccountStore {
         let mut account = self.account_from_import_value(&payload)?;
         let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
-        let current_id = database.current_account_id.clone();
+        let current_id = self.current_account_id(&database).map(str::to_string);
         let existing = database
             .accounts
             .iter()
@@ -446,7 +550,7 @@ impl AccountStore {
         }
         upsert_account(&mut database.accounts, account.clone());
         if was_current {
-            database.current_account_id = Some(account.id.clone());
+            self.set_current_account_id(&mut database, Some(account.id.clone()));
             write_codex_auth_projection(
                 &self.codex_home,
                 &account,
@@ -490,7 +594,8 @@ impl AccountStore {
 
         apply_refreshed_oauth_tokens(account, tokens, now_timestamp());
         let updated = account.clone();
-        let projection = projection_account_after_oauth_update(&database, account_id);
+        let current_id = self.current_account_id(&database);
+        let projection = projection_account_after_oauth_update(&database, current_id, account_id);
         self.write_database(&database)?;
         if let Some(current) = projection {
             write_codex_auth_projection(
@@ -509,9 +614,8 @@ impl AccountStore {
     ) -> Result<Option<CodexAccount>, String> {
         let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
-        let is_current_source = database
-            .current_account_id
-            .as_deref()
+        let is_current_source = self
+            .current_account_id(&database)
             .and_then(|current_id| {
                 database
                     .accounts
@@ -822,8 +926,15 @@ impl AccountStore {
     pub fn release_current_api_key_default_model(&self) -> Result<bool, String> {
         let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
-        let mut changed = database.managed_model_config_backup.take().is_some();
-        if let Some(current_id) = database.current_account_id.as_deref() {
+        let mut changed = self
+            .take_managed_model_config_backup(&mut database)
+            .is_some();
+        if self.state_scope.is_some() {
+            if self.managed_default_model(&database).is_some() {
+                self.set_managed_default_model(&mut database, None);
+                changed = true;
+            }
+        } else if let Some(current_id) = self.current_account_id(&database).map(str::to_string) {
             if let Some(account) = database.accounts.iter_mut().find(|account| {
                 account.id == current_id && account.auth_mode.as_deref() == Some("apikey")
             }) {
@@ -1130,6 +1241,16 @@ impl AccountStore {
                     account.bound_oauth_account_id = Some(updated.id.clone());
                 }
             }
+            for state in database.instance_states.values_mut() {
+                if state.current_account_id.as_deref() == Some(old_account.id.as_str()) {
+                    state.current_account_id = Some(updated.id.clone());
+                }
+                if let Some(backup) = state.managed_model_config_backup.as_mut() {
+                    if backup.managed_account_id.as_deref() == Some(old_account.id.as_str()) {
+                        backup.managed_account_id = Some(updated.id.clone());
+                    }
+                }
+            }
         }
         database.accounts.retain(|account| account.id != account_id);
         database.accounts.insert(0, updated.clone());
@@ -1334,6 +1455,26 @@ impl AccountStore {
                 removed_bound_references = true;
             }
         }
+        for state in database.instance_states.values_mut() {
+            if state.current_account_id.as_deref() == Some(account_id) {
+                state.current_account_id = None;
+                state.managed_model_config_backup = None;
+                state.managed_default_model = None;
+            } else if state
+                .managed_model_config_backup
+                .as_ref()
+                .and_then(|backup| backup.managed_account_id.as_deref())
+                == Some(account_id)
+            {
+                state.managed_model_config_backup = None;
+                state.managed_default_model = None;
+            }
+        }
+        database.instance_states.retain(|_, state| {
+            state.current_account_id.is_some()
+                || state.managed_model_config_backup.is_some()
+                || state.managed_default_model.is_some()
+        });
         if removed_was_current {
             database.current_account_id = None;
         }
@@ -1360,41 +1501,62 @@ impl AccountStore {
     pub fn switch_account(&self, account_id: &str) -> Result<CodexAccount, String> {
         let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
-        if database
-            .managed_model_config_backup
+        let config_document = read_toml_document(&self.codex_home.join("config.toml"))?;
+        let stored_current_account_id = self.current_account_id(&database).map(str::to_string);
+        let current_config = self.read_current_codex_config()?;
+        let inferred_current_account_id =
+            match_current_account_from_config(&database.accounts, &current_config)
+                .map(|account| account.id.clone());
+        let current_account_id = inferred_current_account_id.or(stored_current_account_id);
+        let mut managed_model_config_backup = self.managed_model_config_backup(&database).cloned();
+        let mut scoped_managed_default_model = self
+            .managed_default_model(&database)
+            .and_then(|model| normalize_optional(Some(model)));
+        if managed_model_config_backup
             .as_ref()
             .and_then(|backup| backup.managed_account_id.as_deref())
-            != database.current_account_id.as_deref()
+            != current_account_id.as_deref()
         {
-            database.managed_model_config_backup = None;
+            managed_model_config_backup = None;
+            scoped_managed_default_model = None;
         }
-        let previous_account_index = database
-            .current_account_id
-            .as_deref()
-            .filter(|current_id| *current_id != account_id)
-            .and_then(|current_id| {
-                database
-                    .accounts
-                    .iter()
-                    .position(|account| account.id == current_id)
-            });
-        let config_document = read_toml_document(&self.codex_home.join("config.toml"))?;
-        let mut previous_default_model = previous_account_index
-            .and_then(|index| {
-                let account = &database.accounts[index];
-                (account.auth_mode.as_deref() == Some("apikey"))
-                    .then_some(account.default_model.as_deref())
-                    .flatten()
+        let previous_account_index = database.accounts.iter().position(|account| {
+            current_account_id.as_deref() == Some(account.id.as_str()) && account.id != account_id
+        });
+        let mut previous_default_model = if self.state_scope.is_some() {
+            scoped_managed_default_model.or_else(|| {
+                previous_account_index
+                    .and_then(|index| {
+                        let account = &database.accounts[index];
+                        (account.auth_mode.as_deref() == Some("apikey"))
+                            .then_some(account.default_model.as_deref())
+                            .flatten()
+                    })
+                    .and_then(|model| normalize_optional(Some(model)))
+                    .filter(|model| {
+                        config_document.get("model").and_then(Item::as_str) == Some(model.as_str())
+                    })
             })
-            .and_then(|model| normalize_optional(Some(model)));
+        } else {
+            previous_account_index
+                .and_then(|index| {
+                    let account = &database.accounts[index];
+                    (account.auth_mode.as_deref() == Some("apikey"))
+                        .then_some(account.default_model.as_deref())
+                        .flatten()
+                })
+                .and_then(|model| normalize_optional(Some(model)))
+        };
         if previous_default_model
             .as_deref()
             .is_some_and(|model| config_document.get("model").and_then(Item::as_str) != Some(model))
         {
-            if let Some(index) = previous_account_index {
-                database.accounts[index].default_model = None;
+            if self.state_scope.is_none() {
+                if let Some(index) = previous_account_index {
+                    database.accounts[index].default_model = None;
+                }
             }
-            database.managed_model_config_backup = None;
+            managed_model_config_backup = None;
             previous_default_model = None;
         }
         let target_index = database
@@ -1407,11 +1569,11 @@ impl AccountStore {
         .then(|| database.accounts[target_index].default_model.as_deref())
         .flatten()
         .and_then(|model| normalize_optional(Some(model)));
-        if target_default_model.is_some() && database.managed_model_config_backup.is_none() {
-            database.managed_model_config_backup =
+        if target_default_model.is_some() && managed_model_config_backup.is_none() {
+            managed_model_config_backup =
                 Some(capture_managed_model_config(&config_document, account_id));
         }
-        if let Some(backup) = database.managed_model_config_backup.as_mut() {
+        if let Some(backup) = managed_model_config_backup.as_mut() {
             backup.managed_account_id = Some(account_id.to_string());
             if is_gpt_5_6_model(target_default_model.as_deref()) {
                 let provider_id = api_key_provider_id(&database.accounts[target_index]);
@@ -1421,12 +1583,11 @@ impl AccountStore {
             }
         }
         let leaving_managed_model = target_default_model.is_none()
-            && (previous_default_model.is_some() || database.managed_model_config_backup.is_some());
+            && (previous_default_model.is_some() || managed_model_config_backup.is_some());
         let legacy_previous_provider_id = previous_account_index
             .filter(|_| is_gpt_5_6_model(previous_default_model.as_deref()))
             .map(|index| api_key_provider_id(&database.accounts[index]));
-        let restore_provider_ids = database
-            .managed_model_config_backup
+        let restore_provider_ids = managed_model_config_backup
             .as_ref()
             .map(|backup| backup.touched_provider_ids.clone())
             .filter(|ids| !ids.is_empty())
@@ -1439,7 +1600,7 @@ impl AccountStore {
                     && !is_gpt_5_6_model(target_default_model.as_deref())),
             expected_model: previous_default_model,
             restore_provider_ids,
-            backup: database.managed_model_config_backup.clone(),
+            backup: managed_model_config_backup.clone(),
         };
         database.accounts[target_index].last_used = now_timestamp();
         let switched = database.accounts[target_index].clone();
@@ -1451,23 +1612,13 @@ impl AccountStore {
             model_transition,
         )?;
         if target_default_model.is_none() {
-            database.managed_model_config_backup = None;
+            managed_model_config_backup = None;
         }
-        database.current_account_id = Some(switched.id.clone());
+        self.set_managed_model_config_backup(&mut database, managed_model_config_backup);
+        self.set_managed_default_model(&mut database, target_default_model);
+        self.set_current_account_id(&mut database, Some(switched.id.clone()));
         self.write_database(&database)?;
         Ok(switched)
-    }
-
-    pub fn restart_codex_app(&self) -> Result<String, String> {
-        restart_codex_app()
-    }
-
-    pub fn stop_codex_app(&self) -> Result<(), String> {
-        stop_codex_app()
-    }
-
-    pub fn start_codex_app(&self) -> Result<String, String> {
-        start_codex_app()
     }
 
     fn database_path(&self) -> PathBuf {
@@ -1661,6 +1812,7 @@ impl AccountStore {
     }
 }
 
+#[cfg(test)]
 pub fn codex_restart_commands() -> (
     &'static str,
     Vec<&'static str>,
@@ -1804,6 +1956,7 @@ foreach ($commandName in @('Codex.exe', 'codex.exe')) {
 exit 1
 "#;
 
+#[cfg(test)]
 pub fn codex_restart_delay_ms() -> u64 {
     #[cfg(target_os = "macos")]
     {
@@ -1815,48 +1968,6 @@ pub fn codex_restart_delay_ms() -> u64 {
         300
     }
 }
-
-fn restart_codex_app() -> Result<String, String> {
-    stop_codex_app()?;
-    start_codex_app()
-}
-
-fn stop_codex_app() -> Result<(), String> {
-    let (stop_program, stop_args, _, _) = codex_restart_commands();
-    let mut stop_command = Command::new(stop_program);
-    stop_command.args(stop_args);
-    hide_command_window(&mut stop_command);
-    let _ = stop_command
-        .status()
-        .map_err(|error| format!("关闭 ChatGPT/Codex 失败: {}", error))?;
-    thread::sleep(Duration::from_millis(codex_restart_delay_ms()));
-    Ok(())
-}
-
-fn start_codex_app() -> Result<String, String> {
-    let (_, _, start_program, start_args) = codex_restart_commands();
-    let mut start_command = Command::new(start_program);
-    start_command.args(start_args);
-    hide_command_window(&mut start_command);
-    let status = start_command
-        .status()
-        .map_err(|error| format!("启动 ChatGPT/Codex 失败: {}", error))?;
-    if !status.success() {
-        return Err(
-            "启动 ChatGPT/Codex 失败：未找到桌面应用，请确认已安装并可正常打开".to_string(),
-        );
-    }
-    Ok("已请求重启 ChatGPT/Codex".to_string())
-}
-
-#[cfg(windows)]
-fn hide_command_window(command: &mut Command) {
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(windows))]
-fn hide_command_window(_command: &mut Command) {}
 
 fn upsert_account(accounts: &mut Vec<CodexAccount>, account: CodexAccount) {
     if let Some(existing) = accounts.iter_mut().find(|item| item.id == account.id) {
@@ -1897,9 +2008,10 @@ fn apply_refreshed_oauth_tokens(
 
 fn projection_account_after_oauth_update(
     database: &AccountDatabase,
+    current_id: Option<&str>,
     oauth_account_id: &str,
 ) -> Option<CodexAccount> {
-    let current_id = database.current_account_id.as_deref()?;
+    let current_id = current_id?;
     let current = database
         .accounts
         .iter()

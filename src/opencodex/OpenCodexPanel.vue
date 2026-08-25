@@ -2,6 +2,8 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import InstancePickerModal from "../components/InstancePickerModal.vue";
+import type { CodexInstance } from "../services/instances";
 import {
   activateBundledOpenCodexEngine,
   deleteOpenCodexSwitcherAccount,
@@ -37,7 +39,7 @@ import type {
   OpenCodexVisionModelCatalog,
 } from "./types";
 
-const props = defineProps<{ active: boolean }>();
+const props = defineProps<{ active: boolean; instances: CodexInstance[] }>();
 const emit = defineEmits<{ (event: "accounts-refreshed"): void }>();
 
 const page = ref<OpenCodexPage>("console");
@@ -60,6 +62,8 @@ const visionLoading = ref(false);
 const visionSaving = ref(false);
 const visionSearch = ref("");
 const selectedVisionModels = ref<string[]>([]);
+const instancePickerVisible = ref(false);
+const pendingInstanceAction = ref<"sync" | "restore" | null>(null);
 let unlistenEvents: UnlistenFn | undefined;
 const answeredPortPrompts = new Set<string>();
 
@@ -129,7 +133,7 @@ async function refreshSnapshot(showError = true): Promise<void> {
   }
 }
 
-async function run(action: OpenCodexAction): Promise<void> {
+async function executeAction(action: OpenCodexAction, instanceId?: string): Promise<void> {
   if (busy.value) return;
   if (
     action === "restore"
@@ -172,13 +176,34 @@ async function run(action: OpenCodexAction): Promise<void> {
   }
   busy.value = true;
   try {
-    const started = await runOpenCodexAction(action, settings.value.port);
+    const started = await runOpenCodexAction(action, settings.value.port, instanceId);
     interactiveOperationId.value = started.interactive ? started.operationId : "";
     if (started.interactive) page.value = "console";
   } catch (error) {
     busy.value = false;
     Message.error(`OpenCodex 操作启动失败：${errorText(error)}`);
   }
+}
+
+async function run(action: OpenCodexAction): Promise<void> {
+  if (busy.value) return;
+  if (action === "sync" || action === "restore") {
+    if (props.instances.length <= 1) {
+      await executeAction(action, props.instances[0]?.id || "default");
+      return;
+    }
+    pendingInstanceAction.value = action;
+    instancePickerVisible.value = true;
+    return;
+  }
+  await executeAction(action);
+}
+
+async function confirmInstanceAction(instanceId: string): Promise<void> {
+  const action = pendingInstanceAction.value;
+  instancePickerVisible.value = false;
+  pendingInstanceAction.value = null;
+  if (action) await executeAction(action, instanceId);
 }
 
 async function submitCommandInput(): Promise<void> {
@@ -498,7 +523,12 @@ function toggleMigrationAccount(account: OpenCodexSwitcherAccountScan["accounts"
 watch(
   () => props.active,
   (active) => {
-    if (active) void refreshSnapshot(false);
+    if (active) {
+      void refreshSnapshot(false);
+      return;
+    }
+    instancePickerVisible.value = false;
+    pendingInstanceAction.value = null;
   },
 );
 
@@ -898,6 +928,17 @@ onUnmounted(() => unlistenEvents?.());
         </section>
       </template>
     </a-spin>
+
+    <InstancePickerModal
+      v-model:visible="instancePickerVisible"
+      :instances="instances"
+      :title="pendingInstanceAction === 'restore' ? '选择要恢复的实例' : '选择要同步的实例'"
+      :description="pendingInstanceAction === 'restore'
+        ? 'OpenCodex 将只恢复所选实例的原生 Codex 配置。'
+        : 'OpenCodex 将只向所选实例同步配置与模型。'"
+      :confirm-text="pendingInstanceAction === 'restore' ? '恢复所选实例' : '同步所选实例'"
+      @confirm="confirmInstanceAction"
+    />
   </section>
 </template>
 

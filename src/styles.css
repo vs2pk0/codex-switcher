@@ -1729,6 +1729,10 @@ textarea {
   overflow: auto;
 }
 
+.session-restore-target {
+  margin-bottom: 12px;
+}
+
 .session-restore-item {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -1983,6 +1987,71 @@ textarea {
 .session-workspace > .arco-spin > .arco-spin-children {
   width: 100%;
   min-width: 0;
+}
+
+.session-instance-context {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 440px);
+  align-items: center;
+  gap: 18px;
+  padding: 14px 18px;
+  border: 1px solid #cfe0f7;
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(239, 246, 255, 0.98), rgba(247, 252, 255, 0.96));
+}
+
+.session-instance-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.session-instance-copy span {
+  color: #5c7190;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.session-instance-copy strong {
+  color: #172b4d;
+  font-size: 16px;
+}
+
+.session-instance-copy small,
+.session-instance-option span {
+  overflow: hidden;
+  color: #74859d;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-instance-copy .session-instance-policy {
+  margin-top: 3px;
+  color: #4f6f9b;
+  line-height: 1.5;
+  overflow: visible;
+  white-space: normal;
+}
+
+.session-instance-select {
+  width: 100%;
+}
+
+.session-instance-select .arco-select-view {
+  min-height: 40px;
+  background: #fff;
+}
+
+.session-instance-option {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  padding: 3px 0;
+}
+
+.session-instance-option strong {
+  color: #263247;
 }
 
 .session-overview-grid {
@@ -2878,7 +2947,21 @@ textarea {
 }
 
 .session-copy-modal {
+  width: min(760px, calc(100vw - 32px)) !important;
   max-width: calc(100vw - 32px);
+}
+
+.session-copy-modal .arco-modal-body {
+  overflow-x: hidden;
+}
+
+.session-copy-modal-body,
+.session-copy-source,
+.session-copy-instance-field,
+.session-copy-directory-field,
+.session-copy-directory-input,
+.session-copy-target {
+  min-width: 0;
 }
 
 .session-copy-source {
@@ -2963,6 +3046,7 @@ textarea {
 
 .session-copy-select-popup .arco-select-option-content {
   min-width: 0;
+  max-width: 100%;
   white-space: normal;
 }
 
@@ -2973,6 +3057,7 @@ textarea {
 }
 
 .session-copy-target,
+.session-copy-instance-field,
 .session-copy-directory-field,
 .session-rename-modal-body label,
 .session-directory-field {
@@ -2980,6 +3065,7 @@ textarea {
   gap: 8px;
 }
 
+.session-copy-instance-field > span,
 .session-copy-directory-field > span {
   color: #64748b;
   font-size: 12px;
@@ -2992,7 +3078,23 @@ textarea {
   gap: 10px;
 }
 
+.session-copy-instance-field > .arco-select,
+.session-copy-directory-input > .arco-select {
+  width: 100%;
+  min-width: 0;
+}
+
+.session-copy-modal .arco-select-view-value,
+.session-copy-modal .arco-select-view-value > * {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .session-copy-selected-path {
+  max-width: 100%;
   color: #64748b;
   line-height: 1.5;
   overflow-wrap: anywhere;
@@ -3098,6 +3200,10 @@ textarea {
 }
 
 @media (max-width: 1050px) {
+  .session-instance-context {
+    grid-template-columns: 1fr;
+  }
+
   .session-overview-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -7710,6 +7816,10 @@ textarea {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
+  margin-bottom: 12px;
+}
+
+.settings-backup .arco-alert {
   margin-bottom: 12px;
 }
 
