@@ -730,18 +730,31 @@ fn process_rows() -> Vec<(u32, String)> {
         .collect()
 }
 
+fn launch_user_data_arg(instance: &StoredCodexInstance) -> Option<String> {
+    (instance.id != DEFAULT_INSTANCE_ID)
+        .then(|| format!("--user-data-dir={}", instance.electron_data))
+}
+
+fn process_matches_instance(
+    instance: &StoredCodexInstance,
+    executable: &str,
+    command: &str,
+) -> bool {
+    if !command.starts_with(executable) {
+        return false;
+    }
+    let user_data_arg = format!("--user-data-dir={}", instance.electron_data);
+    if instance.id == DEFAULT_INSTANCE_ID {
+        !command.contains("--user-data-dir=") || command.contains(&user_data_arg)
+    } else {
+        command.contains(&user_data_arg)
+    }
+}
+
 fn live_pid(instance: &StoredCodexInstance) -> Option<u32> {
     let executable = app_executable(instance).ok()?.to_string_lossy().to_string();
-    let user_data_arg = format!("--user-data-dir={}", instance.electron_data);
     process_rows().into_iter().find_map(|(pid, command)| {
-        if !command.starts_with(&executable) {
-            return None;
-        }
-        if instance.id == DEFAULT_INSTANCE_ID {
-            (!command.contains("--user-data-dir=")).then_some(pid)
-        } else {
-            command.contains(&user_data_arg).then_some(pid)
-        }
+        process_matches_instance(instance, &executable, &command).then_some(pid)
     })
 }
 
@@ -888,22 +901,9 @@ fn launch_stored(instance: &StoredCodexInstance) -> Result<CodexInstance, String
     }
     #[cfg(target_os = "macos")]
     {
-        if instance.id == DEFAULT_INSTANCE_ID {
-            let mut command = Command::new("/usr/bin/open");
-            command.args(["-b", "com.openai.codex"]);
-            if let Some(workspace) = instance.workspace.as_ref() {
-                command.arg(workspace);
-            }
-            let status = command
-                .status()
-                .map_err(|error| format!("启动默认 Codex 实例失败：{error}"))?;
-            if !status.success() {
-                return Err("启动默认 Codex 实例失败，请确认已安装官方 App".to_string());
-            }
-            thread::sleep(Duration::from_millis(400));
-            return resolve_instance(DEFAULT_INSTANCE_ID);
+        if instance.id != DEFAULT_INSTANCE_ID {
+            ensure_isolated_desktop_data_supported(&instance.app_path)?;
         }
-        ensure_isolated_desktop_data_supported(&instance.app_path)?;
         fs::create_dir_all(&instance.codex_home)
             .map_err(|error| format!("创建 Codex Home 失败：{error}"))?;
         fs::create_dir_all(&instance.electron_data)
@@ -919,8 +919,10 @@ fn launch_stored(instance: &StoredCodexInstance) -> Result<CodexInstance, String
             .try_clone()
             .map_err(|error| format!("复制实例日志句柄失败：{error}"))?;
         let mut command = Command::new(app_executable(instance)?);
+        if let Some(user_data_arg) = launch_user_data_arg(instance) {
+            command.arg(user_data_arg);
+        }
         command
-            .arg(format!("--user-data-dir={}", instance.electron_data))
             .env("CODEX_HOME", &instance.codex_home)
             .env("CODEX_ELECTRON_USER_DATA_PATH", &instance.electron_data)
             .stdin(Stdio::null())
@@ -1075,6 +1077,57 @@ mod tests {
     #[test]
     fn generated_instance_ids_are_not_default() {
         assert_ne!(make_instance_id(), DEFAULT_INSTANCE_ID);
+    }
+
+    #[test]
+    fn process_matching_keeps_default_and_managed_instances_isolated() {
+        let executable = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
+        let default = default_instance();
+        let managed = StoredCodexInstance {
+            id: "instance-work".to_string(),
+            name: "work".to_string(),
+            codex_home: "/tmp/work-codex-home".to_string(),
+            electron_data: "/tmp/work-electron-data".to_string(),
+            app_path: default.app_path.clone(),
+            workspace: None,
+            retired_data_paths: Vec::new(),
+            created_at: 1,
+        };
+        let legacy_default_command = executable.to_string();
+        let explicit_default_command =
+            format!("{executable} --user-data-dir={}", default.electron_data);
+        let managed_command = format!("{executable} --user-data-dir={}", managed.electron_data);
+
+        assert!(process_matches_instance(
+            &default,
+            executable,
+            &legacy_default_command
+        ));
+        assert!(process_matches_instance(
+            &default,
+            executable,
+            &explicit_default_command
+        ));
+        assert!(!process_matches_instance(
+            &default,
+            executable,
+            &managed_command
+        ));
+        assert!(process_matches_instance(
+            &managed,
+            executable,
+            &managed_command
+        ));
+        assert!(!process_matches_instance(
+            &managed,
+            executable,
+            &explicit_default_command
+        ));
+        assert_eq!(launch_user_data_arg(&default), None);
+        assert_eq!(
+            launch_user_data_arg(&managed),
+            Some(format!("--user-data-dir={}", managed.electron_data))
+        );
     }
 
     #[test]
