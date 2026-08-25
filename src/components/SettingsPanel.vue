@@ -5,6 +5,8 @@ import type {
   CodexSwitcherPaths,
   CodexSwitcherSettings,
 } from "../services/codex";
+import type { CodexInstance } from "../services/instances";
+import { instanceDisplayName } from "../services/instances";
 import { languageOptions, setLanguage, t } from "../i18n";
 
 const props = defineProps<{
@@ -16,6 +18,8 @@ const props = defineProps<{
   backupLoading: boolean;
   backupWorking: boolean;
   backupProgress: number;
+  instances: CodexInstance[];
+  selectedInstanceId: string;
 }>();
 
 const emit = defineEmits<{
@@ -29,6 +33,7 @@ const emit = defineEmits<{
   (event: "restore-backup", backup: CodexSwitcherBackupFile): void;
   (event: "delete-backup", backup: CodexSwitcherBackupFile): void;
   (event: "open-push-settings"): void;
+  (event: "select-instance", instanceId: string): void;
 }>();
 
 function openPath(path?: string): void {
@@ -65,6 +70,24 @@ function changeLanguage(value: unknown): void {
 <template>
   <section class="settings-panel">
     <a-spin :loading="loading" dot>
+      <a-card :bordered="false" class="settings-card instance-settings-card">
+        <div class="instance-settings-row">
+          <div>
+            <strong>{{ t("当前设置实例") }}</strong>
+            <p>{{ t("下方 Codex 目录和配置文件操作只作用于所选实例。") }}</p>
+          </div>
+          <a-select
+            :model-value="selectedInstanceId"
+            class="instance-settings-select"
+            popup-container="body"
+            @change="(value: unknown) => typeof value === 'string' && emit('select-instance', value)"
+          >
+            <a-option v-for="instance in instances" :key="instance.id" :value="instance.id">
+              {{ instanceDisplayName(instance) }}{{ instance.running ? " · 运行中" : "" }}
+            </a-option>
+          </a-select>
+        </div>
+      </a-card>
       <div class="settings-grid">
         <a-card :title="t('数据')" :bordered="false" class="settings-card settings-data">
           <div class="path-row">
@@ -235,6 +258,9 @@ function changeLanguage(value: unknown): void {
           </div>
         </a-card>
         <a-card :title="t('备份')" :bordered="false" class="settings-card settings-backup">
+          <a-alert type="info">
+            {{ t("默认完整备份只包含账号、设置等工具数据和官方默认实例的会话，不会备份任何多开实例。多开实例请在“会话管理”中切换实例后手动备份。") }}
+          </a-alert>
           <div class="backup-actions">
             <a-button type="primary" :loading="backupWorking" @click="emit('export-backup')">
               <template #icon><icon-download /></template>
@@ -283,7 +309,7 @@ function changeLanguage(value: unknown): void {
               </div>
               <div class="backup-empty-copy">
                 <strong>{{ t("还没有备份") }}</strong>
-                <span>{{ t("点击“手动备份”会把账号、设置、统计缓存、费用规则与所有 Codex 会话记录打包成 ZIP。") }}</span>
+                <span>{{ t("点击“手动备份”会把账号、设置、统计缓存、费用规则与官方默认实例的 Codex 会话记录打包成 ZIP；多开实例不会包含在内。") }}</span>
                 <code>{{ appPaths?.backupDir || "~/.codex_switcher/backup" }}</code>
               </div>
             </div>
@@ -293,3 +319,16 @@ function changeLanguage(value: unknown): void {
     </a-spin>
   </section>
 </template>
+
+<style scoped>
+.instance-settings-card { margin-bottom: 16px; }
+.instance-settings-row { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.instance-settings-row > div { min-width: 0; }
+.instance-settings-row strong { color: #172033; font-size: 16px; }
+.instance-settings-row p { margin: 5px 0 0; color: #718096; }
+.instance-settings-select { width: min(420px, 46vw); }
+@media (max-width: 760px) {
+  .instance-settings-row { align-items: stretch; flex-direction: column; gap: 12px; }
+  .instance-settings-select { width: 100%; }
+}
+</style>

@@ -35,10 +35,18 @@ pub(crate) async fn ensure_fresh_access_token(
     account_id: &str,
     reason: &str,
 ) -> Result<CodexAccount, String> {
-    let _guard = TOKEN_REFRESH_LOCK.lock().await;
     let store = AccountStore::default();
+    ensure_fresh_access_token_for_store(&store, account_id, reason).await
+}
+
+pub(crate) async fn ensure_fresh_access_token_for_store(
+    store: &AccountStore,
+    account_id: &str,
+    reason: &str,
+) -> Result<CodexAccount, String> {
+    let _guard = TOKEN_REFRESH_LOCK.lock().await;
     let _ = store.sync_oauth_account_from_current_auth(account_id);
-    let mut account = load_oauth_account(&store, account_id)?;
+    let mut account = load_oauth_account(store, account_id)?;
     let now = now_timestamp();
     if has_stale_refresh_token_error(&account, now) {
         account = store.clear_account_refresh_token_error(account_id)?;
@@ -50,7 +58,7 @@ pub(crate) async fn ensure_fresh_access_token(
     if access_token_usable && !allow_attempt(&account.id) {
         return Ok(account);
     }
-    match refresh_account(&store, account, reason).await {
+    match refresh_account(store, account, reason).await {
         Ok(updated) => {
             clear_attempt_backoff(account_id);
             Ok(updated)
@@ -60,7 +68,7 @@ pub(crate) async fn ensure_fresh_access_token(
             eprintln!(
                 "Codex Token 提前续期失败，继续使用尚未过期的 access_token: account_id={account_id}, error={error}"
             );
-            load_oauth_account(&store, account_id)
+            load_oauth_account(store, account_id)
         }
         Err(error) => Err(error),
     }

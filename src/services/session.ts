@@ -178,61 +178,75 @@ export interface CodexSessionVisibilityRepairOptions {
 export function listSessionsAcrossInstances(options: {
   titleQuery?: string;
   contentQuery?: string;
+  instanceId?: string;
 } = {}): Promise<CodexSessionRecord[]> {
   return invoke("codex_list_sessions_across_instances", {
     titleQuery: options.titleQuery?.trim() || null,
     contentQuery: options.contentQuery?.trim() || null,
+    instanceId: options.instanceId || "default",
   });
 }
 
 export function getSessionTokenStatsAcrossInstances(
   sessionIds: string[],
+  instanceId = "default",
 ): Promise<CodexSessionTokenStats[]> {
-  return invoke("codex_get_session_token_stats_across_instances", { sessionIds });
+  return invoke("codex_get_session_token_stats_across_instances", { sessionIds, instanceId });
 }
 
 export function moveSessionsToTrashAcrossInstances(
   sessionIds: string[],
+  instanceId = "default",
 ): Promise<CodexSessionTrashSummary> {
-  return invoke("codex_move_sessions_to_trash_across_instances", { sessionIds });
+  return invoke("codex_move_sessions_to_trash_across_instances", { sessionIds, instanceId });
 }
 
-export function listTrashedSessionsAcrossInstances(): Promise<CodexTrashedSessionRecord[]> {
-  return invoke("codex_list_trashed_sessions_across_instances");
+export function listTrashedSessionsAcrossInstances(
+  instanceId = "default",
+): Promise<CodexTrashedSessionRecord[]> {
+  return invoke("codex_list_trashed_sessions_across_instances", { instanceId });
 }
 
 export function restoreSessionsFromTrashAcrossInstances(
   sessionIds: string[],
+  instanceId = "default",
 ): Promise<CodexSessionTrashSummary> {
-  return invoke("codex_restore_sessions_from_trash_across_instances", { sessionIds });
+  return invoke("codex_restore_sessions_from_trash_across_instances", { sessionIds, instanceId });
 }
 
 export function copySessionHistoryAcrossInstances(
   sourceSessionId: string,
   copySuffix: string,
   targetProjectPath: string,
+  sourceInstanceId = "default",
+  targetInstanceId = "default",
 ): Promise<CodexSessionMutationResult> {
   return invoke("codex_copy_session_history_across_instances", {
     sourceSessionId,
     copySuffix,
     targetProjectPath,
+    sourceInstanceId,
+    targetInstanceId,
   });
 }
 
 export function renameSessionAcrossInstances(
   sessionId: string,
   title: string,
+  instanceId = "default",
 ): Promise<CodexSessionMutationResult> {
-  return invoke("codex_rename_session_across_instances", { sessionId, title });
+  return invoke("codex_rename_session_across_instances", { sessionId, title, instanceId });
 }
 
 export function updateSessionWorkingDirectoryAcrossInstances(
   sessionId: string,
   projectPath: string,
+  instanceId = "default",
 ): Promise<CodexSessionMutationResult> {
   return invoke("codex_update_session_working_directory_across_instances", {
     sessionId,
     projectPath,
+    instanceId,
   });
 }
 
@@ -241,37 +255,42 @@ export function listSessionContent(
   cursor: number | null = null,
   limit = 20,
   direction: "asc" | "desc" = "asc",
+  instanceId = "default",
 ): Promise<CodexSessionContentPage> {
-  return invoke("codex_list_session_content", { sessionId, cursor, limit, direction });
+  return invoke("codex_list_session_content", { sessionId, cursor, limit, direction, instanceId });
 }
 
 export function getSessionAsset(
   sessionId: string,
   assetId: string,
+  instanceId = "default",
 ): Promise<CodexSessionAsset> {
-  return invoke("codex_get_session_asset", { sessionId, assetId });
+  return invoke("codex_get_session_asset", { sessionId, assetId, instanceId });
 }
 
 export function deleteSessionTurn(
   sessionId: string,
   turnId: string,
+  instanceId = "default",
 ): Promise<CodexSessionTurnMutationResult> {
-  return invoke("codex_delete_session_turn", { sessionId, turnId });
+  return invoke("codex_delete_session_turn", { sessionId, turnId, instanceId });
 }
 
 export function deleteSessionMessages(
   sessionId: string,
   turnId: string,
   messageIds: string[],
+  instanceId = "default",
 ): Promise<CodexSessionMessageMutationResult> {
-  return invoke("codex_delete_session_messages", { sessionId, turnId, messageIds });
+  return invoke("codex_delete_session_messages", { sessionId, turnId, messageIds, instanceId });
 }
 
 export function restoreSessionTurnBackup(
   sessionId: string,
   backupId: string,
+  instanceId = "default",
 ): Promise<CodexSessionMutationResult> {
-  return invoke("codex_restore_session_turn_backup", { sessionId, backupId });
+  return invoke("codex_restore_session_turn_backup", { sessionId, backupId, instanceId });
 }
 
 export function repairSessionVisibilityAcrossInstances(

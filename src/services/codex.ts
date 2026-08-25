@@ -87,6 +87,9 @@ export interface CodexSwitcherBackupFile {
   path: string;
   createdAt: string;
   sizeBytes: number;
+  sourceInstanceId?: string | null;
+  sourceInstanceName?: string | null;
+  manual: boolean;
 }
 
 export interface CodexSwitcherBackupProgressEvent {
@@ -312,16 +315,21 @@ export function deleteCodexAccount(accountId: string): Promise<void> {
   return invoke("delete_codex_account", { accountId });
 }
 
-export function switchCodexAccount(accountId: string): Promise<CodexAccountSwitchResult> {
-  return invoke("switch_codex_account", { accountId });
+export function switchCodexAccount(
+  accountId: string,
+  instanceId = "default",
+): Promise<CodexAccountSwitchResult> {
+  return invoke("switch_codex_account", { accountId, instanceId });
 }
 
-export function restartCodexApp(): Promise<string> {
-  return invoke("restart_codex_app");
+export function restartCodexApp(instanceId = "default"): Promise<string> {
+  return invoke("restart_codex_app", { instanceId });
 }
 
-export function repairCodexSessionModelCompatibility(): Promise<CodexSessionModelCompatibilityRepairSummary> {
-  return invoke("repair_codex_session_model_compatibility");
+export function repairCodexSessionModelCompatibility(
+  instanceId = "default",
+): Promise<CodexSessionModelCompatibilityRepairSummary> {
+  return invoke("repair_codex_session_model_compatibility", { instanceId });
 }
 
 export function getCodexSwitcherSettings(): Promise<CodexSwitcherSettings> {
@@ -334,14 +342,15 @@ export function updateCodexSwitcherSettings(
   return invoke("update_codex_switcher_settings", { settings });
 }
 
-export function getCodexSwitcherPaths(): Promise<CodexSwitcherPaths> {
-  return invoke("get_codex_switcher_paths");
+export function getCodexSwitcherPaths(instanceId = "default"): Promise<CodexSwitcherPaths> {
+  return invoke("get_codex_switcher_paths", { instanceId });
 }
 
 export function readCodexConfigFile(
   fileKind: CodexConfigFileKind,
+  instanceId = "default",
 ): Promise<CodexConfigFileContent> {
-  return invoke("read_codex_config_file", { fileKind });
+  return invoke("read_codex_config_file", { fileKind, instanceId });
 }
 
 export function formatCodexConfigFile(
@@ -354,8 +363,9 @@ export function formatCodexConfigFile(
 export function writeCodexConfigFile(
   fileKind: CodexConfigFileKind,
   content: string,
+  instanceId = "default",
 ): Promise<CodexConfigFileContent> {
-  return invoke("write_codex_config_file", { fileKind, content });
+  return invoke("write_codex_config_file", { fileKind, content, instanceId });
 }
 
 export function exportCodexSwitcherBackup(): Promise<CodexSwitcherBackupFile> {
@@ -366,8 +376,11 @@ export function startCodexSwitcherBackup(taskId: string): Promise<string> {
   return invoke("start_codex_switcher_backup", { taskId });
 }
 
-export function startCodexSwitcherSessionBackup(taskId: string): Promise<string> {
-  return invoke("start_codex_switcher_session_backup", { taskId });
+export function startCodexSwitcherSessionBackup(
+  taskId: string,
+  instanceId = "default",
+): Promise<string> {
+  return invoke("start_codex_switcher_session_backup", { taskId, instanceId });
 }
 
 export function listCodexSwitcherBackups(): Promise<CodexSwitcherBackupFile[]> {
@@ -382,8 +395,11 @@ export function restoreCodexSwitcherBackup(backupPath: string): Promise<CodexAcc
   return invoke("restore_codex_switcher_backup", { backupPath });
 }
 
-export function restoreCodexSwitcherSessionBackup(backupPath: string): Promise<CodexSessionRestoreResult> {
-  return invoke("restore_codex_switcher_session_backup", { backupPath });
+export function restoreCodexSwitcherSessionBackup(
+  backupPath: string,
+  instanceId = "default",
+): Promise<CodexSessionRestoreResult> {
+  return invoke("restore_codex_switcher_session_backup", { backupPath, instanceId });
 }
 
 export function deleteCodexSwitcherBackup(backupPath: string): Promise<void> {
@@ -406,10 +422,10 @@ export function refreshAllCodexQuotas(): Promise<number> {
   return invoke("refresh_all_codex_quotas");
 }
 
-export function resetCodexConfigToml(): Promise<CodexConfigFileContent> {
-  return invoke("reset_codex_config_toml");
+export function resetCodexConfigToml(instanceId = "default"): Promise<CodexConfigFileContent> {
+  return invoke("reset_codex_config_toml", { instanceId });
 }
 
-export function deleteCodexConfigToml(): Promise<boolean> {
-  return invoke("delete_codex_config_toml");
+export function deleteCodexConfigToml(instanceId = "default"): Promise<boolean> {
+  return invoke("delete_codex_config_toml", { instanceId });
 }

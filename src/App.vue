@@ -23,6 +23,7 @@ import AppHeader from "./components/AppHeader.vue";
 import BackupProgressModal from "./components/BackupProgressModal.vue";
 import BadgeStyleModal from "./components/BadgeStyleModal.vue";
 import CodexConfigEditorModal from "./components/CodexConfigEditorModal.vue";
+import CodexInstancesPanel from "./components/CodexInstancesPanel.vue";
 import EditAccountModal from "./components/EditAccountModal.vue";
 import ExportJsonModal from "./components/ExportJsonModal.vue";
 import OAuthBindingModal from "./components/OAuthBindingModal.vue";
@@ -39,6 +40,7 @@ import SessionRepairModal from "./components/SessionRepairModal.vue";
 import SessionRenameModal from "./components/SessionRenameModal.vue";
 import SessionRestoreModal from "./components/SessionRestoreModal.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
+import InstancePickerModal from "./components/InstancePickerModal.vue";
 import SortEditorModal from "./components/SortEditorModal.vue";
 import { defaultBadgeStyles } from "./constants/badgeStyles";
 import {
@@ -172,6 +174,11 @@ import {
 } from "./services/reset";
 import type { CodexAccount, CodexResetCredit } from "./types/codex";
 import type { ActiveView, SessionGroup } from "./types/ui";
+import {
+  instanceDisplayName,
+  listCodexInstances,
+  type CodexInstance,
+} from "./services/instances";
 
 const ApiServicePanel = defineAsyncComponent(() => import("./components/ApiServicePanel.vue"));
 const UsagePanel = defineAsyncComponent(() => import("./components/UsagePanel.vue"));
@@ -196,6 +203,11 @@ const openCodexPanelMounted = ref(false);
 const apiServiceAutoUpdateEvent = ref<ApiServiceAutoUpdateEvent | null>(null);
 const apiServiceAccountIds = ref<Set<string>>(new Set());
 const openCodexAccountIds = ref<Set<string>>(new Set());
+const codexInstances = ref<CodexInstance[]>([]);
+const accountInstancePickerVisible = ref(false);
+const pendingSwitchAccount = ref<CodexAccount | null>(null);
+const settingsInstanceId = ref("default");
+const sessionInstanceId = ref("default");
 const accounts = ref<CodexAccount[]>([]);
 const currentAccount = ref<CodexAccount | null>(null);
 const loading = ref(false);
@@ -268,7 +280,7 @@ const backupProgressMessage = ref("");
 const backupProgressTitle = ref("正在备份");
 const backupProgressStatus = ref<"running" | "completed" | "failed">("running");
 const backupButtonText = computed(() =>
-  backupWorking.value ? t(`备份 ${Math.round(backupProgress.value)}%`) : t("备份"),
+  backupWorking.value ? t(`备份 ${Math.round(backupProgress.value)}%`) : t("手动备份"),
 );
 const sessionRestoreVisible = ref(false);
 const expandedLayout = ref(false);
@@ -592,6 +604,12 @@ const sortDraftAccounts = computed(() => {
     .filter((account): account is CodexAccount => Boolean(account));
 });
 const selectedSessionIdList = computed(() => [...selectedSessionIds.value]);
+const selectedSessionInstanceName = computed(() => {
+  const instance = codexInstances.value.find(
+    (item) => item.id === sessionInstanceId.value,
+  );
+  return instance ? instanceDisplayName(instance) : t("系统默认实例");
+});
 const activeSessionIds = computed(() =>
   sessionTrashMode.value ? trashedSessions.value.map((session) => session.id) : sessions.value.map((session) => session.id),
 );
@@ -629,10 +647,7 @@ const sessionCopyDirectories = computed(() =>
       name: group.projectName,
       path: group.sessions.find((session) => session.projectPath)?.projectPath || "",
     }))
-    .filter(
-      (directory) =>
-        directory.path && directory.path !== sessionCopySource.value?.projectPath,
-    ),
+    .filter((directory) => directory.path),
 );
 const selectedAccountIdList = computed(() => [...selectedAccountIds.value]);
 const effectiveRepairSessionScope = computed(() =>
@@ -1987,7 +2002,9 @@ async function loadSettings(options: { includeStorage?: boolean } = {}): Promise
   try {
     const [nextSettings, nextPaths, nextBackups] = await Promise.all([
       getCodexSwitcherSettings(),
-      options.includeStorage === false ? Promise.resolve(null) : getCodexSwitcherPaths(),
+      options.includeStorage === false
+        ? Promise.resolve(null)
+        : getCodexSwitcherPaths(settingsInstanceId.value),
       options.includeStorage === false ? Promise.resolve(null) : listCodexSwitcherBackups(),
     ]);
     Object.assign(settings, {
@@ -2523,25 +2540,91 @@ async function handleRefreshEveryQuota(): Promise<void> {
 }
 
 async function handleSwitch(account: CodexAccount): Promise<void> {
+  if (!codexInstances.value.length) await loadCodexInstances();
+  pendingSwitchAccount.value = account;
+  if (codexInstances.value.length <= 1) {
+    await performAccountSwitch(codexInstances.value[0]?.id || "default");
+    return;
+  }
+  accountInstancePickerVisible.value = true;
+}
+
+async function performAccountSwitch(instanceId: string): Promise<void> {
+  const account = pendingSwitchAccount.value;
+  if (!account) return;
+  accountInstancePickerVisible.value = false;
   if (switchingId.value) return;
   switchingId.value = account.id;
   try {
-    const result = await switchCodexAccount(account.id);
+    const targetInstance = codexInstances.value.find((instance) => instance.id === instanceId);
+    const result = await switchCodexAccount(account.id, instanceId);
     currentAccount.value = result.account;
-    await loadAccounts();
+    await Promise.all([loadAccounts(), loadCodexInstances()]);
     if (result.warning) {
       Message.warning(result.warning);
     } else {
       const synchronized = result.synchronizedSessionProviderCount
         ? `，同步 ${result.synchronizedSessionProviderCount} 条已有会话`
         : "";
-      Message.success(`已切换到 ${displayName(account)}${synchronized}，已重启 ChatGPT/Codex`);
+      Message.success(`已将 ${targetInstance?.name || "Codex 实例"} 切换到 ${displayName(account)}${synchronized}，并完成重启`);
     }
   } catch (error) {
     Message.error(`切换失败：${errorText(error)}`);
   } finally {
     switchingId.value = "";
+    pendingSwitchAccount.value = null;
   }
+}
+
+async function loadCodexInstances(): Promise<void> {
+  try {
+    codexInstances.value = await listCodexInstances();
+    if (!codexInstances.value.some((instance) => instance.id === settingsInstanceId.value)) {
+      settingsInstanceId.value = "default";
+    }
+    if (!codexInstances.value.some((instance) => instance.id === sessionInstanceId.value)) {
+      sessionInstanceId.value = "default";
+      if (activeView.value === "sessions") void loadSessions();
+    }
+  } catch (error) {
+    Message.warning(`读取 Codex 实例失败：${errorText(error)}`);
+  }
+}
+
+function handleInstancesUpdated(instances: CodexInstance[]): void {
+  codexInstances.value = instances;
+  if (!instances.some((instance) => instance.id === settingsInstanceId.value)) {
+    settingsInstanceId.value = "default";
+    if (activeView.value === "settings") void loadSettings({ includeStorage: true });
+  }
+  if (!instances.some((instance) => instance.id === sessionInstanceId.value)) {
+    sessionInstanceId.value = "default";
+    if (activeView.value === "sessions") void loadSessions();
+  }
+}
+
+async function handleSettingsInstanceChange(instanceId: string): Promise<void> {
+  settingsInstanceId.value = instanceId;
+  await loadSettings({ includeStorage: true });
+}
+
+async function handleSessionInstanceChange(instanceId: string): Promise<void> {
+  if (instanceId === sessionInstanceId.value) return;
+  if (backupWorking.value || sessionRepairing.value || sessionModelRepairing.value) {
+    Message.warning(t("当前会话操作完成后再切换实例"));
+    return;
+  }
+  sessionContentVisible.value = false;
+  sessionContentTarget.value = null;
+  sessionCopyVisible.value = false;
+  sessionCopySource.value = null;
+  sessionRenameVisible.value = false;
+  sessionRenameTarget.value = null;
+  sessionDirectoryVisible.value = false;
+  sessionDirectoryTarget.value = null;
+  sessionRestoreVisible.value = false;
+  sessionInstanceId.value = instanceId;
+  await loadSessions();
 }
 
 function confirmDelete(account: CodexAccount): void {
@@ -3479,11 +3562,16 @@ async function loadSessions(options: { silent?: boolean } = {}): Promise<void> {
   const trashMode = sessionTrashMode.value;
   const titleQuery = sessionSearch.titleQuery;
   const contentQuery = sessionSearch.contentQuery;
+  const instanceId = sessionInstanceId.value;
   sessionLoading.value = true;
   try {
     if (trashMode) {
-      const nextTrashedSessions = await listTrashedSessionsAcrossInstances();
-      if (requestSequence !== sessionLoadSequence || trashMode !== sessionTrashMode.value) return;
+      const nextTrashedSessions = await listTrashedSessionsAcrossInstances(instanceId);
+      if (
+        requestSequence !== sessionLoadSequence
+        || trashMode !== sessionTrashMode.value
+        || instanceId !== sessionInstanceId.value
+      ) return;
       trashedSessions.value = nextTrashedSessions;
       sessions.value = [];
       sessionStats.value = [];
@@ -3491,8 +3579,13 @@ async function loadSessions(options: { silent?: boolean } = {}): Promise<void> {
       const nextSessions = await listSessionsAcrossInstances({
         titleQuery,
         contentQuery,
+        instanceId,
       });
-      if (requestSequence !== sessionLoadSequence || trashMode !== sessionTrashMode.value) return;
+      if (
+        requestSequence !== sessionLoadSequence
+        || trashMode !== sessionTrashMode.value
+        || instanceId !== sessionInstanceId.value
+      ) return;
       sessions.value = nextSessions;
       trashedSessions.value = [];
       sessionStats.value = nextSessions.map((session) => ({
@@ -3584,19 +3677,31 @@ function handleSessionContentUpdated(): void {
   void loadSessions({ silent: true });
 }
 
-async function handleCopySession(projectPath: string): Promise<void> {
+async function handleCopySession(projectPath: string, targetInstanceId: string): Promise<void> {
   const source = sessionCopySource.value;
   if (!source || sessionCopySaving.value) return;
   sessionCopySaving.value = true;
   try {
-    const result = await copySessionHistoryAcrossInstances(source.id, t("副本"), projectPath);
+    const result = await copySessionHistoryAcrossInstances(
+      source.id,
+      t("副本"),
+      projectPath,
+      sessionInstanceId.value,
+      targetInstanceId,
+    );
     sessionCopyVisible.value = false;
     sessionCopySource.value = null;
-    Message.success(t("已复制到目标目录，并作为独立会话与现有会话共存，Codex 已自动重启"));
+    const targetName = codexInstances.value.find(
+      (instance) => instance.id === targetInstanceId,
+    )?.name || t("目标实例");
+    Message.success(`${t("会话已复制到")}“${targetName}”`);
     if (result.warnings.length) {
       Message.warning(`${t("会话已复制，但部分索引同步失败")}：${result.warnings.join("；")}`);
     }
-    await loadSessions();
+    await Promise.all([
+      targetInstanceId === sessionInstanceId.value ? loadSessions() : Promise.resolve(),
+      loadCodexInstances(),
+    ]);
   } catch (error) {
     Message.error(`${t("复制会话失败")}：${errorText(error)}`);
   } finally {
@@ -3614,7 +3719,7 @@ async function handleRenameSession(title: string): Promise<void> {
   if (!session || sessionRenameSaving.value) return;
   sessionRenameSaving.value = true;
   try {
-    const result = await renameSessionAcrossInstances(session.id, title);
+    const result = await renameSessionAcrossInstances(session.id, title, sessionInstanceId.value);
     sessionRenameVisible.value = false;
     sessionRenameTarget.value = null;
     Message.success(t("会话名称已修改"));
@@ -3639,7 +3744,11 @@ async function handleSessionDirectorySave(projectPath: string): Promise<void> {
   if (!session || sessionDirectorySaving.value) return;
   sessionDirectorySaving.value = true;
   try {
-    const result = await updateSessionWorkingDirectoryAcrossInstances(session.id, projectPath);
+    const result = await updateSessionWorkingDirectoryAcrossInstances(
+      session.id,
+      projectPath,
+      sessionInstanceId.value,
+    );
     sessionDirectoryVisible.value = false;
     sessionDirectoryTarget.value = null;
     Message.success(t("工作目录已修改"));
@@ -3667,8 +3776,14 @@ async function handleRepairSessions(): Promise<void> {
     ]);
     repairInstances.value = instances.instances;
     repairProviders.value = providers.providers;
-    repairTargetInstanceId.value =
-      instances.defaultInstanceId || instances.instances[0]?.id || "__default__";
+    const requestedInstanceId = sessionInstanceId.value === "default"
+      ? instances.defaultInstanceId
+      : sessionInstanceId.value;
+    repairTargetInstanceId.value = instances.instances.some(
+      (instance) => instance.id === requestedInstanceId,
+    )
+      ? requestedInstanceId
+      : instances.defaultInstanceId || instances.instances[0]?.id || "__default__";
   } catch (error) {
     Message.warning(`读取修复选项失败：${errorText(error)}`);
   }
@@ -3712,7 +3827,7 @@ async function loadConfigEditorFile(): Promise<void> {
   const requestedKind = configEditorKind.value;
   configEditorLoading.value = true;
   try {
-    const file = await readCodexConfigFile(requestedKind);
+    const file = await readCodexConfigFile(requestedKind, settingsInstanceId.value);
     if (configEditorKind.value !== requestedKind) return;
     configEditorFile.value = file;
     configEditorContent.value = file.content;
@@ -3754,6 +3869,7 @@ async function saveConfigEditorContent(): Promise<void> {
     const file = await writeCodexConfigFile(
       savedKind,
       configEditorContent.value,
+      settingsInstanceId.value,
     );
     configEditorFile.value = file;
     configEditorContent.value = file.content;
@@ -3767,15 +3883,18 @@ async function saveConfigEditorContent(): Promise<void> {
 }
 
 function confirmResetConfig(): void {
+  const instanceName = codexInstances.value.find(
+    (instance) => instance.id === settingsInstanceId.value,
+  )?.name || "默认实例";
   Modal.warning({
     title: "重置 config.toml",
-    content: "确认将本机 Codex 目录下的 config.toml 恢复为内置基础配置？当前文件会先自动备份。",
+    content: `确认将“${instanceName}”的 config.toml 恢复为内置基础配置？当前文件会先自动备份。`,
     okText: "恢复基础配置",
     cancelText: "取消",
     hideCancel: false,
     onOk: async () => {
       try {
-        await resetCodexConfigToml();
+        await resetCodexConfigToml(settingsInstanceId.value);
         await loadAccounts();
         Message.success("已将 config.toml 恢复为基础配置");
       } catch (error) {
@@ -3798,7 +3917,7 @@ function confirmRepairSessionModels(): void {
     onOk: async () => {
       sessionModelRepairing.value = true;
       try {
-        const summary = await repairCodexSessionModelCompatibility();
+        const summary = await repairCodexSessionModelCompatibility(sessionInstanceId.value);
         if (
           summary.repairedRolloutFileCount === 0 &&
           summary.repairedThreadCount === 0 &&
@@ -3823,15 +3942,18 @@ function confirmRepairSessionModels(): void {
 }
 
 function confirmDeleteConfig(): void {
+  const instanceName = codexInstances.value.find(
+    (instance) => instance.id === settingsInstanceId.value,
+  )?.name || "默认实例";
   Modal.warning({
     title: "删除 config.toml",
-    content: "确认永久删除本机 Codex 目录下的 config.toml？此操作只删除当前配置文件，不会自动恢复基础配置。",
+    content: `确认永久删除“${instanceName}”的 config.toml？此操作只删除当前配置文件，不会自动恢复基础配置。`,
     okText: "确认删除",
     cancelText: "取消",
     hideCancel: false,
     onOk: async () => {
       try {
-        const deleted = await deleteCodexConfigToml();
+        const deleted = await deleteCodexConfigToml(settingsInstanceId.value);
         await loadAccounts();
         Message.success(deleted ? "已删除 config.toml" : "config.toml 不存在，无需删除");
       } catch (error) {
@@ -3861,8 +3983,11 @@ async function handleTrashSessions(): Promise<void> {
 
 async function trashSelectedSessions(ids: string[]): Promise<void> {
   try {
-    const summary = await moveSessionsToTrashAcrossInstances(ids);
+    const summary = await moveSessionsToTrashAcrossInstances(ids, sessionInstanceId.value);
     Message.success(`已移动 ${summary.moved} 个会话到回收站`);
+    if (summary.failed.length) {
+      Message.warning(`部分会话处理失败：${summary.failed.join("；")}`);
+    }
     await loadSessions();
   } catch (error) {
     Message.error(`移入回收站失败：${errorText(error)}`);
@@ -3875,8 +4000,11 @@ async function handleRestoreSessions(): Promise<void> {
     Message.warning("请先选择回收站会话");
     return;
   }
-  const summary = await restoreSessionsFromTrashAcrossInstances(ids);
+  const summary = await restoreSessionsFromTrashAcrossInstances(ids, sessionInstanceId.value);
   Message.success(`已恢复 ${summary.restored} 个会话`);
+  if (summary.failed.length) {
+    Message.warning(`部分会话恢复失败：${summary.failed.join("；")}`);
+  }
   await loadSessions();
 }
 
@@ -3956,9 +4084,9 @@ async function handleExportBackup(
 
 async function handleExportSessionBackup(): Promise<void> {
   await handleExportBackup(
-    "已备份会话数据",
-    "正在备份会话数据",
-    startCodexSwitcherSessionBackup,
+    `已手动备份“${selectedSessionInstanceName.value}”的会话数据`,
+    `正在手动备份“${selectedSessionInstanceName.value}”`,
+    (taskId) => startCodexSwitcherSessionBackup(taskId, sessionInstanceId.value),
     loadSessionBackups,
   );
 }
@@ -4010,7 +4138,7 @@ async function runRestoreTask(
 function handleRestoreBackup(backup: CodexSwitcherBackupFile): void {
   Modal.warning({
     title: "恢复完整备份",
-    content: `确认使用 ${backup.name} 恢复账号、设置与所有 Codex 会话记录？`,
+    content: `确认使用 ${backup.name} 恢复账号、设置与官方默认实例的 Codex 会话记录？多开实例不会被修改。`,
     okText: "开始恢复",
     cancelText: "取消",
     hideCancel: false,
@@ -4031,9 +4159,10 @@ function handleRestoreBackup(backup: CodexSwitcherBackupFile): void {
 }
 
 function handleRestoreSessionBackup(backup: CodexSwitcherBackupFile): void {
+  const sourceName = backup.sourceInstanceName || "旧版/未知实例";
   Modal.warning({
     title: "只恢复会话数据",
-    content: `确认从 ${backup.name} 只恢复 Codex 会话、会话回收站与会话索引？账号和设置不会变更。`,
+    content: `确认将 ${backup.name}（来源：${sourceName}）恢复到“${selectedSessionInstanceName.value}”？只恢复会话、回收站与会话索引，账号和设置不会变更。`,
     okText: "开始恢复",
     cancelText: "取消",
     hideCancel: false,
@@ -4043,7 +4172,10 @@ function handleRestoreSessionBackup(backup: CodexSwitcherBackupFile): void {
         "正在恢复会话数据",
         "正在准备恢复 Codex 会话数据...",
         async () => {
-          const result = await restoreCodexSwitcherSessionBackup(backup.path);
+          const result = await restoreCodexSwitcherSessionBackup(
+            backup.path,
+            sessionInstanceId.value,
+          );
           if (result.warning) {
             Message.warning(result.warning);
           }
@@ -4150,6 +4282,9 @@ function switchView(view: ActiveView): void {
   if (view === "openCodex") {
     openCodexPanelMounted.value = true;
     void refreshOpenCodexAccountIds();
+  }
+  if (view === "instances") {
+    void loadCodexInstances();
   }
   if (viewLoadTimer) {
     window.clearTimeout(viewLoadTimer);
@@ -4277,6 +4412,7 @@ onMounted(() => {
   void loadAccounts();
   void refreshApiServiceAccountIds();
   void refreshOpenCodexAccountIds();
+  void loadCodexInstances();
   void loadSettings({ includeStorage: false });
   void listen<OAuthCallbackEvent>("codex-oauth-callback-received", async (event) => {
     const payload = event.payload;
@@ -4487,6 +4623,8 @@ onUnmounted(() => {
     <SessionPanel
       v-if="activeView === 'sessions'"
       v-model:session-trash-mode="sessionTrashMode"
+      :instances="codexInstances"
+      :selected-instance-id="sessionInstanceId"
       :session-search="sessionSearch"
       :session-loading="sessionLoading"
       :backup-working="backupWorking"
@@ -4505,6 +4643,7 @@ onUnmounted(() => {
       :format-time="formatTime"
       :session-approx-tokens="sessionApproxTokens"
       :is-session-group-selected="isSessionGroupSelected"
+      @select-instance="handleSessionInstanceChange"
       @load-sessions="loadSessions"
       @toggle-all-sessions="toggleAllSessions"
       @export-session-backup="handleExportSessionBackup"
@@ -4526,12 +4665,15 @@ onUnmounted(() => {
     <SessionContentModal
       v-model:visible="sessionContentVisible"
       :session="sessionContentTarget"
+      :instance-id="sessionInstanceId"
       @session-updated="handleSessionContentUpdated"
     />
 
     <SessionCopyModal
       v-model:visible="sessionCopyVisible"
       :source="sessionCopySource"
+      :instances="codexInstances"
+      :source-instance-id="sessionInstanceId"
       :directories="sessionCopyDirectories"
       :saving="sessionCopySaving"
       @save="handleCopySession"
@@ -4572,7 +4714,13 @@ onUnmounted(() => {
       v-if="openCodexPanelMounted"
       v-show="activeView === 'openCodex'"
       :active="activeView === 'openCodex'"
+      :instances="codexInstances"
       @accounts-refreshed="refreshOpenCodexAccountIds"
+    />
+
+    <CodexInstancesPanel
+      v-if="activeView === 'instances'"
+      @instances-updated="handleInstancesUpdated"
     />
 
     <SettingsPanel
@@ -4585,6 +4733,8 @@ onUnmounted(() => {
       :backup-loading="backupLoading"
       :backup-working="backupWorking"
       :backup-progress="backupProgress"
+      :instances="codexInstances"
+      :selected-instance-id="settingsInstanceId"
       @save="saveSettings"
       @open-path="openSessionFolder"
       @edit-codex-file="openConfigEditor"
@@ -4595,6 +4745,16 @@ onUnmounted(() => {
       @restore-backup="handleRestoreBackup"
       @delete-backup="handleDeleteBackup"
       @open-push-settings="switchView('pushSettings')"
+      @select-instance="handleSettingsInstanceChange"
+    />
+
+    <InstancePickerModal
+      v-model:visible="accountInstancePickerVisible"
+      :instances="codexInstances"
+      title="选择要切换并重启的实例"
+      :description="pendingSwitchAccount ? `将账号“${displayNameForUi(pendingSwitchAccount)}”写入所选实例，并只重启该实例。` : ''"
+      confirm-text="切换并重启"
+      @confirm="performAccountSwitch"
     />
 
     <PushSettingsPanel
@@ -4653,6 +4813,7 @@ onUnmounted(() => {
       :backups="sessionBackupFiles"
       :loading="sessionBackupLoading"
       :backup-working="backupWorking"
+      :target-instance-name="selectedSessionInstanceName"
       @restore="handleRestoreSessionBackup"
       @backup-now="handleExportSessionBackup"
     />

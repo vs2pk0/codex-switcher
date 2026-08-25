@@ -1,6 +1,7 @@
 mod account;
 mod api_service;
 mod app_update;
+mod instances;
 mod oauth;
 mod opencodex;
 mod push;
@@ -22,8 +23,9 @@ use session::{
     CodexSessionAsset, CodexSessionContentPage, CodexSessionMessageMutationResult,
     CodexSessionModelCompatibilityRepairSummary, CodexSessionMutationResult, CodexSessionRecord,
     CodexSessionTokenStats, CodexSessionTrashSummary, CodexSessionTurnMutationResult,
-    CodexSessionVisibilityRepairInstanceList, CodexSessionVisibilityRepairProviderList,
-    CodexSessionVisibilityRepairSummary, CodexTrashedSessionRecord, SessionStore,
+    CodexSessionVisibilityRepairInstanceList, CodexSessionVisibilityRepairInstanceOption,
+    CodexSessionVisibilityRepairProviderList, CodexSessionVisibilityRepairSummary,
+    CodexTrashedSessionRecord, SessionStore,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -334,6 +336,11 @@ struct CodexSwitcherBackupFile {
     path: String,
     created_at: String,
     size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_instance_name: Option<String>,
+    manual: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1632,7 +1639,18 @@ fn delete_codex_account(account_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn switch_codex_account(account_id: String) -> Result<CodexAccountSwitchResult, String> {
+async fn switch_codex_account(
+    account_id: String,
+    instance_id: Option<String>,
+) -> Result<CodexAccountSwitchResult, String> {
+    let instance_id = instance_id.unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
+    let selected_instance = instances::resolve_instance(&instance_id)?;
+    let selected_codex_home = PathBuf::from(&selected_instance.codex_home);
+    let selected_account_store = AccountStore::new_for_instance(
+        switcher_account_dir(),
+        selected_codex_home.clone(),
+        &selected_instance.id,
+    );
     let accounts = AccountStore::default().list_accounts()?;
     let target = accounts
         .iter()
@@ -1644,12 +1662,21 @@ async fn switch_codex_account(account_id: String) -> Result<CodexAccountSwitchRe
         Some(target.id.clone())
     };
     if let Some(oauth_account_id) = oauth_account_id {
-        token_keeper::ensure_fresh_access_token(&oauth_account_id, "切换账号前 Token 需要续期")
-            .await?;
+        token_keeper::ensure_fresh_access_token_for_store(
+            &selected_account_store,
+            &oauth_account_id,
+            "切换账号前 Token 需要续期",
+        )
+        .await?;
     }
-    let account_store = AccountStore::default();
-    let session_store = SessionStore::default();
-    with_codex_desktop_stopped(|| {
+    instances::run_with_instance_restarted(&instance_id, |instance| {
+        let codex_home = PathBuf::from(&instance.codex_home);
+        let account_store = AccountStore::new_for_instance(
+            switcher_account_dir(),
+            codex_home.clone(),
+            &instance.id,
+        );
+        let session_store = SessionStore::new(codex_home);
         switch_account_and_sync_session_provider(&account_store, &session_store, &account_id)
     })
 }
@@ -1680,20 +1707,25 @@ fn switch_account_and_sync_session_provider(
 }
 
 #[tauri::command]
-fn restart_codex_app() -> Result<String, String> {
-    AccountStore::default().restart_codex_app()
+fn restart_codex_app(instance_id: Option<String>) -> Result<String, String> {
+    let instance_id = instance_id.unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
+    let instance = instances::restart_codex_instance(instance_id)?;
+    Ok(format!("已重启 Codex 实例“{}”", instance.name))
 }
 
 #[tauri::command]
 fn repair_codex_session_model_compatibility(
+    instance_id: Option<String>,
 ) -> Result<CodexSessionModelCompatibilityRepairSummary, String> {
-    let session_store = SessionStore::default();
-    with_codex_desktop_stopped(|| {
+    let instance_id = instance_id.unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
+    instances::run_with_instance_restarted(&instance_id, |instance| {
+        let session_store = SessionStore::new(PathBuf::from(&instance.codex_home));
         let target_provider = session_store.read_target_provider()?;
         session_store.repair_model_compatibility(&target_provider)
     })
 }
 
+#[cfg(test)]
 fn run_with_codex_desktop_restart<T, Stop, Action, Start>(
     stop: Stop,
     action: Action,
@@ -1716,15 +1748,6 @@ where
             action_error, start_error
         )),
     }
-}
-
-fn with_codex_desktop_stopped<T>(action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    let account_store = AccountStore::default();
-    run_with_codex_desktop_restart(
-        || account_store.stop_codex_app(),
-        action,
-        || account_store.start_codex_app(),
-    )
 }
 
 fn mark_visibility_desktop_reloaded(summary: &mut CodexSessionVisibilityRepairSummary) {
@@ -2018,9 +2041,13 @@ fn delete_codex_config_toml_from(codex_home: &Path) -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn read_codex_config_file(file_kind: String) -> Result<CodexConfigFileContent, String> {
+fn read_codex_config_file(
+    file_kind: String,
+    instance_id: Option<String>,
+) -> Result<CodexConfigFileContent, String> {
     let kind = CodexConfigFileKind::parse(&file_kind)?;
-    read_codex_config_file_from(&default_codex_home(), kind)
+    let codex_home = instances::codex_home_for(instance_id.as_deref())?;
+    read_codex_config_file_from(&codex_home, kind)
 }
 
 #[tauri::command]
@@ -2033,9 +2060,11 @@ fn format_codex_config_file(file_kind: String, content: String) -> Result<String
 fn write_codex_config_file(
     file_kind: String,
     content: String,
+    instance_id: Option<String>,
 ) -> Result<CodexConfigFileContent, String> {
     let kind = CodexConfigFileKind::parse(&file_kind)?;
-    let codex_home = default_codex_home();
+    let instance_id = instance_id.unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
+    let codex_home = instances::codex_home_for(Some(&instance_id))?;
     let path = codex_config_file_path(&codex_home, kind);
     let snapshot = (kind == CodexConfigFileKind::ConfigToml)
         .then(|| read_file_snapshot(&path))
@@ -2044,7 +2073,12 @@ fn write_codex_config_file(
     let written = write_codex_config_file_to(&codex_home, kind, &content)?;
     if kind == CodexConfigFileKind::ConfigToml {
         rollback_file_on_error(
-            AccountStore::default().release_current_api_key_default_model(),
+            AccountStore::new_for_instance(
+                switcher_account_dir(),
+                codex_home.clone(),
+                &instance_id,
+            )
+            .release_current_api_key_default_model(),
             &path,
             snapshot.as_deref(),
         )?;
@@ -2053,13 +2087,15 @@ fn write_codex_config_file(
 }
 
 #[tauri::command]
-fn reset_codex_config_toml() -> Result<CodexConfigFileContent, String> {
-    let codex_home = default_codex_home();
+fn reset_codex_config_toml(instance_id: Option<String>) -> Result<CodexConfigFileContent, String> {
+    let instance_id = instance_id.unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
+    let codex_home = instances::codex_home_for(Some(&instance_id))?;
     let path = codex_home.join("config.toml");
     let snapshot = read_file_snapshot(&path)?;
     let restored = reset_codex_config_toml_in(&codex_home)?;
     rollback_file_on_error(
-        AccountStore::default().release_current_api_key_default_model(),
+        AccountStore::new_for_instance(switcher_account_dir(), codex_home.clone(), &instance_id)
+            .release_current_api_key_default_model(),
         &path,
         snapshot.as_deref(),
     )?;
@@ -2067,13 +2103,15 @@ fn reset_codex_config_toml() -> Result<CodexConfigFileContent, String> {
 }
 
 #[tauri::command]
-fn delete_codex_config_toml() -> Result<bool, String> {
-    let codex_home = default_codex_home();
+fn delete_codex_config_toml(instance_id: Option<String>) -> Result<bool, String> {
+    let instance_id = instance_id.unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
+    let codex_home = instances::codex_home_for(Some(&instance_id))?;
     let path = codex_home.join("config.toml");
     let snapshot = read_file_snapshot(&path)?;
     let deleted = delete_codex_config_toml_from(&codex_home)?;
     rollback_file_on_error(
-        AccountStore::default().release_current_api_key_default_model(),
+        AccountStore::new_for_instance(switcher_account_dir(), codex_home.clone(), &instance_id)
+            .release_current_api_key_default_model(),
         &path,
         snapshot.as_deref(),
     )?;
@@ -2135,8 +2173,9 @@ fn codex_update_pricing_config(
 }
 
 #[tauri::command]
-fn get_codex_switcher_paths() -> Result<CodexSwitcherPaths, String> {
+fn get_codex_switcher_paths(instance_id: Option<String>) -> Result<CodexSwitcherPaths, String> {
     ensure_switcher_data_dirs()?;
+    let codex_home = instances::codex_home_for(instance_id.as_deref())?;
     let app_dir = switcher_data_dir();
     let account_dir = switcher_account_dir();
     let session_dir = switcher_session_dir();
@@ -2155,7 +2194,7 @@ fn get_codex_switcher_paths() -> Result<CodexSwitcherPaths, String> {
         session_dir: session_dir.to_string_lossy().to_string(),
         statistics_dir: statistics_dir.to_string_lossy().to_string(),
         data_dir: data_dir.to_string_lossy().to_string(),
-        codex_home: default_codex_home().to_string_lossy().to_string(),
+        codex_home: codex_home.to_string_lossy().to_string(),
     })
 }
 
@@ -2212,11 +2251,17 @@ fn start_codex_switcher_backup(app_handle: AppHandle, task_id: String) -> Result
 fn start_codex_switcher_session_backup(
     app_handle: AppHandle,
     task_id: String,
+    instance_id: Option<String>,
 ) -> Result<String, String> {
     let task_id = task_id.trim().to_string();
     if task_id.is_empty() {
         return Err("备份任务 ID 不能为空".to_string());
     }
+    let source_instance = instances::resolve_instance(
+        instance_id
+            .as_deref()
+            .unwrap_or(instances::DEFAULT_INSTANCE_ID),
+    )?;
     let emit_task_id = task_id.clone();
     thread::spawn(move || {
         emit_backup_progress(
@@ -2227,16 +2272,19 @@ fn start_codex_switcher_session_backup(
             "正在准备会话备份任务...",
             None,
         );
-        let result = export_codex_switcher_session_backup_with_progress(|progress, message| {
-            emit_backup_progress(
-                &app_handle,
-                &emit_task_id,
-                "running",
-                progress,
-                message,
-                None,
-            );
-        });
+        let result = export_codex_switcher_session_backup_with_progress(
+            &source_instance,
+            |progress, message| {
+                emit_backup_progress(
+                    &app_handle,
+                    &emit_task_id,
+                    "running",
+                    progress,
+                    message,
+                    None,
+                );
+            },
+        );
         match result {
             Ok(backup_file) => emit_backup_progress(
                 &app_handle,
@@ -2310,6 +2358,11 @@ where
             "currentAccount": get_current_codex_account()?,
             "settings": read_switcher_settings()?,
             "codexSessions": codex_session_summary,
+            "codexSessionsScope": {
+                "instanceId": instances::DEFAULT_INSTANCE_ID,
+                "instanceName": "系统默认实例",
+                "includesManagedInstances": false,
+            },
             "statistics": statistics_summary,
         });
         progress(15, "正在生成备份清单...");
@@ -2330,19 +2383,26 @@ where
 }
 
 fn export_codex_switcher_session_backup_with_progress<F>(
+    source_instance: &instances::CodexInstance,
     mut progress: F,
 ) -> Result<CodexSwitcherBackupFile, String>
 where
     F: FnMut(u8, &str),
 {
+    let codex_home = Path::new(&source_instance.codex_home);
     progress(5, "正在读取 Codex 会话信息...");
-    let codex_home = default_codex_home();
     let backup = serde_json::json!({
         "app": "Codex Switcher",
         "kind": "codexSessions",
         "version": 1,
+        "backupMode": "manual",
         "exportedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        "codexSessions": codex_session_backup_summary(&codex_home),
+        "sourceInstance": {
+            "id": source_instance.id,
+            "name": source_instance.name,
+            "isDefault": source_instance.is_default,
+        },
+        "codexSessions": codex_session_backup_summary(codex_home),
     });
     progress(15, "正在生成会话备份清单...");
     let content = serde_json::to_string_pretty(&backup)
@@ -2351,13 +2411,16 @@ where
     std::fs::create_dir_all(&backup_dir)
         .map_err(|error| format!("创建会话备份目录失败: {}", error))?;
     let filename = format!(
-        "codex-session-backup-{}.zip",
+        "codex-session-backup-{}-{}.zip",
+        source_instance.id,
         chrono::Local::now().format("%Y%m%d-%H%M%S-%3f")
     );
     let backup_path = backup_dir.join(filename);
-    write_session_backup_zip(&backup_path, &content, &mut progress)?;
+    write_session_backup_zip(&backup_path, &content, codex_home, &mut progress)?;
     progress(98, "正在刷新会话备份文件信息...");
-    backup_file_info(&backup_path)
+    Ok(enrich_session_backup_file_info(backup_file_info(
+        &backup_path,
+    )?))
 }
 
 #[tauri::command]
@@ -2367,7 +2430,12 @@ fn list_codex_switcher_backups() -> Result<Vec<CodexSwitcherBackupFile>, String>
 
 #[tauri::command]
 fn list_codex_switcher_session_backups() -> Result<Vec<CodexSwitcherBackupFile>, String> {
-    list_backup_files_in_dir(&switcher_session_dir(), "会话备份")
+    Ok(
+        list_backup_files_in_dir(&switcher_session_dir(), "会话备份")?
+            .into_iter()
+            .map(enrich_session_backup_file_info)
+            .collect(),
+    )
 }
 
 fn list_backup_files_in_dir(
@@ -2445,12 +2513,13 @@ fn restore_codex_switcher_backup(
 #[tauri::command]
 fn restore_codex_switcher_session_backup(
     backup_path: String,
+    instance_id: Option<String>,
 ) -> Result<CodexSessionRestoreResult, String> {
     let path = validate_session_backup_zip_path(&backup_path)
         .or_else(|_| validate_backup_zip_path(&backup_path))?;
-    let codex_home = default_codex_home();
-    let mut result = with_codex_desktop_stopped(|| {
-        restore_codex_switcher_session_backup_to(&path, &codex_home)
+    let instance_id = instance_id.unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
+    let mut result = instances::run_with_instance_restarted(&instance_id, |target_instance| {
+        restore_codex_switcher_session_backup_to(&path, Path::new(&target_instance.codex_home))
     })?;
     if let Some(visibility) = result.visibility.as_mut() {
         mark_visibility_desktop_reloaded(visibility);
@@ -2621,15 +2690,17 @@ async fn consume_codex_reset_credit(
 fn codex_list_sessions_across_instances(
     title_query: Option<String>,
     content_query: Option<String>,
+    instance_id: Option<String>,
 ) -> Result<Vec<CodexSessionRecord>, String> {
-    SessionStore::default().list_sessions(title_query, content_query)
+    session_store_for_instance(instance_id.as_deref())?.list_sessions(title_query, content_query)
 }
 
 #[tauri::command]
 fn codex_get_session_token_stats_across_instances(
     session_ids: Vec<String>,
+    instance_id: Option<String>,
 ) -> Result<Vec<CodexSessionTokenStats>, String> {
-    SessionStore::default().token_stats(&session_ids)
+    session_store_for_instance(instance_id.as_deref())?.token_stats(&session_ids)
 }
 
 #[tauri::command]
@@ -2638,24 +2709,32 @@ fn codex_list_session_content(
     cursor: Option<u64>,
     limit: Option<usize>,
     direction: Option<String>,
+    instance_id: Option<String>,
 ) -> Result<CodexSessionContentPage, String> {
-    SessionStore::default().list_session_content(&session_id, cursor, limit, direction.as_deref())
+    session_store_for_instance(instance_id.as_deref())?.list_session_content(
+        &session_id,
+        cursor,
+        limit,
+        direction.as_deref(),
+    )
 }
 
 #[tauri::command]
 fn codex_get_session_asset(
     session_id: String,
     asset_id: String,
+    instance_id: Option<String>,
 ) -> Result<CodexSessionAsset, String> {
-    SessionStore::default().get_session_asset(&session_id, &asset_id)
+    session_store_for_instance(instance_id.as_deref())?.get_session_asset(&session_id, &asset_id)
 }
 
 #[tauri::command]
 fn codex_delete_session_turn(
     session_id: String,
     turn_id: String,
+    instance_id: Option<String>,
 ) -> Result<CodexSessionTurnMutationResult, String> {
-    SessionStore::default().delete_session_turn(&session_id, &turn_id)
+    session_store_for_instance(instance_id.as_deref())?.delete_session_turn(&session_id, &turn_id)
 }
 
 #[tauri::command]
@@ -2663,36 +2742,69 @@ fn codex_delete_session_messages(
     session_id: String,
     turn_id: String,
     message_ids: Vec<String>,
+    instance_id: Option<String>,
 ) -> Result<CodexSessionMessageMutationResult, String> {
-    SessionStore::default().delete_session_messages(&session_id, &turn_id, &message_ids)
+    session_store_for_instance(instance_id.as_deref())?.delete_session_messages(
+        &session_id,
+        &turn_id,
+        &message_ids,
+    )
 }
 
 #[tauri::command]
 fn codex_restore_session_turn_backup(
     session_id: String,
     backup_id: String,
+    instance_id: Option<String>,
 ) -> Result<CodexSessionMutationResult, String> {
-    SessionStore::default().restore_session_turn_backup(&session_id, &backup_id)
+    session_store_for_instance(instance_id.as_deref())?
+        .restore_session_turn_backup(&session_id, &backup_id)
 }
 
 #[tauri::command]
 fn codex_move_sessions_to_trash_across_instances(
     session_ids: Vec<String>,
+    instance_id: Option<String>,
 ) -> Result<CodexSessionTrashSummary, String> {
-    SessionStore::default().move_to_trash(&session_ids)
+    session_store_for_instance(instance_id.as_deref())?.move_to_trash(&session_ids)
 }
 
 #[tauri::command]
-fn codex_list_trashed_sessions_across_instances() -> Result<Vec<CodexTrashedSessionRecord>, String>
-{
-    SessionStore::default().list_trashed()
+fn codex_list_trashed_sessions_across_instances(
+    instance_id: Option<String>,
+) -> Result<Vec<CodexTrashedSessionRecord>, String> {
+    let instance_id = instance_id.unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
+    let instance = instances::resolve_instance(&instance_id)?;
+    let store = SessionStore::new(PathBuf::from(&instance.codex_home));
+    let trashed = store.list_trashed()?;
+    let trashed_ids = trashed
+        .iter()
+        .map(|session| session.id.clone())
+        .collect::<Vec<_>>();
+    if !store.codex_indexes_contain_visible_sessions(&trashed_ids)? {
+        return Ok(trashed);
+    }
+    if instance.running {
+        instances::run_with_instance_restarted(&instance_id, |instance| {
+            let store = SessionStore::new(PathBuf::from(&instance.codex_home));
+            store.hide_sessions_from_codex_indexes(&trashed_ids)?;
+            store.list_trashed()
+        })
+    } else {
+        store.hide_sessions_from_codex_indexes(&trashed_ids)?;
+        Ok(trashed)
+    }
 }
 
 #[tauri::command]
 fn codex_restore_sessions_from_trash_across_instances(
     session_ids: Vec<String>,
+    instance_id: Option<String>,
 ) -> Result<CodexSessionTrashSummary, String> {
-    SessionStore::default().restore_from_trash(&session_ids)
+    let instance_id = instance_id.unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
+    instances::run_with_instance_restarted(&instance_id, |instance| {
+        SessionStore::new(PathBuf::from(&instance.codex_home)).restore_from_trash(&session_ids)
+    })
 }
 
 #[tauri::command]
@@ -2700,30 +2812,40 @@ fn codex_copy_session_history_across_instances(
     source_session_id: String,
     copy_suffix: String,
     target_project_path: String,
+    source_instance_id: String,
+    target_instance_id: String,
 ) -> Result<CodexSessionMutationResult, String> {
-    with_codex_desktop_stopped(|| {
-        SessionStore::default().copy_session_to_directory(
-            &source_session_id,
-            &copy_suffix,
-            &target_project_path,
-        )
-    })
+    let source_store = session_store_for_instance(Some(&source_instance_id))?;
+    let target_store = session_store_for_instance(Some(&target_instance_id))?;
+    source_store.copy_session_to_store(
+        &target_store,
+        &source_session_id,
+        &copy_suffix,
+        &target_project_path,
+    )
 }
 
 #[tauri::command]
 fn codex_rename_session_across_instances(
     session_id: String,
     title: String,
+    instance_id: Option<String>,
 ) -> Result<CodexSessionMutationResult, String> {
-    SessionStore::default().rename_session(&session_id, &title)
+    session_store_for_instance(instance_id.as_deref())?.rename_session(&session_id, &title)
 }
 
 #[tauri::command]
 fn codex_update_session_working_directory_across_instances(
     session_id: String,
     project_path: String,
+    instance_id: Option<String>,
 ) -> Result<CodexSessionMutationResult, String> {
-    SessionStore::default().update_session_working_directory(&session_id, &project_path)
+    session_store_for_instance(instance_id.as_deref())?
+        .update_session_working_directory(&session_id, &project_path)
+}
+
+fn session_store_for_instance(instance_id: Option<&str>) -> Result<SessionStore, String> {
+    Ok(SessionStore::new(instances::codex_home_for(instance_id)?))
 }
 
 #[tauri::command]
@@ -2736,23 +2858,128 @@ fn codex_repair_session_visibility_across_instances(
     session_ids: Option<Vec<String>>,
 ) -> Result<CodexSessionVisibilityRepairSummary, String> {
     let _ = run_id;
-    let mut summary = with_codex_desktop_stopped(|| {
-        SessionStore::default().repair_visibility_with_options(
-            mode.as_deref(),
-            target_provider,
-            target_instance_id,
-            repair_instance_ids,
-            session_ids,
-        )
-    })?;
-    mark_visibility_desktop_reloaded(&mut summary);
+    let available_instances = instances::list_codex_instances()?;
+    let normalize_id = |value: &str| {
+        if value.trim().is_empty() || value == "__default__" {
+            instances::DEFAULT_INSTANCE_ID.to_string()
+        } else {
+            value.trim().to_string()
+        }
+    };
+    let normalized_target_id = target_instance_id.as_deref().map(&normalize_id);
+    let mut requested_ids = if let Some(ids) = repair_instance_ids {
+        ids.into_iter()
+            .map(|id| normalize_id(&id))
+            .collect::<Vec<_>>()
+    } else if target_instance_id.is_some() {
+        available_instances
+            .iter()
+            .map(|instance| instance.id.clone())
+            .collect::<Vec<_>>()
+    } else {
+        vec![instances::DEFAULT_INSTANCE_ID.to_string()]
+    };
+    requested_ids.retain(|id| !id.is_empty());
+    requested_ids.sort();
+    requested_ids.dedup();
+    if requested_ids.is_empty() {
+        return Err("没有选择需要修复的 Codex 实例".to_string());
+    }
+
+    let mut combined: Option<CodexSessionVisibilityRepairSummary> = None;
+    for instance_id in requested_ids {
+        let instance = available_instances
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(|| format!("Codex 实例不存在: {instance_id}"))?;
+        let provider = (normalized_target_id.as_deref() == Some(instance_id.as_str()))
+            .then(|| target_provider.clone())
+            .flatten();
+        let instance_name = instance.name.clone();
+        let was_running = instance.running;
+        let selected_session_ids = session_ids.clone();
+        let repair_mode = mode.clone();
+        let mut summary = instances::run_with_instance_restarted(&instance_id, |target| {
+            SessionStore::new(PathBuf::from(&target.codex_home)).repair_visibility_with_options(
+                repair_mode.as_deref(),
+                provider,
+                None,
+                None,
+                selected_session_ids,
+            )
+        })?;
+        if let Some(item) = summary.items.first_mut() {
+            item.instance_id = instance_id.clone();
+            item.instance_name = instance_name;
+            item.running = was_running;
+        }
+        mark_visibility_desktop_reloaded(&mut summary);
+        if let Some(total) = combined.as_mut() {
+            merge_visibility_repair_summary(total, summary);
+        } else {
+            combined = Some(summary);
+        }
+    }
+    let mut summary = combined.ok_or_else(|| "没有匹配到需要修复的 Codex 实例".to_string())?;
+    summary.message = format!(
+        "已修复 {} 个 Codex 实例：扫描 {} 条会话，完成 {} 项修复，目标实例均已重启",
+        summary.instance_count, summary.scanned, summary.repaired
+    );
     Ok(summary)
 }
 
 #[tauri::command]
 fn codex_list_session_visibility_repair_instances(
 ) -> Result<CodexSessionVisibilityRepairInstanceList, String> {
-    SessionStore::default().list_visibility_repair_instances()
+    let options = instances::list_codex_instances()?
+        .into_iter()
+        .map(|instance| {
+            let current_provider =
+                SessionStore::new(PathBuf::from(&instance.codex_home)).read_target_provider()?;
+            Ok(CodexSessionVisibilityRepairInstanceOption {
+                id: instance.id,
+                name: instance.name,
+                user_data_dir: instance.codex_home,
+                current_provider,
+                is_default: instance.is_default,
+                running: instance.running,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(CodexSessionVisibilityRepairInstanceList {
+        default_instance_id: instances::DEFAULT_INSTANCE_ID.to_string(),
+        instances: options,
+    })
+}
+
+fn merge_visibility_repair_summary(
+    total: &mut CodexSessionVisibilityRepairSummary,
+    mut next: CodexSessionVisibilityRepairSummary,
+) {
+    total.scanned += next.scanned;
+    total.repaired += next.repaired;
+    total.instance_count += next.instance_count;
+    total.mutated_instance_count += next.mutated_instance_count;
+    total.changed_rollout_file_count += next.changed_rollout_file_count;
+    total.updated_sqlite_row_count += next.updated_sqlite_row_count;
+    total.updated_sqlite_timestamp_row_count += next.updated_sqlite_timestamp_row_count;
+    total.added_session_index_entry_count += next.added_session_index_entry_count;
+    total.updated_session_index_entry_count += next.updated_session_index_entry_count;
+    total.updated_catalog_row_count += next.updated_catalog_row_count;
+    total.verified_visible_session_count += next.verified_visible_session_count;
+    total.skipped_non_sidebar_session_count += next.skipped_non_sidebar_session_count;
+    total.remaining_invisible_session_count += next.remaining_invisible_session_count;
+    total.created_local_project_count += next.created_local_project_count;
+    total.assigned_local_project_session_count += next.assigned_local_project_session_count;
+    total.verified_local_project_count += next.verified_local_project_count;
+    total.skipped_local_project_session_count += next.skipped_local_project_session_count;
+    total.recreated_generated_image_count += next.recreated_generated_image_count;
+    total.verified_generated_image_count += next.verified_generated_image_count;
+    total.invalid_generated_image_count += next.invalid_generated_image_count;
+    total.desktop_reload_required |= next.desktop_reload_required;
+    total.desktop_reload_performed |= next.desktop_reload_performed;
+    total.backup_dirs.append(&mut next.backup_dirs);
+    total.items.append(&mut next.items);
 }
 
 #[tauri::command]
@@ -2883,19 +3110,32 @@ where
         .map_err(|error| format!("写入备份 JSON 失败: {}", error))?;
     progress(30, "正在写入 Codex Switcher 数据...");
     let root = switcher_data_dir();
-    let excluded_dirs = vec![switcher_backup_dir(), switcher_session_dir()];
+    let excluded_dirs = default_backup_excluded_paths(&root);
     add_directory_to_backup_zip(&mut zip, &root, &root, "data", &excluded_dirs, options)?;
     progress(50, "正在写入 Codex 会话记录...");
-    add_codex_sessions_to_backup_zip(&mut zip, options, progress)?;
+    add_default_codex_sessions_to_backup_zip(&mut zip, options, progress)?;
     progress(92, "正在压缩并完成 ZIP...");
     zip.finish()
         .map_err(|error| format!("完成 ZIP 备份失败: {}", error))?;
     Ok(())
 }
 
+fn default_backup_excluded_paths(root: &Path) -> Vec<PathBuf> {
+    vec![
+        root.join("backup"),
+        root.join("session"),
+        root.join("instances"),
+        root.join("data").join("codex-instances.json"),
+        root.join("config-backups"),
+        root.join("visibility-backups"),
+        root.join("session-edit-backups"),
+    ]
+}
+
 fn write_session_backup_zip<F>(
     backup_path: &Path,
     backup_json: &str,
+    codex_home: &Path,
     progress: &mut F,
 ) -> Result<(), String>
 where
@@ -2913,7 +3153,7 @@ where
     zip.write_all(backup_json.as_bytes())
         .map_err(|error| format!("写入会话备份 JSON 失败: {}", error))?;
     progress(35, "正在写入 Codex 会话数据...");
-    add_codex_sessions_to_backup_zip(&mut zip, options, progress)?;
+    add_codex_sessions_to_backup_zip_from(&mut zip, options, progress, codex_home)?;
     progress(92, "正在压缩并完成会话 ZIP...");
     zip.finish()
         .map_err(|error| format!("完成会话 ZIP 备份失败: {}", error))?;
@@ -3018,11 +3258,14 @@ fn add_file_to_backup_zip(
     Ok(())
 }
 
-fn add_codex_sessions_to_backup_zip(
+fn add_default_codex_sessions_to_backup_zip(
     zip: &mut zip::ZipWriter<std::fs::File>,
     options: zip::write::FileOptions,
     progress: &mut impl FnMut(u8, &str),
 ) -> Result<(), String> {
+    // Default/full backups intentionally include only the official instance.
+    // Managed multi-open instances must be backed up through the explicit
+    // per-instance manual session backup command.
     let codex_home = default_codex_home();
     add_codex_sessions_to_backup_zip_from(zip, options, progress, &codex_home)
 }
@@ -3448,7 +3691,36 @@ fn backup_file_info(path: &Path) -> Result<CodexSwitcherBackupFile, String> {
         path: path.to_string_lossy().to_string(),
         created_at: modified,
         size_bytes: metadata.len(),
+        source_instance_id: None,
+        source_instance_name: None,
+        manual: false,
     })
+}
+
+fn enrich_session_backup_file_info(mut info: CodexSwitcherBackupFile) -> CodexSwitcherBackupFile {
+    info.manual = true;
+    let manifest = (|| {
+        let file = std::fs::File::open(&info.path).ok()?;
+        let mut archive = zip::ZipArchive::new(file).ok()?;
+        let mut content = String::new();
+        archive
+            .by_name("backup.json")
+            .ok()?
+            .read_to_string(&mut content)
+            .ok()?;
+        serde_json::from_str::<Value>(&content).ok()
+    })();
+    if let Some(manifest) = manifest {
+        info.source_instance_id = manifest
+            .pointer("/sourceInstance/id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        info.source_instance_name = manifest
+            .pointer("/sourceInstance/name")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    info
 }
 
 fn validate_backup_zip_path(path: &str) -> Result<PathBuf, String> {
@@ -4028,14 +4300,15 @@ fn compact_http_body(body: &str) -> String {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        backup_entry_restore_target, codex_config_backup_path, codex_session_trash_dir,
-        default_codex_home, delete_codex_config_toml_from, format_codex_config_content,
-        parse_codex_api_key_models, parse_codex_quota, prepare_backup_archive_files_with,
-        read_codex_config_file_from, reset_codex_config_toml_in, rollback_file_on_error,
-        run_with_codex_desktop_restart, switch_account_and_sync_session_provider,
-        switcher_account_dir, switcher_data_dir, validate_prepared_switcher_backup,
-        write_codex_config_file_to, AccountStore, CodexApiKeyModel, CodexConfigFileKind,
-        SessionStore,
+        add_directory_to_backup_zip, backup_entry_restore_target, backup_file_info,
+        codex_config_backup_path, codex_session_trash_dir, default_backup_excluded_paths,
+        default_codex_home, delete_codex_config_toml_from, enrich_session_backup_file_info,
+        format_codex_config_content, parse_codex_api_key_models, parse_codex_quota,
+        prepare_backup_archive_files_with, read_codex_config_file_from, reset_codex_config_toml_in,
+        rollback_file_on_error, run_with_codex_desktop_restart,
+        switch_account_and_sync_session_provider, switcher_account_dir, switcher_data_dir,
+        validate_prepared_switcher_backup, write_codex_config_file_to, AccountStore,
+        CodexApiKeyModel, CodexConfigFileKind, SessionStore,
     };
     use serde_json::json;
     use std::io::Write;
@@ -4732,6 +5005,87 @@ mod tests {
     }
 
     #[test]
+    fn default_backup_excludes_managed_instance_data_and_safety_backups() {
+        let root = tempdir().expect("backup root");
+        let archive_dir = tempdir().expect("archive root");
+        std::fs::create_dir_all(root.path().join("data")).expect("data dir");
+        std::fs::create_dir_all(root.path().join("instances/custom/codex-home/sessions"))
+            .expect("instance sessions");
+        std::fs::create_dir_all(root.path().join("config-backups/custom"))
+            .expect("config backup dir");
+        std::fs::write(root.path().join("data/settings.json"), b"{}")
+            .expect("write included settings");
+        std::fs::write(root.path().join("data/codex-instances.json"), b"[]")
+            .expect("write instance registry");
+        std::fs::write(
+            root.path()
+                .join("instances/custom/codex-home/sessions/custom.jsonl"),
+            b"custom session",
+        )
+        .expect("write custom session");
+        std::fs::write(
+            root.path().join("config-backups/custom/config.toml"),
+            b"custom",
+        )
+        .expect("write custom safety backup");
+
+        let zip_path = archive_dir.path().join("default-data.zip");
+        let file = std::fs::File::create(&zip_path).expect("create zip");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default();
+        add_directory_to_backup_zip(
+            &mut zip,
+            root.path(),
+            root.path(),
+            "data",
+            &default_backup_excluded_paths(root.path()),
+            options,
+        )
+        .expect("add default data");
+        zip.finish().expect("finish zip");
+
+        let file = std::fs::File::open(&zip_path).expect("open zip");
+        let mut archive = zip::ZipArchive::new(file).expect("read zip");
+        let names = (0..archive.len())
+            .map(|index| {
+                archive
+                    .by_index(index)
+                    .expect("zip entry")
+                    .name()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"data/data/settings.json".to_string()));
+        assert!(!names.iter().any(|name| name.contains("instances/custom")));
+        assert!(!names
+            .iter()
+            .any(|name| name.contains("codex-instances.json")));
+        assert!(!names.iter().any(|name| name.contains("config-backups")));
+    }
+
+    #[test]
+    fn manual_session_backup_exposes_its_source_instance() {
+        let directory = tempdir().expect("session backup dir");
+        let zip_path = directory.path().join("session.zip");
+        let file = std::fs::File::create(&zip_path).expect("create zip");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("backup.json", zip::write::FileOptions::default())
+            .expect("start manifest");
+        zip.write_all(
+            r#"{"backupMode":"manual","sourceInstance":{"id":"instance-demo","name":"工作实例"}}"#
+                .as_bytes(),
+        )
+        .expect("write manifest");
+        zip.finish().expect("finish zip");
+
+        let info =
+            enrich_session_backup_file_info(backup_file_info(&zip_path).expect("read backup info"));
+        assert!(info.manual);
+        assert_eq!(info.source_instance_id.as_deref(), Some("instance-demo"));
+        assert_eq!(info.source_instance_name.as_deref(), Some("工作实例"));
+    }
+
+    #[test]
     fn malformed_backup_is_rejected_before_live_files_are_replaced() {
         let live_account_database = switcher_account_dir().join("accounts.json");
         std::fs::create_dir_all(
@@ -5033,6 +5387,12 @@ pub fn run() {
             open_external_url,
             open_path_in_file_manager,
             delete_codex_account,
+            instances::list_codex_instances,
+            instances::save_codex_instance,
+            instances::delete_codex_instance,
+            instances::launch_codex_instance,
+            instances::stop_codex_instance,
+            instances::restart_codex_instance,
             switch_codex_account,
             restart_codex_app,
             repair_codex_session_model_compatibility,

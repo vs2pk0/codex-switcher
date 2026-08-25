@@ -23,8 +23,9 @@ export function getOpenCodexSnapshot(): Promise<OpenCodexSystemSnapshot> {
 export function runOpenCodexAction(
   action: OpenCodexAction,
   port: number,
+  instanceId?: string,
 ): Promise<OpenCodexCommandStarted> {
-  return invoke("opencodex_run_action", { request: { action, port } });
+  return invoke("opencodex_run_action", { request: { action, port, instanceId } });
 }
 
 export function writeOpenCodexInput(operationId: string, value: string): Promise<void> {

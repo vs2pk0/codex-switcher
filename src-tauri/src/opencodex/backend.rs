@@ -346,12 +346,24 @@ impl Backend {
     }
 
     fn command(&self, launcher: &Launcher, args: &[String]) -> Command {
+        self.command_with_codex_home(launcher, args, None)
+    }
+
+    fn command_with_codex_home(
+        &self,
+        launcher: &Launcher,
+        args: &[String],
+        codex_home: Option<&Path>,
+    ) -> Command {
         let mut command = Command::new(&launcher.program);
         command.args(&launcher.prefix_args).args(args);
         if let Some(working_dir) = launcher.working_dir.as_ref() {
             command.current_dir(working_dir);
         }
         command.env("NO_COLOR", "1").env("FORCE_COLOR", "0");
+        if let Some(path) = codex_home {
+            command.env("CODEX_HOME", path);
+        }
         command
     }
 
@@ -681,6 +693,16 @@ impl Backend {
         request: RunActionRequest,
     ) -> Result<CommandStarted, String> {
         validate_port(request.port)?;
+        let codex_home = if matches!(
+            &request.action,
+            CommandAction::Sync | CommandAction::Restore
+        ) {
+            Some(crate::instances::codex_home_for(
+                request.instance_id.as_deref(),
+            )?)
+        } else {
+            None
+        };
         self.begin_mutation()?;
         let launcher = match self.active_launcher() {
             Ok(value) => value,
@@ -697,7 +719,13 @@ impl Backend {
         };
         let backend = Arc::clone(self);
         thread::spawn(move || {
-            backend.action_worker(operation_id, request.action, request.port, launcher)
+            backend.action_worker(
+                operation_id,
+                request.action,
+                request.port,
+                launcher,
+                codex_home,
+            )
         });
         Ok(started)
     }
@@ -708,6 +736,7 @@ impl Backend {
         action: CommandAction,
         port: u16,
         launcher: Launcher,
+        codex_home: Option<PathBuf>,
     ) {
         let action_label = action.label();
         let result = if matches!(action, CommandAction::Start) {
@@ -737,7 +766,13 @@ impl Backend {
             };
             preparation
                 .and_then(|_| {
-                    self.run_captured(&launcher, &args, action.interactive(), &operation_id)
+                    self.run_captured(
+                        &launcher,
+                        &args,
+                        action.interactive(),
+                        &operation_id,
+                        codex_home.as_deref(),
+                    )
                 })
                 .and_then(|code| {
                     if code == Some(0) {
@@ -778,13 +813,14 @@ impl Backend {
         args: &[String],
         interactive: bool,
         operation_id: &str,
+        codex_home: Option<&Path>,
     ) -> Result<Option<i32>, String> {
         self.emit_log(
             operation_id,
             "system",
             &format!("执行：ocx {}", args.join(" ")),
         );
-        let mut command = self.command(launcher, args);
+        let mut command = self.command_with_codex_home(launcher, args, codex_home);
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

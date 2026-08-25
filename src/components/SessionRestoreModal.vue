@@ -7,6 +7,7 @@ defineProps<{
   backups: CodexSwitcherBackupFile[];
   loading: boolean;
   backupWorking: boolean;
+  targetInstanceName: string;
 }>();
 
 defineEmits<{
@@ -24,12 +25,17 @@ defineEmits<{
     width="720px"
     @update:visible="$emit('update:visible', $event)"
   >
+    <a-alert type="info" class="session-restore-target">
+      {{ t("恢复目标") }}：{{ targetInstanceName }}。{{ t("不会修改其他实例。") }}
+    </a-alert>
     <a-spin :loading="loading" dot>
       <div v-if="backups.length" class="session-restore-list">
         <article v-for="backup in backups" :key="backup.path" class="session-restore-item">
           <div class="session-restore-main">
             <strong>{{ backup.name }}</strong>
-            <span>{{ backup.createdAt }}</span>
+            <span>
+              {{ backup.createdAt }} · {{ t("来源实例") }}：{{ backup.sourceInstanceName || t("旧版/未知") }}
+            </span>
           </div>
           <a-button type="primary" :disabled="backupWorking" @click="$emit('restore', backup)">
             <template #icon><icon-import /></template>

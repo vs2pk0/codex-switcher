@@ -875,8 +875,9 @@ impl SessionStore {
         })
     }
 
-    pub fn copy_session_to_directory(
+    pub fn copy_session_to_store(
         &self,
+        target_store: &SessionStore,
         source_session_id: &str,
         copy_suffix: &str,
         target_project_path: &str,
@@ -891,7 +892,9 @@ impl SessionStore {
             .iter()
             .find(|session| session.id == source_session_id)
             .ok_or_else(|| format!("源会话不存在: {}", source_session_id))?;
-        if same_existing_directory(&source.project_path, &target_project_path) {
+        if self.codex_home == target_store.codex_home
+            && same_existing_directory(&source.project_path, &target_project_path)
+        {
             return Err("目标工作目录不能与源会话目录相同，请选择其他目录".to_string());
         }
         let source_path = Path::new(&source.path);
@@ -902,13 +905,37 @@ impl SessionStore {
             return Err("源会话仍在生成或写入内容，请等待当前对话结束后再复制".to_string());
         }
 
-        let target_provider = self.read_target_provider()?;
-        let fork = run_codex_thread_fork(
+        let target_provider = target_store.read_target_provider()?;
+        let staged = target_store.stage_fork_source(
             &self.codex_home,
             source,
+            source_path,
             &target_project_path,
             &target_provider,
         )?;
+        let fork_result = run_codex_thread_fork(
+            &target_store.codex_home,
+            &staged.session,
+            &target_project_path,
+            &target_provider,
+        );
+        let (fork, staging_cleanup_warning) = match fork_result {
+            Ok(fork) => {
+                let warning = target_store
+                    .archive_staged_fork_source(&staged)
+                    .err()
+                    .map(|error| format!("隐藏副本历史底稿失败: {error}"));
+                (fork, warning)
+            }
+            Err(fork_error) => match target_store.cleanup_staged_fork_source(&staged) {
+                Ok(()) => return Err(fork_error),
+                Err(cleanup_error) => {
+                    return Err(format!(
+                        "{fork_error}；同时清理临时复制数据失败: {cleanup_error}"
+                    ));
+                }
+            },
+        };
         if fork.session_id == source.id {
             return Err("Codex 返回了源会话 ID，未能创建独立副本".to_string());
         }
@@ -927,16 +954,21 @@ impl SessionStore {
 
         let title = copied_session_title(&source.title, copy_suffix);
         let mut warnings = Vec::new();
-        if let Err(error) = self.write_session_title(&fork.session_id, &title) {
+        if let Some(warning) = staging_cleanup_warning {
+            warnings.push(warning);
+        }
+        if let Err(error) = target_store.write_session_title(&fork.session_id, &title) {
             warnings.push(error);
         }
-        if let Err(error) = self.update_sqlite_session_title(&fork.session_id, &title) {
+        if let Err(error) = target_store.update_sqlite_session_title(&fork.session_id, &title) {
             warnings.push(error);
         }
-        if let Err(error) = self.update_sqlite_session_cwd(&fork.session_id, &target_project_path) {
+        if let Err(error) =
+            target_store.update_sqlite_session_cwd(&fork.session_id, &target_project_path)
+        {
             warnings.push(error);
         }
-        if let Err(error) = self.repair_visibility_with_options(
+        if let Err(error) = target_store.repair_visibility_with_options(
             Some("quick"),
             Some(target_provider),
             None,
@@ -953,6 +985,162 @@ impl SessionStore {
             backup_path: None,
             warnings,
         })
+    }
+
+    fn stage_fork_source(
+        &self,
+        source_codex_home: &Path,
+        source: &CodexSessionRecord,
+        source_path: &Path,
+        target_project_path: &str,
+        target_provider: &str,
+    ) -> Result<StagedForkSource, String> {
+        let source_before = session_file_fingerprint(source_path)?;
+        let created_at = chrono::Utc::now();
+        let staged_session_id = new_session_id();
+        let staged_path =
+            new_session_rollout_path(&self.sessions_dir(), &staged_session_id, created_at);
+        create_staged_fork_rollout(
+            source_codex_home,
+            source_path,
+            &staged_path,
+            &staged_session_id,
+            target_project_path,
+            target_provider,
+            created_at,
+        )?;
+        if session_file_fingerprint(source_path)? != source_before {
+            let _ = fs::remove_file(&staged_path);
+            return Err("源会话在复制准备期间发生了更新，本次操作已取消，请刷新后重试".to_string());
+        }
+
+        let staged_session = CodexSessionRecord {
+            id: staged_session_id,
+            title: source.title.clone(),
+            project_name: project_name_for_path(target_project_path)
+                .unwrap_or_else(|| target_project_path.to_string()),
+            project_path: target_project_path.to_string(),
+            path: staged_path.to_string_lossy().to_string(),
+            updated_at: created_at.timestamp(),
+            message_count: 0,
+            char_count: 0,
+            size_bytes: fs::metadata(&staged_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or_default(),
+        };
+        let staged = StagedForkSource {
+            session: staged_session,
+            path: staged_path,
+        };
+        if let Err(error) = self.register_staged_fork_source(&staged, target_provider) {
+            let cleanup_error = self.cleanup_staged_fork_source(&staged).err();
+            return Err(match cleanup_error {
+                Some(cleanup_error) => {
+                    format!("准备临时会话索引失败: {error}；清理失败: {cleanup_error}")
+                }
+                None => format!("准备临时会话索引失败: {error}"),
+            });
+        }
+        Ok(staged)
+    }
+
+    fn register_staged_fork_source(
+        &self,
+        staged: &StagedForkSource,
+        target_provider: &str,
+    ) -> Result<(), String> {
+        let record = SessionRepairRecord {
+            id: staged.session.id.clone(),
+            title: staged.session.title.clone(),
+            path: staged.path.clone(),
+            updated_at: staged.session.updated_at,
+        };
+        let mut registered = false;
+        for db_path in self.sqlite_candidate_paths() {
+            if sqlite_insert_missing_session_rows(
+                &db_path,
+                target_provider,
+                Some(std::slice::from_ref(&record)),
+            )? > 0
+            {
+                registered = true;
+            } else if sqlite_thread_columns(&db_path)?.contains("id") {
+                let exists = run_sqlite(
+                    &db_path,
+                    &format!(
+                        "SELECT COUNT(*) FROM threads WHERE id = {};",
+                        sql_quote(&staged.session.id)
+                    ),
+                )?;
+                registered |= exists.trim() == "1";
+            }
+        }
+        if !registered {
+            return Err("目标实例缺少可写的 Codex thread store，无法创建分页会话副本".to_string());
+        }
+        Ok(())
+    }
+
+    fn cleanup_staged_fork_source(&self, staged: &StagedForkSource) -> Result<(), String> {
+        let mut failures = Vec::new();
+        for db_path in self.staged_thread_cleanup_db_paths() {
+            if let Err(error) = remove_staged_thread_rows(&db_path, &staged.session.id) {
+                failures.push(error);
+            }
+        }
+        if let Err(error) = fs::remove_file(&staged.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                failures.push(format!(
+                    "删除临时会话文件失败 ({}): {error}",
+                    staged.path.display()
+                ));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("；"))
+        }
+    }
+
+    fn archive_staged_fork_source(&self, staged: &StagedForkSource) -> Result<(), String> {
+        let file_name = staged
+            .path
+            .file_name()
+            .ok_or_else(|| "无法定位副本历史底稿文件名".to_string())?;
+        let archived_path = self.codex_home.join("archived_sessions").join(file_name);
+        fs::create_dir_all(
+            archived_path
+                .parent()
+                .ok_or_else(|| "无法定位副本历史底稿目录".to_string())?,
+        )
+        .map_err(|error| format!("创建副本历史底稿目录失败: {error}"))?;
+        fs::rename(&staged.path, &archived_path).map_err(|error| {
+            format!(
+                "归档副本历史底稿失败 ({} -> {}): {error}",
+                staged.path.display(),
+                archived_path.display()
+            )
+        })?;
+
+        let mut failures = Vec::new();
+        for db_path in self.sqlite_candidate_paths() {
+            if let Err(error) =
+                archive_staged_thread_row(&db_path, &staged.session.id, &archived_path)
+            {
+                failures.push(error);
+            }
+        }
+        if let Err(error) =
+            self.remove_session_index_entries(std::slice::from_ref(&staged.session.id))
+        {
+            failures.push(error);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("；"))
+        }
     }
 
     #[cfg(test)]
@@ -1138,7 +1326,7 @@ impl SessionStore {
         let sessions = self.list_sessions(None, None)?;
         fs::create_dir_all(self.trash_dir())
             .map_err(|error| format!("创建回收站失败: {}", error))?;
-        let mut moved = 0;
+        let mut moved_sessions = Vec::new();
         let mut failed = Vec::new();
         for session_id in session_ids {
             let Some(session) = sessions.iter().find(|item| &item.id == session_id) else {
@@ -1157,17 +1345,64 @@ impl SessionStore {
                         "trashPath": trash_path.to_string_lossy(),
                         "deletedAt": now_timestamp()
                     });
-                    let _ = fs::write(
-                        metadata_path,
-                        serde_json::to_string_pretty(&metadata).unwrap_or_default(),
-                    );
-                    moved += 1;
+                    let metadata_content = serde_json::to_vec_pretty(&metadata)
+                        .map_err(|error| format!("序列化回收站记录失败: {}", error))?;
+                    if let Err(error) = write_bytes_atomic(&metadata_path, &metadata_content) {
+                        let rollback = fs::rename(&trash_path, &source);
+                        failed.push(match rollback {
+                            Ok(()) => format!("写入回收站记录失败 {}: {}", session.id, error),
+                            Err(rollback_error) => format!(
+                                "写入回收站记录失败 {}: {}；同时回滚会话文件失败: {}",
+                                session.id, error, rollback_error
+                            ),
+                        });
+                        continue;
+                    }
+                    moved_sessions.push((session.clone(), trash_path, metadata_path));
                 }
                 Err(error) => failed.push(format!("移动失败 {}: {}", session.id, error)),
             }
         }
+        if !moved_sessions.is_empty() {
+            let moved_ids = moved_sessions
+                .iter()
+                .map(|(session, _, _)| session.id.clone())
+                .collect::<Vec<_>>();
+            if let Err(error) = self.hide_sessions_from_codex_indexes(&moved_ids) {
+                let mut rolled_back_ids = Vec::new();
+                let mut rollback_failures = Vec::new();
+                for (session, trash_path, metadata_path) in &moved_sessions {
+                    match fs::rename(trash_path, &session.path) {
+                        Ok(()) => {
+                            let _ = fs::remove_file(metadata_path);
+                            rolled_back_ids.push(session.id.clone());
+                        }
+                        Err(rollback_error) => {
+                            rollback_failures.push(format!("{}: {}", session.id, rollback_error))
+                        }
+                    }
+                }
+                if !rolled_back_ids.is_empty() {
+                    if let Err(repair_error) =
+                        self.restore_sessions_to_codex_indexes(&rolled_back_ids)
+                    {
+                        rollback_failures.push(format!("恢复 Codex 索引失败: {}", repair_error));
+                    }
+                }
+                failed.push(if rollback_failures.is_empty() {
+                    format!("同步 Codex 会话列表失败，已回滚文件移动: {}", error)
+                } else {
+                    format!(
+                        "同步 Codex 会话列表失败: {}；部分回滚失败: {}",
+                        error,
+                        rollback_failures.join("；")
+                    )
+                });
+                moved_sessions.retain(|(_, trash_path, _)| trash_path.exists());
+            }
+        }
         Ok(CodexSessionTrashSummary {
-            moved,
+            moved: moved_sessions.len(),
             restored: 0,
             failed,
         })
@@ -1184,21 +1419,24 @@ impl SessionStore {
                 let value: Value = serde_json::from_str(&content)
                     .map_err(|error| format!("解析回收站失败 {}: {}", path.display(), error))?;
                 let id = read_string(&value, "id").unwrap_or_else(|| file_stem(&path));
-                if !seen.insert(id.clone()) {
-                    continue;
-                }
                 let stored_trash_path = read_string(&value, "trashPath").unwrap_or_default();
                 let trash_path =
                     if stored_trash_path.is_empty() || !Path::new(&stored_trash_path).exists() {
-                        path.with_extension("jsonl").to_string_lossy().to_string()
+                        path.with_extension("jsonl")
                     } else {
-                        stored_trash_path
+                        PathBuf::from(stored_trash_path)
                     };
+                if !trash_path.is_file() {
+                    continue;
+                }
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
                 records.push(CodexTrashedSessionRecord {
                     id,
                     title: read_string(&value, "title").unwrap_or_else(|| "未命名会话".to_string()),
                     original_path: read_string(&value, "originalPath").unwrap_or_default(),
-                    trash_path,
+                    trash_path: trash_path.to_string_lossy().to_string(),
                     deleted_at: value
                         .get("deletedAt")
                         .and_then(Value::as_i64)
@@ -1215,7 +1453,7 @@ impl SessionStore {
         session_ids: &[String],
     ) -> Result<CodexSessionTrashSummary, String> {
         let trashed = self.list_trashed()?;
-        let mut restored = 0;
+        let mut restored_ids = Vec::new();
         let mut failed = Vec::new();
         for session_id in session_ids {
             let Some(record) = trashed.iter().find(|item| &item.id == session_id) else {
@@ -1231,14 +1469,22 @@ impl SessionStore {
             match fs::rename(&trash_path, &original_path) {
                 Ok(()) => {
                     let _ = fs::remove_file(trash_path.with_extension("json"));
-                    restored += 1;
+                    restored_ids.push(session_id.clone());
                 }
                 Err(error) => failed.push(format!("恢复失败 {}: {}", session_id, error)),
             }
         }
+        if !restored_ids.is_empty() {
+            if let Err(error) = self.restore_sessions_to_codex_indexes(&restored_ids) {
+                failed.push(format!(
+                    "会话文件已恢复，但同步 Codex 会话列表失败: {}",
+                    error
+                ));
+            }
+        }
         Ok(CodexSessionTrashSummary {
             moved: 0,
-            restored,
+            restored: restored_ids.len(),
             failed,
         })
     }
@@ -1892,22 +2138,6 @@ impl SessionStore {
         Ok(result)
     }
 
-    pub fn list_visibility_repair_instances(
-        &self,
-    ) -> Result<CodexSessionVisibilityRepairInstanceList, String> {
-        Ok(CodexSessionVisibilityRepairInstanceList {
-            default_instance_id: "__default__".to_string(),
-            instances: vec![CodexSessionVisibilityRepairInstanceOption {
-                id: "__default__".to_string(),
-                name: "默认实例".to_string(),
-                user_data_dir: self.codex_home.to_string_lossy().to_string(),
-                current_provider: self.read_target_provider()?,
-                is_default: true,
-                running: false,
-            }],
-        })
-    }
-
     pub fn list_visibility_repair_providers(
         &self,
     ) -> Result<CodexSessionVisibilityRepairProviderList, String> {
@@ -2079,6 +2309,363 @@ impl SessionStore {
                 })?;
         }
         Ok(())
+    }
+
+    pub(crate) fn hide_sessions_from_codex_indexes(
+        &self,
+        session_ids: &[String],
+    ) -> Result<(), String> {
+        self.set_sqlite_session_visibility(session_ids, false)?;
+        self.remove_session_index_entries(session_ids)?;
+        Ok(())
+    }
+
+    pub(crate) fn codex_indexes_contain_visible_sessions(
+        &self,
+        session_ids: &[String],
+    ) -> Result<bool, String> {
+        if session_ids.is_empty() {
+            return Ok(false);
+        }
+        if session_ids.len() > 400 {
+            for chunk in session_ids.chunks(400) {
+                if self.codex_indexes_contain_visible_sessions(chunk)? {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        let ids = session_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let index_path = self.codex_home.join("session_index.jsonl");
+        if index_path.exists() {
+            let content = fs::read_to_string(&index_path)
+                .map_err(|error| format!("读取 session_index.jsonl 失败: {}", error))?;
+            if content.lines().any(|line| {
+                serde_json::from_str::<Value>(line)
+                    .ok()
+                    .and_then(|value| read_string(&value, "id"))
+                    .is_some_and(|id| ids.contains(id.as_str()))
+            }) {
+                return Ok(true);
+            }
+        }
+
+        let placeholders = std::iter::repeat_n("?", session_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        for db_path in self.sqlite_candidate_paths() {
+            let connection = Connection::open(&db_path).map_err(|error| {
+                format!("打开 Codex 会话索引失败 ({}): {}", db_path.display(), error)
+            })?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| format!("设置 Codex 会话索引等待时间失败: {}", error))?;
+            let thread_columns = sqlite_thread_columns_with_connection(&connection)?;
+            if thread_columns.contains("id") {
+                let visible_predicate = if thread_columns.contains("archived") {
+                    " AND COALESCE(archived, 0) <> 1"
+                } else {
+                    ""
+                };
+                let count = connection
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM threads WHERE id IN ({}){}",
+                            placeholders, visible_predicate
+                        ),
+                        rusqlite::params_from_iter(session_ids.iter()),
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "检查 Codex 线程可见性失败 ({}): {}",
+                            db_path.display(),
+                            error
+                        )
+                    })?;
+                if count > 0 {
+                    return Ok(true);
+                }
+            }
+            let catalog_columns =
+                sqlite_table_columns_with_connection(&connection, "local_thread_catalog")?;
+            if catalog_columns.contains("thread_id") {
+                let local_only = if catalog_columns.contains("host_id") {
+                    " AND host_id = 'local'"
+                } else {
+                    ""
+                };
+                let visible_only = if catalog_columns.contains("missing_candidate") {
+                    " AND COALESCE(missing_candidate, 0) <> 1"
+                } else {
+                    ""
+                };
+                let count = connection
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id IN ({}){}{}",
+                            placeholders, local_only, visible_only
+                        ),
+                        rusqlite::params_from_iter(session_ids.iter()),
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "检查 Codex 侧栏可见性失败 ({}): {}",
+                            db_path.display(),
+                            error
+                        )
+                    })?;
+                if count > 0 {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn restore_sessions_to_codex_indexes(&self, session_ids: &[String]) -> Result<(), String> {
+        self.set_sqlite_session_visibility(session_ids, true)?;
+        let selected_ids = session_ids.iter().cloned().collect::<HashSet<_>>();
+        let sessions = self
+            .list_sessions(None, None)?
+            .into_iter()
+            .filter(|session| selected_ids.contains(&session.id))
+            .collect::<Vec<_>>();
+        if sessions.len() != selected_ids.len() {
+            let found = sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<HashSet<_>>();
+            let missing = selected_ids
+                .iter()
+                .filter(|id| !found.contains(id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            return Err(format!("恢复后的会话文件不可读: {}", missing.join(", ")));
+        }
+        let repair_records = sessions
+            .iter()
+            .map(|session| SessionRepairRecord {
+                id: session.id.clone(),
+                title: session.title.clone(),
+                path: PathBuf::from(&session.path),
+                updated_at: session.updated_at,
+            })
+            .collect::<Vec<_>>();
+        let target_provider = self.read_target_provider()?;
+        self.repair_sqlite_visibility(&target_provider, Some(&repair_records))?;
+        self.repair_session_index(&repair_records)?;
+        let catalog = self.repair_desktop_catalog(&target_provider, &repair_records)?;
+        if !catalog.missing_ids.is_empty() {
+            return Err(format!(
+                "恢复 Codex 侧栏目录失败: {}",
+                catalog.missing_ids.join(", ")
+            ));
+        }
+        self.repair_desktop_projects(&repair_records)?;
+        Ok(())
+    }
+
+    fn set_sqlite_session_visibility(
+        &self,
+        session_ids: &[String],
+        visible: bool,
+    ) -> Result<usize, String> {
+        if session_ids.is_empty() {
+            return Ok(0);
+        }
+        if session_ids.len() > 400 {
+            let mut updated = 0usize;
+            for chunk in session_ids.chunks(400) {
+                updated += self.set_sqlite_session_visibility(chunk, visible)?;
+            }
+            return Ok(updated);
+        }
+        let placeholders = std::iter::repeat_n("?", session_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut updated = 0usize;
+        for db_path in self.sqlite_candidate_paths() {
+            let connection = Connection::open(&db_path).map_err(|error| {
+                format!("打开 Codex 会话索引失败 ({}): {}", db_path.display(), error)
+            })?;
+            let thread_columns = sqlite_thread_columns_with_connection(&connection)?;
+            let catalog_columns =
+                sqlite_table_columns_with_connection(&connection, "local_thread_catalog")?;
+            let has_threads = thread_columns.contains("id");
+            let has_catalog = catalog_columns.contains("thread_id");
+            if !has_threads && !has_catalog {
+                continue;
+            }
+            drop(connection);
+            backup_sqlite_file(&db_path)?;
+
+            let mut connection = Connection::open(&db_path).map_err(|error| {
+                format!(
+                    "重新打开 Codex 会话索引失败 ({}): {}",
+                    db_path.display(),
+                    error
+                )
+            })?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| format!("设置 Codex 会话索引等待时间失败: {}", error))?;
+            let transaction = connection
+                .transaction()
+                .map_err(|error| format!("开启 Codex 会话索引事务失败: {}", error))?;
+
+            if has_threads {
+                let sql = if visible {
+                    let mut assignments = Vec::new();
+                    let mut predicates = Vec::new();
+                    if thread_columns.contains("archived") {
+                        assignments.push("archived = 0");
+                        predicates.push("COALESCE(archived, 0) <> 0");
+                    }
+                    if thread_columns.contains("archived_at") {
+                        assignments.push("archived_at = NULL");
+                        predicates.push("archived_at IS NOT NULL");
+                    }
+                    (!assignments.is_empty()).then(|| {
+                        format!(
+                            "UPDATE threads SET {} WHERE id IN ({}) AND ({})",
+                            assignments.join(", "),
+                            placeholders,
+                            predicates.join(" OR ")
+                        )
+                    })
+                } else if thread_columns.contains("archived") {
+                    let mut assignments = vec!["archived = 1".to_string()];
+                    if thread_columns.contains("archived_at") {
+                        assignments.push(format!("archived_at = {}", now_timestamp()));
+                    }
+                    Some(format!(
+                        "UPDATE threads SET {} WHERE id IN ({}) AND COALESCE(archived, 0) <> 1",
+                        assignments.join(", "),
+                        placeholders
+                    ))
+                } else {
+                    Some(format!(
+                        "DELETE FROM threads WHERE id IN ({})",
+                        placeholders
+                    ))
+                };
+                if let Some(sql) = sql {
+                    updated += transaction
+                        .execute(&sql, rusqlite::params_from_iter(session_ids.iter()))
+                        .map_err(|error| {
+                            format!(
+                                "更新 Codex 线程可见性失败 ({}): {}",
+                                db_path.display(),
+                                error
+                            )
+                        })?;
+                }
+            }
+
+            let mut catalog_updated = 0usize;
+            if has_catalog {
+                let local_only = if catalog_columns.contains("host_id") {
+                    " AND host_id = 'local'"
+                } else {
+                    ""
+                };
+                let sql = if catalog_columns.contains("missing_candidate") {
+                    format!(
+                        "UPDATE local_thread_catalog SET missing_candidate = {} WHERE thread_id IN ({}){} AND COALESCE(missing_candidate, 0) <> {}",
+                        usize::from(!visible),
+                        placeholders,
+                        local_only,
+                        usize::from(!visible)
+                    )
+                } else if visible {
+                    String::new()
+                } else {
+                    format!(
+                        "DELETE FROM local_thread_catalog WHERE thread_id IN ({}){}",
+                        placeholders, local_only
+                    )
+                };
+                if !sql.is_empty() {
+                    catalog_updated = transaction
+                        .execute(&sql, rusqlite::params_from_iter(session_ids.iter()))
+                        .map_err(|error| {
+                            format!(
+                                "更新 Codex 侧栏可见性失败 ({}): {}",
+                                db_path.display(),
+                                error
+                            )
+                        })?;
+                    updated += catalog_updated;
+                }
+            }
+            if catalog_updated > 0
+                && sqlite_table_exists_with_connection(
+                    &transaction,
+                    "local_thread_catalog_metadata",
+                )?
+            {
+                transaction
+                    .execute(
+                        "INSERT INTO local_thread_catalog_metadata (id, catalog_revision) VALUES (1, 1) \
+                         ON CONFLICT(id) DO UPDATE SET catalog_revision = catalog_revision + 1",
+                        [],
+                    )
+                    .map_err(|error| format!("更新 Codex 侧栏目录版本失败: {}", error))?;
+            }
+            transaction
+                .commit()
+                .map_err(|error| format!("提交 Codex 会话索引更新失败: {}", error))?;
+        }
+        Ok(updated)
+    }
+
+    fn remove_session_index_entries(&self, session_ids: &[String]) -> Result<usize, String> {
+        if session_ids.is_empty() {
+            return Ok(0);
+        }
+        let path = self.codex_home.join("session_index.jsonl");
+        if !path.exists() {
+            return Ok(0);
+        }
+        let content = fs::read_to_string(&path)
+            .map_err(|error| format!("读取 session_index.jsonl 失败: {}", error))?;
+        let ids = session_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let mut removed = 0usize;
+        let mut lines = Vec::new();
+        for line in content.lines() {
+            let remove = serde_json::from_str::<Value>(line)
+                .ok()
+                .and_then(|value| read_string(&value, "id"))
+                .is_some_and(|id| ids.contains(id.as_str()));
+            if remove {
+                removed += 1;
+            } else {
+                lines.push(line);
+            }
+        }
+        if removed == 0 {
+            return Ok(0);
+        }
+        let backup_dir = visibility_backup_dir();
+        fs::create_dir_all(&backup_dir)
+            .map_err(|error| format!("创建会话索引备份目录失败: {}", error))?;
+        fs::copy(&path, backup_dir.join("session_index.jsonl"))
+            .map_err(|error| format!("备份 session_index.jsonl 失败: {}", error))?;
+        let mut next = lines.join("\n");
+        if !next.is_empty() {
+            next.push('\n');
+        }
+        write_bytes_atomic(&path, next.as_bytes())
+            .map_err(|error| format!("更新 session_index.jsonl 失败: {}", error))?;
+        Ok(removed)
     }
 
     fn find_session_path(&self, session_id: &str) -> Result<PathBuf, String> {
@@ -2287,6 +2874,26 @@ impl SessionStore {
                     if paths.iter().any(|item| item == &path) {
                         continue;
                     }
+                    paths.push(path);
+                }
+            }
+        }
+        paths
+    }
+
+    fn staged_thread_cleanup_db_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.sqlite_candidate_paths();
+        if let Ok(entries) = fs::read_dir(&self.codex_home) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|item| item.to_str()) else {
+                    continue;
+                };
+                if path.is_file()
+                    && name.starts_with("thread_history_")
+                    && (name.ends_with(".sqlite") || name.ends_with(".db"))
+                    && !paths.iter().any(|item| item == &path)
+                {
                     paths.push(path);
                 }
             }
@@ -2921,7 +3528,7 @@ fn backup_sqlite_file(db_path: &Path) -> Result<String, String> {
 fn visibility_backup_dir() -> PathBuf {
     switcher_root_dir()
         .join("visibility-backups")
-        .join(chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string())
+        .join(chrono::Utc::now().format("%Y%m%d-%H%M%S-%6f").to_string())
 }
 
 fn visibility_repair_marker_path() -> PathBuf {
@@ -4770,6 +5377,385 @@ struct CodexThreadForkResult {
     project_path: String,
 }
 
+#[derive(Debug)]
+struct StagedForkSource {
+    session: CodexSessionRecord,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForkSourceSegment {
+    path: PathBuf,
+    end_byte_offset: Option<u64>,
+}
+
+fn create_staged_fork_rollout(
+    source_codex_home: &Path,
+    source_path: &Path,
+    staged_path: &Path,
+    staged_session_id: &str,
+    target_project_path: &str,
+    target_provider: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    let segments = fork_source_segments(source_codex_home, source_path)?;
+    let parent = staged_path
+        .parent()
+        .ok_or_else(|| "无法定位临时会话目录".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| format!("创建临时会话目录失败: {error}"))?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let target = options
+        .open(staged_path)
+        .map_err(|error| format!("创建临时会话失败 ({}): {error}", staged_path.display()))?;
+    let mut writer = BufWriter::new(target);
+    let timestamp = created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut meta = read_session_meta_value(source_path)?;
+    rewrite_staged_session_meta(
+        &mut meta,
+        staged_session_id,
+        target_project_path,
+        target_provider,
+        &timestamp,
+    )?;
+    let mut history_count = 0_u64;
+    let write_result = (|| {
+        serde_json::to_writer(&mut writer, &meta)
+            .map_err(|error| format!("生成临时会话身份失败: {error}"))?;
+        writer
+            .write_all(b"\n")
+            .map_err(|error| format!("写入临时会话失败: {error}"))?;
+        for segment in &segments {
+            let source = fs::File::open(&segment.path)
+                .map_err(|error| format!("读取源会话失败 ({}): {error}", segment.path.display()))?;
+            let mut reader = BufReader::new(source);
+            let mut consumed = 0_u64;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let read = reader
+                    .read_line(&mut line)
+                    .map_err(|error| format!("读取源会话记录失败: {error}"))?;
+                if read == 0 {
+                    break;
+                }
+                let next_consumed = consumed.saturating_add(read as u64);
+                if segment
+                    .end_byte_offset
+                    .is_some_and(|end| next_consumed > end)
+                {
+                    break;
+                }
+                consumed = next_consumed;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(mut value) = serde_json::from_str::<Value>(&line) else {
+                    // An incomplete or malformed record cannot be consumed by Codex. Omitting it
+                    // and assigning fresh ordinals keeps subsequent valid history usable.
+                    continue;
+                };
+                if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+                    continue;
+                }
+                history_count = history_count.saturating_add(1);
+                value
+                    .as_object_mut()
+                    .ok_or_else(|| "源会话记录格式无效".to_string())?
+                    .insert("ordinal".to_string(), Value::from(history_count));
+                serde_json::to_writer(&mut writer, &value)
+                    .map_err(|error| format!("生成临时会话记录失败: {error}"))?;
+                writer
+                    .write_all(b"\n")
+                    .map_err(|error| format!("写入临时会话失败: {error}"))?;
+            }
+        }
+        if history_count == 0 {
+            return Err("源会话没有可复制的历史数据".to_string());
+        }
+        writer
+            .flush()
+            .map_err(|error| format!("刷新临时会话失败: {error}"))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| format!("同步临时会话失败: {error}"))
+    })();
+    if let Err(error) = write_result {
+        drop(writer);
+        let _ = fs::remove_file(staged_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn read_session_meta_value(path: &Path) -> Result<Value, String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("读取会话身份失败 ({}): {error}", path.display()))?;
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| format!("读取会话身份失败: {error}"))?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+            return Ok(value);
+        }
+    }
+    Err(format!(
+        "源会话缺少 session_meta，不能安全复制: {}",
+        path.display()
+    ))
+}
+
+fn rewrite_staged_session_meta(
+    value: &mut Value,
+    staged_session_id: &str,
+    target_project_path: &str,
+    target_provider: &str,
+    timestamp: &str,
+) -> Result<(), String> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "源会话的 session_meta 格式无效".to_string())?;
+    object.insert(
+        "timestamp".to_string(),
+        Value::String(timestamp.to_string()),
+    );
+    object.insert("ordinal".to_string(), Value::from(0));
+    object.remove("history_base");
+    object.remove("subagent_history_start_ordinal");
+    let payload = object
+        .get_mut("payload")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "源会话的 session_meta 缺少 payload".to_string())?;
+    payload.insert(
+        "id".to_string(),
+        Value::String(staged_session_id.to_string()),
+    );
+    payload.insert(
+        "session_id".to_string(),
+        Value::String(staged_session_id.to_string()),
+    );
+    if payload.contains_key("thread_id") {
+        payload.insert(
+            "thread_id".to_string(),
+            Value::String(staged_session_id.to_string()),
+        );
+    }
+    payload.insert(
+        "timestamp".to_string(),
+        Value::String(timestamp.to_string()),
+    );
+    payload.insert(
+        "cwd".to_string(),
+        Value::String(target_project_path.to_string()),
+    );
+    payload.insert(
+        "model_provider".to_string(),
+        Value::String(target_provider.to_string()),
+    );
+    payload.remove("history_base");
+    payload.remove("subagent_history_start_ordinal");
+    Ok(())
+}
+
+fn fork_source_segments(
+    source_codex_home: &Path,
+    source_path: &Path,
+) -> Result<Vec<ForkSourceSegment>, String> {
+    fn collect(
+        codex_home: &Path,
+        path: PathBuf,
+        end_byte_offset: Option<u64>,
+        seen: &mut HashSet<String>,
+        segments: &mut Vec<ForkSourceSegment>,
+    ) -> Result<(), String> {
+        let meta = read_session_meta_value(&path)?;
+        let payload = meta
+            .get("payload")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "源会话的 session_meta 缺少 payload".to_string())?;
+        let history_base = payload
+            .get("history_base")
+            .or_else(|| meta.get("history_base"));
+        if let Some(base) = history_base.and_then(Value::as_object) {
+            let parent_id = base
+                .get("thread_id")
+                .or_else(|| base.get("threadId"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| "源会话 history_base 缺少 thread_id".to_string())?;
+            let parent_end = base
+                .get("end_byte_offset")
+                .or_else(|| base.get("endByteOffset"))
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "源会话 history_base 缺少 end_byte_offset".to_string())?;
+            if !seen.insert(parent_id.to_string()) {
+                return Err(format!("源会话历史引用存在循环: {parent_id}"));
+            }
+            let parent_path = find_rollout_path_in_store(codex_home, parent_id)?;
+            collect(codex_home, parent_path, Some(parent_end), seen, segments)?;
+        }
+        segments.push(ForkSourceSegment {
+            path,
+            end_byte_offset,
+        });
+        Ok(())
+    }
+
+    let source_meta = read_session_meta_value(source_path)?;
+    let source_id = extract_session_id(
+        &serde_json::to_string(&source_meta)
+            .map_err(|error| format!("解析源会话 ID 失败: {error}"))?,
+    )
+    .unwrap_or_else(|| source_path.to_string_lossy().to_string());
+    let mut seen = HashSet::from([source_id]);
+    let mut segments = Vec::new();
+    collect(
+        source_codex_home,
+        source_path.to_path_buf(),
+        None,
+        &mut seen,
+        &mut segments,
+    )?;
+    Ok(segments)
+}
+
+fn find_rollout_path_in_store(codex_home: &Path, rollout_id: &str) -> Result<PathBuf, String> {
+    for root in [
+        codex_home.join("sessions"),
+        codex_home.join("archived_sessions"),
+    ] {
+        for path in collect_jsonl_files(&root)? {
+            if path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .is_some_and(|stem| stem.ends_with(rollout_id))
+                || session_file_has_id(&path, rollout_id)?
+            {
+                return Ok(path);
+            }
+        }
+    }
+    Err(format!("源会话引用的历史底稿不存在: {rollout_id}"))
+}
+
+fn remove_staged_thread_rows(db_path: &Path, session_id: &str) -> Result<(), String> {
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let mut connection = Connection::open(db_path)
+        .map_err(|error| format!("打开临时会话索引失败 ({}): {error}", db_path.display()))?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| format!("设置临时会话索引等待时间失败: {error}"))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开启临时会话清理事务失败: {error}"))?;
+    for (table, column) in [
+        ("thread_items", "thread_id"),
+        ("thread_turns", "thread_id"),
+        ("thread_history_projection_state", "thread_id"),
+        ("local_thread_catalog", "thread_id"),
+        ("threads", "id"),
+    ] {
+        if !sqlite_table_exists_with_connection(&transaction, table)? {
+            continue;
+        }
+        let columns = sqlite_table_columns_with_connection(&transaction, table)?;
+        if !columns.contains(column) {
+            continue;
+        }
+        transaction
+            .execute(
+                &format!("DELETE FROM {table} WHERE {column} = ?1"),
+                params![session_id],
+            )
+            .map_err(|error| {
+                format!(
+                    "清理临时会话索引失败 ({} / {table}): {error}",
+                    db_path.display()
+                )
+            })?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("提交临时会话清理失败: {error}"))
+}
+
+fn archive_staged_thread_row(
+    db_path: &Path,
+    session_id: &str,
+    archived_path: &Path,
+) -> Result<(), String> {
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let mut connection = Connection::open(db_path)
+        .map_err(|error| format!("打开副本历史底稿索引失败 ({}): {error}", db_path.display()))?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| format!("设置副本历史底稿索引等待时间失败: {error}"))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开启副本历史底稿归档事务失败: {error}"))?;
+    let thread_columns = sqlite_table_columns_with_connection(&transaction, "threads")?;
+    if thread_columns.contains("id") {
+        let mut assignments = Vec::new();
+        if thread_columns.contains("rollout_path") {
+            assignments.push("rollout_path = ?2".to_string());
+        }
+        if thread_columns.contains("archived") {
+            assignments.push("archived = 1".to_string());
+        }
+        if thread_columns.contains("archived_at") {
+            assignments.push(format!("archived_at = {}", now_timestamp()));
+        }
+        if !assignments.is_empty() {
+            transaction
+                .execute(
+                    &format!(
+                        "UPDATE threads SET {} WHERE id = ?1",
+                        assignments.join(", ")
+                    ),
+                    params![session_id, archived_path.to_string_lossy()],
+                )
+                .map_err(|error| {
+                    format!("归档副本历史底稿线程失败 ({}): {error}", db_path.display())
+                })?;
+        }
+    }
+    let catalog_columns =
+        sqlite_table_columns_with_connection(&transaction, "local_thread_catalog")?;
+    if catalog_columns.contains("thread_id") {
+        let local_only = if catalog_columns.contains("host_id") {
+            " AND host_id = 'local'"
+        } else {
+            ""
+        };
+        transaction
+            .execute(
+                &format!("DELETE FROM local_thread_catalog WHERE thread_id = ?1{local_only}"),
+                params![session_id],
+            )
+            .map_err(|error| {
+                format!(
+                    "隐藏副本历史底稿侧栏记录失败 ({}): {error}",
+                    db_path.display()
+                )
+            })?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("提交副本历史底稿归档失败: {error}"))
+}
+
 fn normalize_copy_target_directory(project_path: &str) -> Result<String, String> {
     let project_path = project_path.trim();
     if project_path.is_empty() {
@@ -5000,7 +5986,6 @@ fn run_codex_thread_fork(
     Ok(fork)
 }
 
-#[cfg(test)]
 fn new_session_id() -> String {
     let mut bytes = rand::random::<[u8; 16]>();
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -5019,7 +6004,6 @@ fn new_session_id() -> String {
     )
 }
 
-#[cfg(test)]
 fn new_session_rollout_path(
     sessions_dir: &Path,
     session_id: &str,
@@ -6006,8 +6990,9 @@ fn now_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_history_onto_target, extract_title, find_task_started_offsets_reverse,
-        normalize_copy_target_directory, parse_codex_thread_fork_response, repair_sqlite_db,
+        archive_staged_thread_row, copy_history_onto_target, create_staged_fork_rollout,
+        extract_title, find_task_started_offsets_reverse, normalize_copy_target_directory,
+        parse_codex_thread_fork_response, remove_staged_thread_rows, repair_sqlite_db,
         restore_session_file_if_unchanged, same_existing_directory, session_file_fingerprint,
         sql_quote, SessionRepairRecord, SessionStore,
     };
@@ -6080,6 +7065,260 @@ mod tests {
             parse_codex_thread_fork_response(&json!({ "id": 2, "result": {} }))
                 .expect_err("missing id should fail")
                 .contains("新会话 ID")
+        );
+    }
+
+    #[test]
+    fn stages_a_fork_with_a_fresh_identity_and_contiguous_ordinals() {
+        let source_dir = tempdir().expect("source directory");
+        let target_dir = tempdir().expect("target directory");
+        let source_path = source_dir.path().join("source.jsonl");
+        let staged_path = target_dir.path().join("staged.jsonl");
+        fs::write(
+            &source_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"source","session_id":"source","thread_id":"source","cwd":"/old","model_provider":"old"},"ordinal":0}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"保留历史"}]},"ordinal":476}"#,
+                "\n",
+                "not-json\n",
+                r#"{"type":"event_msg","payload":{"type":"task_complete"},"ordinal":627}"#,
+                "\n"
+            ),
+        )
+        .expect("write source");
+        let created_at = chrono::DateTime::parse_from_rfc3339("2026-08-25T12:00:00Z")
+            .expect("timestamp")
+            .with_timezone(&chrono::Utc);
+
+        create_staged_fork_rollout(
+            source_dir.path(),
+            &source_path,
+            &staged_path,
+            "staged-id",
+            &target_dir.path().to_string_lossy(),
+            "target-provider",
+            created_at,
+        )
+        .expect("stage rollout");
+
+        let values = fs::read_to_string(staged_path)
+            .expect("read staged")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid staged line"))
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 3);
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value["ordinal"].as_u64().expect("ordinal"))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(values[0]["payload"]["id"], "staged-id");
+        assert_eq!(values[0]["payload"]["session_id"], "staged-id");
+        assert_eq!(values[0]["payload"]["thread_id"], "staged-id");
+        assert_eq!(values[0]["payload"]["model_provider"], "target-provider");
+        assert_eq!(
+            values[0]["payload"]["cwd"],
+            target_dir.path().to_string_lossy().as_ref()
+        );
+        assert_eq!(values[1]["payload"]["type"], "message");
+        assert_eq!(values[2]["payload"]["type"], "task_complete");
+    }
+
+    #[test]
+    fn stages_the_complete_lineage_of_an_existing_paginated_fork() {
+        let source_home = tempdir().expect("source home");
+        let target_dir = tempdir().expect("target directory");
+        let sessions_dir = source_home.path().join("sessions/2026/08/25");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory");
+        let parent_path = sessions_dir.join("rollout-2026-08-25T10-00-00-parent-id.jsonl");
+        let parent_meta = concat!(
+            r#"{"type":"session_meta","payload":{"id":"parent-id"},"ordinal":0}"#,
+            "\n"
+        );
+        let inherited = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"继承内容"}]},"ordinal":1}"#,
+            "\n"
+        );
+        let excluded = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"截断后内容"}]},"ordinal":2}"#,
+            "\n"
+        );
+        fs::write(&parent_path, format!("{parent_meta}{inherited}{excluded}"))
+            .expect("write parent");
+        let cutoff = (parent_meta.len() + inherited.len()) as u64;
+        let child_path = sessions_dir.join("rollout-2026-08-25T11-00-00-child-id.jsonl");
+        fs::write(
+            &child_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "child-id",
+                        "history_base": {
+                            "thread_id": "parent-id",
+                            "end_ordinal_exclusive": 2,
+                            "end_byte_offset": cutoff
+                        }
+                    },
+                    "ordinal": 2
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"text": "子会话内容"}]
+                    },
+                    "ordinal": 3
+                })
+            ),
+        )
+        .expect("write child");
+        let staged_path = target_dir.path().join("staged.jsonl");
+
+        create_staged_fork_rollout(
+            source_home.path(),
+            &child_path,
+            &staged_path,
+            "staged-id",
+            &target_dir.path().to_string_lossy(),
+            "openai",
+            chrono::Utc::now(),
+        )
+        .expect("stage fork lineage");
+
+        let staged = fs::read_to_string(staged_path).expect("read staged");
+        assert!(staged.contains("继承内容"));
+        assert!(!staged.contains("截断后内容"));
+        assert!(staged.contains("子会话内容"));
+        assert!(!staged.contains("history_base"));
+        assert_eq!(
+            staged
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<Value>(line).expect("valid staged line")["ordinal"]
+                        .as_u64()
+                        .expect("ordinal")
+                })
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn removes_only_the_staged_thread_rows() {
+        let temp = tempdir().expect("temp directory");
+        let db_path = temp.path().join("state_5.sqlite");
+        run_sqlite_test(
+            &db_path,
+            r#"
+                CREATE TABLE threads (id TEXT PRIMARY KEY);
+                CREATE TABLE thread_items (thread_id TEXT NOT NULL, item_id TEXT NOT NULL);
+                CREATE TABLE thread_turns (thread_id TEXT NOT NULL, turn_id TEXT NOT NULL);
+                CREATE TABLE thread_history_projection_state (
+                    thread_id TEXT PRIMARY KEY,
+                    next_rollout_byte_offset INTEGER NOT NULL,
+                    next_rollout_ordinal INTEGER NOT NULL
+                );
+                INSERT INTO threads (id) VALUES ('staged'), ('keep');
+                INSERT INTO thread_items (thread_id, item_id) VALUES ('staged', 'drop'), ('keep', 'keep');
+                INSERT INTO thread_turns (thread_id, turn_id) VALUES ('staged', 'drop'), ('keep', 'keep');
+                INSERT INTO thread_history_projection_state VALUES ('staged', 1, 1), ('keep', 1, 1);
+            "#,
+        );
+
+        remove_staged_thread_rows(&db_path, "staged").expect("remove staged rows");
+
+        for table in [
+            "threads",
+            "thread_items",
+            "thread_turns",
+            "thread_history_projection_state",
+        ] {
+            assert_eq!(
+                run_sqlite_test_output(
+                    &db_path,
+                    &format!(
+                        "SELECT COUNT(*) FROM {table} WHERE {} = 'staged';",
+                        if table == "threads" {
+                            "id"
+                        } else {
+                            "thread_id"
+                        }
+                    ),
+                )
+                .trim(),
+                "0"
+            );
+            assert_eq!(
+                run_sqlite_test_output(
+                    &db_path,
+                    &format!(
+                        "SELECT COUNT(*) FROM {table} WHERE {} = 'keep';",
+                        if table == "threads" {
+                            "id"
+                        } else {
+                            "thread_id"
+                        }
+                    ),
+                )
+                .trim(),
+                "1"
+            );
+        }
+    }
+
+    #[test]
+    fn archives_a_staged_fork_base_without_removing_its_history_projection() {
+        let temp = tempdir().expect("temp directory");
+        let db_path = temp.path().join("state_5.sqlite");
+        let archived_path = temp.path().join("archived_sessions/staged.jsonl");
+        run_sqlite_test(
+            &db_path,
+            r#"
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    archived_at INTEGER
+                );
+                CREATE TABLE thread_items (thread_id TEXT NOT NULL, item_id TEXT NOT NULL);
+                CREATE TABLE local_thread_catalog (host_id TEXT NOT NULL, thread_id TEXT NOT NULL);
+                INSERT INTO threads (id, rollout_path) VALUES ('staged', '/old/staged.jsonl');
+                INSERT INTO thread_items (thread_id, item_id) VALUES ('staged', 'history');
+                INSERT INTO local_thread_catalog (host_id, thread_id) VALUES ('local', 'staged');
+            "#,
+        );
+
+        archive_staged_thread_row(&db_path, "staged", &archived_path).expect("archive staged row");
+
+        let row = run_sqlite_test_output(
+            &db_path,
+            "SELECT rollout_path || '|' || archived || '|' || (archived_at IS NOT NULL) FROM threads WHERE id = 'staged';",
+        );
+        assert_eq!(
+            row.trim(),
+            format!("{}|1|1", archived_path.to_string_lossy())
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &db_path,
+                "SELECT COUNT(*) FROM thread_items WHERE thread_id = 'staged';",
+            )
+            .trim(),
+            "1"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &db_path,
+                "SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id = 'staged';",
+            )
+            .trim(),
+            "0"
         );
     }
 
@@ -6667,6 +7906,224 @@ mod tests {
             .expect("restore");
         assert_eq!(restored.restored, 1);
         assert!(session_path.exists());
+    }
+
+    #[test]
+    fn moving_to_trash_hides_desktop_indexes_and_restore_reenables_them() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions").join("2026").join("08");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        fs::write(
+            codex.path().join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .expect("write config");
+        let session_id = "session-trash-index";
+        let session_path = sessions_dir.join("session-trash-index.jsonl");
+        let rollout = format!(
+            "{}\n{}\n",
+            json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "cwd": codex.path().to_string_lossy(),
+                    "source": "vscode",
+                    "timestamp": "2026-08-25T13:38:28Z"
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "需要回收的会话"}]
+                }
+            })
+        );
+        fs::write(&session_path, rollout).expect("write session");
+        fs::write(
+            codex.path().join("session_index.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "id": session_id,
+                    "thread_name": "需要回收的会话",
+                    "updated_at": "2026-08-25T13:38:28Z"
+                })
+            ),
+        )
+        .expect("write session index");
+
+        let state_db = codex.path().join("state_5.sqlite");
+        run_sqlite_test(
+            &state_db,
+            r#"
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    archived_at INTEGER,
+                    model_provider TEXT,
+                    title TEXT,
+                    first_user_message TEXT,
+                    preview TEXT,
+                    has_user_event INTEGER,
+                    thread_source TEXT
+                );
+                INSERT INTO threads (
+                    id, archived, model_provider, title, first_user_message,
+                    preview, has_user_event, thread_source
+                ) VALUES (
+                    'session-trash-index', 0, 'openai', '需要回收的会话',
+                    '需要回收的会话', '需要回收的会话', 1, 'user'
+                );
+                "#,
+        );
+        let catalog_db = codex.path().join("sqlite").join("codex-dev.db");
+        fs::create_dir_all(catalog_db.parent().expect("catalog parent")).expect("catalog dir");
+        run_sqlite_test(
+            &catalog_db,
+            &format!(
+                r#"
+                    CREATE TABLE local_thread_catalog (
+                        host_id TEXT NOT NULL,
+                        thread_id TEXT NOT NULL,
+                        display_title TEXT NOT NULL,
+                        source_created_at REAL NOT NULL,
+                        source_updated_at REAL NOT NULL,
+                        cwd TEXT,
+                        source_kind TEXT NOT NULL,
+                        model_provider TEXT,
+                        observation_sequence INTEGER NOT NULL,
+                        missing_candidate INTEGER NOT NULL DEFAULT 0,
+                        source_recency_at REAL NOT NULL DEFAULT 0,
+                        PRIMARY KEY (host_id, thread_id)
+                    );
+                    CREATE TABLE local_thread_catalog_metadata (
+                        id INTEGER PRIMARY KEY,
+                        catalog_revision INTEGER NOT NULL
+                    );
+                    INSERT INTO local_thread_catalog_metadata (id, catalog_revision) VALUES (1, 0);
+                    INSERT INTO local_thread_catalog (
+                        host_id, thread_id, display_title, source_created_at,
+                        source_updated_at, cwd, source_kind, model_provider,
+                        observation_sequence, missing_candidate, source_recency_at
+                    ) VALUES (
+                        'local', 'session-trash-index', '需要回收的会话', 1, 1,
+                        {}, 'vscode', 'openai', 1, 0, 1
+                    );
+                    "#,
+                sql_quote(&codex.path().to_string_lossy())
+            ),
+        );
+        let store = SessionStore::new(codex.path().to_path_buf());
+        assert!(store
+            .codex_indexes_contain_visible_sessions(&[session_id.to_string()])
+            .expect("detect visible Codex indexes"));
+
+        let moved = store
+            .move_to_trash(&[session_id.to_string()])
+            .expect("move indexed session to trash");
+        assert_eq!(moved.moved, 1);
+        assert!(moved.failed.is_empty());
+        assert_eq!(
+            run_sqlite_test_output(
+                &state_db,
+                "SELECT archived FROM threads WHERE id = 'session-trash-index';"
+            )
+            .trim(),
+            "1"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &catalog_db,
+                "SELECT missing_candidate FROM local_thread_catalog WHERE host_id = 'local' AND thread_id = 'session-trash-index';"
+            )
+            .trim(),
+            "1"
+        );
+        assert!(
+            !fs::read_to_string(codex.path().join("session_index.jsonl"))
+                .expect("read hidden session index")
+                .contains(session_id)
+        );
+        assert!(!store
+            .codex_indexes_contain_visible_sessions(&[session_id.to_string()])
+            .expect("verify hidden Codex indexes"));
+
+        run_sqlite_test(
+            &state_db,
+            "UPDATE threads SET archived = 0, archived_at = NULL WHERE id = 'session-trash-index';",
+        );
+        run_sqlite_test(
+            &catalog_db,
+            "UPDATE local_thread_catalog SET missing_candidate = 0 WHERE host_id = 'local' AND thread_id = 'session-trash-index';",
+        );
+        fs::write(
+            codex.path().join("session_index.jsonl"),
+            format!(
+                "{}\n",
+                json!({"id": session_id, "thread_name": "遗留可见记录"})
+            ),
+        )
+        .expect("restore legacy visible index residue");
+        let legacy_trashed_ids = store
+            .list_trashed()
+            .expect("list legacy trashed sessions")
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        assert!(store
+            .codex_indexes_contain_visible_sessions(&legacy_trashed_ids)
+            .expect("detect legacy visible residue"));
+        store
+            .hide_sessions_from_codex_indexes(&legacy_trashed_ids)
+            .expect("reconcile legacy visible residue");
+        assert!(!store
+            .codex_indexes_contain_visible_sessions(&legacy_trashed_ids)
+            .expect("verify reconciled legacy residue"));
+
+        let restored = store
+            .restore_from_trash(&[session_id.to_string()])
+            .expect("restore indexed session");
+        assert_eq!(restored.restored, 1);
+        assert!(restored.failed.is_empty());
+        assert_eq!(
+            run_sqlite_test_output(
+                &state_db,
+                "SELECT archived FROM threads WHERE id = 'session-trash-index';"
+            )
+            .trim(),
+            "0"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &catalog_db,
+                "SELECT missing_candidate FROM local_thread_catalog WHERE host_id = 'local' AND thread_id = 'session-trash-index';"
+            )
+            .trim(),
+            "0"
+        );
+        assert!(fs::read_to_string(codex.path().join("session_index.jsonl"))
+            .expect("read restored session index")
+            .contains(session_id));
+        assert!(store
+            .codex_indexes_contain_visible_sessions(&[session_id.to_string()])
+            .expect("verify restored Codex indexes"));
+
+        fs::write(
+            store.trash_dir().join(format!("{}.json", session_id)),
+            json!({
+                "id": session_id,
+                "title": "已失效的回收站元数据",
+                "originalPath": session_path,
+                "trashPath": store.trash_dir().join(format!("{}.jsonl", session_id))
+            })
+            .to_string(),
+        )
+        .expect("write stale trash metadata");
+        assert!(store
+            .list_trashed()
+            .expect("ignore stale trash metadata")
+            .is_empty());
     }
 
     #[test]

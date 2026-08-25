@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { CodexSessionRecord, CodexTrashedSessionRecord } from "../services/session";
+import { instanceDisplayName, type CodexInstance } from "../services/instances";
 import type { SessionGroup } from "../types/ui";
 import { formatLocalizedCount, t } from "../i18n";
 
 const props = defineProps<{
+  instances: CodexInstance[];
+  selectedInstanceId: string;
   sessionSearch: { titleQuery: string; contentQuery: string };
   sessionTrashMode: boolean;
   sessionLoading: boolean;
@@ -27,6 +30,7 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
+  (event: "select-instance", instanceId: string): void;
   (event: "update:session-trash-mode", value: boolean): void;
   (event: "load-sessions"): void;
   (event: "toggle-all-sessions"): void;
@@ -48,6 +52,9 @@ const emit = defineEmits<{
 
 const totalTokens = computed(() => props.sessionGroups.reduce((sum, group) => sum + group.approximateTokens, 0));
 const totalSize = computed(() => props.sessionGroups.reduce((sum, group) => sum + group.sizeBytes, 0));
+const selectedInstance = computed(() =>
+  props.instances.find((instance) => instance.id === props.selectedInstanceId),
+);
 
 function formatFileSize(bytes?: number | null): string {
   const safeBytes = typeof bytes === "number" && Number.isFinite(bytes) ? bytes : 0;
@@ -75,6 +82,33 @@ function switchMode(trashMode: boolean): void {
 
 <template>
   <section class="session-panel session-workspace">
+    <section v-if="instances.length > 1" class="session-instance-context">
+      <div class="session-instance-copy">
+        <span>{{ t("当前会话实例") }}</span>
+        <strong>{{ selectedInstance ? instanceDisplayName(selectedInstance) : t("系统默认实例") }}</strong>
+        <small>{{ selectedInstance?.codexHome || "~/.codex" }}</small>
+        <small class="session-instance-policy">
+          {{ selectedInstance?.isDefault
+            ? t("官方实例会包含在默认完整备份中，也可以在这里单独手动备份。")
+            : t("多开实例不会进入默认完整备份，只能在这里手动备份。") }}
+        </small>
+      </div>
+      <a-select
+        :model-value="selectedInstanceId"
+        :disabled="sessionLoading || backupWorking || sessionRepairing || sessionModelRepairing"
+        popup-container="body"
+        class="session-instance-select"
+        @change="emit('select-instance', String($event))"
+      >
+        <a-option v-for="instance in instances" :key="instance.id" :value="instance.id">
+          <div class="session-instance-option">
+            <strong>{{ instanceDisplayName(instance) }}</strong>
+            <span>{{ instance.running ? t("运行中") : t("未运行") }} · {{ instance.codexHome }}</span>
+          </div>
+        </a-option>
+      </a-select>
+    </section>
+
     <section class="session-overview-grid">
       <article>
         <span class="session-overview-icon blue"><icon-folder /></span>
@@ -152,7 +186,7 @@ function switchMode(trashMode: boolean): void {
                 <a-tooltip :content="t('查看会话内容')">
                   <a-button size="small" type="text" @click="emit('view-session-content', session)"><template #icon><icon-eye /></template></a-button>
                 </a-tooltip>
-                <a-tooltip :content="t('复制到其他目录')">
+                <a-tooltip :content="t('复制到其他实例或目录')">
                   <a-button size="small" type="text" @click="emit('copy-session', session)"><template #icon><icon-copy /></template></a-button>
                 </a-tooltip>
                 <a-tooltip :content="t('修改会话名称')">

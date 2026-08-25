@@ -20,6 +20,7 @@ import {
 const props = defineProps<{
   visible: boolean;
   session: CodexSessionRecord | null;
+  instanceId: string;
 }>();
 
 const emit = defineEmits<{
@@ -82,7 +83,7 @@ const attachmentCount = computed(() =>
 );
 
 watch(
-  () => [props.visible, props.session?.id] as const,
+  () => [props.visible, props.session?.id, props.instanceId] as const,
   ([visible]) => {
     requestSequence += 1;
     resetState();
@@ -265,7 +266,13 @@ async function loadFirstPage(): Promise<void> {
   const sequence = ++requestSequence;
   loading.value = true;
   try {
-    const page = await listSessionContent(session.id, null, 20, sortDirection.value);
+    const page = await listSessionContent(
+      session.id,
+      null,
+      20,
+      sortDirection.value,
+      props.instanceId,
+    );
     if (sequence !== requestSequence || props.session?.id !== session.id) return;
     turns.value = page.turns;
     nextCursor.value = page.nextCursor ?? null;
@@ -283,7 +290,13 @@ async function loadMore(): Promise<void> {
   const sequence = requestSequence;
   loadingMore.value = true;
   try {
-    const page = await listSessionContent(session.id, cursor, 20, sortDirection.value);
+    const page = await listSessionContent(
+      session.id,
+      cursor,
+      20,
+      sortDirection.value,
+      props.instanceId,
+    );
     if (sequence !== requestSequence || props.session?.id !== session.id) return;
     const knownIds = new Set(turns.value.map((turn) => turn.id));
     turns.value = [...turns.value, ...page.turns.filter((turn) => !knownIds.has(turn.id))];
@@ -317,7 +330,7 @@ async function loadAsset(attachment: CodexSessionAttachment): Promise<void> {
   const sequence = requestSequence;
   setInProgress(assetLoadingIds, attachment.id, true);
   try {
-    const asset = await getSessionAsset(session.id, attachment.id);
+    const asset = await getSessionAsset(session.id, attachment.id, props.instanceId);
     if (sequence !== requestSequence || props.session?.id !== session.id) return;
     assetUrls.value = { ...assetUrls.value, [attachment.id]: asset.dataUrl };
   } catch (error) {
@@ -348,7 +361,7 @@ function confirmDelete(turn: CodexSessionTurn): void {
     async onOk() {
       setInProgress(deletingTurnIds, turn.id, true);
       try {
-        const result = await deleteSessionTurn(session.id, turn.id);
+        const result = await deleteSessionTurn(session.id, turn.id, props.instanceId);
         lastBackupId.value = result.backupId;
         Message.success(`${t("已删除这轮对话")}，${t("已释放空间")} ${formatFileSize(result.removedBytes)}`);
         if (result.warnings.length) Message.warning(result.warnings.join("；"));
@@ -405,7 +418,12 @@ function confirmDeleteMessages(turn: CodexSessionTurn, entry: SessionMessageEntr
     async onOk() {
       setInProgress(deletingMessageIds, entry.id, true);
       try {
-        const result = await deleteSessionMessages(session.id, turn.id, entry.messageIds);
+        const result = await deleteSessionMessages(
+          session.id,
+          turn.id,
+          entry.messageIds,
+          props.instanceId,
+        );
         lastBackupId.value = result.backupId;
         if (skillDetail.value && entry.messageIds.includes(skillDetail.value.payload.id)) {
           skillDetail.value = null;
@@ -435,7 +453,11 @@ function confirmRestore(): void {
     async onOk() {
       restoring.value = true;
       try {
-        const result = await restoreSessionTurnBackup(session.id, backupId);
+        const result = await restoreSessionTurnBackup(
+          session.id,
+          backupId,
+          props.instanceId,
+        );
         lastBackupId.value = "";
         Message.success(t("会话内容已恢复"));
         if (result.warnings.length) Message.warning(result.warnings.join("；"));

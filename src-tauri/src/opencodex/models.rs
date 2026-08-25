@@ -119,6 +119,8 @@ mod tests {
 pub struct RunActionRequest {
     pub action: CommandAction,
     pub port: u16,
+    #[serde(default)]
+    pub instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

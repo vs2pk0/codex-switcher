@@ -98,6 +98,16 @@ const sidebarCollapsed = ref(true);
           <span class="sidebar-label">OpenCodex</span>
         </button>
       </a-tooltip>
+      <a-tooltip :content="t('Codex 多开')" position="right" :disabled="!sidebarCollapsed">
+        <button
+          type="button"
+          :class="{ active: activeView === 'instances' }"
+          @click="$emit('switch-view', 'instances')"
+        >
+          <icon-apps />
+          <span class="sidebar-label">{{ t("Codex 多开") }}</span>
+        </button>
+      </a-tooltip>
       <a-tooltip :content="t('设置')" position="right" :disabled="!sidebarCollapsed">
         <button
           type="button"
@@ -213,6 +223,10 @@ const sidebarCollapsed = ref(true);
       <a-button :type="activeView === 'openCodex' ? 'primary' : 'text'" @click="$emit('switch-view', 'openCodex')">
         <template #icon><icon-command /></template>
         OpenCodex
+      </a-button>
+      <a-button :type="activeView === 'instances' ? 'primary' : 'text'" @click="$emit('switch-view', 'instances')">
+        <template #icon><icon-apps /></template>
+        {{ t("Codex 多开") }}
       </a-button>
       <a-button :type="activeView === 'settings' || activeView === 'pushSettings' ? 'primary' : 'text'" @click="$emit('switch-view', 'settings')">
         <template #icon><icon-settings /></template>
