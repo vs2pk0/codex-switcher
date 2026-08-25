@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -875,18 +875,95 @@ impl SessionStore {
         })
     }
 
+    pub fn copy_session_to_directory(
+        &self,
+        source_session_id: &str,
+        copy_suffix: &str,
+        target_project_path: &str,
+    ) -> Result<CodexSessionMutationResult, String> {
+        let source_session_id = source_session_id.trim();
+        if source_session_id.is_empty() {
+            return Err("源会话不能为空".to_string());
+        }
+        let target_project_path = normalize_copy_target_directory(target_project_path)?;
+        let sessions = self.list_sessions(None, None)?;
+        let source = sessions
+            .iter()
+            .find(|session| session.id == source_session_id)
+            .ok_or_else(|| format!("源会话不存在: {}", source_session_id))?;
+        if same_existing_directory(&source.project_path, &target_project_path) {
+            return Err("目标工作目录不能与源会话目录相同，请选择其他目录".to_string());
+        }
+        let source_path = Path::new(&source.path);
+        if !source_path.is_file() {
+            return Err(format!("源会话文件不存在: {}", source_path.display()));
+        }
+        if session_has_open_turn(source_path)? {
+            return Err("源会话仍在生成或写入内容，请等待当前对话结束后再复制".to_string());
+        }
+
+        let target_provider = self.read_target_provider()?;
+        let fork = run_codex_thread_fork(
+            &self.codex_home,
+            source,
+            &target_project_path,
+            &target_provider,
+        )?;
+        if fork.session_id == source.id {
+            return Err("Codex 返回了源会话 ID，未能创建独立副本".to_string());
+        }
+        if fork.history_mode != "paginated" {
+            return Err(format!(
+                "Codex 创建的副本不是分页会话（history_mode={}），为避免生成无法恢复的会话，本次操作已停止",
+                fork.history_mode
+            ));
+        }
+        if !same_existing_directory(&fork.project_path, &target_project_path) {
+            return Err(format!(
+                "Codex 创建的副本未归属目标目录（实际目录: {}），本次操作未完成",
+                fork.project_path
+            ));
+        }
+
+        let title = copied_session_title(&source.title, copy_suffix);
+        let mut warnings = Vec::new();
+        if let Err(error) = self.write_session_title(&fork.session_id, &title) {
+            warnings.push(error);
+        }
+        if let Err(error) = self.update_sqlite_session_title(&fork.session_id, &title) {
+            warnings.push(error);
+        }
+        if let Err(error) = self.update_sqlite_session_cwd(&fork.session_id, &target_project_path) {
+            warnings.push(error);
+        }
+        if let Err(error) = self.repair_visibility_with_options(
+            Some("quick"),
+            Some(target_provider),
+            None,
+            None,
+            Some(vec![fork.session_id.clone()]),
+        ) {
+            warnings.push(format!("副本已创建，但同步 Codex 侧栏失败: {error}"));
+        }
+
+        Ok(CodexSessionMutationResult {
+            session_id: fork.session_id,
+            title,
+            project_path: Some(target_project_path),
+            backup_path: None,
+            warnings,
+        })
+    }
+
+    #[cfg(test)]
     pub fn copy_session_history(
         &self,
         source_session_id: &str,
-        target_session_id: &str,
+        copy_suffix: &str,
     ) -> Result<CodexSessionMutationResult, String> {
         let source_session_id = source_session_id.trim();
-        let target_session_id = target_session_id.trim();
-        if source_session_id.is_empty() || target_session_id.is_empty() {
-            return Err("源会话和目标会话不能为空".to_string());
-        }
-        if source_session_id == target_session_id {
-            return Err("源会话和目标会话不能相同".to_string());
+        if source_session_id.is_empty() {
+            return Err("源会话不能为空".to_string());
         }
 
         let sessions = self.list_sessions(None, None)?;
@@ -894,145 +971,59 @@ impl SessionStore {
             .iter()
             .find(|session| session.id == source_session_id)
             .ok_or_else(|| format!("源会话不存在: {}", source_session_id))?;
-        let target = sessions
-            .iter()
-            .find(|session| session.id == target_session_id)
-            .ok_or_else(|| format!("目标会话不存在: {}", target_session_id))?;
         let source_path = Path::new(&source.path);
-        let target_path = Path::new(&target.path);
         if session_has_open_turn(source_path)? {
             return Err("源会话仍在生成或写入内容，请等待当前对话结束后再复制".to_string());
         }
-        if session_has_open_turn(target_path)? {
-            return Err("目标会话仍在生成或写入内容，请等待当前对话结束后再复制".to_string());
-        }
         let source_before = session_file_fingerprint(source_path)?;
-        let target_before = session_file_fingerprint(target_path)?;
         let source_content = fs::read_to_string(source_path)
             .map_err(|error| format!("读取源会话失败: {}", error))?;
-        let target_content = fs::read_to_string(target_path)
-            .map_err(|error| format!("读取目标会话失败: {}", error))?;
-        if session_file_fingerprint(source_path)? != source_before
-            || session_file_fingerprint(target_path)? != target_before
-        {
-            return Err(
-                "源会话或目标会话在读取期间发生了更新，本次操作已取消，请刷新后重试".to_string(),
-            );
+        if session_file_fingerprint(source_path)? != source_before {
+            return Err("源会话在读取期间发生了更新，本次操作已取消，请刷新后重试".to_string());
         }
-        let next_content = copy_history_onto_target(&source_content, &target_content)?;
 
-        if session_file_fingerprint(source_path)? != source_before
-            || session_file_fingerprint(target_path)? != target_before
-        {
-            return Err(
-                "源会话或目标会话在复制准备期间发生了更新，本次操作已取消，请刷新后重试"
-                    .to_string(),
-            );
+        let target_provider = self.read_target_provider()?;
+        let created_at = chrono::Utc::now();
+        let target_session_id = new_session_id();
+        let target_meta = copied_session_meta(
+            &source_content,
+            &target_session_id,
+            &target_provider,
+            created_at,
+        )?;
+        let next_content = copy_history_onto_target(&source_content, &target_meta)?;
+        if session_file_fingerprint(source_path)? != source_before {
+            return Err("源会话在复制准备期间发生了更新，本次操作已取消，请刷新后重试".to_string());
         }
-        let backup_path = self.backup_session_file(target_path, "copy")?;
-        if session_file_fingerprint(source_path)? != source_before
-            || session_file_fingerprint(target_path)? != target_before
-        {
-            let _ = fs::remove_file(&backup_path);
-            return Err(
-                "源会话或目标会话在备份期间发生了更新，本次操作已取消，请刷新后重试".to_string(),
-            );
-        }
-        if let Err(error) =
-            replace_session_bytes_if_unchanged(target_path, next_content.as_bytes(), target_before)
-        {
-            let _ = fs::remove_file(&backup_path);
-            return Err(error);
-        }
-        if let Err(projection_error) = self.reset_thread_history_projection(target_session_id) {
-            let rollback_result = fs::read(&backup_path)
-                .map_err(|error| format!("读取目标会话复制备份失败: {}", error))
-                .and_then(|content| write_bytes_atomic(target_path, &content));
-            return match rollback_result {
-                Ok(()) => Err(projection_error),
-                Err(rollback_error) => Err(format!(
-                    "{}；同时回滚目标会话失败：{}",
-                    projection_error, rollback_error
-                )),
-            };
-        }
+        let target_path =
+            new_session_rollout_path(&self.sessions_dir(), &target_session_id, created_at);
+        create_new_session_file(&target_path, next_content.as_bytes())?;
 
         let mut warnings = Vec::new();
-        if let Err(error) = self.write_session_title(target_session_id, &source.title) {
+        if let Err(error) = self.repair_visibility_with_options(
+            Some("deep"),
+            Some(target_provider),
+            None,
+            None,
+            Some(vec![target_session_id.clone()]),
+        ) {
+            warnings.push(format!("新会话已创建，但同步 Codex 索引失败: {error}"));
+        }
+        let title = copied_session_title(&source.title, copy_suffix);
+        if let Err(error) = self.write_session_title(&target_session_id, &title) {
             warnings.push(error);
         }
-        if let Err(error) = self.update_sqlite_session_title(target_session_id, &source.title) {
+        if let Err(error) = self.update_sqlite_session_title(&target_session_id, &title) {
             warnings.push(error);
         }
 
         Ok(CodexSessionMutationResult {
-            session_id: target_session_id.to_string(),
-            title: source.title.clone(),
-            project_path: None,
-            backup_path: Some(backup_path.to_string_lossy().to_string()),
+            session_id: target_session_id,
+            title,
+            project_path: Some(source.project_path.clone()),
+            backup_path: None,
             warnings,
         })
-    }
-
-    fn reset_thread_history_projection(&self, session_id: &str) -> Result<Option<String>, String> {
-        let db_path = self.codex_home.join("thread_history_1.sqlite");
-        if !db_path.is_file() {
-            return Ok(None);
-        }
-        let mut connection = Connection::open(&db_path).map_err(|error| {
-            format!(
-                "打开 Codex 会话历史投影失败 ({}): {}",
-                db_path.display(),
-                error
-            )
-        })?;
-        connection
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|error| format!("设置 Codex 会话历史投影等待时间失败: {}", error))?;
-        connection
-            .execute_batch("PRAGMA wal_checkpoint(FULL);")
-            .map_err(|error| format!("同步 Codex 会话历史投影失败: {}", error))?;
-
-        let tables = [
-            "thread_items",
-            "thread_turns",
-            "thread_history_projection_state",
-        ];
-        let mut existing_tables = Vec::new();
-        let mut projected_row_count = 0usize;
-        for table in tables {
-            if !sqlite_table_exists_with_connection(&connection, table)? {
-                continue;
-            }
-            projected_row_count += connection
-                .query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE thread_id = ?1"),
-                    params![session_id],
-                    |row| row.get::<_, usize>(0),
-                )
-                .map_err(|error| format!("检查 Codex 会话历史投影失败: {}", error))?;
-            existing_tables.push(table);
-        }
-        if projected_row_count == 0 {
-            return Ok(None);
-        }
-
-        let backup_dir = backup_sqlite_file(&db_path)?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| format!("开启 Codex 会话历史投影重建事务失败: {}", error))?;
-        for table in existing_tables {
-            transaction
-                .execute(
-                    &format!("DELETE FROM {table} WHERE thread_id = ?1"),
-                    params![session_id],
-                )
-                .map_err(|error| format!("清理 Codex 会话历史投影失败: {}", error))?;
-        }
-        transaction
-            .commit()
-            .map_err(|error| format!("提交 Codex 会话历史投影重建失败: {}", error))?;
-        Ok(Some(backup_dir))
     }
 
     pub fn rename_session(
@@ -2371,9 +2362,12 @@ fn repair_sqlite_db(
     if !columns.contains("id") {
         return Ok(0);
     }
+    let repaired_history_modes =
+        sqlite_repair_paginated_history_modes(db_path, &columns, sessions)?;
     let before = sqlite_count_repairable_rows(db_path, target_provider, sessions)?;
     if before == 0 {
-        return sqlite_insert_missing_session_rows(db_path, target_provider, sessions);
+        return sqlite_insert_missing_session_rows(db_path, target_provider, sessions)
+            .map(|inserted| repaired_history_modes + inserted);
     }
     let escaped_provider = sql_quote(target_provider);
     let set_clause = sqlite_repair_set_clause(&columns, &escaped_provider);
@@ -2384,7 +2378,46 @@ fn repair_sqlite_db(
     let sql = format!("UPDATE threads SET {set_clause} WHERE {where_clause};");
     run_sqlite(db_path, &sql)?;
     let inserted = sqlite_insert_missing_session_rows(db_path, target_provider, sessions)?;
-    Ok(before + inserted)
+    Ok(repaired_history_modes + before + inserted)
+}
+
+fn sqlite_repair_paginated_history_modes(
+    db_path: &Path,
+    columns: &HashSet<String>,
+    sessions: Option<&[SessionRepairRecord]>,
+) -> Result<usize, String> {
+    if !columns.contains("history_mode") {
+        return Ok(0);
+    }
+    let Some(sessions) = sessions else {
+        return Ok(0);
+    };
+    let ids = sessions
+        .iter()
+        .filter(|session| rollout_history_mode(&session.path) == "paginated")
+        .map(|session| sql_quote(&session.id))
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let where_clause = format!(
+        "id IN ({}) AND COALESCE(history_mode, '') <> 'paginated'",
+        ids.join(", ")
+    );
+    let count = run_sqlite(
+        db_path,
+        &format!("SELECT COUNT(*) FROM threads WHERE {where_clause};"),
+    )?
+    .trim()
+    .parse::<usize>()
+    .unwrap_or(0);
+    if count > 0 {
+        run_sqlite(
+            db_path,
+            &format!("UPDATE threads SET history_mode = 'paginated' WHERE {where_clause};"),
+        )?;
+    }
+    Ok(count)
 }
 
 fn sqlite_count_repairable_rows(
@@ -2650,7 +2683,13 @@ fn sqlite_insert_missing_session_rows(
             "approval_mode",
             &metadata.approval_mode,
         );
-        push_sql_value(&mut names, &mut values, &columns, "history_mode", "legacy");
+        push_sql_value(
+            &mut names,
+            &mut values,
+            &columns,
+            "history_mode",
+            &metadata.history_mode,
+        );
         push_sql_value(&mut names, &mut values, &columns, "thread_source", "user");
         if columns.contains("has_user_event") {
             names.push("has_user_event".to_string());
@@ -2712,6 +2751,7 @@ struct SessionSqliteMetadata {
     cli_version: String,
     sandbox_policy: String,
     approval_mode: String,
+    history_mode: String,
 }
 
 fn sqlite_metadata_for_session(session: &SessionRepairRecord) -> SessionSqliteMetadata {
@@ -2722,6 +2762,7 @@ fn sqlite_metadata_for_session(session: &SessionRepairRecord) -> SessionSqliteMe
         cli_version: String::new(),
         sandbox_policy: "read-only".to_string(),
         approval_mode: "on-request".to_string(),
+        history_mode: rollout_history_mode(&session.path).to_string(),
     };
     let Ok(content) = fs::read_to_string(&session.path) else {
         return metadata;
@@ -2779,6 +2820,31 @@ fn sqlite_metadata_for_session(session: &SessionRepairRecord) -> SessionSqliteMe
         }
     }
     metadata
+}
+
+fn rollout_history_mode(path: &Path) -> &'static str {
+    let Ok(file) = fs::File::open(path) else {
+        return "legacy";
+    };
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            return "legacy";
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            return "legacy";
+        };
+        return if value.get("type").and_then(Value::as_str) == Some("session_meta")
+            && value.get("ordinal").and_then(Value::as_u64).is_some()
+        {
+            "paginated"
+        } else {
+            "legacy"
+        };
+    }
+    "legacy"
 }
 
 fn metadata_value_to_string(value: &Value) -> Option<String> {
@@ -4567,45 +4633,6 @@ fn restore_session_file_if_unchanged(
     result
 }
 
-fn replace_session_bytes_if_unchanged(
-    path: &Path,
-    content: &[u8],
-    expected: SessionFileFingerprint,
-) -> Result<(), String> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("session.jsonl");
-    let tmp_path = parent.join(format!(
-        ".{file_name}.copy-{:016x}.tmp",
-        rand::random::<u64>()
-    ));
-    let result = (|| -> Result<(), String> {
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)
-            .map_err(|error| format!("创建会话复制临时文件失败: {}", error))?;
-        output
-            .write_all(content)
-            .map_err(|error| format!("写入目标会话临时文件失败: {}", error))?;
-        output
-            .sync_all()
-            .map_err(|error| format!("同步目标会话临时文件失败: {}", error))?;
-        drop(output);
-
-        if session_file_fingerprint(path)? != expected {
-            return Err("目标会话在复制过程中发生了更新，本次操作已取消，请刷新后重试".to_string());
-        }
-        replace_file_atomic(path, &tmp_path).map_err(|error| format!("写入目标会话失败: {}", error))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-    result
-}
-
 fn scrub_compacted_line(
     line: &[u8],
     response_item_ids: &HashSet<String>,
@@ -4690,6 +4717,367 @@ fn build_session_record(path: &Path, content: &str) -> Result<CodexSessionRecord
     })
 }
 
+#[cfg(test)]
+fn copied_session_meta(
+    source: &str,
+    target_session_id: &str,
+    target_provider: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Result<String, String> {
+    let mut value = source
+        .lines()
+        .find_map(|line| {
+            let value = serde_json::from_str::<Value>(line).ok()?;
+            (value.get("type").and_then(Value::as_str) == Some("session_meta")).then_some(value)
+        })
+        .ok_or_else(|| "源会话缺少 session_meta，不能安全复制".to_string())?;
+    let timestamp = created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "源会话的 session_meta 格式无效".to_string())?;
+    object.insert("timestamp".to_string(), Value::String(timestamp.clone()));
+    object.insert("ordinal".to_string(), Value::from(0));
+    let payload = object
+        .get_mut("payload")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "源会话的 session_meta 缺少 payload".to_string())?;
+    payload.insert(
+        "id".to_string(),
+        Value::String(target_session_id.to_string()),
+    );
+    payload.insert(
+        "session_id".to_string(),
+        Value::String(target_session_id.to_string()),
+    );
+    if payload.contains_key("thread_id") {
+        payload.insert(
+            "thread_id".to_string(),
+            Value::String(target_session_id.to_string()),
+        );
+    }
+    payload.insert("timestamp".to_string(), Value::String(timestamp));
+    payload.insert(
+        "model_provider".to_string(),
+        Value::String(target_provider.to_string()),
+    );
+    serde_json::to_string(&value).map_err(|error| format!("生成新会话身份失败: {error}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexThreadForkResult {
+    session_id: String,
+    history_mode: String,
+    project_path: String,
+}
+
+fn normalize_copy_target_directory(project_path: &str) -> Result<String, String> {
+    let project_path = project_path.trim();
+    if project_path.is_empty() {
+        return Err("目标工作目录不能为空".to_string());
+    }
+    let directory = PathBuf::from(project_path);
+    if !directory.is_absolute() {
+        return Err("目标工作目录必须使用绝对路径".to_string());
+    }
+    if !directory.is_dir() {
+        return Err(format!(
+            "目标工作目录不存在或不是文件夹: {}",
+            directory.display()
+        ));
+    }
+    Ok(directory.to_string_lossy().to_string())
+}
+
+fn same_existing_directory(left: &str, right: &str) -> bool {
+    let left = Path::new(left);
+    let right = Path::new(right);
+    if !left.is_dir() || !right.is_dir() {
+        return false;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn codex_cli_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        for path in [
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Applications/Codex.app/Contents/Resources/codex",
+        ] {
+            let candidate = PathBuf::from(path);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            let local_app_data = PathBuf::from(local_app_data);
+            for relative in [
+                ["Programs", "Codex", "resources", "codex.exe"].as_slice(),
+                ["Programs", "Codex", "app", "resources", "codex.exe"].as_slice(),
+                ["Codex", "resources", "codex.exe"].as_slice(),
+            ] {
+                let mut candidate = local_app_data.clone();
+                for segment in relative {
+                    candidate.push(segment);
+                }
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    PathBuf::from(if cfg!(target_os = "windows") {
+        "codex.exe"
+    } else {
+        "codex"
+    })
+}
+
+fn write_codex_app_server_request(writer: &mut impl Write, request: &Value) -> Result<(), String> {
+    serde_json::to_writer(&mut *writer, request)
+        .map_err(|error| format!("生成 Codex 会话复制请求失败: {error}"))?;
+    writer
+        .write_all(b"\n")
+        .and_then(|_| writer.flush())
+        .map_err(|error| format!("发送 Codex 会话复制请求失败: {error}"))
+}
+
+fn read_codex_app_server_response(
+    reader: &mut impl BufRead,
+    request_id: i64,
+) -> Result<Value, String> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("读取 Codex 会话复制响应失败: {error}"))?;
+        if read == 0 {
+            return Err("Codex 会话复制服务提前退出".to_string());
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("id").and_then(Value::as_i64) != Some(request_id) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Codex 会话复制失败");
+            return Err(message.to_string());
+        }
+        return Ok(value);
+    }
+}
+
+fn parse_codex_thread_fork_response(response: &Value) -> Result<CodexThreadForkResult, String> {
+    let session_id = response
+        .pointer("/result/thread/id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Codex 会话复制响应缺少新会话 ID".to_string())?;
+    let history_mode = response
+        .pointer("/result/thread/historyMode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Codex 会话复制响应缺少 history_mode".to_string())?;
+    let project_path = response
+        .pointer("/result/thread/cwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Codex 会话复制响应缺少工作目录".to_string())?;
+    Ok(CodexThreadForkResult {
+        session_id: session_id.to_string(),
+        history_mode: history_mode.to_string(),
+        project_path: project_path.to_string(),
+    })
+}
+
+fn run_codex_thread_fork(
+    codex_home: &Path,
+    source: &CodexSessionRecord,
+    target_project_path: &str,
+    target_provider: &str,
+) -> Result<CodexThreadForkResult, String> {
+    let cli_path = codex_cli_path();
+    let mut child = Command::new(&cli_path)
+        .args(["app-server", "--stdio"])
+        .env("CODEX_HOME", codex_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "无法启动 Codex 会话复制服务 ({}): {error}",
+                cli_path.display()
+            )
+        })?;
+
+    let stderr = child.stderr.take();
+    let stderr_reader = std::thread::spawn(move || {
+        let mut output = String::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_string(&mut output);
+        }
+        output
+    });
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "无法连接 Codex 会话复制服务输入流".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法连接 Codex 会话复制服务输出流".to_string())?;
+    let mut reader = BufReader::new(stdout);
+
+    let operation = (|| {
+        write_codex_app_server_request(
+            &mut stdin,
+            &serde_json::json!({
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "codex-account-switcher",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "capabilities": {
+                        "experimentalApi": true,
+                    }
+                }
+            }),
+        )?;
+        read_codex_app_server_response(&mut reader, 1)?;
+        write_codex_app_server_request(
+            &mut stdin,
+            &serde_json::json!({
+                "id": 2,
+                "method": "thread/fork",
+                "params": {
+                    "threadId": source.id,
+                    "path": source.path,
+                    "cwd": target_project_path,
+                    "modelProvider": target_provider,
+                    "ephemeral": false,
+                    "excludeTurns": true,
+                    "deferGoalContinuation": true,
+                }
+            }),
+        )?;
+        let response = read_codex_app_server_response(&mut reader, 2)?;
+        parse_codex_thread_fork_response(&response)
+    })();
+
+    drop(stdin);
+    drop(reader);
+    let status = child.wait();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let fork = operation?;
+    let status = status.map_err(|error| format!("等待 Codex 会话复制服务退出失败: {error}"))?;
+    if !status.success() {
+        let detail = stderr.lines().last().unwrap_or("").trim();
+        return Err(if detail.is_empty() {
+            "Codex 会话复制服务异常退出".to_string()
+        } else {
+            format!("Codex 会话复制服务异常退出: {detail}")
+        });
+    }
+    Ok(fork)
+}
+
+#[cfg(test)]
+fn new_session_id() -> String {
+    let mut bytes = rand::random::<[u8; 16]>();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+#[cfg(test)]
+fn new_session_rollout_path(
+    sessions_dir: &Path,
+    session_id: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> PathBuf {
+    let local_time = created_at.with_timezone(&chrono::Local);
+    sessions_dir
+        .join(local_time.format("%Y").to_string())
+        .join(local_time.format("%m").to_string())
+        .join(local_time.format("%d").to_string())
+        .join(format!(
+            "rollout-{}-{session_id}.jsonl",
+            local_time.format("%Y-%m-%dT%H-%M-%S")
+        ))
+}
+
+#[cfg(test)]
+fn create_new_session_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "无法定位新会话目录".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| format!("创建新会话目录失败: {error}"))?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("创建新会话失败 ({}): {error}", path.display()))?;
+    if let Err(error) = file.write_all(content).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(format!("写入新会话失败 ({}): {error}", path.display()));
+    }
+    Ok(())
+}
+
+fn copied_session_title(source_title: &str, copy_suffix: &str) -> String {
+    let base = source_title.trim();
+    let base = if base.is_empty() {
+        "未命名会话"
+    } else {
+        base
+    };
+    let suffix = copy_suffix.trim();
+    let suffix = if suffix.is_empty() { "副本" } else { suffix };
+    let suffix = format!(" {}", suffix.chars().take(30).collect::<String>());
+    let max_base_chars = 100usize.saturating_sub(suffix.chars().count());
+    format!(
+        "{}{suffix}",
+        base.chars().take(max_base_chars).collect::<String>()
+    )
+}
+
+#[cfg(test)]
 fn copy_history_onto_target(source: &str, target: &str) -> Result<String, String> {
     let target_meta = target
         .lines()
@@ -4728,6 +5116,7 @@ fn copy_history_onto_target(source: &str, target: &str) -> Result<String, String
     Ok(output)
 }
 
+#[cfg(test)]
 fn append_portable_history_projection(
     output: &mut String,
     source: &str,
@@ -4864,6 +5253,7 @@ fn append_portable_history_projection(
     Ok(())
 }
 
+#[cfg(test)]
 fn portable_history_messages(source: &str) -> Vec<CodexSessionMessage> {
     let mut messages = Vec::new();
     let mut line_offset = 0u64;
@@ -4893,6 +5283,7 @@ fn portable_history_messages(source: &str) -> Vec<CodexSessionMessage> {
     messages
 }
 
+#[cfg(test)]
 fn portable_history_turns(messages: Vec<CodexSessionMessage>) -> Vec<Vec<CodexSessionMessage>> {
     let mut turns = Vec::<Vec<CodexSessionMessage>>::new();
     for message in messages {
@@ -4905,6 +5296,7 @@ fn portable_history_turns(messages: Vec<CodexSessionMessage>) -> Vec<Vec<CodexSe
     turns
 }
 
+#[cfg(test)]
 fn portable_response_message_payload(message: &CodexSessionMessage) -> Value {
     let content_type = if message.role == "user" {
         "input_text"
@@ -4922,6 +5314,7 @@ fn portable_response_message_payload(message: &CodexSessionMessage) -> Value {
     })
 }
 
+#[cfg(test)]
 fn portable_message_text(message: &CodexSessionMessage) -> String {
     if !message.text.trim().is_empty() {
         return message.text.clone();
@@ -4933,12 +5326,14 @@ fn portable_message_text(message: &CodexSessionMessage) -> String {
     }
 }
 
+#[cfg(test)]
 fn portable_timestamp_millis(timestamp: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .map(|value| value.timestamp_millis())
         .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis())
 }
 
+#[cfg(test)]
 fn json_value_with_type(timestamp: &str, record_type: &str, payload: Value) -> Value {
     let timestamp = if timestamp.trim().is_empty() {
         chrono::Utc::now().to_rfc3339()
@@ -4952,6 +5347,7 @@ fn json_value_with_type(timestamp: &str, record_type: &str, payload: Value) -> V
     })
 }
 
+#[cfg(test)]
 fn append_rollout_value(
     output: &mut String,
     mut value: Value,
@@ -4971,6 +5367,7 @@ fn append_rollout_value(
     Ok(())
 }
 
+#[cfg(test)]
 fn rollout_line_ordinal(line: &str) -> Option<u64> {
     serde_json::from_str::<Value>(line)
         .ok()?
@@ -4978,6 +5375,7 @@ fn rollout_line_ordinal(line: &str) -> Option<u64> {
         .as_u64()
 }
 
+#[cfg(test)]
 fn align_rollout_line_ordinal(line: &str, ordinal: Option<u64>) -> Result<String, String> {
     let mut value = match serde_json::from_str::<Value>(line) {
         Ok(value) => value,
@@ -5065,6 +5463,7 @@ fn normalize_paginated_rollout_ordinals(content: &str) -> Result<Option<String>,
     Ok(changed.then_some(output))
 }
 
+#[cfg(test)]
 fn rewrite_copied_history_line(
     line: &str,
     response_item_ids: &mut HashMap<String, String>,
@@ -5124,10 +5523,12 @@ fn rewrite_copied_history_line(
         .map_err(|error| format!("重写会话响应 ID 失败: {}", error))
 }
 
+#[cfg(test)]
 fn copied_payload_is_opaque_compaction(payload: &Value) -> bool {
     payload.get("type").and_then(Value::as_str) == Some("compaction")
 }
 
+#[cfg(test)]
 fn rewrite_copied_payload(
     payload: &mut Value,
     response_item_ids: &mut HashMap<String, String>,
@@ -5163,6 +5564,7 @@ fn rewrite_copied_payload(
     true
 }
 
+#[cfg(test)]
 fn new_local_response_item_id() -> String {
     // Codex assigns a prefixed ID when an item has no ID, then forwards prefixed IDs to the
     // Responses API. A non-prefixed local ID remains stable in history but is stripped from the
@@ -5170,6 +5572,7 @@ fn new_local_response_item_id() -> String {
     format!("{:032x}", rand::random::<u128>())
 }
 
+#[cfg(test)]
 fn response_item_type_supports_id(item_type: &str) -> bool {
     matches!(
         item_type,
@@ -5192,6 +5595,7 @@ fn response_item_type_supports_id(item_type: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn is_session_meta_line(line: &str) -> bool {
     serde_json::from_str::<Value>(line)
         .ok()
@@ -5603,8 +6007,9 @@ fn now_timestamp() -> i64 {
 mod tests {
     use super::{
         copy_history_onto_target, extract_title, find_task_started_offsets_reverse,
-        replace_session_bytes_if_unchanged, restore_session_file_if_unchanged,
-        session_file_fingerprint, sql_quote, SessionRepairRecord, SessionStore,
+        normalize_copy_target_directory, parse_codex_thread_fork_response, repair_sqlite_db,
+        restore_session_file_if_unchanged, same_existing_directory, session_file_fingerprint,
+        sql_quote, SessionRepairRecord, SessionStore,
     };
     use serde_json::{json, Value};
     use std::fs;
@@ -5621,6 +6026,127 @@ mod tests {
             .join("\n");
         content.push('\n');
         fs::write(path, content).expect("write jsonl");
+    }
+
+    #[test]
+    fn copy_target_directory_requires_an_existing_absolute_folder() {
+        let target = tempdir().expect("target directory");
+        assert_eq!(
+            normalize_copy_target_directory(&target.path().to_string_lossy())
+                .expect("valid target"),
+            target.path().to_string_lossy()
+        );
+        assert!(normalize_copy_target_directory("relative/project")
+            .expect_err("relative target should fail")
+            .contains("绝对路径"));
+        assert!(
+            normalize_copy_target_directory(&target.path().join("missing").to_string_lossy())
+                .expect_err("missing target should fail")
+                .contains("不存在")
+        );
+    }
+
+    #[test]
+    fn copy_target_directory_must_differ_from_the_source_directory() {
+        let source = tempdir().expect("source directory");
+        let target = tempdir().expect("target directory");
+        assert!(same_existing_directory(
+            &source.path().to_string_lossy(),
+            &source.path().join(".").to_string_lossy()
+        ));
+        assert!(!same_existing_directory(
+            &source.path().to_string_lossy(),
+            &target.path().to_string_lossy()
+        ));
+    }
+
+    #[test]
+    fn parses_the_official_codex_thread_fork_response() {
+        let response = json!({
+            "id": 2,
+            "result": {
+                "thread": {
+                    "id": "01a03a00-0000-7000-8000-000000000001",
+                    "historyMode": "paginated",
+                    "cwd": "/tmp/target"
+                }
+            }
+        });
+        let result = parse_codex_thread_fork_response(&response).expect("fork response");
+        assert_eq!(result.session_id, "01a03a00-0000-7000-8000-000000000001");
+        assert_eq!(result.history_mode, "paginated");
+        assert_eq!(result.project_path, "/tmp/target");
+        assert!(
+            parse_codex_thread_fork_response(&json!({ "id": 2, "result": {} }))
+                .expect_err("missing id should fail")
+                .contains("新会话 ID")
+        );
+    }
+
+    #[test]
+    fn sqlite_visibility_repair_preserves_and_recovers_paginated_history_mode() {
+        let codex = tempdir().expect("codex tempdir");
+        let existing_path = codex.path().join("existing-paginated.jsonl");
+        let missing_path = codex.path().join("missing-paginated.jsonl");
+        let legacy_path = codex.path().join("legacy.jsonl");
+        for path in [&existing_path, &missing_path] {
+            fs::write(
+                path,
+                concat!(
+                    r#"{"type":"session_meta","payload":{"id":"paginated"},"ordinal":0}"#,
+                    "\n",
+                    r#"{"type":"response_item","payload":{"type":"message"},"ordinal":1}"#,
+                    "\n"
+                ),
+            )
+            .expect("write paginated rollout");
+        }
+        fs::write(
+            &legacy_path,
+            concat!(r#"{"type":"session_meta","payload":{"id":"legacy"}}"#, "\n"),
+        )
+        .expect("write legacy rollout");
+        let db_path = codex.path().join("state_5.sqlite");
+        run_sqlite_test(
+            &db_path,
+            r#"
+                CREATE TABLE threads (id TEXT PRIMARY KEY, history_mode TEXT);
+                INSERT INTO threads (id, history_mode) VALUES ('existing', 'legacy');
+            "#,
+        );
+        let records = vec![
+            SessionRepairRecord {
+                id: "existing".to_string(),
+                title: "Existing".to_string(),
+                path: existing_path,
+                updated_at: 10,
+            },
+            SessionRepairRecord {
+                id: "missing".to_string(),
+                title: "Missing".to_string(),
+                path: missing_path,
+                updated_at: 10,
+            },
+            SessionRepairRecord {
+                id: "legacy".to_string(),
+                title: "Legacy".to_string(),
+                path: legacy_path,
+                updated_at: 10,
+            },
+        ];
+
+        assert_eq!(
+            repair_sqlite_db(&db_path, "openai", Some(&records)).expect("repair sqlite"),
+            3
+        );
+        let rows = run_sqlite_test_output(
+            &db_path,
+            "SELECT id || '|' || history_mode FROM threads ORDER BY id;",
+        );
+        assert_eq!(
+            rows.lines().collect::<Vec<_>>(),
+            vec!["existing|paginated", "legacy|legacy", "missing|paginated"]
+        );
     }
 
     fn task_started(turn_id: &str, timestamp: &str) -> Value {
@@ -6296,40 +6822,42 @@ mod tests {
     }
 
     #[test]
-    fn copies_history_while_preserving_target_session_identity_and_backup() {
+    fn copies_history_into_a_new_session_without_overwriting_existing_sessions() {
         let codex = tempdir().expect("codex tempdir");
         let sessions_dir = codex.path().join("sessions");
         fs::create_dir_all(&sessions_dir).expect("session dir");
+        fs::write(
+            codex.path().join("config.toml"),
+            "model_provider = \"current\"\n",
+        )
+        .expect("write config");
         let source_path = sessions_dir.join("source.jsonl");
         let target_path = sessions_dir.join("target.jsonl");
-        fs::write(
-            &source_path,
-            concat!(
-                r#"{"type":"session_meta","payload":{"id":"source","session_id":"source","model_provider":"old"}}"#,
-                "\n",
-                r#"{"type":"response_item","payload":{"type":"reasoning","id":"rs_resp_stale_0","summary":[],"content":[],"encrypted_content":"ocx1:source-reasoning"}}"#,
-                "\n",
-                r#"{"type":"response_item","payload":{"type":"compaction","id":"cmp_resp_stale_0","encrypted_content":"ocx1:source-compaction"}}"#,
-                "\n",
-                r#"{"type":"response_item","payload":{"type":"message","id":"msg_resp_stale_0","role":"user","content":[{"text":"需要复制的历史"}]}}"#,
-                "\n",
-                r#"{"type":"response_item","payload":{"type":"function_call","id":"fc_call_stale_0","name":"shell","arguments":"{}","call_id":"call_pair"}}"#,
-                "\n",
-                r#"{"type":"response_item","payload":{"type":"function_call_output","id":"fco_call_stale_0","call_id":"call_pair","output":"ok"}}"#,
-                "\n",
-                r#"{"type":"response_item","payload":{"type":"future_response_item","id":"future_resp_stale_0","data":"future"}}"#,
-                "\n",
-                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"历史回复"}]}}"#,
-                "\n",
-                r#"{"type":"compacted","payload":{"replacement_history":[{"type":"reasoning","id":"rs_resp_stale_0","summary":[],"content":[],"encrypted_content":"ocx1:nested-reasoning"},{"type":"message","id":"msg_resp_stale_0","role":"user","content":[{"text":"需要复制的历史"}]},{"type":"function_call","id":"fc_call_stale_0","name":"shell","arguments":"{}","call_id":"call_pair"},{"type":"function_call_output","id":"fco_call_stale_0","call_id":"call_pair","output":"ok"},{"type":"compaction","id":"cmp_nested_stale_0","encrypted_content":"ocx1:nested-compaction"}],"message":""}}"#,
-                "\n"
-            ),
-        )
-        .expect("write source");
+        let original_source = concat!(
+            r#"{"type":"session_meta","payload":{"id":"source","session_id":"source","model_provider":"old","cwd":"/tmp/project","source":"vscode"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"reasoning","id":"rs_resp_stale_0","summary":[],"content":[],"encrypted_content":"ocx1:source-reasoning"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"compaction","id":"cmp_resp_stale_0","encrypted_content":"ocx1:source-compaction"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","id":"msg_resp_stale_0","role":"user","content":[{"text":"需要复制的历史"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","id":"fc_call_stale_0","name":"shell","arguments":"{}","call_id":"call_pair"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","id":"fco_call_stale_0","call_id":"call_pair","output":"ok"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"future_response_item","id":"future_resp_stale_0","data":"future"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"历史回复"}]}}"#,
+            "\n",
+            r#"{"type":"compacted","payload":{"replacement_history":[{"type":"reasoning","id":"rs_resp_stale_0","summary":[],"content":[],"encrypted_content":"ocx1:nested-reasoning"},{"type":"message","id":"msg_resp_stale_0","role":"user","content":[{"text":"需要复制的历史"}]},{"type":"function_call","id":"fc_call_stale_0","name":"shell","arguments":"{}","call_id":"call_pair"},{"type":"function_call_output","id":"fco_call_stale_0","call_id":"call_pair","output":"ok"},{"type":"compaction","id":"cmp_nested_stale_0","encrypted_content":"ocx1:nested-compaction"}],"message":""}}"#,
+            "\n"
+        );
+        fs::write(&source_path, original_source).expect("write source");
         let original_target = concat!(
             r#"{"type":"session_meta","payload":{"id":"target","session_id":"target","model_provider":"current"},"ordinal":0}"#,
             "\n",
-            r#"{"type":"response_item","payload":{"role":"user","content":[{"text":"占位内容"}]}}"#,
+            r#"{"type":"response_item","payload":{"role":"user","content":[{"text":"必须保留的现有内容"}]}}"#,
             "\n"
         );
         fs::write(&target_path, original_target).expect("write target");
@@ -6355,11 +6883,19 @@ mod tests {
         let store = SessionStore::new(codex.path().to_path_buf());
 
         let result = store
-            .copy_session_history("source", "target")
+            .copy_session_history("source", "副本")
             .expect("copy session history");
 
-        let copied = fs::read_to_string(&target_path).expect("read copied target");
-        assert!(copied.contains(r#""id":"target""#));
+        assert_ne!(result.session_id, "source");
+        assert_ne!(result.session_id, "target");
+        let copied_session = store
+            .list_sessions(None, None)
+            .expect("list copied sessions")
+            .into_iter()
+            .find(|session| session.id == result.session_id)
+            .expect("new session record");
+        let copied = fs::read_to_string(&copied_session.path).expect("read copied session");
+        assert!(copied.contains(&format!(r#""id":"{}""#, result.session_id)));
         assert!(copied.contains(r#""model_provider":"current""#));
         assert!(copied.contains("需要复制的历史"));
         assert!(copied.contains("历史回复"));
@@ -6387,7 +6923,15 @@ mod tests {
         ] {
             assert!(!copied.contains(stale_id));
         }
-        assert!(!copied.contains("占位内容"));
+        assert!(!copied.contains("必须保留的现有内容"));
+        assert_eq!(
+            fs::read_to_string(&source_path).expect("read source"),
+            original_source
+        );
+        assert_eq!(
+            fs::read_to_string(&target_path).expect("read target"),
+            original_target
+        );
         let copied_items = copied
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -6466,12 +7010,15 @@ mod tests {
             visible_items_after_compaction[1]["payload"]["item"]["type"].as_str(),
             Some("AgentMessage")
         );
-        assert_eq!(result.session_id, "target");
-        assert_eq!(result.title, "需要复制的历史");
-        let backup_path = result.backup_path.expect("backup path");
+        assert_eq!(result.title, "需要复制的历史 副本");
+        assert!(result.backup_path.is_none());
+        assert_eq!(result.project_path.as_deref(), Some("/tmp/project"));
         assert_eq!(
-            fs::read_to_string(backup_path).expect("read backup"),
-            original_target
+            store
+                .list_sessions(None, None)
+                .expect("list sessions")
+                .len(),
+            3
         );
         assert_eq!(
             run_sqlite_test_output(
@@ -6479,7 +7026,7 @@ mod tests {
                 "SELECT COUNT(*) FROM thread_items WHERE thread_id = 'target';"
             )
             .trim(),
-            "0"
+            "1"
         );
         assert_eq!(
             run_sqlite_test_output(
@@ -6487,7 +7034,7 @@ mod tests {
                 "SELECT COUNT(*) FROM thread_turns WHERE thread_id = 'target';"
             )
             .trim(),
-            "0"
+            "1"
         );
         assert_eq!(
             run_sqlite_test_output(
@@ -6495,7 +7042,7 @@ mod tests {
                 "SELECT COUNT(*) FROM thread_history_projection_state WHERE thread_id = 'target';"
             )
             .trim(),
-            "0"
+            "1"
         );
         assert_eq!(
             run_sqlite_test_output(
@@ -6508,63 +7055,40 @@ mod tests {
     }
 
     #[test]
-    fn copy_history_rolls_back_target_when_projection_reset_fails() {
+    fn copy_history_keeps_the_new_session_when_index_sync_fails() {
         let codex = tempdir().expect("codex tempdir");
         let sessions_dir = codex.path().join("sessions");
         fs::create_dir_all(&sessions_dir).expect("session dir");
         let source_path = sessions_dir.join("source-rollback.jsonl");
-        let target_path = sessions_dir.join("target-rollback.jsonl");
-        fs::write(
-            &source_path,
-            concat!(
-                r#"{"type":"session_meta","payload":{"id":"source-rollback"}}"#,
-                "\n",
-                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"源历史"}]}}"#,
-                "\n"
-            ),
-        )
-        .expect("write source");
-        let original_target = concat!(
-            r#"{"type":"session_meta","payload":{"id":"target-rollback"}}"#,
+        let original_source = concat!(
+            r#"{"type":"session_meta","payload":{"id":"source-rollback","source":"vscode"}}"#,
             "\n",
-            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"目标占位"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"源历史"}]}}"#,
             "\n"
         );
-        fs::write(&target_path, original_target).expect("write target");
-        let history_db = codex.path().join("thread_history_1.sqlite");
-        run_sqlite_test(
-            &history_db,
-            r#"
-                CREATE TABLE thread_items (thread_id TEXT NOT NULL, item_id TEXT NOT NULL);
-                INSERT INTO thread_items (thread_id, item_id)
-                VALUES ('target-rollback', 'old-item');
-                CREATE TRIGGER block_target_projection_delete
-                BEFORE DELETE ON thread_items
-                WHEN OLD.thread_id = 'target-rollback'
-                BEGIN
-                    SELECT RAISE(ABORT, 'blocked projection reset');
-                END;
-            "#,
-        );
+        fs::write(&source_path, original_source).expect("write source");
+        fs::write(codex.path().join("state_5.sqlite"), "not a sqlite database")
+            .expect("write invalid database");
         let store = SessionStore::new(codex.path().to_path_buf());
 
-        let error = store
-            .copy_session_history("source-rollback", "target-rollback")
-            .expect_err("projection reset should fail");
+        let result = store
+            .copy_session_history("source-rollback", "副本")
+            .expect("copy remains successful");
 
-        assert!(error.contains("清理 Codex 会话历史投影失败"));
+        assert!(!result.warnings.is_empty());
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("索引失败") || warning.contains("SQLite")));
         assert_eq!(
-            fs::read_to_string(target_path).expect("read rolled back target"),
-            original_target
+            fs::read_to_string(source_path).expect("read unchanged source"),
+            original_source
         );
-        assert_eq!(
-            run_sqlite_test_output(
-                &history_db,
-                "SELECT COUNT(*) FROM thread_items WHERE thread_id = 'target-rollback';"
-            )
-            .trim(),
-            "1"
-        );
+        let sessions = store.list_sessions(None, None).expect("list sessions");
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions
+            .iter()
+            .any(|session| session.id == result.session_id));
     }
 
     #[test]
@@ -6681,84 +7205,81 @@ mod tests {
     }
 
     #[test]
-    fn refuses_to_copy_onto_a_target_with_an_open_turn() {
+    fn refuses_to_copy_a_source_with_an_open_turn() {
         let codex = tempdir().expect("codex tempdir");
         let sessions_dir = codex.path().join("sessions");
         fs::create_dir_all(&sessions_dir).expect("session dir");
         let source_path = sessions_dir.join("source-open-guard.jsonl");
-        let target_path = sessions_dir.join("target-open-guard.jsonl");
         write_jsonl(
             &source_path,
             &[
                 json!({"type":"session_meta","payload":{"id":"source-open-guard"}}),
+                task_started("source-active-turn", "2026-08-10T12:00:00Z"),
                 response_message(
                     "source-message",
                     "user",
                     "2026-08-10T12:00:00Z",
-                    vec![json!({"type":"input_text","text":"稳定的源会话"})],
-                ),
-            ],
-        );
-        write_jsonl(
-            &target_path,
-            &[
-                json!({"type":"session_meta","payload":{"id":"target-open-guard"}}),
-                task_started("target-active-turn", "2026-08-10T12:01:00Z"),
-                response_message(
-                    "target-message",
-                    "user",
-                    "2026-08-10T12:01:00Z",
                     vec![json!({"type":"input_text","text":"仍在生成"})],
                 ),
             ],
         );
-        let before = fs::read_to_string(&target_path).expect("read target before copy");
+        let before = fs::read_to_string(&source_path).expect("read source before copy");
         let store = SessionStore::new(codex.path().to_path_buf());
 
         let error = store
-            .copy_session_history("source-open-guard", "target-open-guard")
-            .expect_err("open target should reject copy");
+            .copy_session_history("source-open-guard", "副本")
+            .expect_err("open source should reject copy");
 
-        assert!(error.contains("目标会话仍在生成"));
+        assert!(error.contains("源会话仍在生成"));
         assert_eq!(
-            fs::read_to_string(&target_path).expect("read unchanged target"),
+            fs::read_to_string(&source_path).expect("read unchanged source"),
             before
         );
-    }
-
-    #[test]
-    fn conditional_session_replace_rejects_a_stale_fingerprint() {
-        let codex = tempdir().expect("codex tempdir");
-        let target_path = codex.path().join("stale-target.jsonl");
-        fs::write(&target_path, "before\n").expect("write target");
-        let expected = session_file_fingerprint(&target_path).expect("target fingerprint");
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&target_path)
-            .expect("open target append")
-            .write_all(b"concurrent update\n")
-            .expect("append target");
-
-        let error = replace_session_bytes_if_unchanged(&target_path, b"replacement\n", expected)
-            .expect_err("stale replacement should fail");
-
-        assert!(error.contains("复制过程中发生了更新"));
         assert_eq!(
-            fs::read_to_string(&target_path).expect("read target after rejection"),
-            "before\nconcurrent update\n"
+            store
+                .list_sessions(None, None)
+                .expect("list sessions")
+                .len(),
+            1
         );
     }
 
     #[test]
-    fn rejects_copying_session_onto_itself() {
+    fn repeated_copying_always_adds_distinct_sessions() {
         let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let source_path = sessions_dir.join("repeat-source.jsonl");
+        let source = concat!(
+            r#"{"type":"session_meta","payload":{"id":"repeat-source","source":"vscode"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"重复复制测试"}]}}"#,
+            "\n"
+        );
+        fs::write(&source_path, source).expect("write source");
         let store = SessionStore::new(codex.path().to_path_buf());
 
-        let error = store
-            .copy_session_history("same", "same")
-            .expect_err("same session should fail");
+        let first = store
+            .copy_session_history("repeat-source", "副本")
+            .expect("first copy");
+        let second = store
+            .copy_session_history("repeat-source", "副本")
+            .expect("second copy");
 
-        assert!(error.contains("不能相同"));
+        assert_ne!(first.session_id, second.session_id);
+        assert_ne!(first.session_id, "repeat-source");
+        assert_ne!(second.session_id, "repeat-source");
+        assert_eq!(
+            store
+                .list_sessions(None, None)
+                .expect("list sessions")
+                .len(),
+            3
+        );
+        assert_eq!(
+            fs::read_to_string(source_path).expect("read source"),
+            source
+        );
     }
 
     #[test]
