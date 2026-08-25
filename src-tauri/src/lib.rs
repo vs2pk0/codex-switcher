@@ -5098,6 +5098,8 @@ pub fn run() {
             opencodex::opencodex_install_engine_version,
             opencodex::opencodex_activate_bundled_engine,
             opencodex::opencodex_delete_engine_version,
+            opencodex::opencodex_get_vision_models,
+            opencodex::opencodex_update_vision_models,
         ])
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {

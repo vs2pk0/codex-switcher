@@ -186,6 +186,8 @@ pub struct CodexSessionModelCompatibilityRepairSummary {
     pub repaired_rollout_file_count: usize,
     pub rewritten_rollout_model_field_count: usize,
     pub synchronized_rollout_provider_count: usize,
+    pub removed_encrypted_reasoning_item_count: usize,
+    pub removed_encrypted_compaction_item_count: usize,
     pub repaired_thread_count: usize,
     pub synchronized_catalog_row_count: usize,
     pub repaired_database_count: usize,
@@ -454,6 +456,8 @@ impl SessionStore {
             repaired_rollout_file_count: 0,
             rewritten_rollout_model_field_count: 0,
             synchronized_rollout_provider_count: 0,
+            removed_encrypted_reasoning_item_count: 0,
+            removed_encrypted_compaction_item_count: 0,
             repaired_thread_count: 0,
             synchronized_catalog_row_count: 0,
             repaired_database_count: 0,
@@ -461,7 +465,7 @@ impl SessionStore {
         };
 
         for path in collect_jsonl_files(&self.sessions_dir())? {
-            let Some((tmp_path, rewritten_model_fields, synchronized_providers)) =
+            let Some((tmp_path, rewrite_stats)) =
                 prepare_rollout_model_compatibility_rewrite(&path, target_provider)?
             else {
                 continue;
@@ -492,8 +496,12 @@ impl SessionStore {
                 }
             }
             summary.repaired_rollout_file_count += 1;
-            summary.rewritten_rollout_model_field_count += rewritten_model_fields;
-            summary.synchronized_rollout_provider_count += synchronized_providers;
+            summary.rewritten_rollout_model_field_count += rewrite_stats.rewritten_model_fields;
+            summary.synchronized_rollout_provider_count += rewrite_stats.synchronized_providers;
+            summary.removed_encrypted_reasoning_item_count +=
+                rewrite_stats.removed_encrypted_reasoning_items;
+            summary.removed_encrypted_compaction_item_count +=
+                rewrite_stats.removed_encrypted_compaction_items;
         }
 
         for db_path in self.sqlite_candidate_paths() {
@@ -2963,10 +2971,34 @@ fn should_repair_default_instance(
         .unwrap_or(true)
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RolloutModelCompatibilityRewriteStats {
+    rewritten_model_fields: usize,
+    synchronized_providers: usize,
+    removed_encrypted_reasoning_items: usize,
+    removed_encrypted_compaction_items: usize,
+}
+
+impl RolloutModelCompatibilityRewriteStats {
+    fn changed(self) -> bool {
+        self.rewritten_model_fields > 0
+            || self.synchronized_providers > 0
+            || self.removed_encrypted_reasoning_items > 0
+            || self.removed_encrypted_compaction_items > 0
+    }
+
+    fn add(&mut self, other: Self) {
+        self.rewritten_model_fields += other.rewritten_model_fields;
+        self.synchronized_providers += other.synchronized_providers;
+        self.removed_encrypted_reasoning_items += other.removed_encrypted_reasoning_items;
+        self.removed_encrypted_compaction_items += other.removed_encrypted_compaction_items;
+    }
+}
+
 fn prepare_rollout_model_compatibility_rewrite(
     path: &Path,
     target_provider: &str,
-) -> Result<Option<(PathBuf, usize, usize)>, String> {
+) -> Result<Option<(PathBuf, RolloutModelCompatibilityRewriteStats)>, String> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -2995,8 +3027,7 @@ fn prepare_rollout_model_compatibility_rewrite(
     let mut reader = BufReader::new(input);
     let mut writer = BufWriter::new(output);
     let mut line = Vec::new();
-    let mut rewritten_model_fields = 0usize;
-    let mut synchronized_providers = 0usize;
+    let mut rewrite_stats = RolloutModelCompatibilityRewriteStats::default();
     let result = (|| -> Result<(), String> {
         loop {
             line.clear();
@@ -3016,7 +3047,22 @@ fn prepare_rollout_model_compatibility_rewrite(
             let may_be_session_meta = line
                 .windows(b"session_meta".len())
                 .any(|window| window == b"session_meta");
-            if !may_contain_model && !may_contain_provider && !may_be_session_meta {
+            let may_contain_encrypted_content = line
+                .windows(b"encrypted_content".len())
+                .any(|window| window == b"encrypted_content");
+            let may_contain_remote_reasoning_id = line
+                .windows(b"\"rs_".len())
+                .any(|window| window == b"\"rs_");
+            let may_contain_remote_compaction_id = line
+                .windows(b"\"cmp_".len())
+                .any(|window| window == b"\"cmp_");
+            if !may_contain_model
+                && !may_contain_provider
+                && !may_be_session_meta
+                && !may_contain_encrypted_content
+                && !may_contain_remote_reasoning_id
+                && !may_contain_remote_compaction_id
+            {
                 writer.write_all(&line).map_err(|error| {
                     format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
                 })?;
@@ -3032,12 +3078,16 @@ fn prepare_rollout_model_compatibility_rewrite(
                     continue;
                 }
             };
-            let (model_changes, provider_changes) =
-                rewrite_rollout_model_compatibility_value(&mut value, target_provider);
-            if model_changes == 0 && provider_changes == 0 {
+            let line_stats = rewrite_rollout_model_compatibility_value(&mut value, target_provider);
+            if !line_stats.changed() {
                 writer.write_all(&line).map_err(|error| {
                     format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
                 })?;
+                continue;
+            }
+            rewrite_stats.add(line_stats);
+
+            if line_stats.removed_encrypted_reasoning_items > 0 {
                 continue;
             }
 
@@ -3054,8 +3104,6 @@ fn prepare_rollout_model_compatibility_rewrite(
             writer.write_all(ending).map_err(|error| {
                 format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
             })?;
-            rewritten_model_fields += model_changes;
-            synchronized_providers += provider_changes;
         }
         writer
             .flush()
@@ -3072,28 +3120,46 @@ fn prepare_rollout_model_compatibility_rewrite(
         return Err(error);
     }
     drop(writer);
-    if rewritten_model_fields == 0 && synchronized_providers == 0 {
+    if !rewrite_stats.changed() {
         let _ = fs::remove_file(&tmp_path);
         return Ok(None);
     }
-    Ok(Some((
-        tmp_path,
-        rewritten_model_fields,
-        synchronized_providers,
-    )))
+    Ok(Some((tmp_path, rewrite_stats)))
 }
 
 fn rewrite_rollout_model_compatibility_value(
     value: &mut Value,
     target_provider: &str,
-) -> (usize, usize) {
+) -> RolloutModelCompatibilityRewriteStats {
     let record_type = value
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let mut model_changes = 0usize;
-    let mut provider_changes = 0usize;
+    let mut stats = RolloutModelCompatibilityRewriteStats::default();
+
+    if record_type == "response_item" {
+        let should_remove = value
+            .get("payload")
+            .and_then(Value::as_object)
+            .is_some_and(is_nonportable_encrypted_reasoning_item);
+        if should_remove {
+            stats.removed_encrypted_reasoning_items = 1;
+            return stats;
+        }
+    }
+
+    if record_type == "compacted" {
+        if let Some(replacement_history) = value
+            .pointer_mut("/payload/replacement_history")
+            .and_then(Value::as_array_mut)
+        {
+            let previous_len = replacement_history.len();
+            replacement_history.retain(|item| !is_nonportable_encrypted_compaction_item(item));
+            stats.removed_encrypted_compaction_items =
+                previous_len.saturating_sub(replacement_history.len());
+        }
+    }
 
     if record_type == "session_meta" {
         if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
@@ -3107,7 +3173,7 @@ fn rewrite_rollout_model_compatibility_value(
                     "model_provider".to_string(),
                     Value::String(target_provider.to_string()),
                 );
-                provider_changes += 1;
+                stats.synchronized_providers += 1;
             }
         }
     }
@@ -3138,25 +3204,63 @@ fn rewrite_rollout_model_compatibility_value(
         let Some(current) = model.as_str() else {
             continue;
         };
-        let Some(normalized) = normalize_qualified_model_for_provider(current, target_provider)
-        else {
+        let Some(normalized) = normalize_model_for_provider(current, target_provider) else {
             continue;
         };
         *model = Value::String(normalized);
-        model_changes += 1;
+        stats.rewritten_model_fields += 1;
     }
-    (model_changes, provider_changes)
+    stats
 }
 
-fn normalize_qualified_model_for_provider(model: &str, target_provider: &str) -> Option<String> {
-    let (current_provider, model_id) = model.split_once('/')?;
-    if current_provider.is_empty() || model_id.is_empty() || model_id.contains('/') {
+fn is_nonportable_encrypted_reasoning_item(payload: &serde_json::Map<String, Value>) -> bool {
+    if payload.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return false;
+    }
+    payload.contains_key("encrypted_content")
+        || payload
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("rs_"))
+}
+
+fn is_nonportable_encrypted_compaction_item(item: &Value) -> bool {
+    let Some(item) = item.as_object() else {
+        return false;
+    };
+    if item.get("type").and_then(Value::as_str) != Some("compaction") {
+        return false;
+    }
+    item.contains_key("encrypted_content")
+        || item
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("cmp_"))
+}
+
+fn normalize_model_for_provider(model: &str, target_provider: &str) -> Option<String> {
+    let model = model.trim();
+    if model.is_empty() {
         return None;
     }
+
     if target_provider == "openai" {
+        let (current_provider, model_id) = model.split_once('/')?;
+        if current_provider.is_empty() || model_id.is_empty() {
+            return None;
+        }
         return Some(model_id.to_string());
     }
-    if current_provider == target_provider {
+
+    let target_prefix = format!("{target_provider}/");
+    if model.starts_with(&target_prefix) {
+        return None;
+    }
+    let model_id = model
+        .split_once('/')
+        .map(|(_, model_id)| model_id)
+        .unwrap_or(model);
+    if model_id.is_empty() {
         return None;
     }
     Some(format!("{target_provider}/{model_id}"))
@@ -7085,6 +7189,10 @@ mod tests {
             "\n",
             r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"保留正文中的 zbc/gpt-5.6-sol，不要全局替换"}]}}"#,
             "\n",
+            r#"{"type":"response_item","payload":{"type":"reasoning","id":"rs_old-account","summary":[{"type":"summary_text","text":"旧账号推理摘要"}],"encrypted_content":"old-account-ciphertext"}}"#,
+            "\n",
+            r#"{"type":"compacted","payload":{"message":"保留可读压缩摘要","replacement_history":[{"type":"message","id":"msg_summary","role":"user","content":[{"type":"input_text","text":"保留可读压缩摘要"}]},{"type":"compaction","id":"cmp_old-account","encrypted_content":"old-account-ciphertext"}]}}"#,
+            "\n",
             r#"{"type":"turn_context","payload":{"model":"gpt-5.5","effort":"medium"}}"#,
             "\n"
         );
@@ -7140,6 +7248,8 @@ mod tests {
         assert_eq!(summary.repaired_rollout_file_count, 1);
         assert_eq!(summary.rewritten_rollout_model_field_count, 7);
         assert_eq!(summary.synchronized_rollout_provider_count, 1);
+        assert_eq!(summary.removed_encrypted_reasoning_item_count, 1);
+        assert_eq!(summary.removed_encrypted_compaction_item_count, 1);
         assert_eq!(summary.repaired_thread_count, 2);
         assert_eq!(summary.synchronized_catalog_row_count, 1);
         assert_eq!(summary.repaired_database_count, 2);
@@ -7184,7 +7294,7 @@ mod tests {
             .trim(),
             "1"
         );
-        let repaired_rollout = fs::read_to_string(rollout_path).expect("read rollout");
+        let repaired_rollout = fs::read_to_string(&rollout_path).expect("read rollout");
         assert!(repaired_rollout.contains(r#""model_provider":"openai""#));
         assert_eq!(
             repaired_rollout.matches(r#""model":"gpt-5.6-sol""#).count(),
@@ -7192,8 +7302,124 @@ mod tests {
         );
         assert!(repaired_rollout.contains(r#""model":"gpt-5.5""#));
         assert!(repaired_rollout.contains(r#""text":"保留正文中的 zbc/gpt-5.6-sol，不要全局替换""#));
+        assert!(repaired_rollout.contains(r#""text":"保留可读压缩摘要""#));
+        assert!(!repaired_rollout.contains("rs_old-account"));
+        assert!(!repaired_rollout.contains("cmp_old-account"));
+        assert!(!repaired_rollout.contains("old-account-ciphertext"));
         assert!(!repaired_rollout.contains(r#""model":"zbc/gpt-5.6-sol""#));
         assert!(!repaired_rollout.contains(r#""model":"zhangbo-codex/gpt-5.6-sol""#));
+
+        let mut rollout_file = fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout_path)
+            .expect("open rollout for API-provider history");
+        writeln!(
+            rollout_file,
+            r#"{{"type":"response_item","payload":{{"type":"reasoning","id":"rs_official-account","summary":[],"encrypted_content":"official-account-ciphertext"}}}}"#
+        )
+        .expect("append official reasoning item");
+        writeln!(
+            rollout_file,
+            r#"{{"type":"compacted","payload":{{"message":"保留第二次压缩摘要","replacement_history":[{{"type":"message","id":"msg_second_summary","role":"user","content":[{{"type":"input_text","text":"保留第二次压缩摘要"}}]}},{{"type":"compaction","id":"cmp_official-account","encrypted_content":"official-account-ciphertext"}}]}}}}"#
+        )
+        .expect("append official compaction item");
+        drop(rollout_file);
+
+        let api_provider_summary = store
+            .repair_model_compatibility("api_service")
+            .expect("repair after switching to API provider");
+        assert_eq!(api_provider_summary.repaired_rollout_file_count, 1);
+        assert_eq!(api_provider_summary.rewritten_rollout_model_field_count, 8);
+        assert_eq!(api_provider_summary.synchronized_rollout_provider_count, 1);
+        assert_eq!(
+            api_provider_summary.removed_encrypted_reasoning_item_count,
+            1
+        );
+        assert_eq!(
+            api_provider_summary.removed_encrypted_compaction_item_count,
+            1
+        );
+        assert_eq!(api_provider_summary.repaired_thread_count, 3);
+        assert_eq!(api_provider_summary.synchronized_catalog_row_count, 1);
+
+        let api_provider_rollout = fs::read_to_string(&rollout_path).expect("read API rollout");
+        assert!(api_provider_rollout.contains(r#""model_provider":"api_service""#));
+        assert_eq!(
+            api_provider_rollout
+                .matches(r#""model":"api_service/gpt-5.6-sol""#)
+                .count(),
+            7
+        );
+        assert!(api_provider_rollout.contains(r#""model":"api_service/gpt-5.5""#));
+        assert!(api_provider_rollout.contains(r#""text":"保留第二次压缩摘要""#));
+        assert!(!api_provider_rollout.contains("rs_official-account"));
+        assert!(!api_provider_rollout.contains("cmp_official-account"));
+        assert!(!api_provider_rollout.contains("official-account-ciphertext"));
+
+        let mut api_rollout_file = fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout_path)
+            .expect("open rollout for official return history");
+        writeln!(
+            api_rollout_file,
+            r#"{{"type":"response_item","payload":{{"type":"reasoning","id":"rs_api-service-account","summary":[],"encrypted_content":"api-service-account-ciphertext"}}}}"#
+        )
+        .expect("append API-provider reasoning item");
+        writeln!(
+            api_rollout_file,
+            r#"{{"type":"compacted","payload":{{"message":"保留 API 服务压缩摘要","replacement_history":[{{"type":"message","id":"msg_api_summary","role":"user","content":[{{"type":"input_text","text":"保留 API 服务压缩摘要"}}]}},{{"type":"compaction","id":"cmp_api-service-account","encrypted_content":"api-service-account-ciphertext"}}]}}}}"#
+        )
+        .expect("append API-provider compaction item");
+        drop(api_rollout_file);
+
+        let official_return_summary = store
+            .repair_model_compatibility("openai")
+            .expect("repair after switching back to official account");
+        assert_eq!(official_return_summary.repaired_rollout_file_count, 1);
+        assert_eq!(
+            official_return_summary.rewritten_rollout_model_field_count,
+            8
+        );
+        assert_eq!(
+            official_return_summary.synchronized_rollout_provider_count,
+            1
+        );
+        assert_eq!(
+            official_return_summary.removed_encrypted_reasoning_item_count,
+            1
+        );
+        assert_eq!(
+            official_return_summary.removed_encrypted_compaction_item_count,
+            1
+        );
+        assert_eq!(official_return_summary.repaired_thread_count, 3);
+        assert_eq!(official_return_summary.synchronized_catalog_row_count, 1);
+
+        let official_return_rollout =
+            fs::read_to_string(&rollout_path).expect("read returned official rollout");
+        assert!(official_return_rollout.contains(r#""model_provider":"openai""#));
+        assert_eq!(
+            official_return_rollout
+                .matches(r#""model":"gpt-5.6-sol""#)
+                .count(),
+            7
+        );
+        assert!(official_return_rollout.contains(r#""model":"gpt-5.5""#));
+        assert!(official_return_rollout.contains(r#""text":"保留 API 服务压缩摘要""#));
+        assert!(!official_return_rollout.contains(r#""model":"api_service/gpt-5.6-sol""#));
+        assert!(!official_return_rollout.contains("rs_api-service-account"));
+        assert!(!official_return_rollout.contains("cmp_api-service-account"));
+        assert!(!official_return_rollout.contains("api-service-account-ciphertext"));
+
+        let no_op_summary = store
+            .repair_model_compatibility("openai")
+            .expect("repeat compatibility repair");
+        assert_eq!(no_op_summary.repaired_rollout_file_count, 0);
+        assert_eq!(no_op_summary.repaired_thread_count, 0);
+        assert_eq!(no_op_summary.synchronized_catalog_row_count, 0);
+        assert_eq!(no_op_summary.removed_encrypted_reasoning_item_count, 0);
+        assert_eq!(no_op_summary.removed_encrypted_compaction_item_count, 0);
+        assert!(no_op_summary.backup_dirs.is_empty());
     }
 
     #[test]

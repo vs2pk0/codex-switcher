@@ -3781,11 +3781,11 @@ function confirmResetConfig(): void {
 function confirmRepairSessionModels(): void {
   if (sessionModelRepairing.value) return;
   Modal.warning({
-    title: t("修复会话模型"),
+    title: t("一键修复切号会话"),
     content: t(
-      "将按当前账号清理本地会话中残留的旧 Provider 模型前缀，重置显式模型与推理强度，并同步 Provider。修复前会备份会话文件和数据库，不会删除会话内容。修复期间 ChatGPT/Codex 会自动重启。",
+      "无论从正常账号切到 API 服务账号，还是再切回来，都会按当前账号双向修复 Provider 模型前缀、线程模型与推理强度，并清理上一个账号遗留的 cmp/rs 加密引用。只移除无法跨账号复用的推理和压缩元数据，用户消息、助手回复与工具记录都会保留；修复前会自动备份，期间 ChatGPT/Codex 会自动重启。",
     ),
-    okText: t("开始修复"),
+    okText: t("一键修复"),
     cancelText: t("取消"),
     hideCancel: false,
     onOk: async () => {
@@ -3797,14 +3797,17 @@ function confirmRepairSessionModels(): void {
           summary.repairedThreadCount === 0 &&
           summary.synchronizedCatalogRowCount === 0
         ) {
-          Message.success(t("当前会话模型配置无需修复"));
+          Message.success(t("当前切号会话无需修复"));
         } else {
+          const removedEncryptedItems =
+            summary.removedEncryptedReasoningItemCount +
+            summary.removedEncryptedCompactionItemCount;
           Message.success(
-            `${t("会话模型修复完成")}：${summary.repairedThreadCount} ${t("条会话")}，${summary.repairedRolloutFileCount} ${t("个会话文件")}`,
+            `${t("切号会话一键修复完成")}：${summary.repairedThreadCount} ${t("条会话")}，${summary.repairedRolloutFileCount} ${t("个会话文件")}，${t("清理加密引用")} ${removedEncryptedItems} ${t("个")}`,
           );
         }
       } catch (error) {
-        Message.error(`${t("修复会话模型失败")}：${errorText(error)}`);
+        Message.error(`${t("一键修复切号会话失败")}：${errorText(error)}`);
       } finally {
         sessionModelRepairing.value = false;
       }
@@ -4483,6 +4486,7 @@ onUnmounted(() => {
       :backup-button-text="backupButtonText"
       :session-backup-loading="sessionBackupLoading"
       :session-repairing="sessionRepairing"
+      :session-model-repairing="sessionModelRepairing"
       :active-session-ids="activeSessionIds"
       :all-sessions-selected="allSessionsSelected"
       :selected-session-ids="selectedSessionIds"
@@ -4499,6 +4503,7 @@ onUnmounted(() => {
       @export-session-backup="handleExportSessionBackup"
       @open-session-restore-modal="openSessionRestoreModal"
       @repair-sessions="handleRepairSessions"
+      @repair-session-models="confirmRepairSessionModels"
       @trash-sessions="handleTrashSessions"
       @restore-sessions="handleRestoreSessions"
       @toggle-session-group-expanded="toggleSessionGroupExpanded"
@@ -4573,11 +4578,9 @@ onUnmounted(() => {
       :backup-loading="backupLoading"
       :backup-working="backupWorking"
       :backup-progress="backupProgress"
-      :session-model-repairing="sessionModelRepairing"
       @save="saveSettings"
       @open-path="openSessionFolder"
       @edit-codex-file="openConfigEditor"
-      @repair-session-models="confirmRepairSessionModels"
       @reset-config="confirmResetConfig"
       @delete-config="confirmDeleteConfig"
       @export-backup="handleExportBackup"

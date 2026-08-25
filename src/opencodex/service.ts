@@ -12,6 +12,8 @@ import type {
   OpenCodexSwitcherDeleteResult,
   OpenCodexSwitcherImportResult,
   OpenCodexSystemSnapshot,
+  OpenCodexVisionModelCatalog,
+  OpenCodexVisionModelsUpdateResult,
 } from "./types";
 
 export function getOpenCodexSnapshot(): Promise<OpenCodexSystemSnapshot> {
@@ -75,6 +77,16 @@ export function deleteOpenCodexSwitcherAccount(
   sourceId: string,
 ): Promise<OpenCodexSwitcherDeleteResult> {
   return invoke("opencodex_delete_switcher_account", { request: { sourceId } });
+}
+
+export function getOpenCodexVisionModels(): Promise<OpenCodexVisionModelCatalog> {
+  return invoke("opencodex_get_vision_models");
+}
+
+export function updateOpenCodexVisionModels(
+  models: Array<{ provider: string; id: string }>,
+): Promise<OpenCodexVisionModelsUpdateResult> {
+  return invoke("opencodex_update_vision_models", { request: { models } });
 }
 
 export async function subscribeOpenCodexEvents(

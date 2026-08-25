@@ -4,6 +4,7 @@ use super::models::{
     EngineInstallResult, EngineRelease, EngineUpdateCatalog, HealthBody,
     ImportSwitcherAccountsRequest, InstallEngineVersionRequest, RunActionRequest,
     SwitcherAccountScan, SwitcherDeleteResult, SwitcherImportResult, SystemSnapshot,
+    UpdateVisionModelsRequest, VisionModel, VisionModelCatalog, VisionModelsUpdateResult,
 };
 use chrono::Utc;
 use once_cell::sync::Lazy;
@@ -11,6 +12,7 @@ use regex::Regex;
 use semver::Version;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -61,6 +63,20 @@ struct RemoteEngineCatalog {
 #[serde(rename_all = "camelCase")]
 struct EngineHelperInstallResult {
     version: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagementModelRow {
+    provider: String,
+    id: String,
+    namespaced: String,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(default)]
+    native: bool,
+    #[serde(default)]
+    input_modalities: Vec<String>,
 }
 
 pub struct Backend {
@@ -401,6 +417,195 @@ impl Backend {
             bundled_runtime_available: self.bundled_runtime_path().is_ok(),
             background_service,
         }
+    }
+
+    pub fn get_vision_models(&self) -> Result<VisionModelCatalog, String> {
+        let port = running_open_codex_port()
+            .ok_or_else(|| "请先启动 OpenCodex 服务，再读取当前模型".to_string())?;
+        let directory = config_dir().ok_or_else(|| "无法定位 OpenCodex 配置目录".to_string())?;
+        let token = fs::read_to_string(directory.join("admin-api-token"))
+            .map_err(|error| format!("无法读取 OpenCodex 管理凭证：{error}"))?;
+        let token = token.trim();
+        if token.is_empty() {
+            return Err("OpenCodex 管理凭证为空".to_string());
+        }
+        let response = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .map_err(|error| format!("无法创建 OpenCodex 管理连接：{error}"))?
+            .get(format!("http://127.0.0.1:{port}/api/models"))
+            .bearer_auth(token)
+            .send()
+            .map_err(|error| format!("读取 OpenCodex 模型失败：{error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("OpenCodex 模型接口返回 {}", response.status()));
+        }
+        let rows = response
+            .json::<Vec<ManagementModelRow>>()
+            .map_err(|error| format!("OpenCodex 模型接口返回了无效数据：{error}"))?;
+        let config_text = fs::read_to_string(directory.join("config.json"))
+            .map_err(|error| format!("无法读取 OpenCodex 配置：{error}"))?;
+        let config: Value = serde_json::from_str(&config_text)
+            .map_err(|error| format!("OpenCodex 配置格式无效：{error}"))?;
+        let configured_providers = config
+            .get("providers")
+            .and_then(Value::as_object)
+            .map(|providers| providers.keys().cloned().collect::<HashSet<_>>())
+            .unwrap_or_default();
+        let selected = configured_sidecar_models(&config);
+        let mut models = rows
+            .into_iter()
+            .filter(|row| !row.native && configured_providers.contains(&row.provider))
+            .map(|row| {
+                let sidecar_enabled = selected
+                    .get(&row.provider)
+                    .is_some_and(|ids| ids.contains(&row.id));
+                let native_vision =
+                    !sidecar_enabled && row.input_modalities.iter().any(|item| item == "image");
+                VisionModel {
+                    provider: row.provider,
+                    id: row.id,
+                    namespaced: row.namespaced,
+                    disabled: row.disabled,
+                    native_vision,
+                    sidecar_enabled,
+                }
+            })
+            .collect::<Vec<_>>();
+        models.sort_by(|left, right| {
+            left.provider
+                .cmp(&right.provider)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(VisionModelCatalog {
+            models,
+            sidecar_model: config
+                .pointer("/visionSidecar/model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            sidecar_backend: config
+                .pointer("/visionSidecar/backend")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+    }
+
+    pub fn update_vision_models(
+        &self,
+        request: UpdateVisionModelsRequest,
+    ) -> Result<VisionModelsUpdateResult, String> {
+        let live = self.get_vision_models()?;
+        let known = live
+            .models
+            .iter()
+            .filter(|model| !model.native_vision && !model.disabled)
+            .map(|model| (model.provider.clone(), model.id.clone()))
+            .collect::<HashSet<_>>();
+        let selected = request
+            .models
+            .into_iter()
+            .map(|model| {
+                (
+                    model.provider.trim().to_string(),
+                    model.id.trim().to_string(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        if selected.iter().any(|model| !known.contains(model)) {
+            return Err("选择中包含不存在、已禁用或原生支持图片的模型，请刷新后重试".to_string());
+        }
+
+        let mut provider_models = BTreeMap::<String, Vec<String>>::new();
+        for model in &live.models {
+            if !model.native_vision {
+                provider_models.entry(model.provider.clone()).or_default();
+            }
+        }
+        for (provider, id) in &selected {
+            provider_models
+                .entry(provider.clone())
+                .or_default()
+                .push(id.clone());
+        }
+        for ids in provider_models.values_mut() {
+            ids.sort();
+            ids.dedup();
+        }
+
+        self.begin_mutation()?;
+        let result = (|| {
+            let launcher = self.active_launcher()?;
+            let mut changed_providers = Vec::new();
+            for (provider, ids) in &provider_models {
+                let current = live
+                    .models
+                    .iter()
+                    .filter(|model| model.provider == *provider && model.sidecar_enabled)
+                    .map(|model| model.id.clone())
+                    .collect::<HashSet<_>>();
+                if current == ids.iter().cloned().collect::<HashSet<_>>() {
+                    continue;
+                }
+                let path = format!("providers.{provider}.noVisionModels");
+                let json = serde_json::to_string(ids)
+                    .map_err(|error| format!("无法生成图片模型配置：{error}"))?;
+                let args = vec![
+                    "config".to_string(),
+                    "set".to_string(),
+                    path,
+                    json,
+                    "--json".to_string(),
+                ];
+                let output = self
+                    .command(&launcher, &args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .map_err(|error| format!("无法保存 {provider} 图片模型配置：{error}"))?;
+                if !output.status.success() {
+                    let detail = self.redact(String::from_utf8_lossy(&output.stderr).trim());
+                    return Err(if detail.is_empty() {
+                        format!("保存 {provider} 图片模型配置失败")
+                    } else {
+                        detail
+                    });
+                }
+                changed_providers.push(provider.clone());
+            }
+            if !changed_providers.is_empty() {
+                let output = self
+                    .command(&launcher, &["restart".to_string()])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .map_err(|error| format!("配置已保存，但重启 OpenCodex 失败：{error}"))?;
+                if !output.status.success() {
+                    let detail = self.redact(String::from_utf8_lossy(&output.stderr).trim());
+                    return Err(if detail.is_empty() {
+                        "配置已保存，但重启 OpenCodex 失败".to_string()
+                    } else {
+                        format!("配置已保存，但重启 OpenCodex 失败：{detail}")
+                    });
+                }
+            }
+            let count = selected.len();
+            Ok(VisionModelsUpdateResult {
+                selected_count: count,
+                changed_providers,
+                message: if count == 0 {
+                    "已关闭所有图片转文字模型并同步 Codex".to_string()
+                } else {
+                    format!("已为 {count} 个模型开启图片输入并同步 Codex")
+                },
+            })
+        })();
+        self.finish_mutation();
+        if let Ok(value) = &result {
+            self.persist_log("system", &value.message);
+        }
+        result
     }
 
     fn background_service_state(&self) -> BackgroundServiceState {
@@ -1294,6 +1499,35 @@ fn read_configured_port() -> Option<u16> {
     u16::try_from(port).ok().filter(|port| *port > 0)
 }
 
+fn running_open_codex_port() -> Option<u16> {
+    let configured = read_configured_port().unwrap_or(DEFAULT_PORT);
+    let runtime = read_runtime_port();
+    runtime
+        .filter(|port| probe_health(*port).is_some())
+        .or_else(|| probe_health(configured).map(|_| configured))
+}
+
+fn configured_sidecar_models(config: &Value) -> HashMap<String, HashSet<String>> {
+    let mut result = HashMap::new();
+    let Some(providers) = config.get("providers").and_then(Value::as_object) else {
+        return result;
+    };
+    for (provider, value) in providers {
+        let ids = value
+            .get("noVisionModels")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        if !ids.is_empty() {
+            result.insert(provider.clone(), ids);
+        }
+    }
+    result
+}
+
 fn config_is_initialized(directory: &Path) -> bool {
     let Ok(text) = fs::read_to_string(directory.join("config.json")) else {
         return false;
@@ -1394,8 +1628,9 @@ fn display_action(action: &CommandAction) -> &'static str {
 mod tests {
     use super::{
         build_engine_update_catalog, codex_integration_is_enabled, config_is_initialized,
-        managed_versions_to_remove, package_version, validate_engine_version,
-        validate_managed_package, validate_port, RemoteEngineCatalog, DEFAULT_PORT,
+        configured_sidecar_models, managed_versions_to_remove, package_version,
+        validate_engine_version, validate_managed_package, validate_port, RemoteEngineCatalog,
+        DEFAULT_PORT,
     };
     use chrono::Utc;
     use std::{
@@ -1435,6 +1670,25 @@ mod tests {
             .join("@bitkyc08")
             .join("opencodex");
         assert_eq!(package_version(&package).as_deref(), Some("2.27.0"));
+    }
+
+    #[test]
+    fn reads_only_configured_sidecar_model_ids() {
+        let config = serde_json::json!({
+            "providers": {
+                "zbc": { "noVisionModels": ["gpt-5.6-sol", "gpt-5.6-terra", 7] },
+                "native": { "noVisionModels": [] },
+                "invalid": { "noVisionModels": "gpt-5.5" }
+            }
+        });
+        let selected = configured_sidecar_models(&config);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected.get("zbc").expect("zbc model set"),
+            &["gpt-5.6-sol".to_string(), "gpt-5.6-terra".to_string()]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]

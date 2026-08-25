@@ -1,4 +1,4 @@
-export type OpenCodexPage = "console" | "web" | "versions" | "logs" | "settings";
+export type OpenCodexPage = "console" | "web" | "vision" | "versions" | "logs" | "settings";
 
 export type OpenCodexAction =
   | "init"
@@ -132,4 +132,25 @@ export interface OpenCodexSwitcherDeleteResult {
 export interface OpenCodexSettings {
   port: number;
   dashboardOpenMode: "client" | "browser";
+}
+
+export interface OpenCodexVisionModel {
+  provider: string;
+  id: string;
+  namespaced: string;
+  disabled: boolean;
+  nativeVision: boolean;
+  sidecarEnabled: boolean;
+}
+
+export interface OpenCodexVisionModelCatalog {
+  models: OpenCodexVisionModel[];
+  sidecarModel?: string | null;
+  sidecarBackend?: string | null;
+}
+
+export interface OpenCodexVisionModelsUpdateResult {
+  selectedCount: number;
+  changedProviders: string[];
+  message: string;
 }
