@@ -2698,10 +2698,15 @@ fn codex_restore_sessions_from_trash_across_instances(
 #[tauri::command]
 fn codex_copy_session_history_across_instances(
     source_session_id: String,
-    target_session_id: String,
+    copy_suffix: String,
+    target_project_path: String,
 ) -> Result<CodexSessionMutationResult, String> {
     with_codex_desktop_stopped(|| {
-        SessionStore::default().copy_session_history(&source_session_id, &target_session_id)
+        SessionStore::default().copy_session_to_directory(
+            &source_session_id,
+            &copy_suffix,
+            &target_project_path,
+        )
     })
 }
 

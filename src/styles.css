@@ -2973,10 +2973,47 @@ textarea {
 }
 
 .session-copy-target,
+.session-copy-directory-field,
 .session-rename-modal-body label,
 .session-directory-field {
   display: grid;
   gap: 8px;
+}
+
+.session-copy-directory-field > span {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.session-copy-directory-input {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.session-copy-selected-path {
+  color: #64748b;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.session-copy-target {
+  padding: 14px 16px;
+  border: 1px solid #dce8df;
+  border-radius: 8px;
+  background: #f7fcf8;
+}
+
+.session-copy-target strong {
+  color: #173b2b;
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+
+.session-copy-target small {
+  color: #6f8378;
+  line-height: 1.6;
 }
 
 .session-directory-session {

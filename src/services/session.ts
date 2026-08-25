@@ -209,11 +209,13 @@ export function restoreSessionsFromTrashAcrossInstances(
 
 export function copySessionHistoryAcrossInstances(
   sourceSessionId: string,
-  targetSessionId: string,
+  copySuffix: string,
+  targetProjectPath: string,
 ): Promise<CodexSessionMutationResult> {
   return invoke("codex_copy_session_history_across_instances", {
     sourceSessionId,
-    targetSessionId,
+    copySuffix,
+    targetProjectPath,
   });
 }
 

@@ -152,7 +152,7 @@ function switchMode(trashMode: boolean): void {
                 <a-tooltip :content="t('查看会话内容')">
                   <a-button size="small" type="text" @click="emit('view-session-content', session)"><template #icon><icon-eye /></template></a-button>
                 </a-tooltip>
-                <a-tooltip :content="t('复制到其他会话')">
+                <a-tooltip :content="t('复制到其他目录')">
                   <a-button size="small" type="text" @click="emit('copy-session', session)"><template #icon><icon-copy /></template></a-button>
                 </a-tooltip>
                 <a-tooltip :content="t('修改会话名称')">

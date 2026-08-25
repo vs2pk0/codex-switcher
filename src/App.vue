@@ -623,6 +623,17 @@ const sessionGroups = computed<SessionGroup[]>(() => {
     }))
     .sort((left, right) => right.latestUpdatedAt - left.latestUpdatedAt);
 });
+const sessionCopyDirectories = computed(() =>
+  sessionGroups.value
+    .map((group) => ({
+      name: group.projectName,
+      path: group.sessions.find((session) => session.projectPath)?.projectPath || "",
+    }))
+    .filter(
+      (directory) =>
+        directory.path && directory.path !== sessionCopySource.value?.projectPath,
+    ),
+);
 const selectedAccountIdList = computed(() => [...selectedAccountIds.value]);
 const effectiveRepairSessionScope = computed(() =>
   repairSessionScope.value === "selected" && selectedSessionIdList.value.length
@@ -3560,10 +3571,6 @@ async function openSessionFolder(path: string): Promise<void> {
 }
 
 function openSessionCopy(session: CodexSessionRecord): void {
-  if (sessions.value.length < 2) {
-    Message.warning(t("请先新建一个空会话并刷新列表"));
-    return;
-  }
   sessionCopySource.value = session;
   sessionCopyVisible.value = true;
 }
@@ -3577,15 +3584,15 @@ function handleSessionContentUpdated(): void {
   void loadSessions({ silent: true });
 }
 
-async function handleCopySession(targetSessionId: string): Promise<void> {
+async function handleCopySession(projectPath: string): Promise<void> {
   const source = sessionCopySource.value;
   if (!source || sessionCopySaving.value) return;
   sessionCopySaving.value = true;
   try {
-    const result = await copySessionHistoryAcrossInstances(source.id, targetSessionId);
+    const result = await copySessionHistoryAcrossInstances(source.id, t("副本"), projectPath);
     sessionCopyVisible.value = false;
     sessionCopySource.value = null;
-    Message.success(t("会话数据已复制并重建历史，Codex 已自动重启"));
+    Message.success(t("已复制到目标目录，并作为独立会话与现有会话共存，Codex 已自动重启"));
     if (result.warnings.length) {
       Message.warning(`${t("会话已复制，但部分索引同步失败")}：${result.warnings.join("；")}`);
     }
@@ -4525,7 +4532,7 @@ onUnmounted(() => {
     <SessionCopyModal
       v-model:visible="sessionCopyVisible"
       :source="sessionCopySource"
-      :sessions="sessions"
+      :directories="sessionCopyDirectories"
       :saving="sessionCopySaving"
       @save="handleCopySession"
     />
