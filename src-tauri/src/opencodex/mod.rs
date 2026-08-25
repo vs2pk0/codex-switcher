@@ -6,7 +6,8 @@ use models::{
     CommandStarted, DeleteEngineVersionRequest, DeleteSwitcherAccountRequest, EngineDeleteResult,
     EngineInstallResult, EngineUpdateCatalog, ImportSwitcherAccountsRequest,
     InstallEngineVersionRequest, RunActionRequest, SwitcherAccountScan, SwitcherDeleteResult,
-    SwitcherImportResult, SystemSnapshot,
+    SwitcherImportResult, SystemSnapshot, UpdateVisionModelsRequest, VisionModelCatalog,
+    VisionModelsUpdateResult,
 };
 use std::sync::Arc;
 use tauri::State;
@@ -110,4 +111,19 @@ pub fn opencodex_delete_engine_version(
     request: DeleteEngineVersionRequest,
 ) -> Result<EngineDeleteResult, String> {
     backend.delete_engine_version(request)
+}
+
+#[tauri::command]
+pub fn opencodex_get_vision_models(
+    backend: State<'_, Arc<OpenCodexBackend>>,
+) -> Result<VisionModelCatalog, String> {
+    backend.get_vision_models()
+}
+
+#[tauri::command]
+pub fn opencodex_update_vision_models(
+    backend: State<'_, Arc<OpenCodexBackend>>,
+    request: UpdateVisionModelsRequest,
+) -> Result<VisionModelsUpdateResult, String> {
+    backend.update_vision_models(request)
 }

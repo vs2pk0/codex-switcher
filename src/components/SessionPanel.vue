@@ -12,6 +12,7 @@ const props = defineProps<{
   backupButtonText: string;
   sessionBackupLoading: boolean;
   sessionRepairing: boolean;
+  sessionModelRepairing: boolean;
   activeSessionIds: string[];
   allSessionsSelected: boolean;
   selectedSessionIds: Set<string>;
@@ -32,6 +33,7 @@ const emit = defineEmits<{
   (event: "export-session-backup"): void;
   (event: "open-session-restore-modal"): void;
   (event: "repair-sessions"): void;
+  (event: "repair-session-models"): void;
   (event: "trash-sessions"): void;
   (event: "restore-sessions"): void;
   (event: "toggle-session-group-expanded", key: string): void;
@@ -110,6 +112,7 @@ function switchMode(trashMode: boolean): void {
         <a-button :loading="backupWorking" @click="emit('export-session-backup')"><template #icon><icon-download /></template>{{ backupButtonText }}</a-button>
         <a-button :loading="sessionBackupLoading" :disabled="backupWorking" @click="emit('open-session-restore-modal')"><template #icon><icon-import /></template>{{ t("恢复会话") }}</a-button>
         <a-button :loading="sessionRepairing" type="primary" @click="emit('repair-sessions')"><template #icon><icon-tool /></template>{{ t("修复可见性") }}</a-button>
+        <a-button :loading="sessionModelRepairing" status="success" @click="emit('repair-session-models')"><template #icon><icon-sync /></template>{{ t("一键修复切号会话") }}</a-button>
         <a-button v-if="!sessionTrashMode" status="danger" :disabled="!selectedSessionIdList.length" @click="emit('trash-sessions')"><template #icon><icon-delete /></template>{{ t("移入回收站") }}</a-button>
         <template v-else>
           <a-button :disabled="!activeSessionIds.length" @click="emit('toggle-all-sessions')"><template #icon><icon-check /></template>{{ t(allSessionsSelected ? "取消全选" : "全选回收站") }}</a-button>

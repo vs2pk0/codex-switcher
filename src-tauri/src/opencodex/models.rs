@@ -272,3 +272,43 @@ pub struct HealthBody {
     pub port: Option<u16>,
     pub status: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisionModel {
+    pub provider: String,
+    pub id: String,
+    pub namespaced: String,
+    pub disabled: bool,
+    pub native_vision: bool,
+    pub sidecar_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisionModelCatalog {
+    pub models: Vec<VisionModel>,
+    pub sidecar_model: Option<String>,
+    pub sidecar_backend: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisionModelSelection {
+    pub provider: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateVisionModelsRequest {
+    pub models: Vec<VisionModelSelection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisionModelsUpdateResult {
+    pub selected_count: usize,
+    pub changed_providers: Vec<String>,
+    pub message: String,
+}

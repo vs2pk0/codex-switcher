@@ -16,14 +16,12 @@ const props = defineProps<{
   backupLoading: boolean;
   backupWorking: boolean;
   backupProgress: number;
-  sessionModelRepairing: boolean;
 }>();
 
 const emit = defineEmits<{
   (event: "save"): void;
   (event: "open-path", path: string): void;
   (event: "edit-codex-file", fileKind: CodexConfigFileKind): void;
-  (event: "repair-session-models"): void;
   (event: "reset-config"): void;
   (event: "delete-config"): void;
   (event: "export-backup"): void;
@@ -216,15 +214,6 @@ function changeLanguage(value: unknown): void {
             <a-button @click="emit('edit-codex-file', 'config')">
               <template #icon><icon-edit /></template>
               {{ t("编辑 config.toml") }}
-            </a-button>
-            <a-button
-              type="outline"
-              status="success"
-              :loading="sessionModelRepairing"
-              @click="emit('repair-session-models')"
-            >
-              <template #icon><icon-tool /></template>
-              {{ t("修复会话模型") }}
             </a-button>
             <a-divider />
             <a-button status="warning" @click="emit('reset-config')">

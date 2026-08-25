@@ -305,6 +305,14 @@ const en: Record<string, string> = {
   "编辑 auth.json": "Edit auth.json",
   "编辑 config.toml": "Edit config.toml",
   "修复会话模型": "Repair Session Models",
+  "一键修复切号会话": "Repair Switched-Account Sessions",
+  "一键修复": "Repair All",
+  "当前切号会话无需修复": "Switched-account sessions are already compatible",
+  "切号会话一键修复完成": "Switched-account session repair completed",
+  "一键修复切号会话失败": "Failed to repair switched-account sessions",
+  "清理加密引用": "removed encrypted references",
+  "无论从正常账号切到 API 服务账号，还是再切回来，都会按当前账号双向修复 Provider 模型前缀、线程模型与推理强度，并清理上一个账号遗留的 cmp/rs 加密引用。只移除无法跨账号复用的推理和压缩元数据，用户消息、助手回复与工具记录都会保留；修复前会自动备份，期间 ChatGPT/Codex 会自动重启。":
+    "Whether switching from an official account to an API service account or back again, repair provider-qualified model names in both directions, reset thread model and reasoning settings for the current account, and remove cmp/rs encrypted references left by the previous account. Only reasoning and compaction metadata that cannot be reused across accounts is removed; user messages, assistant replies, and tool records are preserved. A backup is created first, and ChatGPT/Codex restarts automatically.",
   "将按当前账号清理本地会话中残留的旧 Provider 模型前缀，重置显式模型与推理强度，并同步 Provider。修复前会备份会话文件和数据库，不会删除会话内容。修复期间 ChatGPT/Codex 会自动重启。":
     "Remove stale provider prefixes from local session models, reset explicit model and reasoning selections, and synchronize the provider with the current account. Session files and databases are backed up first; session content is not deleted. ChatGPT/Codex restarts automatically during repair.",
   "开始修复": "Start Repair",
@@ -1288,6 +1296,14 @@ const ru: Record<string, string> = {
   "编辑 auth.json": "Изменить auth.json",
   "编辑 config.toml": "Изменить config.toml",
   "修复会话模型": "Исправить модели сессий",
+  "一键修复切号会话": "Исправить сессии после смены аккаунта",
+  "一键修复": "Исправить всё",
+  "当前切号会话无需修复": "Сессии после смены аккаунта уже совместимы",
+  "切号会话一键修复完成": "Сессии после смены аккаунта исправлены",
+  "一键修复切号会话失败": "Не удалось исправить сессии после смены аккаунта",
+  "清理加密引用": "удалено зашифрованных ссылок",
+  "无论从正常账号切到 API 服务账号，还是再切回来，都会按当前账号双向修复 Provider 模型前缀、线程模型与推理强度，并清理上一个账号遗留的 cmp/rs 加密引用。只移除无法跨账号复用的推理和压缩元数据，用户消息、助手回复与工具记录都会保留；修复前会自动备份，期间 ChatGPT/Codex 会自动重启。":
+    "При переключении с официального аккаунта на аккаунт API-сервиса и обратно квалифицированные имена моделей исправляются в обоих направлениях, настройки модели и глубины рассуждений приводятся к текущему аккаунту, а зашифрованные ссылки cmp/rs от предыдущего аккаунта удаляются. Удаляются только метаданные рассуждений и сжатия, которые нельзя использовать с другим аккаунтом; сообщения пользователя, ответы помощника и записи инструментов сохраняются. Сначала создаётся резервная копия, затем ChatGPT/Codex автоматически перезапускается.",
   "将按当前账号清理本地会话中残留的旧 Provider 模型前缀，重置显式模型与推理强度，并同步 Provider。修复前会备份会话文件和数据库，不会删除会话内容。修复期间 ChatGPT/Codex 会自动重启。":
     "Устаревшие префиксы поставщика будут удалены из моделей локальных сессий, явные настройки модели и глубины рассуждений сброшены, а поставщик синхронизирован с текущим аккаунтом. Перед исправлением файлы и базы сессий будут сохранены; содержимое сессий не удаляется. ChatGPT/Codex автоматически перезапустится.",
   "开始修复": "Начать исправление",

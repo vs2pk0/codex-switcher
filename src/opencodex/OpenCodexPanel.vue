@@ -8,6 +8,7 @@ import {
   deleteOpenCodexEngine,
   getOpenCodexEngineCatalog,
   getOpenCodexSnapshot,
+  getOpenCodexVisionModels,
   importOpenCodexSwitcherAccounts,
   installOpenCodexEngine,
   openOpenCodexDashboard,
@@ -15,6 +16,7 @@ import {
   runOpenCodexAction,
   scanOpenCodexSwitcherAccounts,
   subscribeOpenCodexEvents,
+  updateOpenCodexVisionModels,
   writeOpenCodexInput,
 } from "./service";
 import {
@@ -32,6 +34,7 @@ import type {
   OpenCodexSettings,
   OpenCodexSwitcherAccountScan,
   OpenCodexSystemSnapshot,
+  OpenCodexVisionModelCatalog,
 } from "./types";
 
 const props = defineProps<{ active: boolean }>();
@@ -52,6 +55,11 @@ const accountScanLoading = ref(false);
 const selectedAccountIds = ref<string[]>([]);
 const importingAccounts = ref(false);
 const deletingAccountId = ref("");
+const visionCatalog = ref<OpenCodexVisionModelCatalog | null>(null);
+const visionLoading = ref(false);
+const visionSaving = ref(false);
+const visionSearch = ref("");
+const selectedVisionModels = ref<string[]>([]);
 let unlistenEvents: UnlistenFn | undefined;
 const answeredPortPrompts = new Set<string>();
 
@@ -76,6 +84,16 @@ const selectedImportAccountIds = computed(() => selectedAccountIds.value.filter(
 const selectedDeleteAccounts = computed(() => (accountScan.value?.accounts ?? []).filter((account) =>
   selectedAccountIds.value.includes(account.sourceId) && account.deletable,
 ));
+const filteredVisionModels = computed(() => {
+  const query = visionSearch.value.trim().toLowerCase();
+  return (visionCatalog.value?.models ?? []).filter((model) =>
+    !query || model.namespaced.toLowerCase().includes(query),
+  );
+});
+const sidecarSelectableModels = computed(() =>
+  filteredVisionModels.value.filter((model) => !model.nativeVision && !model.disabled),
+);
+const selectedVisionCount = computed(() => selectedVisionModels.value.length);
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -301,6 +319,63 @@ async function scanAccounts(): Promise<void> {
   }
 }
 
+async function loadVisionModels(): Promise<void> {
+  if (!snapshot.value?.running) {
+    visionCatalog.value = null;
+    selectedVisionModels.value = [];
+    return;
+  }
+  visionLoading.value = true;
+  try {
+    visionCatalog.value = await getOpenCodexVisionModels();
+    selectedVisionModels.value = visionCatalog.value.models
+      .filter((model) => model.sidecarEnabled)
+      .map((model) => model.namespaced);
+  } catch (error) {
+    Message.error(`读取 OpenCodex 模型失败：${errorText(error)}`);
+  } finally {
+    visionLoading.value = false;
+  }
+}
+
+function toggleVisionModel(namespaced: string): void {
+  selectedVisionModels.value = selectedVisionModels.value.includes(namespaced)
+    ? selectedVisionModels.value.filter((model) => model !== namespaced)
+    : [...selectedVisionModels.value, namespaced];
+}
+
+function selectFilteredVisionModels(): void {
+  const visible = sidecarSelectableModels.value.map((model) => model.namespaced);
+  selectedVisionModels.value = [...new Set([...selectedVisionModels.value, ...visible])];
+}
+
+function clearVisionModels(): void {
+  selectedVisionModels.value = [];
+}
+
+async function saveVisionModels(): Promise<void> {
+  const models = (visionCatalog.value?.models ?? [])
+    .filter((model) => selectedVisionModels.value.includes(model.namespaced))
+    .map((model) => ({ provider: model.provider, id: model.id }));
+  visionSaving.value = true;
+  try {
+    const result = await updateOpenCodexVisionModels(models);
+    Message.success(result.message);
+    await Promise.all([refreshSnapshot(false), loadVisionModels()]);
+    if (result.changedProviders.length) {
+      Modal.info({
+        title: "图片模型已同步",
+        content: "Codex 客户端会缓存模型能力。请用 Command + Q（Windows 使用退出菜单）完全退出 Codex，再重新打开后使用图片输入。",
+        okText: "知道了",
+      });
+    }
+  } catch (error) {
+    Message.error(`保存图片模型失败：${errorText(error)}`);
+  } finally {
+    visionSaving.value = false;
+  }
+}
+
 async function importAccounts(): Promise<void> {
   if (!selectedImportAccountIds.value.length) {
     Message.warning("请至少选择一个可导入账号");
@@ -429,6 +504,7 @@ watch(
 
 watch(page, (nextPage) => {
   if (nextPage === "versions" && !catalog.value) void checkVersions();
+  if (nextPage === "vision") void loadVisionModels();
 });
 
 onMounted(async () => {
@@ -492,6 +568,9 @@ onUnmounted(() => unlistenEvents?.());
       </button>
       <button :class="{ active: page === 'web' }" @click="page = 'web'">
         <icon-public />Web 管理
+      </button>
+      <button :class="{ active: page === 'vision' }" @click="page = 'vision'">
+        <icon-image />图片模型
       </button>
       <button :class="{ active: page === 'versions' }" @click="page = 'versions'">
         <icon-apps />版本管理
@@ -661,6 +740,63 @@ onUnmounted(() => unlistenEvents?.());
         </section>
       </template>
 
+      <template v-else-if="page === 'vision'">
+        <section v-if="!snapshot?.running" class="vision-offline-card">
+          <span class="vision-offline-icon"><icon-image /></span>
+          <h2>启动服务后配置图片模型</h2>
+          <p>模型列表来自当前运行中的 OpenCodex。启动后可选择需要通过图片描述器兼容的模型。</p>
+          <a-button type="primary" :disabled="busy || !snapshot?.initialized" @click="run('start')"><template #icon><icon-play-arrow /></template>启动 OpenCodex</a-button>
+        </section>
+        <section v-else class="vision-manager-card">
+          <div class="vision-manager-header">
+            <div>
+              <span class="vision-kicker">VISION SIDECAR</span>
+              <h2>图片输入兼容</h2>
+              <p>为本身不识图的模型开启图片粘贴。OpenCodex 会先用图片模型生成描述，再交给所选模型处理。</p>
+            </div>
+            <div class="vision-sidecar-summary">
+              <small>图片描述模型</small>
+              <strong>{{ visionCatalog?.sidecarModel || 'OpenCodex 默认模型' }}</strong>
+              <span>{{ visionCatalog?.sidecarBackend || '自动选择后端' }}</span>
+            </div>
+          </div>
+          <div class="vision-toolbar">
+            <a-input v-model="visionSearch" allow-clear placeholder="搜索 Provider 或模型名称"><template #prefix><icon-search /></template></a-input>
+            <a-button :loading="visionLoading" @click="loadVisionModels"><template #icon><icon-refresh /></template>读取当前模型</a-button>
+            <a-button :disabled="!sidecarSelectableModels.length" @click="selectFilteredVisionModels">选择当前结果</a-button>
+            <a-button :disabled="!selectedVisionCount" @click="clearVisionModels">清空选择</a-button>
+          </div>
+          <a-spin :loading="visionLoading" tip="正在读取 OpenCodex 当前模型…">
+            <div v-if="filteredVisionModels.length" class="vision-model-list">
+              <article
+                v-for="model in filteredVisionModels"
+                :key="model.namespaced"
+                :class="['vision-model-row', { selected: selectedVisionModels.includes(model.namespaced), native: model.nativeVision, disabled: model.disabled }]"
+                @click="!model.nativeVision && !model.disabled && toggleVisionModel(model.namespaced)"
+              >
+                <a-checkbox
+                  v-if="!model.nativeVision"
+                  :model-value="selectedVisionModels.includes(model.namespaced)"
+                  :disabled="model.disabled"
+                  @click.stop
+                  @change="toggleVisionModel(model.namespaced)"
+                />
+                <span v-else class="vision-native-check"><icon-check /></span>
+                <span class="vision-model-identity"><strong>{{ model.id }}</strong><small>{{ model.provider }}</small></span>
+                <span v-if="model.nativeVision" class="vision-mode-pill native">原生支持图片</span>
+                <span v-else-if="model.disabled" class="vision-mode-pill disabled">模型已禁用</span>
+                <span v-else :class="['vision-mode-pill', selectedVisionModels.includes(model.namespaced) ? 'sidecar' : 'text']">{{ selectedVisionModels.includes(model.namespaced) ? '图片转文字' : '仅文本' }}</span>
+              </article>
+            </div>
+            <a-empty v-else description="没有匹配的模型" />
+          </a-spin>
+          <footer class="vision-save-bar">
+            <div><strong>已选择 {{ selectedVisionCount }} 个兼容模型</strong><span>保存会自动重启 OpenCodex 并同步 Codex 模型目录</span></div>
+            <a-button type="primary" size="large" :loading="visionSaving" :disabled="visionLoading" @click="saveVisionModels"><template #icon><icon-save /></template>保存并同步</a-button>
+          </footer>
+        </section>
+      </template>
+
       <template v-else-if="page === 'logs'">
         <section class="logs-card">
           <div class="section-heading">
@@ -785,6 +921,9 @@ onUnmounted(() => unlistenEvents?.());
 .quick-grid button.toggle-enabled { border-color: rgba(16, 185, 129, .24); background: rgba(240, 253, 250, .88); }.quick-toggle-state { display: inline-flex; flex: 0 0 auto; height: 24px; align-items: center; padding: 0 9px; border-radius: 999px; font-size: 10px; font-style: normal; font-weight: 820; }.quick-toggle-state.on { color: #047857; background: #d1fae5; }.quick-toggle-state.off { color: #64748b; background: #eef2f7; }
 .console-output { overflow: auto; max-height: 280px; min-height: 150px; padding: 15px; border-radius: 12px; background: #111821; color: #b9f69b; font: 12.5px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }.console-line { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 8px; }.console-line time { color: #64748b; }.console-line.stderr span { color: #fda4af; }.console-line.system span { color: #93c5fd; }.console-empty { display: grid; min-height: 120px; place-items: center; color: #64748b; }.interactive-input { display: flex; gap: 10px; margin-top: 12px; }
 .web-management-card { display: grid; justify-items: center; padding: 58px 28px; text-align: center; }.web-orb { display: grid; width: 82px; height: 82px; place-items: center; margin-bottom: 18px; border-radius: 26px; color: #0f766e; background: #e3f6f1; font-size: 34px; }.web-management-card h2 { margin: 14px 0 6px; font-size: 28px; }.web-management-card > p { color: #66758c; font: 16px ui-monospace, SFMono-Regular, Menlo, monospace; }.web-actions { display: flex; gap: 12px; margin: 24px 0; }
+.vision-offline-card { display: grid; min-height: 430px; place-items: center; align-content: center; gap: 12px; padding: 48px 24px; border: 1px solid rgba(85, 113, 156, .17); border-radius: 16px; background: rgba(255, 255, 255, .82); text-align: center; }.vision-offline-card h2 { margin: 8px 0 0; font-size: 24px; }.vision-offline-card p { max-width: 560px; margin: 0 0 8px; color: #66758c; line-height: 1.7; }.vision-offline-icon { display: grid; width: 72px; height: 72px; place-items: center; border-radius: 20px; color: #0f766e; background: #e3f6f1; font-size: 30px; }
+.vision-manager-card { overflow: hidden; border: 1px solid rgba(85, 113, 156, .17); border-radius: 16px; background: rgba(255, 255, 255, .86); box-shadow: 0 14px 34px rgba(30, 53, 84, .06); }.vision-manager-header { display: grid; grid-template-columns: minmax(0, 1fr) minmax(210px, 280px); align-items: center; gap: 24px; padding: 24px; border-bottom: 1px solid rgba(85, 113, 156, .13); background: linear-gradient(120deg, rgba(238, 250, 247, .94), rgba(242, 247, 255, .94)); }.vision-kicker { color: #0f766e; font-size: 11px; font-weight: 850; letter-spacing: .08em; }.vision-manager-header h2 { margin: 6px 0; font-size: 24px; }.vision-manager-header p { max-width: 700px; margin: 0; color: #607087; line-height: 1.65; }.vision-sidecar-summary { display: grid; gap: 4px; padding: 16px; border: 1px solid rgba(15, 118, 110, .16); border-radius: 12px; background: rgba(255, 255, 255, .78); }.vision-sidecar-summary small, .vision-sidecar-summary span { color: #718096; }.vision-sidecar-summary strong { overflow: hidden; color: #0f766e; font-size: 16px; text-overflow: ellipsis; white-space: nowrap; }
+.vision-toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) auto auto auto; gap: 8px; padding: 16px 18px; border-bottom: 1px solid rgba(85, 113, 156, .12); }.vision-model-list { display: grid; max-height: min(52vh, 560px); overflow-y: auto; padding: 8px 18px 18px; }.vision-model-row { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; min-width: 0; align-items: center; gap: 10px; min-height: 58px; padding: 8px 10px; border-bottom: 1px solid rgba(85, 113, 156, .1); cursor: pointer; }.vision-model-row:hover:not(.disabled):not(.native), .vision-model-row.selected { background: rgba(236, 253, 245, .74); }.vision-model-row.native { cursor: default; }.vision-model-row.disabled { opacity: .52; cursor: not-allowed; }.vision-native-check { display: grid; width: 22px; height: 22px; place-items: center; border-radius: 50%; color: #fff; background: #16a34a; font-size: 12px; }.vision-model-identity { display: grid; min-width: 0; gap: 3px; }.vision-model-identity strong, .vision-model-identity small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.vision-model-identity strong { color: #172033; font-size: 14px; }.vision-model-identity small { color: #718096; font-size: 11px; }.vision-mode-pill { display: inline-flex; min-width: 76px; height: 25px; align-items: center; justify-content: center; padding: 0 9px; border-radius: 999px; font-size: 10px; font-weight: 820; }.vision-mode-pill.native { color: #047857; background: #d1fae5; }.vision-mode-pill.sidecar { color: #1d4ed8; background: #dbeafe; }.vision-mode-pill.text { color: #64748b; background: #eef2f7; }.vision-mode-pill.disabled { color: #9f1239; background: #ffe4e6; }.vision-save-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 20px; border-top: 1px solid rgba(85, 113, 156, .14); background: #f8fafc; }.vision-save-bar > div { display: grid; gap: 3px; }.vision-save-bar span { color: #718096; font-size: 12px; }
 .version-header-card { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; border: 1px solid rgba(85, 113, 156, .17); border-radius: 16px; background: rgba(255, 255, 255, .82); }.version-header-card > div { display: grid; gap: 6px; padding: 22px; }.version-header-card > div + div { border-left: 1px solid rgba(85, 113, 156, .14); }.version-header-card small, .version-header-card span { color: #718096; }.version-header-card strong { font-size: 26px; }.latest-release { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 20px; border-radius: 14px; background: linear-gradient(135deg, #effaf7, #eef6ff); }.release-icon { display: grid; width: 58px; height: 58px; place-items: center; border-radius: 18px; color: #0f766e; background: #fff; font-size: 24px; }.latest-release h3 { margin: 8px 0 4px; font-size: 21px; }.latest-release p { margin: 0; color: #66758c; }.release-picker { display: flex; gap: 10px; margin-top: 14px; }.release-picker .arco-select { flex: 1; }
 .local-version-section, .github-version-section { margin-top: 18px; padding-top: 18px; border-top: 1px solid rgba(85, 113, 156, .14); }.local-version-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; }.local-version-heading h3 { margin: 0; font-size: 16px; }.local-version-heading p { margin: 4px 0 0; color: #718096; }.local-version-list { display: grid; gap: 8px; margin-top: 12px; }.local-version-row { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 12px; border: 1px solid rgba(85, 113, 156, .14); border-radius: 10px; background: rgba(248, 251, 255, .86); }.local-version-row > div:first-child { display: grid; gap: 3px; min-width: 0; }.local-version-row span { color: #718096; font-size: 12px; }.local-version-actions { display: flex; flex: 0 0 auto; gap: 6px; }
 .full-log { max-height: calc(100vh - 330px); min-height: 420px; }.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }.settings-card { padding: 20px; }.settings-card :deep(.arco-input-number) { width: 100%; }.danger-card { grid-column: 1 / -1; border-color: rgba(245, 158, 11, .28); }.danger-actions { display: flex; gap: 10px; }
@@ -799,5 +938,5 @@ onUnmounted(() => unlistenEvents?.());
 .migration-batch-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 @media (max-width: 1080px) { .opencodex-hero { align-items: flex-start; flex-direction: column; }.opencodex-status-strip { width: 100%; overflow-x: auto; }.overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 900px) { .migration-list { grid-template-columns: 1fr; } }
-@media (max-width: 760px) { .opencodex-tabs { overflow-x: auto; }.opencodex-tabs button { flex: 0 0 auto; }.overview-grid, .quick-grid, .settings-grid, .version-header-card { grid-template-columns: 1fr; }.version-header-card > div + div { border-top: 1px solid rgba(85, 113, 156, .14); border-left: 0; }.latest-release { grid-template-columns: 1fr; }.release-picker, .web-actions { align-items: stretch; flex-direction: column; }.local-version-row, .local-version-heading { align-items: stretch; flex-direction: column; }.local-version-actions { justify-content: flex-end; }.migration-account-card { grid-template-columns: auto auto minmax(0, 1fr); }.migration-card-actions { grid-column: 2 / -1; display: flex; min-width: 0; align-items: center; justify-content: space-between; } }
+@media (max-width: 760px) { .opencodex-tabs { overflow-x: auto; }.opencodex-tabs button { flex: 0 0 auto; }.overview-grid, .quick-grid, .settings-grid, .version-header-card, .vision-manager-header { grid-template-columns: 1fr; }.version-header-card > div + div { border-top: 1px solid rgba(85, 113, 156, .14); border-left: 0; }.latest-release { grid-template-columns: 1fr; }.release-picker, .web-actions { align-items: stretch; flex-direction: column; }.local-version-row, .local-version-heading, .vision-save-bar { align-items: stretch; flex-direction: column; }.local-version-actions { justify-content: flex-end; }.migration-account-card { grid-template-columns: auto auto minmax(0, 1fr); }.migration-card-actions { grid-column: 2 / -1; display: flex; min-width: 0; align-items: center; justify-content: space-between; }.vision-toolbar { grid-template-columns: 1fr 1fr; }.vision-toolbar .arco-input-wrapper { grid-column: 1 / -1; } }
 </style>
