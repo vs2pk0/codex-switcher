@@ -12,6 +12,7 @@ export interface CodexInstance {
   isDefault: boolean;
   running: boolean;
   pid?: number | null;
+  openCodexConnected: boolean;
 }
 
 export interface CodexInstanceCapabilities {

@@ -185,16 +185,22 @@ onMounted(refresh);
         <article v-for="instance in instances" :key="instance.id" class="instance-card" :class="{ running: instance.running }">
           <header>
             <span class="instance-status" />
-            <div>
+            <div class="instance-card-heading">
               <h3>{{ t(instanceDisplayName(instance)) }}</h3>
               <p>{{ instance.running ? `${t("运行中")} · PID ${instance.pid}` : t("未运行") }}</p>
             </div>
-            <a-tag v-if="instance.isDefault" color="blue">{{ t("默认") }}</a-tag>
+            <div class="instance-card-tags">
+              <a-tag v-if="instance.openCodexConnected" color="purple">
+                <template #icon><icon-link /></template>
+                OpenCodex
+              </a-tag>
+              <a-tag v-if="instance.isDefault" color="blue">{{ t("默认") }}</a-tag>
+            </div>
           </header>
           <dl>
-            <div><dt>Codex Home</dt><dd>{{ instance.codexHome }}</dd><button @click="openPathInFileManager(instance.codexHome)"><icon-folder /></button></div>
-            <div><dt>{{ t("桌面数据") }}</dt><dd>{{ instance.electronData }}</dd><button @click="openPathInFileManager(instance.electronData)"><icon-folder /></button></div>
-            <div><dt>{{ t("工作区") }}</dt><dd>{{ instance.workspace || t("未设置") }}</dd></div>
+            <div><dt>Codex Home</dt><dd :title="instance.codexHome">{{ instance.codexHome }}</dd><button @click="openPathInFileManager(instance.codexHome)"><icon-folder /></button></div>
+            <div><dt>{{ t("桌面数据") }}</dt><dd :title="instance.electronData">{{ instance.electronData }}</dd><button @click="openPathInFileManager(instance.electronData)"><icon-folder /></button></div>
+            <div><dt>{{ t("工作区") }}</dt><dd :title="instance.workspace || t('未设置')">{{ instance.workspace || t("未设置") }}</dd></div>
           </dl>
           <footer>
             <a-button v-if="!instance.running" type="primary" :loading="workingId === instance.id" @click="runAction(instance, 'launch')"><template #icon><icon-play-arrow /></template>{{ t("启动") }}</a-button>
@@ -225,13 +231,20 @@ onMounted(refresh);
 .instances-hero h1 { margin: 0; color: #111827; font-size: clamp(28px, 3vw, 42px); letter-spacing: -.04em; }
 .instances-hero p { margin: 7px 0 0; color: #64748b; font-size: 15px; }
 .instances-hero-actions { display: flex; gap: 10px; }
-.instance-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; }
-.instance-card { overflow: hidden; border: 1px solid #dbe5f2; border-radius: 16px; background: rgba(255,255,255,.88); box-shadow: 0 12px 32px rgba(37, 59, 93, .06); }
+.instance-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); align-items: stretch; gap: 16px; }
+.instance-card { display: grid; grid-template-rows: auto 1fr auto; overflow: hidden; min-width: 0; border: 1px solid #dbe5f2; border-radius: 16px; background: rgba(255,255,255,.88); box-shadow: 0 12px 32px rgba(37, 59, 93, .06); }
 .instance-card.running { border-color: rgba(34,197,94,.46); }
-.instance-card > header { display: flex; align-items: center; gap: 12px; padding: 18px 20px; border-bottom: 1px solid #e8eef6; }
-.instance-card > header > div { flex: 1; }.instance-card h3 { margin: 0; font-size: 17px; }.instance-card header p { margin: 4px 0 0; color: #75849a; font-size: 12px; }
+.instance-card > header { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; min-height: 76px; gap: 12px; box-sizing: border-box; padding: 16px 20px; border-bottom: 1px solid #e8eef6; }
+.instance-card-heading { min-width: 0; }.instance-card h3 { overflow: hidden; margin: 0; font-size: 17px; text-overflow: ellipsis; white-space: nowrap; }.instance-card header p { margin: 4px 0 0; color: #75849a; font-size: 12px; }
+.instance-card-tags { display: flex; flex: none; align-items: center; justify-content: flex-end; gap: 6px; white-space: nowrap; }
 .instance-status { width: 11px; height: 11px; border-radius: 50%; background: #aab5c4; }.running .instance-status { background: #22c55e; box-shadow: 0 0 0 5px rgba(34,197,94,.12); }
 .instance-card dl { display: grid; gap: 10px; margin: 0; padding: 18px 20px; }
 .instance-card dl div { display: grid; grid-template-columns: 92px minmax(0, 1fr) 28px; align-items: center; gap: 10px; }.instance-card dt { color: #64748b; font-size: 12px; font-weight: 700; }.instance-card dd { overflow: hidden; margin: 0; color: #334155; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }.instance-card dl button { border: 0; color: #64748b; background: transparent; cursor: pointer; }
-.instance-card footer { display: flex; gap: 8px; padding: 14px 20px; border-top: 1px solid #e8eef6; background: #f8fafc; }
+.instance-card footer { display: flex; align-items: center; min-height: 60px; gap: 8px; box-sizing: border-box; padding: 12px 20px; border-top: 1px solid #e8eef6; background: #f8fafc; }
+@media (max-width: 560px) {
+  .instance-grid { grid-template-columns: minmax(0, 1fr); }
+  .instance-card > header { grid-template-columns: auto minmax(0, 1fr); }
+  .instance-card-tags { grid-column: 2; justify-content: flex-start; }
+  .instance-card footer { flex-wrap: wrap; }
+}
 </style>

@@ -16,6 +16,8 @@ use std::os::windows::process::CommandExt;
 
 pub const DEFAULT_INSTANCE_ID: &str = "default";
 const INSTANCES_FILE: &str = "codex-instances.json";
+const OPENCODEX_SECTION_MARKER: &str = "# Auto-injected by opencodex";
+const OPENCODEX_JOURNAL_FILE: &str = "opencodex-journal.json";
 static INSTANCE_OPERATION_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +48,7 @@ pub struct CodexInstance {
     pub is_default: bool,
     pub running: bool,
     pub pid: Option<u32>,
+    pub open_codex_connected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -815,6 +818,7 @@ fn live_pid(instance: &StoredCodexInstance) -> Option<u32> {
 
 fn public_instance(instance: StoredCodexInstance) -> CodexInstance {
     let pid = live_pid(&instance);
+    let open_codex_connected = codex_home_has_opencodex_routing(Path::new(&instance.codex_home));
     CodexInstance {
         id: instance.id.clone(),
         name: instance.name,
@@ -826,7 +830,74 @@ fn public_instance(instance: StoredCodexInstance) -> CodexInstance {
         is_default: instance.id == DEFAULT_INSTANCE_ID,
         running: pid.is_some(),
         pid,
+        open_codex_connected,
     }
+}
+
+fn codex_home_has_opencodex_routing(codex_home: &Path) -> bool {
+    let Ok(config) = fs::read_to_string(codex_home.join("config.toml")) else {
+        return false;
+    };
+    if marker_owned_openai_base_url(&config) {
+        return true;
+    }
+
+    let Ok(document) = config.parse::<toml_edit::Document>() else {
+        return false;
+    };
+    let legacy_provider = document
+        .get("model_provider")
+        .and_then(toml_edit::Item::as_str)
+        == Some("opencodex")
+        && document
+            .get("model_providers")
+            .and_then(toml_edit::Item::as_table_like)
+            .and_then(|providers| providers.get("opencodex"))
+            .and_then(toml_edit::Item::as_table_like)
+            .and_then(|provider| provider.get("base_url"))
+            .and_then(toml_edit::Item::as_str)
+            .is_some();
+    if legacy_provider {
+        return true;
+    }
+
+    let Some(active_base_url) = document
+        .get("openai_base_url")
+        .and_then(toml_edit::Item::as_str)
+    else {
+        return false;
+    };
+    let Ok(journal) = fs::read_to_string(codex_home.join(OPENCODEX_JOURNAL_FILE)) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&journal)
+        .ok()
+        .is_some_and(|value| {
+            value.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+                && value
+                    .get("injectedOpenaiBaseUrl")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(active_base_url)
+        })
+}
+
+fn marker_owned_openai_base_url(config: &str) -> bool {
+    let mut previous_was_marker = false;
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            break;
+        }
+        if previous_was_marker
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "openai_base_url")
+        {
+            return true;
+        }
+        previous_was_marker = trimmed == OPENCODEX_SECTION_MARKER;
+    }
+    false
 }
 
 pub fn resolve_instance(instance_id: &str) -> Result<CodexInstance, String> {
@@ -1195,6 +1266,96 @@ mod tests {
         assert_eq!(instance.id, DEFAULT_INSTANCE_ID);
         assert!(!instance.codex_home.is_empty());
         assert!(!instance.electron_data.is_empty());
+    }
+
+    #[test]
+    fn detects_only_opencodex_owned_instance_routing() {
+        let marker_home = tempfile::tempdir().expect("marker home");
+        fs::write(
+            marker_home.path().join("config.toml"),
+            concat!(
+                "model = \"gpt-5.5\"\n",
+                "# Auto-injected by opencodex\n",
+                "openai_base_url = \"http://127.0.0.1:15800/v1\"\n",
+                "[features]\nresponses_websockets = true\n",
+            ),
+        )
+        .expect("write marker config");
+        assert!(codex_home_has_opencodex_routing(marker_home.path()));
+
+        let user_home = tempfile::tempdir().expect("user home");
+        fs::write(
+            user_home.path().join("config.toml"),
+            "openai_base_url = \"https://gateway.example/v1\"\n",
+        )
+        .expect("write user config");
+        assert!(!codex_home_has_opencodex_routing(user_home.path()));
+
+        fs::write(
+            user_home.path().join("config.toml"),
+            concat!(
+                "# Auto-injected by opencodex\n",
+                "openai_base_url_backup = \"https://gateway.example/v1\"\n",
+            ),
+        )
+        .expect("write similar user config key");
+        assert!(!codex_home_has_opencodex_routing(user_home.path()));
+
+        let legacy_home = tempfile::tempdir().expect("legacy home");
+        fs::write(
+            legacy_home.path().join("config.toml"),
+            concat!(
+                "model_provider = \"opencodex\"\n",
+                "[model_providers.opencodex]\n",
+                "base_url = \"http://127.0.0.1:15800/v1\"\n",
+            ),
+        )
+        .expect("write legacy config");
+        assert!(codex_home_has_opencodex_routing(legacy_home.path()));
+    }
+
+    #[test]
+    fn journal_recognizes_opencodex_routing_after_marker_is_rewritten() {
+        let home = tempfile::tempdir().expect("journal home");
+        fs::write(
+            home.path().join("config.toml"),
+            "openai_base_url = \"http://127.0.0.1:15800/v1\"\n",
+        )
+        .expect("write rewritten config");
+        fs::write(
+            home.path().join(OPENCODEX_JOURNAL_FILE),
+            serde_json::json!({
+                "version": 1,
+                "injectedOpenaiBaseUrl": "http://127.0.0.1:15800/v1"
+            })
+            .to_string(),
+        )
+        .expect("write journal");
+
+        assert!(codex_home_has_opencodex_routing(home.path()));
+
+        fs::write(
+            home.path().join("config.toml"),
+            "openai_base_url = \"https://changed.example/v1\"\n",
+        )
+        .expect("replace with user routing");
+        assert!(!codex_home_has_opencodex_routing(home.path()));
+
+        fs::write(
+            home.path().join("config.toml"),
+            "openai_base_url = \"http://127.0.0.1:15800/v1\"\n",
+        )
+        .expect("restore injected routing");
+        fs::write(
+            home.path().join(OPENCODEX_JOURNAL_FILE),
+            serde_json::json!({
+                "version": 2,
+                "injectedOpenaiBaseUrl": "http://127.0.0.1:15800/v1"
+            })
+            .to_string(),
+        )
+        .expect("write unsupported journal");
+        assert!(!codex_home_has_opencodex_routing(home.path()));
     }
 
     #[test]
