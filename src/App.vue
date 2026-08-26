@@ -176,6 +176,7 @@ import {
 import type { CodexAccount, CodexResetCredit } from "./types/codex";
 import type { ActiveView, SessionGroup } from "./types/ui";
 import {
+  getCodexInstanceCapabilities,
   instanceDisplayName,
   listCodexInstances,
   type CodexInstance,
@@ -188,6 +189,7 @@ const OpenCodexPanel = defineAsyncComponent(
 );
 
 const activeView = ref<ActiveView>("accounts");
+const managedInstancesSupported = ref(false);
 const appVersion = ref("0.1.0");
 const checkingAppUpdate = ref(false);
 const appUpdateVisible = ref(false);
@@ -2593,6 +2595,18 @@ async function loadCodexInstances(): Promise<void> {
   }
 }
 
+async function loadCodexInstanceCapabilities(): Promise<void> {
+  try {
+    const capabilities = await getCodexInstanceCapabilities();
+    managedInstancesSupported.value = capabilities.managedInstancesSupported;
+    if (!managedInstancesSupported.value && activeView.value === "instances") {
+      activeView.value = "accounts";
+    }
+  } catch {
+    managedInstancesSupported.value = false;
+  }
+}
+
 function handleInstancesUpdated(instances: CodexInstance[]): void {
   codexInstances.value = instances;
   if (!instances.some((instance) => instance.id === settingsInstanceId.value)) {
@@ -4313,6 +4327,7 @@ function handleAddTabChange(key: string | number): void {
 }
 
 function switchView(view: ActiveView): void {
+  if (view === "instances" && !managedInstancesSupported.value) return;
   window.scrollTo({ top: 0, left: 0, behavior: "auto" });
   activeView.value = view;
   if (view === "usage") {
@@ -4454,6 +4469,7 @@ onMounted(() => {
   void loadAccounts();
   void refreshApiServiceAccountIds();
   void refreshOpenCodexAccountIds();
+  void loadCodexInstanceCapabilities();
   void loadCodexInstances();
   void loadSettings({ includeStorage: false });
   void listen<OAuthCallbackEvent>("codex-oauth-callback-received", async (event) => {
@@ -4509,6 +4525,7 @@ onUnmounted(() => {
     <AppHeader
       :active-view="activeView"
       :sidebar-enabled="settings.sidebarEnabled"
+      :managed-instances-supported="managedInstancesSupported"
       :accounts-count="accounts.length"
       :oauth-count="oauthCount"
       :api-key-count="apiKeyCount"
@@ -4763,7 +4780,7 @@ onUnmounted(() => {
     />
 
     <CodexInstancesPanel
-      v-if="activeView === 'instances'"
+      v-if="managedInstancesSupported && activeView === 'instances'"
       @instances-updated="handleInstancesUpdated"
     />
 

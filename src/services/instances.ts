@@ -13,6 +13,10 @@ export interface CodexInstance {
   pid?: number | null;
 }
 
+export interface CodexInstanceCapabilities {
+  managedInstancesSupported: boolean;
+}
+
 export interface SaveCodexInstanceInput {
   id?: string | null;
   name: string;
@@ -31,6 +35,10 @@ export interface DeleteCodexInstanceResult {
 
 export function listCodexInstances(): Promise<CodexInstance[]> {
   return invoke("list_codex_instances");
+}
+
+export function getCodexInstanceCapabilities(): Promise<CodexInstanceCapabilities> {
+  return invoke("get_codex_instance_capabilities");
 }
 
 export function saveCodexInstance(input: SaveCodexInstanceInput): Promise<CodexInstance> {

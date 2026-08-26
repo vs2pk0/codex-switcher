@@ -5388,6 +5388,7 @@ pub fn run() {
             open_external_url,
             open_path_in_file_manager,
             delete_codex_account,
+            instances::get_codex_instance_capabilities,
             instances::list_codex_instances,
             instances::save_codex_instance,
             instances::delete_codex_instance,
