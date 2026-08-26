@@ -138,6 +138,7 @@ import {
   type AppUpdateInfo,
 } from "./services/appUpdate";
 import {
+  buildSingleSessionHistoryRepairOptions,
   copySessionHistoryAcrossInstances,
   listSessionVisibilityRepairInstances,
   listSessionVisibilityRepairProviders,
@@ -411,6 +412,7 @@ const selectedSessionIds = ref<Set<string>>(new Set());
 const expandedSessionGroups = ref<Set<string>>(new Set());
 const sessionLoading = ref(false);
 const sessionRepairing = ref(false);
+const repairingSessionId = ref("");
 const repairVisible = ref(false);
 const repairMode = ref<CodexSessionVisibilityRepairMode>("quick");
 const repairInstanceScope = ref<"target" | "all">("target");
@@ -3823,6 +3825,46 @@ async function runRepairSessions(): Promise<void> {
   }
 }
 
+function confirmRepairSingleSessionHistory(session: CodexSessionRecord): void {
+  if (repairingSessionId.value || sessionRepairing.value || sessionModelRepairing.value) return;
+  Modal.warning({
+    title: t("恢复完整会话"),
+    content: t(
+      "将修复该会话的分页历史模式、消息序号和本地索引，并自动备份原始文件。修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。",
+    ),
+    okText: t("开始修复"),
+    cancelText: t("取消"),
+    hideCancel: false,
+    onOk: async () => {
+      repairingSessionId.value = session.id;
+      try {
+        const instanceList = await listSessionVisibilityRepairInstances();
+        const requestedInstanceId = sessionInstanceId.value === "default"
+          ? instanceList.defaultInstanceId
+          : sessionInstanceId.value;
+        const target = instanceList.instances.find(
+          (instance) => instance.id === requestedInstanceId,
+        );
+        if (!target) throw new Error(t("未找到需要修复的 Codex 实例"));
+        const summary = await repairSessionVisibilityAcrossInstances(
+          buildSingleSessionHistoryRepairOptions(session.id, target),
+        );
+        if (summary.scanned === 0) {
+          throw new Error(t("未找到需要修复的会话，请刷新后重试"));
+        }
+        await loadSessions({ silent: true });
+        Message.success(
+          `${t("完整会话已恢复")}：${session.title || t("未命名会话")}；${summary.message}`,
+        );
+      } catch (error) {
+        Message.error(`${t("恢复完整会话失败")}：${errorText(error)}`);
+      } finally {
+        repairingSessionId.value = "";
+      }
+    },
+  });
+}
+
 async function loadConfigEditorFile(): Promise<void> {
   const requestedKind = configEditorKind.value;
   configEditorLoading.value = true;
@@ -4631,6 +4673,7 @@ onUnmounted(() => {
       :backup-button-text="backupButtonText"
       :session-backup-loading="sessionBackupLoading"
       :session-repairing="sessionRepairing"
+      :repairing-session-id="repairingSessionId"
       :session-model-repairing="sessionModelRepairing"
       :active-session-ids="activeSessionIds"
       :all-sessions-selected="allSessionsSelected"
@@ -4649,6 +4692,7 @@ onUnmounted(() => {
       @export-session-backup="handleExportSessionBackup"
       @open-session-restore-modal="openSessionRestoreModal"
       @repair-sessions="handleRepairSessions"
+      @repair-session-history="confirmRepairSingleSessionHistory"
       @repair-session-models="confirmRepairSessionModels"
       @trash-sessions="handleTrashSessions"
       @restore-sessions="handleRestoreSessions"

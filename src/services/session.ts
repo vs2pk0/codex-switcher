@@ -121,6 +121,7 @@ export interface CodexSessionVisibilityRepairSummary {
   recreatedGeneratedImageCount?: number;
   verifiedGeneratedImageCount?: number;
   invalidGeneratedImageCount?: number;
+  resetHistoryProjectionCount?: number;
   desktopReloadRequired?: boolean;
   desktopReloadPerformed?: boolean;
   backupDirs?: string[];
@@ -173,6 +174,23 @@ export interface CodexSessionVisibilityRepairOptions {
   targetInstanceId?: string | null;
   repairInstanceIds?: string[] | null;
   sessionIds?: string[] | null;
+}
+
+export function buildSingleSessionHistoryRepairOptions(
+  sessionId: string,
+  target: Pick<CodexSessionVisibilityRepairInstanceOption, "id" | "currentProvider">,
+): CodexSessionVisibilityRepairOptions {
+  const normalizedSessionId = sessionId.trim();
+  const normalizedInstanceId = target.id.trim();
+  if (!normalizedSessionId) throw new Error("会话 ID 不能为空");
+  if (!normalizedInstanceId) throw new Error("Codex 实例 ID 不能为空");
+  return {
+    mode: "deep",
+    targetProvider: target.currentProvider,
+    targetInstanceId: normalizedInstanceId,
+    repairInstanceIds: [normalizedInstanceId],
+    sessionIds: [normalizedSessionId],
+  };
 }
 
 export function listSessionsAcrossInstances(options: {

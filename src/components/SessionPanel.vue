@@ -15,6 +15,7 @@ const props = defineProps<{
   backupButtonText: string;
   sessionBackupLoading: boolean;
   sessionRepairing: boolean;
+  repairingSessionId: string;
   sessionModelRepairing: boolean;
   activeSessionIds: string[];
   allSessionsSelected: boolean;
@@ -37,6 +38,7 @@ const emit = defineEmits<{
   (event: "export-session-backup"): void;
   (event: "open-session-restore-modal"): void;
   (event: "repair-sessions"): void;
+  (event: "repair-session-history", session: CodexSessionRecord): void;
   (event: "repair-session-models"): void;
   (event: "trash-sessions"): void;
   (event: "restore-sessions"): void;
@@ -183,6 +185,18 @@ function switchMode(trashMode: boolean): void {
               <span class="session-size">{{ formatFileSize(session.sizeBytes) }}</span>
               <span>{{ formatTime(session.updatedAt) }}</span>
               <div class="session-child-actions">
+                <a-tooltip :content="t('恢复完整会话')">
+                  <a-button
+                    size="small"
+                    type="text"
+                    status="success"
+                    :loading="repairingSessionId === session.id"
+                    :disabled="Boolean(repairingSessionId && repairingSessionId !== session.id) || sessionRepairing || sessionModelRepairing"
+                    @click="emit('repair-session-history', session)"
+                  >
+                    <template #icon><icon-tool /></template>
+                  </a-button>
+                </a-tooltip>
                 <a-tooltip :content="t('查看会话内容')">
                   <a-button size="small" type="text" @click="emit('view-session-content', session)"><template #icon><icon-eye /></template></a-button>
                 </a-tooltip>
