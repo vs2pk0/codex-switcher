@@ -15,8 +15,13 @@ use tauri::State;
 pub type OpenCodexBackend = Backend;
 
 #[tauri::command]
-pub fn opencodex_get_system_snapshot(backend: State<'_, Arc<OpenCodexBackend>>) -> SystemSnapshot {
-    backend.snapshot()
+pub async fn opencodex_get_system_snapshot(
+    backend: State<'_, Arc<OpenCodexBackend>>,
+) -> Result<SystemSnapshot, String> {
+    let backend = Arc::clone(backend.inner());
+    tauri::async_runtime::spawn_blocking(move || backend.snapshot())
+        .await
+        .map_err(|error| format!("读取 OpenCodex 状态任务失败：{error}"))
 }
 
 #[tauri::command]
@@ -53,26 +58,46 @@ pub fn opencodex_open_dashboard_browser(
 }
 
 #[tauri::command]
-pub fn opencodex_read_manager_logs(
+pub async fn opencodex_read_manager_logs(
     backend: State<'_, Arc<OpenCodexBackend>>,
     limit: usize,
-) -> Vec<String> {
-    backend.read_logs(limit)
+) -> Result<Vec<String>, String> {
+    let backend = Arc::clone(backend.inner());
+    tauri::async_runtime::spawn_blocking(move || backend.read_logs(limit))
+        .await
+        .map_err(|error| format!("读取 OpenCodex 日志任务失败：{error}"))
 }
 
 #[tauri::command]
-pub fn opencodex_scan_switcher_accounts(
+pub async fn opencodex_scan_switcher_accounts(
     backend: State<'_, Arc<OpenCodexBackend>>,
 ) -> Result<SwitcherAccountScan, String> {
-    backend.scan_codex_switcher_accounts()
+    let backend = Arc::clone(backend.inner());
+    tauri::async_runtime::spawn_blocking(move || backend.scan_codex_switcher_accounts())
+        .await
+        .map_err(|error| format!("扫描 OpenCodex 账号任务失败：{error}"))?
 }
 
 #[tauri::command]
-pub fn opencodex_import_switcher_accounts(
+pub async fn opencodex_import_switcher_accounts(
     backend: State<'_, Arc<OpenCodexBackend>>,
     request: ImportSwitcherAccountsRequest,
 ) -> Result<SwitcherImportResult, String> {
-    backend.import_codex_switcher_accounts(request)
+    let backend = Arc::clone(backend.inner());
+    tauri::async_runtime::spawn_blocking(move || backend.import_codex_switcher_accounts(request))
+        .await
+        .map_err(|error| format!("导入 OpenCodex 账号任务失败：{error}"))?
+}
+
+#[tauri::command]
+pub async fn opencodex_bind_switcher_accounts(
+    backend: State<'_, Arc<OpenCodexBackend>>,
+    request: ImportSwitcherAccountsRequest,
+) -> Result<SwitcherImportResult, String> {
+    let backend = Arc::clone(backend.inner());
+    tauri::async_runtime::spawn_blocking(move || backend.bind_codex_switcher_accounts(request))
+        .await
+        .map_err(|error| format!("绑定 OpenCodex 账号任务失败：{error}"))?
 }
 
 #[tauri::command]

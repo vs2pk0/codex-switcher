@@ -74,6 +74,12 @@ export function importOpenCodexSwitcherAccounts(
   return invoke("opencodex_import_switcher_accounts", { request: { sourceIds } });
 }
 
+export function bindOpenCodexSwitcherAccounts(
+  sourceIds: string[],
+): Promise<OpenCodexSwitcherImportResult> {
+  return invoke("opencodex_bind_switcher_accounts", { request: { sourceIds } });
+}
+
 export function deleteOpenCodexSwitcherAccount(
   sourceId: string,
 ): Promise<OpenCodexSwitcherDeleteResult> {

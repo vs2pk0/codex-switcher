@@ -1,6 +1,7 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import type { CodexSwitcherSettings } from "../services/codex";
-import { t } from "../i18n";
+import { currentLanguage, t } from "../i18n";
 
 const props = defineProps<{
   settings: CodexSwitcherSettings;
@@ -18,7 +19,7 @@ const emit = defineEmits<{
   (event: "reset-page"): void;
   (event: "save-settings"): void;
   (event: "open-sort-editor"): void;
-  (event: "bind-selected-to-api-service"): void;
+  (event: "bind-selected", target: "api-service" | "open-codex"): void;
   (event: "batch-export"): void;
   (event: "open-add", tab: "oauth" | "token" | "apikey"): void;
 }>();
@@ -31,6 +32,9 @@ const accountViewModeLabels: Record<AccountViewMode, string> = {
   compact: "紧凑视图",
   table: "表格视图",
 };
+const usesLongCopyLayout = computed(() =>
+  currentLanguage.value === "en" || currentLanguage.value === "ru",
+);
 
 function accountViewModeLabel(): string {
   return t(accountViewModeLabels[props.settings.accountViewMode] ?? accountViewModeLabels.card);
@@ -49,10 +53,16 @@ function handleSortModeChange(value: string): void {
   }
   emit("save-settings");
 }
+
+function handleBindTarget(value: string | number | Record<string, unknown> | undefined): void {
+  if (value === "api-service" || value === "open-codex") {
+    emit("bind-selected", value);
+  }
+}
 </script>
 
 <template>
-  <section class="account-ops">
+  <section class="account-ops" :class="{ 'account-ops-long-copy': usesLongCopyLayout }">
     <div class="account-ops-left">
       <a-checkbox
         :model-value="isCurrentPageSelected"
@@ -143,10 +153,22 @@ function handleSortModeChange(value: string): void {
     </div>
     <div class="account-ops-footer">
       <div class="account-batch-actions">
-        <a-button class="batch-action batch-bind" @click="$emit('bind-selected-to-api-service')">
-          <template #icon><icon-link /></template>
-          {{ t("绑定到 API 服务") }}
-        </a-button>
+        <a-dropdown
+          trigger="click"
+          position="bl"
+          popup-container="body"
+          :popup-max-height="false"
+          @select="handleBindTarget"
+        >
+          <a-button class="batch-action batch-bind">
+            <template #icon><icon-link /></template>
+            {{ t("绑定") }} <icon-down />
+          </a-button>
+          <template #content>
+            <a-doption value="api-service">{{ t("绑定到 API 服务") }}</a-doption>
+            <a-doption value="open-codex">{{ t("绑定到 OpenCodex") }}</a-doption>
+          </template>
+        </a-dropdown>
         <a-button class="batch-action batch-export" @click="$emit('batch-export')">
           <template #icon><icon-download /></template>
           {{ t("批量导出") }}

@@ -19,8 +19,9 @@ pub struct CodexSessionRecord {
     pub project_path: String,
     pub path: String,
     pub updated_at: i64,
-    pub message_count: usize,
-    pub char_count: usize,
+    pub message_count: Option<usize>,
+    pub char_count: Option<usize>,
+    pub approximate_tokens: usize,
     pub size_bytes: u64,
 }
 
@@ -689,9 +690,7 @@ impl SessionStore {
         let custom_titles = self.read_session_titles();
         let mut sessions = Vec::new();
         for path in collect_jsonl_files(&self.sessions_dir())? {
-            let content = fs::read_to_string(&path)
-                .map_err(|error| format!("读取会话失败 {}: {}", path.display(), error))?;
-            let mut record = build_session_record(&path, &content)?;
+            let mut record = build_session_record_summary(&path)?;
             if let Some(title) = custom_titles.get(&record.id) {
                 record.title = title.clone();
             }
@@ -701,7 +700,7 @@ impl SessionStore {
                 }
             }
             if let Some(query) = content_query.as_deref() {
-                if !content.to_lowercase().contains(query) {
+                if !session_file_contains_query(&path, query)? {
                     continue;
                 }
             }
@@ -1070,8 +1069,9 @@ impl SessionStore {
             project_path: target_project_path.to_string(),
             path: staged_path.to_string_lossy().to_string(),
             updated_at: created_at.timestamp(),
-            message_count: 0,
-            char_count: 0,
+            message_count: Some(0),
+            char_count: Some(0),
+            approximate_tokens: 0,
             size_bytes: fs::metadata(&staged_path)
                 .map(|metadata| metadata.len())
                 .unwrap_or_default(),
@@ -1393,16 +1393,19 @@ impl SessionStore {
         &self,
         session_ids: &[String],
     ) -> Result<Vec<CodexSessionTokenStats>, String> {
-        let sessions = self.list_sessions(None, None)?;
-        Ok(session_ids
-            .iter()
-            .filter_map(|id| sessions.iter().find(|session| &session.id == id))
-            .map(|session| CodexSessionTokenStats {
-                session_id: session.id.clone(),
-                approximate_tokens: session.char_count.div_ceil(4),
-                char_count: session.char_count,
-            })
-            .collect())
+        let mut stats = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            let Ok(path) = self.find_session_path(session_id) else {
+                continue;
+            };
+            let char_count = count_session_characters(&path)?;
+            stats.push(CodexSessionTokenStats {
+                session_id: session_id.clone(),
+                approximate_tokens: char_count.div_ceil(4),
+                char_count,
+            });
+        }
+        Ok(stats)
     }
 
     pub fn move_to_trash(
@@ -5664,20 +5667,23 @@ fn scrub_compacted_line(
     Ok(serialized)
 }
 
-fn build_session_record(path: &Path, content: &str) -> Result<CodexSessionRecord, String> {
-    let title = extract_title(content).unwrap_or_else(|| file_stem(path));
-    let project_path = extract_project_path(content).unwrap_or_default();
+fn build_session_record_summary(path: &Path) -> Result<CodexSessionRecord, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("读取会话元数据失败 {}: {error}", path.display()))?;
+    let header = read_session_record_header(path)?;
+    let title = header.title.unwrap_or_else(|| file_stem(path));
+    let project_path = header.project_path.unwrap_or_default();
     let project_name =
         project_name_for_path(&project_path).unwrap_or_else(|| "未归属项目".to_string());
-    let id = extract_session_id(content).unwrap_or_else(|| session_id_for_path(path));
-    let metadata = fs::metadata(path).ok();
+    let id = header.id.unwrap_or_else(|| session_id_for_path(path));
     let updated_at = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.modified().ok())
+        .modified()
+        .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default();
-    let size_bytes = metadata.map(|metadata| metadata.len()).unwrap_or_default();
+    let size_bytes = metadata.len();
+    let approximate_tokens = usize::try_from(size_bytes.div_ceil(4)).unwrap_or(usize::MAX);
     Ok(CodexSessionRecord {
         id,
         title,
@@ -5685,13 +5691,97 @@ fn build_session_record(path: &Path, content: &str) -> Result<CodexSessionRecord
         project_path,
         path: path.to_string_lossy().to_string(),
         updated_at,
-        message_count: content
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count(),
-        char_count: content.chars().count(),
+        message_count: None,
+        char_count: None,
+        approximate_tokens,
         size_bytes,
     })
+}
+
+#[derive(Default)]
+struct SessionRecordHeader {
+    id: Option<String>,
+    title: Option<String>,
+    project_path: Option<String>,
+}
+
+fn read_session_record_header(path: &Path) -> Result<SessionRecordHeader, String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("读取会话失败 {}: {error}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut header = SessionRecordHeader::default();
+    let mut fallback_title = None;
+
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("读取会话摘要失败 {}: {error}", path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+            if header.id.is_none() {
+                header.id = extract_session_id(&line);
+            }
+            if header.project_path.is_none() {
+                header.project_path = extract_project_path(&line);
+            }
+        } else {
+            let title = normalize_session_title(find_text(&value));
+            if is_user_message_value(&value) && title.is_some() {
+                header.title = title;
+            } else if fallback_title.is_none() {
+                fallback_title = title;
+            }
+        }
+
+        // Once the first valid user title is available, later history cannot affect
+        // the list summary. Standard Codex metadata precedes the first message.
+        if header.title.is_some() {
+            break;
+        }
+    }
+
+    if header.title.is_none() {
+        header.title = fallback_title;
+    }
+    Ok(header)
+}
+
+fn count_session_characters(path: &Path) -> Result<usize, String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("读取会话失败 {}: {error}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut total = 0usize;
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("统计会话失败 {}: {error}", path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        total = total.saturating_add(line.chars().count());
+    }
+    Ok(total)
+}
+
+fn session_file_contains_query(path: &Path, query: &str) -> Result<bool, String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("读取会话失败 {}: {error}", path.display()))?;
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| format!("搜索会话失败 {}: {error}", path.display()))?;
+        if line.to_lowercase().contains(query) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -7018,6 +7108,7 @@ fn extract_session_id(content: &str) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 fn extract_title(content: &str) -> Option<String> {
     for line in content.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -8589,6 +8680,64 @@ mod tests {
             .expect("restore");
         assert_eq!(restored.restored, 1);
         assert!(session_path.exists());
+    }
+
+    #[test]
+    fn session_list_reads_complete_large_records_until_the_first_user_title() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-large.jsonl");
+        let content = format!(
+            "{}\n{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":"session-large","cwd":"/tmp/project"}}),
+            json!({"type":"event_msg","payload":{"type":"agent_reasoning","text":"x".repeat(600 * 1024)}}),
+            json!({"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"快速加载大会话"}]}})
+        );
+        let expected_char_count = content.chars().count();
+        fs::write(&session_path, &content).expect("write large session");
+
+        let sessions = SessionStore::new(codex.path().to_path_buf())
+            .list_sessions(None, None)
+            .expect("list large session from complete records");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "session-large");
+        assert_eq!(sessions[0].title, "快速加载大会话");
+        assert_eq!(sessions[0].project_path, "/tmp/project");
+        assert!(sessions[0].size_bytes > 512 * 1024);
+        assert!(sessions[0].char_count.is_none());
+        assert!(sessions[0].message_count.is_none());
+        assert!(sessions[0].approximate_tokens > 0);
+
+        let stats = SessionStore::new(codex.path().to_path_buf())
+            .token_stats(&["session-large".to_string()])
+            .expect("stream exact token statistics");
+        assert_eq!(stats[0].char_count, expected_char_count);
+        assert_eq!(stats[0].approximate_tokens, expected_char_count.div_ceil(4));
+    }
+
+    #[test]
+    fn session_content_search_streams_beyond_the_list_preview() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-search-tail.jsonl");
+        let mut content = format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":"session-search-tail"}}),
+            json!({"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"尾部搜索测试"}]}})
+        );
+        content.push_str(&"x".repeat(512 * 1024));
+        content.push_str("\n只有完整流式搜索才能找到这个标记\n");
+        fs::write(&session_path, content).expect("write searchable session");
+
+        let sessions = SessionStore::new(codex.path().to_path_buf())
+            .list_sessions(None, Some("完整流式搜索".to_string()))
+            .expect("search complete session");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "session-search-tail");
     }
 
     #[test]

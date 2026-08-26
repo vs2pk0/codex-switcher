@@ -873,6 +873,46 @@ textarea {
   }
 }
 
+/* English and Russian controls need more horizontal room than their CJK labels.
+   Keep filters and batch actions on separate rows instead of squeezing or clipping them. */
+.account-ops.account-ops-long-copy {
+  display: grid;
+  gap: 8px;
+}
+
+.account-ops.account-ops-long-copy .account-ops-left {
+  width: 100%;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+}
+
+.account-ops.account-ops-long-copy .account-search-input {
+  flex: 1 1 260px;
+  width: auto;
+  max-width: none;
+}
+
+.account-ops.account-ops-long-copy .sort-select {
+  flex-basis: 190px;
+  width: 190px;
+}
+
+.account-ops.account-ops-long-copy .page-size-select {
+  flex-basis: 126px;
+  width: 126px;
+}
+
+.account-ops.account-ops-long-copy .account-ops-footer {
+  width: 100%;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.account-ops.account-ops-long-copy .account-batch-actions {
+  margin-left: 0;
+}
+
 .session-panel {
   width: min(1420px, 100%);
   margin: 0;
@@ -2166,6 +2206,30 @@ textarea {
   height: 36px;
   padding: 0 12px;
   white-space: nowrap;
+}
+
+.session-workspace.session-long-copy-layout .session-command-bar .session-actions {
+  flex-wrap: wrap;
+}
+
+.session-workspace.session-long-copy-layout .session-command-bar .session-actions .arco-btn {
+  padding: 0 10px;
+  font-size: 13px;
+}
+
+@media (min-width: 1051px) {
+  .session-workspace.session-long-copy-layout .session-command-bar {
+    grid-template-columns: minmax(420px, 1fr) auto;
+  }
+
+  .session-workspace.session-long-copy-layout .session-command-bar .session-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+  }
+
+  .session-workspace.session-long-copy-layout .session-instance-context {
+    grid-template-columns: minmax(0, 1fr) minmax(360px, 500px);
+  }
 }
 
 .session-project-table {

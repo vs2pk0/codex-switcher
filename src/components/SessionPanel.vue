@@ -3,7 +3,7 @@ import { computed } from "vue";
 import type { CodexSessionRecord, CodexTrashedSessionRecord } from "../services/session";
 import { instanceDisplayName, type CodexInstance } from "../services/instances";
 import type { SessionGroup } from "../types/ui";
-import { formatLocalizedCount, t } from "../i18n";
+import { currentLanguage, formatLocalizedCount, t } from "../i18n";
 
 const props = defineProps<{
   instances: CodexInstance[];
@@ -57,6 +57,9 @@ const totalSize = computed(() => props.sessionGroups.reduce((sum, group) => sum 
 const selectedInstance = computed(() =>
   props.instances.find((instance) => instance.id === props.selectedInstanceId),
 );
+const usesLongCopyLayout = computed(() =>
+  currentLanguage.value === "en" || currentLanguage.value === "ru",
+);
 
 function formatFileSize(bytes?: number | null): string {
   const safeBytes = typeof bytes === "number" && Number.isFinite(bytes) ? bytes : 0;
@@ -83,7 +86,10 @@ function switchMode(trashMode: boolean): void {
 </script>
 
 <template>
-  <section class="session-panel session-workspace">
+  <section
+    class="session-panel session-workspace"
+    :class="{ 'session-long-copy-layout': usesLongCopyLayout }"
+  >
     <section v-if="instances.length > 1" class="session-instance-context">
       <div class="session-instance-copy">
         <span>{{ t("当前会话实例") }}</span>

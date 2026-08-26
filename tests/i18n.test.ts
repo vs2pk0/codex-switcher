@@ -54,6 +54,15 @@ test("英文设置、多开与 OpenCodex 页面不会回退为中文", () => {
   currentLanguage.value = "en";
 
   assert.equal(t("当前设置实例"), "Current Settings Instance");
+  assert.equal(t("当前会话实例"), "Current Session Instance");
+  assert.equal(
+    t("官方实例会包含在默认完整备份中，也可以在这里单独手动备份。"),
+    "The official instance is included in the default full backup. You can also back it up separately here.",
+  );
+  assert.equal(
+    t("多开实例不会进入默认完整备份，只能在这里手动备份。"),
+    "Additional instances are excluded from the default full backup and must be backed up manually here.",
+  );
   assert.equal(t("Codex 多开"), "Codex Instances");
   assert.equal(t("运行控制台"), "Control Console");
   assert.equal(t("Web 管理"), "Web Management");
@@ -70,6 +79,11 @@ test("俄语设置、多开与 OpenCodex 页面不会回退为中文", () => {
   currentLanguage.value = "ru";
 
   assert.equal(t("当前设置实例"), "Текущий экземпляр настроек");
+  assert.equal(t("当前会话实例"), "Текущий экземпляр сессий");
+  assert.equal(
+    t("多开实例不会进入默认完整备份，只能在这里手动备份。"),
+    "Дополнительные экземпляры не входят в полную резервную копию по умолчанию; их нужно сохранять здесь вручную.",
+  );
   assert.equal(t("Codex 多开"), "Экземпляры Codex");
   assert.equal(t("运行控制台"), "Панель управления");
   assert.equal(t("图片模型"), "Модели изображений");
@@ -90,4 +104,22 @@ test("繁体中文设置、多开与 OpenCodex 页面不会简繁混排", () => 
     t("为每个桌面实例隔离账号、配置、会话、插件与 Electron 数据。"),
     "為每個桌面執行個體隔離帳號、設定、會話、外掛與 Electron 資料。",
   );
+});
+
+test("账号绑定入口与 OpenCodex 绑定提示支持全部界面语言", () => {
+  currentLanguage.value = "en";
+  assert.equal(t("绑定"), "Bind");
+  assert.equal(t("绑定到 OpenCodex"), "Bind to OpenCodex");
+  assert.equal(
+    formatTranslatedText("已绑定 {count} 个账号到 OpenCodex", { count: 2 }),
+    "Bound 2 accounts to OpenCodex",
+  );
+
+  currentLanguage.value = "ru";
+  assert.equal(t("绑定"), "Привязать");
+  assert.equal(t("绑定到 OpenCodex"), "Привязать к OpenCodex");
+
+  currentLanguage.value = "zh-TW";
+  assert.equal(t("绑定"), "綁定");
+  assert.equal(t("请先启动 OpenCodex 服务，再绑定账号"), "請先啟動 OpenCodex 服務，再綁定帳號");
 });

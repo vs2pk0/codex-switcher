@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { t } from "../i18n";
 
 export interface CodexInstance {
   id: string;
@@ -62,5 +63,5 @@ export function restartCodexInstance(instanceId: string): Promise<CodexInstance>
 }
 
 export function instanceDisplayName(instance: CodexInstance): string {
-  return instance.isDefault ? `${instance.name}（原版）` : instance.name;
+  return instance.isDefault ? t("系统默认实例（原版）") : instance.name;
 }

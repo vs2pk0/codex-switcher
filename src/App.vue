@@ -114,7 +114,9 @@ import {
   type CodexSwitcherSettings,
 } from "./services/codex";
 import {
+  bindOpenCodexSwitcherAccounts,
   deleteOpenCodexSwitcherAccount,
+  getOpenCodexSnapshot,
   scanOpenCodexSwitcherAccounts,
 } from "./opencodex/service";
 import {
@@ -2721,6 +2723,10 @@ async function confirmBindSelectedToApiService(): Promise<void> {
     Message.error(`读取 API 服务配置失败：${errorText(error)}`);
     return;
   }
+  if (!serviceState.service.running) {
+    Message.warning(t("请先启动 API 服务，再绑定账号"));
+    return;
+  }
   const selected = selectedAccountIdList.value
     .map((id) => accounts.value.find((account) => account.id === id))
     .filter((account): account is CodexAccount => Boolean(account))
@@ -2750,6 +2756,70 @@ async function confirmBindSelectedToApiService(): Promise<void> {
       }
     },
   });
+}
+
+async function confirmBindSelectedToOpenCodex(): Promise<void> {
+  if (!selectedAccountIdList.value.length) {
+    Message.warning(t("请先勾选要绑定到 OpenCodex 的账号"));
+    return;
+  }
+  try {
+    const snapshot = await getOpenCodexSnapshot();
+    if (!snapshot.running) {
+      Message.warning(t("请先启动 OpenCodex 服务，再绑定账号"));
+      return;
+    }
+    const scan = await scanOpenCodexSwitcherAccounts();
+    const selectedIds = new Set(selectedAccountIdList.value);
+    const eligible = scan.accounts.filter(
+      (account) => selectedIds.has(account.sourceId) && account.eligible,
+    );
+    if (!eligible.length) {
+      Message.warning(t("所选账号均已绑定或不支持绑定到 OpenCodex"));
+      return;
+    }
+    const skippedCount = selectedAccountIdList.value.length - eligible.length;
+    Modal.warning({
+      title: t("绑定到 OpenCodex"),
+      content: skippedCount
+        ? formatTranslatedText(
+            "将绑定 {eligible} 个账号到 OpenCodex；另有 {skipped} 个账号已绑定或不受支持。绑定期间 OpenCodex 会短暂重启，是否继续？",
+            { eligible: eligible.length, skipped: skippedCount },
+          )
+        : formatTranslatedText(
+            "将绑定 {count} 个账号到 OpenCodex。绑定期间 OpenCodex 会短暂重启，是否继续？",
+            { count: eligible.length },
+          ),
+      okText: t("确认绑定"),
+      cancelText: t("取消"),
+      hideCancel: false,
+      async onOk() {
+        try {
+          const result = await bindOpenCodexSwitcherAccounts(
+            eligible.map((account) => account.sourceId),
+          );
+          await refreshOpenCodexAccountIds();
+          Message.success(
+            formatTranslatedText("已绑定 {count} 个账号到 OpenCodex", {
+              count: result.importedCount,
+            }),
+          );
+        } catch (error) {
+          Message.error(`${t("绑定到 OpenCodex 失败")}：${errorText(error)}`);
+        }
+      },
+    });
+  } catch (error) {
+    Message.error(`${t("读取 OpenCodex 状态失败")}：${errorText(error)}`);
+  }
+}
+
+function confirmBindSelected(target: "api-service" | "open-codex"): void {
+  if (target === "api-service") {
+    void confirmBindSelectedToApiService();
+  } else {
+    void confirmBindSelectedToOpenCodex();
+  }
 }
 
 async function refreshBatchExportText(): Promise<void> {
@@ -3606,8 +3676,8 @@ async function loadSessions(options: { silent?: boolean } = {}): Promise<void> {
       trashedSessions.value = [];
       sessionStats.value = nextSessions.map((session) => ({
         sessionId: session.id,
-        approximateTokens: Math.ceil((session.charCount || 0) / 4),
-        charCount: session.charCount || 0,
+        approximateTokens: session.approximateTokens,
+        charCount: session.charCount ?? 0,
       }));
       const firstGroup = nextSessions[0] ? sessionGroupKey(nextSessions[0]) : "";
       expandedSessionGroups.value = firstGroup ? new Set([firstGroup]) : new Set();
@@ -4338,7 +4408,6 @@ function switchView(view: ActiveView): void {
   }
   if (view === "openCodex") {
     openCodexPanelMounted.value = true;
-    void refreshOpenCodexAccountIds();
   }
   if (view === "instances") {
     void loadCodexInstances();
@@ -4558,7 +4627,7 @@ onUnmounted(() => {
       @reset-page="currentPage = 1"
       @save-settings="saveSettings"
       @open-sort-editor="openSortEditor"
-      @bind-selected-to-api-service="confirmBindSelectedToApiService"
+      @bind-selected="confirmBindSelected"
       @batch-export="openBatchExport"
       @open-add="openAddModal"
     />
