@@ -2,6 +2,7 @@
 import { computed, ref, watch } from "vue";
 import type { CodexInstance } from "../services/instances";
 import { instanceDisplayName } from "../services/instances";
+import { t } from "../i18n";
 
 const props = withDefaults(defineProps<{
   visible: boolean;
@@ -53,6 +54,7 @@ function confirm(): void {
     cancel-text="取消"
     :ok-button-props="{ disabled: !selectedId }"
     modal-class="instance-picker-modal"
+    width="720px"
     @ok="confirm"
     @cancel="$emit('update:visible', false)"
   >
@@ -60,12 +62,18 @@ function confirm(): void {
     <a-radio-group v-model="selectedId" direction="vertical" class="instance-picker-list">
       <a-radio v-for="instance in options" :key="instance.id" :value="instance.id">
         <div class="instance-picker-option">
-          <div>
-            <strong>{{ instanceDisplayName(instance) }}</strong>
-            <span>{{ instance.codexHome }}</span>
+          <div class="instance-picker-copy">
+            <div class="instance-picker-name">
+              <strong>{{ instanceDisplayName(instance) }}</strong>
+              <a-tag v-if="instance.openCodexConnected" color="purple" size="small">
+                <template #icon><icon-link /></template>
+                OpenCodex
+              </a-tag>
+            </div>
+            <span class="instance-picker-path" :title="instance.codexHome">{{ instance.codexHome }}</span>
           </div>
-          <a-tag :color="instance.running ? 'green' : 'gray'">
-            {{ instance.running ? `运行中 · PID ${instance.pid}` : "未运行" }}
+          <a-tag class="instance-picker-runtime" :color="instance.running ? 'green' : 'gray'">
+            {{ instance.running ? `${t("运行中")} · PID ${instance.pid}` : t("未运行") }}
           </a-tag>
         </div>
       </a-radio>
@@ -77,11 +85,18 @@ function confirm(): void {
 <style scoped>
 .instance-picker-description { margin: 0 0 14px; color: #64748b; }
 .instance-picker-list { display: grid; gap: 10px; width: 100%; }
-.instance-picker-list :deep(.arco-radio) { width: 100%; margin: 0; padding: 13px 14px; border: 1px solid #dbe5f3; border-radius: 12px; background: #f8fbff; }
+.instance-picker-list :deep(.arco-radio) { width: 100%; box-sizing: border-box; margin: 0; padding: 13px 14px; border: 1px solid #dbe5f3; border-radius: 12px; background: #f8fbff; }
 .instance-picker-list :deep(.arco-radio-checked) { border-color: #3b82f6; background: #eff6ff; }
-.instance-picker-list :deep(.arco-radio-label) { width: calc(100% - 24px); }
-.instance-picker-option { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-.instance-picker-option > div { display: grid; min-width: 0; gap: 4px; }
+.instance-picker-list :deep(.arco-radio-label) { min-width: 0; width: calc(100% - 24px); box-sizing: border-box; }
+.instance-picker-option { display: grid; grid-template-columns: minmax(0, 1fr) 156px; align-items: center; width: 100%; gap: 16px; }
+.instance-picker-copy { display: grid; min-width: 0; gap: 4px; }
+.instance-picker-name { display: flex; min-width: 0; align-items: center; gap: 8px; }
+.instance-picker-name strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .instance-picker-option strong { font-size: 14px; color: #172033; }
-.instance-picker-option span { overflow: hidden; color: #718096; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.instance-picker-path { overflow: hidden; color: #718096; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.instance-picker-runtime { display: inline-flex; width: 156px; box-sizing: border-box; align-items: center; justify-content: center; justify-self: end; white-space: nowrap; }
+@media (max-width: 640px) {
+  .instance-picker-option { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .instance-picker-runtime { justify-self: start; }
+}
 </style>
