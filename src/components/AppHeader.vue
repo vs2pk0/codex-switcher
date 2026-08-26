@@ -7,6 +7,7 @@ import type { ActiveView } from "../types/ui";
 defineProps<{
   activeView: ActiveView;
   sidebarEnabled: boolean;
+  managedInstancesSupported: boolean;
   accountsCount: number;
   oauthCount: number;
   apiKeyCount: number;
@@ -98,7 +99,12 @@ const sidebarCollapsed = ref(true);
           <span class="sidebar-label">OpenCodex</span>
         </button>
       </a-tooltip>
-      <a-tooltip :content="t('Codex 多开')" position="right" :disabled="!sidebarCollapsed">
+      <a-tooltip
+        v-if="managedInstancesSupported"
+        :content="t('Codex 多开')"
+        position="right"
+        :disabled="!sidebarCollapsed"
+      >
         <button
           type="button"
           :class="{ active: activeView === 'instances' }"
@@ -224,7 +230,11 @@ const sidebarCollapsed = ref(true);
         <template #icon><icon-command /></template>
         OpenCodex
       </a-button>
-      <a-button :type="activeView === 'instances' ? 'primary' : 'text'" @click="$emit('switch-view', 'instances')">
+      <a-button
+        v-if="managedInstancesSupported"
+        :type="activeView === 'instances' ? 'primary' : 'text'"
+        @click="$emit('switch-view', 'instances')"
+      >
         <template #icon><icon-apps /></template>
         {{ t("Codex 多开") }}
       </a-button>

@@ -11,6 +11,9 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 pub const DEFAULT_INSTANCE_ID: &str = "default";
 const INSTANCES_FILE: &str = "codex-instances.json";
 static INSTANCE_OPERATION_LOCK: Mutex<()> = Mutex::new(());
@@ -43,6 +46,12 @@ pub struct CodexInstance {
     pub is_default: bool,
     pub running: bool,
     pub pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexInstanceCapabilities {
+    pub managed_instances_supported: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -114,6 +123,14 @@ fn default_instance() -> StoredCodexInstance {
         retired_data_paths: Vec::new(),
         created_at: 0,
     }
+}
+
+fn managed_instances_supported() -> bool {
+    cfg!(target_os = "macos")
+}
+
+fn managed_instances_unavailable_error() -> String {
+    "Codex 多开目前仅支持 macOS，其他平台暂不开放此功能".to_string()
 }
 
 fn read_stored_instances() -> Result<Vec<StoredCodexInstance>, String> {
@@ -714,6 +731,7 @@ fn ensure_isolated_desktop_data_supported(_app_path: &str) -> Result<(), String>
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn process_rows() -> Vec<(u32, String)> {
     let output = Command::new("ps").args(["-axo", "pid=,command="]).output();
     let Ok(output) = output else {
@@ -728,6 +746,33 @@ fn process_rows() -> Vec<(u32, String)> {
             Some((pid, trimmed[split..].trim().to_string()))
         })
         .collect()
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_tasklist_codex_pids(output: &str) -> Vec<u32> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.trim().trim_matches('"').split("\",\"");
+            let image_name = fields.next()?;
+            let pid = fields.next()?;
+            image_name
+                .eq_ignore_ascii_case("Codex.exe")
+                .then(|| pid.parse::<u32>().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn windows_default_codex_pids() -> Vec<u32> {
+    let mut command = Command::new("tasklist");
+    command.args(["/FI", "IMAGENAME eq Codex.exe", "/FO", "CSV", "/NH"]);
+    hide_command_window(&mut command);
+    let Ok(output) = command.output() else {
+        return Vec::new();
+    };
+    parse_windows_tasklist_codex_pids(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn launch_user_data_arg(instance: &StoredCodexInstance) -> Option<String> {
@@ -752,10 +797,20 @@ fn process_matches_instance(
 }
 
 fn live_pid(instance: &StoredCodexInstance) -> Option<u32> {
-    let executable = app_executable(instance).ok()?.to_string_lossy().to_string();
-    process_rows().into_iter().find_map(|(pid, command)| {
-        process_matches_instance(instance, &executable, &command).then_some(pid)
-    })
+    #[cfg(windows)]
+    {
+        if instance.id != DEFAULT_INSTANCE_ID {
+            return None;
+        }
+        windows_default_codex_pids().into_iter().next()
+    }
+    #[cfg(not(windows))]
+    {
+        let executable = app_executable(instance).ok()?.to_string_lossy().to_string();
+        process_rows().into_iter().find_map(|(pid, command)| {
+            process_matches_instance(instance, &executable, &command).then_some(pid)
+        })
+    }
 }
 
 fn public_instance(instance: StoredCodexInstance) -> CodexInstance {
@@ -779,6 +834,9 @@ pub fn resolve_instance(instance_id: &str) -> Result<CodexInstance, String> {
     if id.is_empty() || id == DEFAULT_INSTANCE_ID {
         return Ok(public_instance(default_instance()));
     }
+    if !managed_instances_supported() {
+        return Err(managed_instances_unavailable_error());
+    }
     read_stored_instances()?
         .into_iter()
         .find(|instance| instance.id == id)
@@ -795,12 +853,24 @@ pub fn codex_home_for(instance_id: Option<&str>) -> Result<PathBuf, String> {
 #[tauri::command]
 pub fn list_codex_instances() -> Result<Vec<CodexInstance>, String> {
     let mut result = vec![public_instance(default_instance())];
-    result.extend(read_stored_instances()?.into_iter().map(public_instance));
+    if managed_instances_supported() {
+        result.extend(read_stored_instances()?.into_iter().map(public_instance));
+    }
     Ok(result)
 }
 
 #[tauri::command]
+pub fn get_codex_instance_capabilities() -> CodexInstanceCapabilities {
+    CodexInstanceCapabilities {
+        managed_instances_supported: managed_instances_supported(),
+    }
+}
+
+#[tauri::command]
 pub fn save_codex_instance(input: SaveCodexInstanceInput) -> Result<CodexInstance, String> {
+    if !managed_instances_supported() {
+        return Err(managed_instances_unavailable_error());
+    }
     let _guard = INSTANCE_OPERATION_LOCK
         .lock()
         .map_err(|_| "Codex 实例配置锁已损坏".to_string())?;
@@ -896,6 +966,9 @@ pub fn delete_codex_instance(instance_id: String) -> Result<DeleteCodexInstanceR
 }
 
 fn launch_stored(instance: &StoredCodexInstance) -> Result<CodexInstance, String> {
+    if instance.id != DEFAULT_INSTANCE_ID && !managed_instances_supported() {
+        return Err(managed_instances_unavailable_error());
+    }
     if let Some(pid) = live_pid(instance) {
         return Err(format!("实例已在运行（PID {pid}）"));
     }
@@ -959,7 +1032,28 @@ fn launch_stored(instance: &StoredCodexInstance) -> Result<CodexInstance, String
         });
         resolve_instance(&instance.id)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            crate::account::WINDOWS_CODEX_START_SCRIPT,
+        ]);
+        hide_command_window(&mut command);
+        let status = command
+            .status()
+            .map_err(|error| format!("启动 Codex 失败：{error}"))?;
+        if !status.success() {
+            return Err("启动 Codex 失败：未找到桌面应用，请确认已安装并可正常打开".to_string());
+        }
+        thread::sleep(Duration::from_millis(500));
+        resolve_instance(DEFAULT_INSTANCE_ID)
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         let _ = instance;
         Err("多开实例启动目前仅支持 macOS".to_string())
@@ -979,6 +1073,9 @@ fn stored_instance(instance_id: &str) -> Result<StoredCodexInstance, String> {
     if instance_id.trim().is_empty() || instance_id == DEFAULT_INSTANCE_ID {
         return Ok(default_instance());
     }
+    if !managed_instances_supported() {
+        return Err(managed_instances_unavailable_error());
+    }
     read_stored_instances()?
         .into_iter()
         .find(|instance| instance.id == instance_id)
@@ -986,35 +1083,61 @@ fn stored_instance(instance_id: &str) -> Result<StoredCodexInstance, String> {
 }
 
 fn stop_stored(instance: &StoredCodexInstance) -> Result<(), String> {
-    let Some(pid) = live_pid(instance) else {
-        return Ok(());
-    };
-    #[cfg(unix)]
-    unsafe {
-        if libc::kill(pid as i32, libc::SIGTERM) != 0 {
-            return Err(format!(
-                "停止实例 PID {pid} 失败：{}",
-                std::io::Error::last_os_error()
-            ));
-        }
-    }
     #[cfg(windows)]
     {
-        let status = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status()
-            .map_err(|error| format!("停止实例失败：{error}"))?;
-        if !status.success() {
-            return Err(format!("停止实例 PID {pid} 失败"));
-        }
-    }
-    for _ in 0..30 {
-        if live_pid(instance).is_none() {
+        if instance.id != DEFAULT_INSTANCE_ID {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(100));
+        let pid = live_pid(instance);
+        let mut command = Command::new("taskkill");
+        command.args(["/IM", "Codex.exe", "/T", "/F"]);
+        hide_command_window(&mut command);
+        let status = command
+            .status()
+            .map_err(|error| format!("停止实例失败：{error}"))?;
+        if !status.success() && pid.is_some() && live_pid(instance).is_some() {
+            return Err(format!("停止 Codex 进程 PID {} 失败", pid.unwrap()));
+        }
+        for _ in 0..30 {
+            if live_pid(instance).is_none() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        return Err(format!(
+            "Codex 进程 PID {} 未在超时时间内退出",
+            pid.unwrap_or_default()
+        ));
     }
-    Err(format!("实例 PID {pid} 未在超时时间内退出"))
+
+    #[cfg(not(windows))]
+    {
+        let Some(pid) = live_pid(instance) else {
+            return Ok(());
+        };
+        #[cfg(unix)]
+        unsafe {
+            if libc::kill(pid as i32, libc::SIGTERM) != 0 {
+                return Err(format!(
+                    "停止实例 PID {pid} 失败：{}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        for _ in 0..30 {
+            if live_pid(instance).is_none() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err(format!("实例 PID {pid} 未在超时时间内退出"))
+    }
+}
+
+#[cfg(windows)]
+fn hide_command_window(command: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[tauri::command]
@@ -1077,6 +1200,24 @@ mod tests {
     #[test]
     fn generated_instance_ids_are_not_default() {
         assert_ne!(make_instance_id(), DEFAULT_INSTANCE_ID);
+    }
+
+    #[test]
+    fn capabilities_match_the_supported_platform() {
+        assert_eq!(
+            get_codex_instance_capabilities().managed_instances_supported,
+            cfg!(target_os = "macos")
+        );
+    }
+
+    #[test]
+    fn windows_tasklist_parser_only_returns_codex_processes() {
+        let output = concat!(
+            "\"Codex.exe\",\"1234\",\"Console\",\"1\",\"100,000 K\"\n",
+            "\"codex.EXE\",\"5678\",\"Console\",\"1\",\"80,000 K\"\n",
+            "\"Codex Switcher.exe\",\"9999\",\"Console\",\"1\",\"50,000 K\"\n",
+        );
+        assert_eq!(parse_windows_tasklist_codex_pids(output), vec![1234, 5678]);
     }
 
     #[test]

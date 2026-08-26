@@ -1853,7 +1853,7 @@ pub fn codex_restart_commands() -> (
 }
 
 #[cfg(target_os = "windows")]
-const WINDOWS_CODEX_START_SCRIPT: &str = r#"
+pub(crate) const WINDOWS_CODEX_START_SCRIPT: &str = r#"
 $ErrorActionPreference = 'SilentlyContinue'
 function Start-CodexStoreTarget([string]$target) {
   if ([string]::IsNullOrWhiteSpace($target)) { return $false }
