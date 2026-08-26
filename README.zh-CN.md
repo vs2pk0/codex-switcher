@@ -10,27 +10,36 @@
   </p>
 </div>
 
-Codex Switcher 将多个 Codex 登录配置集中在一个桌面应用中。它可以切换当前账号、将选中的认证信息写回本机 Codex 配置，并提供额度监控、会话恢复、本地 Token 用量统计和费用预估。
+Codex Switcher 将多个 Codex 登录配置集中在一个桌面应用中。它可以切换当前账号、隔离运行多个 Codex 桌面实例、修复本机会话、管理 OpenCodex 与 CLIProxyAPI，并提供额度监控、本地 Token 用量统计和费用预估。
 
 ## 应用截图
 
-### 账号总览
-
-![开启隐私模式的账号总览](doc/assets/screenshots/accounts-overview.jpg)
-
-### 消费看板
-
-![本地 Token 用量与预估费用看板](doc/assets/screenshots/usage-dashboard.jpg)
+<table>
+  <tr>
+    <td width="50%"><strong>账号总览与额度监控</strong><br><img src="doc/assets/screenshots/accounts-overview.jpg" alt="开启隐私模式的账号总览"></td>
+    <td width="50%"><strong>Token 用量与费用预估</strong><br><img src="doc/assets/screenshots/usage-dashboard.jpg" alt="本地 Token 用量与预估费用看板"></td>
+  </tr>
+  <tr>
+    <td width="50%"><strong>会话内容、附件与修复</strong><br><img src="doc/assets/screenshots/session-content-repair.jpg" alt="包含已恢复图片附件的 Codex 会话内容"></td>
+    <td width="50%"><strong>Codex 桌面多开实例</strong><br><img src="doc/assets/screenshots/codex-instances.jpg" alt="Codex 多开实例管理"></td>
+  </tr>
+  <tr>
+    <td width="50%"><strong>OpenCodex 运行控制台</strong><br><img src="doc/assets/screenshots/opencodex-console.jpg" alt="OpenCodex 服务与 Engine 控制台"></td>
+    <td width="50%"><strong>OpenCodex Web 管理</strong><br><img src="doc/assets/screenshots/opencodex-web.jpg" alt="OpenCodex Web Dashboard 启动页"></td>
+  </tr>
+</table>
 
 ## 主要功能
 
-- **OAuth 与 API Key 账号**：添加、编辑、导入、导出、筛选、排序和切换多个账号。
-- **Codex 桌面多开（macOS）**：为官方桌面 App 的每个实例隔离 `CODEX_HOME` 和 Electron 数据目录，并可指定账号切换、OpenCodex 同步/恢复及配置编辑所作用的实例。
-- **额度监控**：查看账号可用状态、订阅有效期、标准额度窗口，以及可选的 GPT 5.3 Codex Spark 额度窗口。
-- **会话工具**：管理、修复、备份和恢复本机 Codex 会话。
-- **使用统计**：汇总本地 Token、缓存、模型分布和预估费用，并支持自定义模型计价规则。
-- **CLIProxyAPI 集成**：安装、更新、运行和配置内置 API 服务，并将选中的账号绑定到服务。
-- **隐私控制**：在界面中隐藏账号标识，应用数据默认保存在本机。
+- **OAuth 与 API Key 账号**：添加、编辑、导入、导出、筛选、排序、刷新和切换多个账号。
+- **额度监控与重置**：查看可用状态、订阅有效期、额度窗口、GPT 5.3 Codex Spark 额度、重置记录和预约重置。
+- **会话管理与修复**：搜索项目和消息内容，预览 Markdown 与附件，删除单条消息或完整轮次，备份、恢复、修复可见性并恢复被截断的会话。
+- **Codex 桌面多开（macOS）**：为官方桌面 App 隔离 `CODEX_HOME` 和 Electron 数据，并将账号切换、会话、设置及 OpenCodex 操作定向到所选实例。
+- **OpenCodex Manager**：初始化和控制代理、管理 Engine 版本、打开 Web Dashboard、同步模型、配置图片输入兼容、导入 Switcher 账号、查看日志并恢复原生 Codex。
+- **使用统计**：汇总本地 Token、缓存、模型和来源分布、预估费用，并支持自定义模型计价规则。
+- **CLIProxyAPI 集成**：安装、更新、运行、配置和管理内置 CPA API 服务版本，并绑定选中的账号。
+- **配置与备份**：校验并编辑 `auth.json` 和 `config.toml`，自动备份原文件，创建 ZIP 完整备份并恢复历史数据。
+- **本地优先隐私**：隐藏账号标识、自动脱敏 OpenCodex 日志，应用数据默认保存在本机。
 - **四种界面语言**：English、简体中文、繁體中文（台灣）和 Русский。
 
 ## 内置 CPA API 服务
@@ -43,6 +52,17 @@ Codex Switcher 将多个 Codex 登录配置集中在一个桌面应用中。它�
 - **版本管理**：检测官方版本、导入可信的本地安装包、查看已安装版本、切换当前版本和删除非当前版本。
 - **安全切换**：CPA 运行中切换版本会自动重启；如果新版本启动失败，Codex Switcher 会恢复到原来的版本。
 - **本地工作区**：运行时、配置、认证文件和下载缓存统一保存在 `~/.codex_switcher/api-service`。
+
+## OpenCodex Manager
+
+“OpenCodex”页面将本地 [OpenCodex](https://github.com/lidge-jun/opencodex) 代理及其 Engine 生命周期整合进 Codex Switcher。
+
+- **运行控制台**：在一个页面完成初始化、启动、停止、重启、环境诊断、配置同步、健康检查和脱敏日志查看。
+- **Engine 生命周期**：检测稳定版和预览版，安装或切换本地版本，删除非当前版本，并可安全回退到客户端内置基线。
+- **Codex 集成**：向所选 Codex 实例同步配置与模型目录，也可停止代理并恢复该实例的原生配置。
+- **Web Dashboard**：可在独立客户端窗口或系统浏览器中打开 OpenCodex 管理页面。
+- **图片输入兼容**：为仅文本模型选择图片描述 Sidecar，保存后自动重启 OpenCodex 并同步模型目录。
+- **账号迁移与后台服务**：导入兼容的 Switcher OAuth 账号，并可将 OpenCodex 注册为登录后自动运行的后台服务。
 
 ## 安装
 

@@ -4,6 +4,7 @@ import { Message, Modal } from "@arco-design/web-vue";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import InstancePickerModal from "../components/InstancePickerModal.vue";
 import type { CodexInstance } from "../services/instances";
+import { currentLanguage, formatTranslatedText, t } from "../i18n";
 import {
   activateBundledOpenCodexEngine,
   deleteOpenCodexSwitcherAccount,
@@ -113,11 +114,11 @@ function appendLog(event: OpenCodexCommandLogEvent): void {
         logs.value = [...logs.value.slice(-999), {
           operationId: event.operationId,
           stream: "system",
-          line: `已使用管理器默认端口 ${selectedPort}`,
+          line: formatTranslatedText("已使用管理器默认端口 {port}", { port: selectedPort }),
           timestamp: new Date().toISOString(),
         }];
       })
-      .catch((error) => Message.error(`自动填写 OpenCodex 端口失败：${errorText(error)}`));
+      .catch((error) => Message.error(formatTranslatedText("自动填写 OpenCodex 端口失败：{error}", { error: errorText(error) })));
   }
 }
 
@@ -127,7 +128,7 @@ async function refreshSnapshot(showError = true): Promise<void> {
     snapshot.value = await getOpenCodexSnapshot();
     if (snapshot.value.running && snapshot.value.port) settings.value.port = snapshot.value.port;
   } catch (error) {
-    if (showError) Message.error(`读取 OpenCodex 状态失败：${errorText(error)}`);
+    if (showError) Message.error(formatTranslatedText("读取 OpenCodex 状态失败：{error}", { error: errorText(error) }));
   } finally {
     loading.value = false;
   }
@@ -144,28 +145,28 @@ async function executeAction(action: OpenCodexAction, instanceId?: string): Prom
     const confirmed = await new Promise<boolean>((resolve) => {
       const confirmation = action === "restore"
         ? {
-            title: "恢复原生 Codex",
-            content: "将停止 OpenCodex 服务并恢复原生 Codex 配置，是否继续？",
+            title: t("恢复原生 Codex"),
+            content: t("将停止 OpenCodex 服务并恢复原生 Codex 配置，是否继续？"),
           }
         : action === "uninstall"
           ? {
-              title: "卸载 OpenCodex",
-              content: "将执行 OpenCodex 官方卸载流程。配置备份仍由 OpenCodex 自身策略处理，是否继续？",
+              title: t("卸载 OpenCodex"),
+              content: t("将执行 OpenCodex 官方卸载流程。配置备份仍由 OpenCodex 自身策略处理，是否继续？"),
             }
           : action === "service_install"
             ? {
-                title: "开启后台服务",
-                content: "将注册并启动 OpenCodex 系统后台服务，使其在登录后自动运行。是否继续？",
+                title: t("开启后台服务"),
+                content: t("将注册并启动 OpenCodex 系统后台服务，使其在登录后自动运行。是否继续？"),
               }
             : {
-                title: "取消后台服务",
-                content: "将停止并移除 OpenCodex 后台服务，同时恢复原生 Codex 配置；账号和 OpenCodex 配置仍会保留。是否继续？",
+                title: t("取消后台服务"),
+                content: t("将停止并移除 OpenCodex 后台服务，同时恢复原生 Codex 配置；账号和 OpenCodex 配置仍会保留。是否继续？"),
               };
       Modal.warning({
         title: confirmation.title,
         content: confirmation.content,
-        okText: "确认执行",
-        cancelText: "取消",
+        okText: t("确认执行"),
+        cancelText: t("取消"),
         hideCancel: false,
         onOk: () => resolve(true),
         onCancel: () => resolve(false),
@@ -181,7 +182,7 @@ async function executeAction(action: OpenCodexAction, instanceId?: string): Prom
     if (started.interactive) page.value = "console";
   } catch (error) {
     busy.value = false;
-    Message.error(`OpenCodex 操作启动失败：${errorText(error)}`);
+    Message.error(formatTranslatedText("OpenCodex 操作启动失败：{error}", { error: errorText(error) }));
   }
 }
 
@@ -213,7 +214,7 @@ async function submitCommandInput(): Promise<void> {
     await writeOpenCodexInput(operationId, `${commandInput.value}\n`);
     commandInput.value = "";
   } catch (error) {
-    Message.error(`发送初始化输入失败：${errorText(error)}`);
+    Message.error(formatTranslatedText("发送初始化输入失败：{error}", { error: errorText(error) }));
   }
 }
 
@@ -221,7 +222,7 @@ async function openDashboard(mode = settings.value.dashboardOpenMode): Promise<v
   try {
     await openOpenCodexDashboard(mode, effectivePort.value);
   } catch (error) {
-    Message.error(`打开 OpenCodex Dashboard 失败：${errorText(error)}`);
+    Message.error(formatTranslatedText("打开 OpenCodex Dashboard 失败：{error}", { error: errorText(error) }));
   }
 }
 
@@ -236,10 +237,10 @@ async function checkVersions(): Promise<void> {
       catalog.value.releases[0]?.version ||
       "";
     if (catalog.value.remoteError) {
-      Message.warning(`GitHub 版本暂时不可用，本地 Engine 仍可管理：${catalog.value.remoteError}`);
+      Message.warning(formatTranslatedText("GitHub 版本暂时不可用，本地 Engine 仍可管理：{error}", { error: catalog.value.remoteError }));
     }
   } catch (error) {
-    Message.error(`检测 OpenCodex Engine 版本失败：${errorText(error)}`);
+    Message.error(formatTranslatedText("检测 OpenCodex Engine 版本失败：{error}", { error: errorText(error) }));
   } finally {
     catalogLoading.value = false;
   }
@@ -247,7 +248,7 @@ async function checkVersions(): Promise<void> {
 
 async function applyRelease(release: OpenCodexEngineRelease): Promise<void> {
   if (snapshot.value?.running) {
-    Message.warning("请先停止 OpenCodex 服务，再更新或切换 Engine");
+    Message.warning(t("请先停止 OpenCodex 服务，再更新或切换 Engine"));
     return;
   }
   busy.value = true;
@@ -256,7 +257,7 @@ async function applyRelease(release: OpenCodexEngineRelease): Promise<void> {
     Message.success(result.message);
     await Promise.all([refreshSnapshot(false), checkVersions()]);
   } catch (error) {
-    Message.error(`安装 Engine 失败：${errorText(error)}`);
+    Message.error(formatTranslatedText("安装 Engine 失败：{error}", { error: errorText(error) }));
   } finally {
     busy.value = false;
   }
@@ -264,7 +265,7 @@ async function applyRelease(release: OpenCodexEngineRelease): Promise<void> {
 
 async function rollbackEngine(): Promise<void> {
   if (snapshot.value?.running) {
-    Message.warning("请先停止 OpenCodex 服务，再回退 Engine");
+    Message.warning(t("请先停止 OpenCodex 服务，再回退 Engine"));
     return;
   }
   busy.value = true;
@@ -273,7 +274,7 @@ async function rollbackEngine(): Promise<void> {
     Message.success(result.message);
     await Promise.all([refreshSnapshot(false), checkVersions()]);
   } catch (error) {
-    Message.error(`回退 Engine 失败：${errorText(error)}`);
+    Message.error(formatTranslatedText("回退 Engine 失败：{error}", { error: errorText(error) }));
   } finally {
     busy.value = false;
   }
@@ -281,7 +282,7 @@ async function rollbackEngine(): Promise<void> {
 
 async function switchInstalledVersion(version: string): Promise<void> {
   if (snapshot.value?.running) {
-    Message.warning("请先停止 OpenCodex 服务，再切换 Engine");
+    Message.warning(t("请先停止 OpenCodex 服务，再切换 Engine"));
     return;
   }
   busy.value = true;
@@ -290,7 +291,7 @@ async function switchInstalledVersion(version: string): Promise<void> {
     Message.success(result.message);
     await Promise.all([refreshSnapshot(false), checkVersions()]);
   } catch (error) {
-    Message.error(`切换 Engine 失败：${errorText(error)}`);
+    Message.error(formatTranslatedText("切换 Engine 失败：{error}", { error: errorText(error) }));
   } finally {
     busy.value = false;
   }
@@ -298,10 +299,10 @@ async function switchInstalledVersion(version: string): Promise<void> {
 
 function confirmDeleteInstalledVersion(version: string): void {
   Modal.warning({
-    title: "删除本地 Engine",
-    content: `确认删除本地 Engine v${version}？删除后仍可从 GitHub 版本列表重新下载安装。`,
-    okText: "删除",
-    cancelText: "取消",
+    title: t("删除本地 Engine"),
+    content: formatTranslatedText("确认删除本地 Engine v{version}？删除后仍可从 GitHub 版本列表重新下载安装。", { version }),
+    okText: t("删除"),
+    cancelText: t("取消"),
     hideCancel: false,
     async onOk() {
       busy.value = true;
@@ -310,7 +311,7 @@ function confirmDeleteInstalledVersion(version: string): void {
         Message.success(result.message);
         await checkVersions();
       } catch (error) {
-        Message.error(`删除 Engine 失败：${errorText(error)}`);
+        Message.error(formatTranslatedText("删除 Engine 失败：{error}", { error: errorText(error) }));
       } finally {
         busy.value = false;
       }
@@ -320,14 +321,14 @@ function confirmDeleteInstalledVersion(version: string): void {
 
 function saveSettings(): void {
   if (!Number.isInteger(settings.value.port) || settings.value.port < 1024 || settings.value.port > 65535) {
-    Message.warning("端口必须在 1024–65535 之间");
+    Message.warning(t("端口必须在 1024–65535 之间"));
     return;
   }
   localStorage.setItem(
     "codex-switcher-opencodex-settings",
     serializeOpenCodexSettings(settings.value),
   );
-  Message.success("OpenCodex 设置已保存，下一次启动服务时生效");
+  Message.success(t("OpenCodex 设置已保存，下一次启动服务时生效"));
 }
 
 async function scanAccounts(): Promise<void> {
@@ -338,7 +339,7 @@ async function scanAccounts(): Promise<void> {
       .filter((account) => account.eligible)
       .map((account) => account.sourceId);
   } catch (error) {
-    Message.error(`扫描 Switcher 账号失败：${errorText(error)}`);
+    Message.error(formatTranslatedText("扫描 Switcher 账号失败：{error}", { error: errorText(error) }));
   } finally {
     accountScanLoading.value = false;
   }
@@ -357,7 +358,7 @@ async function loadVisionModels(): Promise<void> {
       .filter((model) => model.sidecarEnabled)
       .map((model) => model.namespaced);
   } catch (error) {
-    Message.error(`读取 OpenCodex 模型失败：${errorText(error)}`);
+    Message.error(formatTranslatedText("读取 OpenCodex 模型失败：{error}", { error: errorText(error) }));
   } finally {
     visionLoading.value = false;
   }
@@ -389,13 +390,13 @@ async function saveVisionModels(): Promise<void> {
     await Promise.all([refreshSnapshot(false), loadVisionModels()]);
     if (result.changedProviders.length) {
       Modal.info({
-        title: "图片模型已同步",
-        content: "Codex 客户端会缓存模型能力。请用 Command + Q（Windows 使用退出菜单）完全退出 Codex，再重新打开后使用图片输入。",
-        okText: "知道了",
+        title: t("图片模型已同步"),
+        content: t("Codex 客户端会缓存模型能力。请用 Command + Q（Windows 使用退出菜单）完全退出 Codex，再重新打开后使用图片输入。"),
+        okText: t("知道了"),
       });
     }
   } catch (error) {
-    Message.error(`保存图片模型失败：${errorText(error)}`);
+    Message.error(formatTranslatedText("保存图片模型失败：{error}", { error: errorText(error) }));
   } finally {
     visionSaving.value = false;
   }
@@ -403,17 +404,20 @@ async function saveVisionModels(): Promise<void> {
 
 async function importAccounts(): Promise<void> {
   if (!selectedImportAccountIds.value.length) {
-    Message.warning("请至少选择一个可导入账号");
+    Message.warning(t("请至少选择一个可导入账号"));
     return;
   }
   importingAccounts.value = true;
   try {
     const result = await importOpenCodexSwitcherAccounts(selectedImportAccountIds.value);
-    Message.success(`已导入 ${result.importedCount} 个账号，跳过 ${result.skippedCount} 个`);
+    Message.success(formatTranslatedText("已导入 {importedCount} 个账号，跳过 {skippedCount} 个", {
+      importedCount: result.importedCount,
+      skippedCount: result.skippedCount,
+    }));
     emit("accounts-refreshed");
     await scanAccounts();
   } catch (error) {
-    Message.error(`导入 OpenCodex 账号失败：${errorText(error)}`);
+    Message.error(formatTranslatedText("导入 OpenCodex 账号失败：{error}", { error: errorText(error) }));
   } finally {
     importingAccounts.value = false;
   }
@@ -422,18 +426,18 @@ async function importAccounts(): Promise<void> {
 function confirmDeleteSelectedAccounts(): void {
   const selected = [...selectedDeleteAccounts.value];
   if (!selected.length || deletingAccountId.value) {
-    Message.warning("请至少选择一个已导入且可删除的账号");
+    Message.warning(t("请至少选择一个已导入且可删除的账号"));
     return;
   }
   if (snapshot.value?.running) {
-    Message.warning("请先停止 OpenCodex 服务，再删除账号");
+    Message.warning(t("请先停止 OpenCodex 服务，再删除账号"));
     return;
   }
   Modal.warning({
-    title: "批量删除 OpenCodex 账号",
-    content: `确认从 OpenCodex 删除所选 ${selected.length} 个账号？Switcher 账号总览中的原账号会保留。`,
-    okText: "删除",
-    cancelText: "取消",
+    title: t("批量删除 OpenCodex 账号"),
+    content: formatTranslatedText("确认从 OpenCodex 删除所选 {count} 个账号？Switcher 账号总览中的原账号会保留。", { count: selected.length }),
+    okText: t("删除"),
+    cancelText: t("取消"),
     hideCancel: false,
     onOk: async () => {
       deletingAccountId.value = "__selected__";
@@ -445,14 +449,14 @@ function confirmDeleteSelectedAccounts(): void {
         const deletedCount = results.filter((result) => result.deleted).length;
         const failures = results.filter((result) => !result.deleted && /身份|不匹配|无法确认/.test(result.message));
         if (failures.length) {
-          Message.warning(`已删除 ${deletedCount} 个账号，${failures.length} 个账号因身份校验失败而保留`);
+          Message.warning(formatTranslatedText("已删除 {deletedCount} 个账号，{failureCount} 个账号因身份校验失败而保留", { deletedCount, failureCount: failures.length }));
         } else {
-          Message.success(`已从 OpenCodex 删除 ${deletedCount} 个账号`);
+          Message.success(formatTranslatedText("已从 OpenCodex 删除 {count} 个账号", { count: deletedCount }));
         }
         emit("accounts-refreshed");
         await scanAccounts();
       } catch (error) {
-        Message.error(`批量删除 OpenCodex 账号失败：${errorText(error)}`);
+        Message.error(formatTranslatedText("批量删除 OpenCodex 账号失败：{error}", { error: errorText(error) }));
         throw error;
       } finally {
         deletingAccountId.value = "";
@@ -466,14 +470,14 @@ function confirmDeleteMigratedAccount(
 ): void {
   if (!account.deletable || deletingAccountId.value) return;
   if (snapshot.value?.running) {
-    Message.warning("请先停止 OpenCodex 服务，再删除账号");
+    Message.warning(t("请先停止 OpenCodex 服务，再删除账号"));
     return;
   }
   Modal.warning({
-    title: "删除 OpenCodex 账号",
-    content: `确认从 OpenCodex 删除 ${account.email || account.sourceId}？Switcher 账号总览中的原账号会保留。`,
-    okText: "删除",
-    cancelText: "取消",
+    title: t("删除 OpenCodex 账号"),
+    content: formatTranslatedText("确认从 OpenCodex 删除 {account}？Switcher 账号总览中的原账号会保留。", { account: account.email || account.sourceId }),
+    okText: t("删除"),
+    cancelText: t("取消"),
     hideCancel: false,
     onOk: async () => {
       deletingAccountId.value = account.sourceId;
@@ -483,7 +487,7 @@ function confirmDeleteMigratedAccount(
         emit("accounts-refreshed");
         await scanAccounts();
       } catch (error) {
-        Message.error(`删除 OpenCodex 账号失败：${errorText(error)}`);
+        Message.error(formatTranslatedText("删除 OpenCodex 账号失败：{error}", { error: errorText(error) }));
         throw error;
       } finally {
         deletingAccountId.value = "";
@@ -494,7 +498,8 @@ function confirmDeleteMigratedAccount(
 
 function formatLogTime(value: string): string {
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString("zh-CN", { hour12: false });
+  const locale = currentLanguage.value === "ru" ? "ru-RU" : currentLanguage.value === "en" ? "en-US" : currentLanguage.value === "zh-TW" ? "zh-TW" : "zh-CN";
+  return Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString(locale, { hour12: false });
 }
 
 function accountInitial(email: string): string {
@@ -507,10 +512,22 @@ function shortSourceId(sourceId: string): string {
 }
 
 function accountStatusLabel(status: string): string {
-  if (status === "ready") return "待导入";
-  if (status === "already_imported") return "已导入";
-  if (status === "unsupported") return "不支持";
-  return "无效";
+  if (status === "ready") return t("待导入");
+  if (status === "already_imported") return t("已导入");
+  if (status === "unsupported") return t("不支持");
+  return t("无效");
+}
+
+function backgroundServiceSummary(): string {
+  const service = snapshot.value?.backgroundService;
+  if (!service) return "";
+  if (!service.supported) return t("当前系统不支持后台服务");
+  if (!service.installed) return t("后台服务尚未安装");
+  if (service.conflict) return t("检测到后台服务冲突，请卸载后重新安装");
+  if (service.stale) return t("后台服务文件已过期，请重新安装");
+  if (service.running) return t("后台服务已安装并正在运行");
+  if (service.enabled) return t("后台服务已启用，当前未运行");
+  return t("后台服务已安装，当前未启用");
 }
 
 function toggleMigrationAccount(account: OpenCodexSwitcherAccountScan["accounts"][number]): void {
@@ -564,7 +581,7 @@ onMounted(async () => {
     );
     await refreshSnapshot(false);
   } catch (error) {
-    Message.error(`初始化 OpenCodex 管理模块失败：${errorText(error)}`);
+    Message.error(formatTranslatedText("初始化 OpenCodex 管理模块失败：{error}", { error: errorText(error) }));
   }
 });
 
@@ -579,134 +596,134 @@ onUnmounted(() => unlistenEvents?.());
           <span class="opencodex-brand-mark">OC</span>
           <div>
             <h1>OpenCodex Manager</h1>
-            <p>本地代理、Codex 集成与 Engine 版本控制台</p>
+            <p>{{ t("本地代理、Codex 集成与 Engine 版本控制台") }}</p>
           </div>
         </div>
       </div>
       <div class="opencodex-status-strip">
         <span :class="['status-dot', snapshot?.running ? 'online' : 'offline']" />
-        <strong>{{ snapshot?.running ? "服务运行中" : "服务未运行" }}</strong>
-        <span>Engine {{ snapshot?.engineVersion ? `v${snapshot.engineVersion}` : "不可用" }}</span>
-        <span>{{ snapshot?.platform || "检测中" }}</span>
-        <span>端口 {{ effectivePort }}</span>
+        <strong>{{ t(snapshot?.running ? "服务运行中" : "服务未运行") }}</strong>
+        <span>Engine {{ snapshot?.engineVersion ? `v${snapshot.engineVersion}` : t("不可用") }}</span>
+        <span>{{ snapshot?.platform || t("检测中") }}</span>
+        <span>{{ t("端口") }} {{ effectivePort }}</span>
       </div>
     </header>
 
-    <nav class="opencodex-tabs" aria-label="OpenCodex 功能导航">
+    <nav class="opencodex-tabs" :aria-label="t('OpenCodex 功能导航')">
       <button :class="{ active: page === 'console' }" @click="page = 'console'">
-        <icon-command />运行控制台
+        <icon-command />{{ t("运行控制台") }}
       </button>
       <button :class="{ active: page === 'web' }" @click="page = 'web'">
-        <icon-public />Web 管理
+        <icon-public />{{ t("Web 管理") }}
       </button>
       <button :class="{ active: page === 'vision' }" @click="page = 'vision'">
-        <icon-image />图片模型
+        <icon-image />{{ t("图片模型") }}
       </button>
       <button :class="{ active: page === 'versions' }" @click="page = 'versions'">
-        <icon-apps />版本管理
+        <icon-apps />{{ t("版本管理") }}
       </button>
       <button :class="{ active: page === 'logs' }" @click="page = 'logs'">
-        <icon-file />运行日志
+        <icon-file />{{ t("运行日志") }}
       </button>
       <button :class="{ active: page === 'settings' }" @click="page = 'settings'">
-        <icon-settings />设置
+        <icon-settings />{{ t("设置") }}
       </button>
     </nav>
 
-    <a-spin :loading="loading" class="opencodex-content" tip="正在读取 OpenCodex 状态…">
+    <a-spin :loading="loading" class="opencodex-content" :tip="t('正在读取 OpenCodex 状态…')">
       <template v-if="page === 'console'">
         <section class="service-control-card">
           <div class="service-actions">
             <a-button type="primary" :disabled="busy || snapshot?.running || !snapshot?.initialized" @click="run('start')">
-              <template #icon><icon-play-arrow /></template>启动服务
+              <template #icon><icon-play-arrow /></template>{{ t("启动服务") }}
             </a-button>
             <a-button :disabled="busy || !snapshot?.running" @click="run('stop')">
-              <template #icon><icon-pause /></template>停止
+              <template #icon><icon-pause /></template>{{ t("停止") }}
             </a-button>
             <a-button :disabled="busy || !snapshot?.initialized" @click="run('restart')">
-              <template #icon><icon-refresh /></template>重启
+              <template #icon><icon-refresh /></template>{{ t("重启") }}
             </a-button>
             <a-button :disabled="busy" @click="run('init')">
-              <template #icon><icon-command /></template>{{ snapshot?.initialized ? "重新初始化" : "初始化" }}
+              <template #icon><icon-command /></template>{{ t(snapshot?.initialized ? "重新初始化" : "初始化") }}
             </a-button>
             <a-button type="text" :disabled="loading" @click="refreshSnapshot()">
-              <template #icon><icon-sync /></template>刷新状态
+              <template #icon><icon-sync /></template>{{ t("刷新状态") }}
             </a-button>
           </div>
           <div class="health-indicator">
             <icon-heart-fill />
-            <span><small>服务健康</small><strong>{{ snapshot?.ready ? "正常" : snapshot?.running ? "正在就绪" : "未运行" }}</strong></span>
+            <span><small>{{ t("服务健康") }}</small><strong>{{ t(snapshot?.ready ? "正常" : snapshot?.running ? "正在就绪" : "未运行") }}</strong></span>
           </div>
         </section>
 
         <section class="overview-grid">
           <article class="overview-card">
             <span class="overview-icon green"><icon-apps /></span>
-            <small>Engine 版本</small>
-            <strong>{{ snapshot?.engineVersion ? `v${snapshot.engineVersion}` : "资源不可用" }}</strong>
-            <p>{{ snapshot?.engineSource === "managed" ? "在线安装版本" : "客户端内置基线" }}</p>
+            <small>{{ t("Engine 版本") }}</small>
+            <strong>{{ snapshot?.engineVersion ? `v${snapshot.engineVersion}` : t("资源不可用") }}</strong>
+            <p>{{ t(snapshot?.engineSource === "managed" ? "在线安装版本" : "客户端内置基线") }}</p>
           </article>
           <article class="overview-card">
             <span class="overview-icon blue"><icon-thunderbolt /></span>
-            <small>服务状态</small>
-            <strong>{{ snapshot?.running ? "运行中" : "已停止" }}</strong>
-            <p>{{ snapshot?.pid ? `PID ${snapshot.pid}` : "暂无运行进程" }}</p>
+            <small>{{ t("服务状态") }}</small>
+            <strong>{{ t(snapshot?.running ? "运行中" : "已停止") }}</strong>
+            <p>{{ snapshot?.pid ? `PID ${snapshot.pid}` : t("暂无运行进程") }}</p>
           </article>
           <article class="overview-card access-card">
             <span class="overview-icon cyan"><icon-public /></span>
-            <small>访问地址</small>
+            <small>{{ t("访问地址") }}</small>
             <strong>localhost:{{ effectivePort }}</strong>
             <p>
-              <a-link :disabled="!snapshot?.running" @click="openDashboard('client')">客户端打开</a-link>
-              <a-link :disabled="!snapshot?.running" @click="openDashboard('browser')">浏览器打开</a-link>
+              <a-link :disabled="!snapshot?.running" @click="openDashboard('client')">{{ t("客户端打开") }}</a-link>
+              <a-link :disabled="!snapshot?.running" @click="openDashboard('browser')">{{ t("浏览器打开") }}</a-link>
             </p>
           </article>
           <article class="overview-card">
             <span class="overview-icon violet"><icon-link /></span>
-            <small>Codex 集成</small>
-            <strong>{{ snapshot?.integrationStatus || "等待检测" }}</strong>
-            <p>{{ snapshot?.initialized ? "配置与模型可同步" : "需要完成首次初始化" }}</p>
+            <small>{{ t("Codex 集成") }}</small>
+            <strong>{{ t(snapshot?.integrationStatus || "等待检测") }}</strong>
+            <p>{{ t(snapshot?.initialized ? "配置与模型可同步" : "需要完成首次初始化") }}</p>
           </article>
         </section>
 
         <section class="quick-card">
-          <div class="section-heading"><div><h2>快捷操作</h2><p>所有命令均经过 Rust 白名单和参数校验</p></div></div>
+          <div class="section-heading"><div><h2>{{ t("快捷操作") }}</h2><p>{{ t("所有命令均经过 Rust 白名单和参数校验") }}</p></div></div>
           <div class="quick-grid">
-            <button :disabled="busy || !snapshot?.initialized" @click="run('doctor')"><span><icon-bug /></span><div><strong>环境诊断</strong><small>检查运行环境与配置</small></div><icon-right /></button>
-            <button :disabled="busy || !snapshot?.initialized" @click="run('sync')"><span><icon-sync /></span><div><strong>同步配置</strong><small>重新同步 Codex 模型</small></div><icon-right /></button>
+            <button :disabled="busy || !snapshot?.initialized" @click="run('doctor')"><span><icon-bug /></span><div><strong>{{ t("环境诊断") }}</strong><small>{{ t("检查运行环境与配置") }}</small></div><icon-right /></button>
+            <button :disabled="busy || !snapshot?.initialized" @click="run('sync')"><span><icon-sync /></span><div><strong>{{ t("同步配置") }}</strong><small>{{ t("重新同步 Codex 模型") }}</small></div><icon-right /></button>
             <button
               :class="{ 'toggle-enabled': snapshot?.backgroundService?.installed }"
               :disabled="busy || !snapshot?.initialized || snapshot?.backgroundService?.supported === false"
-              :title="snapshot?.backgroundService?.summary"
+              :title="backgroundServiceSummary()"
               @click="run(snapshot?.backgroundService?.installed ? 'service_uninstall' : 'service_install')"
             >
               <span><icon-storage /></span>
               <div>
-                <strong>{{ snapshot?.backgroundService?.installed ? "取消后台服务" : "后台服务" }}</strong>
-                <small>{{ snapshot?.backgroundService?.installed ? "已注册，再次点击取消" : "注册系统启动服务" }}</small>
+                <strong>{{ t(snapshot?.backgroundService?.installed ? "取消后台服务" : "后台服务") }}</strong>
+                <small>{{ t(snapshot?.backgroundService?.installed ? "已注册，再次点击取消" : "注册系统启动服务") }}</small>
               </div>
               <em :class="['quick-toggle-state', snapshot?.backgroundService?.installed ? 'on' : 'off']">
-                {{ snapshot?.backgroundService?.installed ? "已开启" : "未开启" }}
+                {{ t(snapshot?.backgroundService?.installed ? "已开启" : "未开启") }}
               </em>
             </button>
-            <button :disabled="busy || !snapshot?.initialized" @click="run('restore')"><span><icon-undo /></span><div><strong>恢复 Codex</strong><small>停止服务并还原配置</small></div><icon-right /></button>
+            <button :disabled="busy || !snapshot?.initialized" @click="run('restore')"><span><icon-undo /></span><div><strong>{{ t("恢复 Codex") }}</strong><small>{{ t("停止服务并还原配置") }}</small></div><icon-right /></button>
           </div>
         </section>
 
         <section class="console-card">
           <div class="section-heading">
-            <div><h2>最近输出</h2><p>凭据和 Token 会在进入前端前自动脱敏</p></div>
-            <a-button size="small" @click="page = 'logs'"><template #icon><icon-file /></template>完整日志</a-button>
+            <div><h2>{{ t("最近输出") }}</h2><p>{{ t("凭据和 Token 会在进入前端前自动脱敏") }}</p></div>
+            <a-button size="small" @click="page = 'logs'"><template #icon><icon-file /></template>{{ t("完整日志") }}</a-button>
           </div>
           <div class="console-output">
-            <div v-if="!recentLogs.length" class="console-empty">等待 OpenCodex 输出…</div>
+            <div v-if="!recentLogs.length" class="console-empty">{{ t("等待 OpenCodex 输出…") }}</div>
             <div v-for="(entry, index) in recentLogs" :key="`${entry.operationId}-${index}`" :class="['console-line', entry.stream]">
               <time>{{ formatLogTime(entry.timestamp) }}</time><span>{{ entry.line }}</span>
             </div>
           </div>
           <form v-if="interactiveOperationId" class="interactive-input" @submit.prevent="submitCommandInput">
-            <a-input v-model="commandInput" autofocus placeholder="输入初始化向导答案；直接回车表示使用默认值" />
-            <a-button html-type="submit" type="primary"><template #icon><icon-send /></template>发送</a-button>
+            <a-input v-model="commandInput" autofocus :placeholder="t('输入初始化向导答案；直接回车表示使用默认值')" />
+            <a-button html-type="submit" type="primary"><template #icon><icon-send /></template>{{ t("发送") }}</a-button>
           </form>
         </section>
       </template>
@@ -714,57 +731,57 @@ onUnmounted(() => unlistenEvents?.());
       <template v-else-if="page === 'web'">
         <section class="web-management-card">
           <div class="web-orb"><icon-public /></div>
-          <a-tag :color="snapshot?.running ? 'green' : 'gray'">{{ snapshot?.running ? "服务已连接" : "服务未运行" }}</a-tag>
+          <a-tag :color="snapshot?.running ? 'green' : 'gray'">{{ t(snapshot?.running ? "服务已连接" : "服务未运行") }}</a-tag>
           <h2>OpenCodex Web Dashboard</h2>
           <p>{{ snapshot?.dashboardUrl || `http://127.0.0.1:${effectivePort}` }}</p>
           <div class="web-actions">
-            <a-button type="primary" size="large" :disabled="!snapshot?.running" @click="openDashboard('client')"><template #icon><icon-desktop /></template>客户端窗口打开</a-button>
-            <a-button size="large" :disabled="!snapshot?.running" @click="openDashboard('browser')"><template #icon><icon-launch /></template>系统浏览器打开</a-button>
+            <a-button type="primary" size="large" :disabled="!snapshot?.running" @click="openDashboard('client')"><template #icon><icon-desktop /></template>{{ t("客户端窗口打开") }}</a-button>
+            <a-button size="large" :disabled="!snapshot?.running" @click="openDashboard('browser')"><template #icon><icon-launch /></template>{{ t("系统浏览器打开") }}</a-button>
           </div>
-          <a-alert v-if="!snapshot?.running" type="warning" show-icon>请先在“运行控制台”启动服务，再打开 Web 管理页面。</a-alert>
+          <a-alert v-if="!snapshot?.running" type="warning" show-icon>{{ t("请先在“运行控制台”启动服务，再打开 Web 管理页面。") }}</a-alert>
         </section>
       </template>
 
       <template v-else-if="page === 'versions'">
         <section class="version-header-card">
-          <div><small>当前 Engine</small><strong>{{ snapshot?.engineVersion ? `v${snapshot.engineVersion}` : "不可用" }}</strong><span>{{ snapshot?.engineSource === "managed" ? "在线版本" : "内置基线" }}</span></div>
-          <div><small>最新稳定版</small><strong>{{ catalog?.latestStable ? `v${catalog.latestStable.version}` : "等待检测" }}</strong><span>GitHub Release</span></div>
-          <div><small>桌面客户端</small><strong>v{{ snapshot?.desktopVersion || "-" }}</strong><span>{{ snapshot?.platform }}</span></div>
+          <div><small>{{ t("当前 Engine") }}</small><strong>{{ snapshot?.engineVersion ? `v${snapshot.engineVersion}` : t("不可用") }}</strong><span>{{ t(snapshot?.engineSource === "managed" ? "在线版本" : "内置基线") }}</span></div>
+          <div><small>{{ t("最新稳定版") }}</small><strong>{{ catalog?.latestStable ? `v${catalog.latestStable.version}` : t("等待检测") }}</strong><span>GitHub Release</span></div>
+          <div><small>{{ t("桌面客户端") }}</small><strong>v{{ snapshot?.desktopVersion || "-" }}</strong><span>{{ snapshot?.platform }}</span></div>
         </section>
         <section class="version-manager-card">
           <div class="section-heading">
-            <div><h2>Engine 版本管理</h2><p>使用内置 Bun 下载并校验官方 @bitkyc08/opencodex 包</p></div>
-            <a-button type="primary" :loading="catalogLoading" @click="checkVersions"><template #icon><icon-refresh /></template>检测更新</a-button>
+            <div><h2>{{ t("Engine 版本管理") }}</h2><p>{{ t("使用内置 Bun 下载并校验官方 @bitkyc08/opencodex 包") }}</p></div>
+            <a-button type="primary" :loading="catalogLoading" @click="checkVersions"><template #icon><icon-refresh /></template>{{ t("检测更新") }}</a-button>
           </div>
           <div v-if="catalog?.latestStable" class="latest-release">
             <span class="release-icon"><icon-download /></span>
-            <div><a-tag :color="catalog.latestStable.newerThanCurrent ? 'orange' : 'green'">{{ catalog.latestStable.newerThanCurrent ? "发现新版本" : "已是最新稳定版" }}</a-tag><h3>OpenCodex Engine v{{ catalog.latestStable.version }}</h3><p>内置版本始终保留，可随时安全回退。</p></div>
-            <a-button type="primary" :disabled="busy || snapshot?.running || !catalog.latestStable.newerThanCurrent" @click="applyRelease(catalog.latestStable)">更新到最新版</a-button>
+            <div><a-tag :color="catalog.latestStable.newerThanCurrent ? 'orange' : 'green'">{{ t(catalog.latestStable.newerThanCurrent ? "发现新版本" : "已是最新稳定版") }}</a-tag><h3>OpenCodex Engine v{{ catalog.latestStable.version }}</h3><p>{{ t("内置版本始终保留，可随时安全回退。") }}</p></div>
+            <a-button type="primary" :disabled="busy || snapshot?.running || !catalog.latestStable.newerThanCurrent" @click="applyRelease(catalog.latestStable)">{{ t("更新到最新版") }}</a-button>
           </div>
           <div class="local-version-section">
             <div class="local-version-heading">
-              <div><h3>本地版本</h3><p>保留当前版本和最近 3 个历史版本，可随时切换或删除非当前版本。</p></div>
-              <a-tag color="blue">{{ catalog?.installedVersions.length || 0 }} 个本地版本</a-tag>
+              <div><h3>{{ t("本地版本") }}</h3><p>{{ t("保留当前版本和最近 3 个历史版本，可随时切换或删除非当前版本。") }}</p></div>
+              <a-tag color="blue">{{ catalog?.installedVersions.length || 0 }} {{ t("个本地版本") }}</a-tag>
             </div>
             <div v-if="catalog?.installedVersions.length" class="local-version-list">
               <div v-for="version in catalog.installedVersions" :key="version" class="local-version-row">
-                <div><strong>Engine v{{ version }}</strong><span>{{ catalog.currentVersion === version ? "当前使用" : "本地已安装" }}</span></div>
+                <div><strong>Engine v{{ version }}</strong><span>{{ t(catalog.currentVersion === version ? "当前使用" : "本地已安装") }}</span></div>
                 <div class="local-version-actions">
-                  <a-button size="small" :disabled="busy || snapshot?.running || catalog.currentVersion === version" @click="switchInstalledVersion(version)">切换</a-button>
-                  <a-button size="small" status="danger" :disabled="busy || snapshot?.running || catalog.currentVersion === version" @click="confirmDeleteInstalledVersion(version)"><template #icon><icon-delete /></template>删除</a-button>
+                  <a-button size="small" :disabled="busy || snapshot?.running || catalog.currentVersion === version" @click="switchInstalledVersion(version)">{{ t("切换") }}</a-button>
+                  <a-button size="small" status="danger" :disabled="busy || snapshot?.running || catalog.currentVersion === version" @click="confirmDeleteInstalledVersion(version)"><template #icon><icon-delete /></template>{{ t("删除") }}</a-button>
                 </div>
               </div>
             </div>
-            <a-empty v-else description="暂无本地历史版本" />
+            <a-empty v-else :description="t('暂无本地历史版本')" />
           </div>
           <div class="github-version-section">
-            <div class="local-version-heading"><div><h3>GitHub 版本</h3><p>选择官方 Release；未安装时下载并使用，已安装时直接切换。</p></div></div>
+            <div class="local-version-heading"><div><h3>{{ t("GitHub 版本") }}</h3><p>{{ t("选择官方 Release；未安装时下载并使用，已安装时直接切换。") }}</p></div></div>
           <div class="release-picker">
-            <a-select v-model="selectedVersion" placeholder="选择 Engine 版本" :loading="catalogLoading">
-              <a-option v-for="release in catalog?.releases || []" :key="release.version" :value="release.version">v{{ release.version }}{{ release.prerelease ? " · 预览" : " · 稳定" }}{{ release.active ? " · 当前" : release.installed ? " · 已安装" : "" }}</a-option>
+            <a-select v-model="selectedVersion" :placeholder="t('选择 Engine 版本')" :loading="catalogLoading">
+              <a-option v-for="release in catalog?.releases || []" :key="release.version" :value="release.version">v{{ release.version }} · {{ t(release.prerelease ? "预览" : "稳定") }}{{ release.active ? ` · ${t("当前")}` : release.installed ? ` · ${t("已安装")}` : "" }}</a-option>
             </a-select>
-            <a-button :disabled="busy || !selectedRelease || selectedRelease.active || snapshot?.running" @click="selectedRelease && applyRelease(selectedRelease)">{{ selectedRelease?.installed ? "切换版本" : "下载并使用" }}</a-button>
-            <a-button v-if="snapshot?.engineSource === 'managed'" :disabled="busy || snapshot?.running" @click="rollbackEngine"><template #icon><icon-undo /></template>回退内置版本</a-button>
+            <a-button :disabled="busy || !selectedRelease || selectedRelease.active || snapshot?.running" @click="selectedRelease && applyRelease(selectedRelease)">{{ t(selectedRelease?.installed ? "切换版本" : "下载并使用") }}</a-button>
+            <a-button v-if="snapshot?.engineSource === 'managed'" :disabled="busy || snapshot?.running" @click="rollbackEngine"><template #icon><icon-undo /></template>{{ t("回退内置版本") }}</a-button>
           </div>
           </div>
         </section>
@@ -773,30 +790,30 @@ onUnmounted(() => unlistenEvents?.());
       <template v-else-if="page === 'vision'">
         <section v-if="!snapshot?.running" class="vision-offline-card">
           <span class="vision-offline-icon"><icon-image /></span>
-          <h2>启动服务后配置图片模型</h2>
-          <p>模型列表来自当前运行中的 OpenCodex。启动后可选择需要通过图片描述器兼容的模型。</p>
-          <a-button type="primary" :disabled="busy || !snapshot?.initialized" @click="run('start')"><template #icon><icon-play-arrow /></template>启动 OpenCodex</a-button>
+          <h2>{{ t("启动服务后配置图片模型") }}</h2>
+          <p>{{ t("模型列表来自当前运行中的 OpenCodex。启动后可选择需要通过图片描述器兼容的模型。") }}</p>
+          <a-button type="primary" :disabled="busy || !snapshot?.initialized" @click="run('start')"><template #icon><icon-play-arrow /></template>{{ t("启动 OpenCodex") }}</a-button>
         </section>
         <section v-else class="vision-manager-card">
           <div class="vision-manager-header">
             <div>
               <span class="vision-kicker">VISION SIDECAR</span>
-              <h2>图片输入兼容</h2>
-              <p>为本身不识图的模型开启图片粘贴。OpenCodex 会先用图片模型生成描述，再交给所选模型处理。</p>
+              <h2>{{ t("图片输入兼容") }}</h2>
+              <p>{{ t("为本身不识图的模型开启图片粘贴。OpenCodex 会先用图片模型生成描述，再交给所选模型处理。") }}</p>
             </div>
             <div class="vision-sidecar-summary">
-              <small>图片描述模型</small>
-              <strong>{{ visionCatalog?.sidecarModel || 'OpenCodex 默认模型' }}</strong>
-              <span>{{ visionCatalog?.sidecarBackend || '自动选择后端' }}</span>
+              <small>{{ t("图片描述模型") }}</small>
+              <strong>{{ visionCatalog?.sidecarModel || t('OpenCodex 默认模型') }}</strong>
+              <span>{{ visionCatalog?.sidecarBackend || t('自动选择后端') }}</span>
             </div>
           </div>
           <div class="vision-toolbar">
-            <a-input v-model="visionSearch" allow-clear placeholder="搜索 Provider 或模型名称"><template #prefix><icon-search /></template></a-input>
-            <a-button :loading="visionLoading" @click="loadVisionModels"><template #icon><icon-refresh /></template>读取当前模型</a-button>
-            <a-button :disabled="!sidecarSelectableModels.length" @click="selectFilteredVisionModels">选择当前结果</a-button>
-            <a-button :disabled="!selectedVisionCount" @click="clearVisionModels">清空选择</a-button>
+            <a-input v-model="visionSearch" allow-clear :placeholder="t('搜索 Provider 或模型名称')"><template #prefix><icon-search /></template></a-input>
+            <a-button :loading="visionLoading" @click="loadVisionModels"><template #icon><icon-refresh /></template>{{ t("读取当前模型") }}</a-button>
+            <a-button :disabled="!sidecarSelectableModels.length" @click="selectFilteredVisionModels">{{ t("选择当前结果") }}</a-button>
+            <a-button :disabled="!selectedVisionCount" @click="clearVisionModels">{{ t("清空选择") }}</a-button>
           </div>
-          <a-spin :loading="visionLoading" tip="正在读取 OpenCodex 当前模型…">
+          <a-spin :loading="visionLoading" :tip="t('正在读取 OpenCodex 当前模型…')">
             <div v-if="filteredVisionModels.length" class="vision-model-list">
               <article
                 v-for="model in filteredVisionModels"
@@ -813,16 +830,16 @@ onUnmounted(() => unlistenEvents?.());
                 />
                 <span v-else class="vision-native-check"><icon-check /></span>
                 <span class="vision-model-identity"><strong>{{ model.id }}</strong><small>{{ model.provider }}</small></span>
-                <span v-if="model.nativeVision" class="vision-mode-pill native">原生支持图片</span>
-                <span v-else-if="model.disabled" class="vision-mode-pill disabled">模型已禁用</span>
-                <span v-else :class="['vision-mode-pill', selectedVisionModels.includes(model.namespaced) ? 'sidecar' : 'text']">{{ selectedVisionModels.includes(model.namespaced) ? '图片转文字' : '仅文本' }}</span>
+                <span v-if="model.nativeVision" class="vision-mode-pill native">{{ t("原生支持图片") }}</span>
+                <span v-else-if="model.disabled" class="vision-mode-pill disabled">{{ t("模型已禁用") }}</span>
+                <span v-else :class="['vision-mode-pill', selectedVisionModels.includes(model.namespaced) ? 'sidecar' : 'text']">{{ t(selectedVisionModels.includes(model.namespaced) ? '图片转文字' : '仅文本') }}</span>
               </article>
             </div>
-            <a-empty v-else description="没有匹配的模型" />
+            <a-empty v-else :description="t('没有匹配的模型')" />
           </a-spin>
           <footer class="vision-save-bar">
-            <div><strong>已选择 {{ selectedVisionCount }} 个兼容模型</strong><span>保存会自动重启 OpenCodex 并同步 Codex 模型目录</span></div>
-            <a-button type="primary" size="large" :loading="visionSaving" :disabled="visionLoading" @click="saveVisionModels"><template #icon><icon-save /></template>保存并同步</a-button>
+            <div><strong>{{ t("已选择") }} {{ selectedVisionCount }} {{ t("个兼容模型") }}</strong><span>{{ t("保存会自动重启 OpenCodex 并同步 Codex 模型目录") }}</span></div>
+            <a-button type="primary" size="large" :loading="visionSaving" :disabled="visionLoading" @click="saveVisionModels"><template #icon><icon-save /></template>{{ t("保存并同步") }}</a-button>
           </footer>
         </section>
       </template>
@@ -830,33 +847,33 @@ onUnmounted(() => unlistenEvents?.());
       <template v-else-if="page === 'logs'">
         <section class="logs-card">
           <div class="section-heading">
-            <div><h2>运行日志</h2><p>最多保留并展示最近 1000 条脱敏输出</p></div>
-            <div><a-button size="small" @click="refreshSnapshot()"><template #icon><icon-refresh /></template>刷新状态</a-button><a-button size="small" @click="logs = []"><template #icon><icon-delete /></template>清空显示</a-button></div>
+            <div><h2>{{ t("运行日志") }}</h2><p>{{ t("最多保留并展示最近 1000 条脱敏输出") }}</p></div>
+            <div><a-button size="small" @click="refreshSnapshot()"><template #icon><icon-refresh /></template>{{ t("刷新状态") }}</a-button><a-button size="small" @click="logs = []"><template #icon><icon-delete /></template>{{ t("清空显示") }}</a-button></div>
           </div>
           <div class="console-output full-log">
-            <div v-if="!logs.length" class="console-empty">暂无日志</div>
+            <div v-if="!logs.length" class="console-empty">{{ t("暂无日志") }}</div>
             <div v-for="(entry, index) in logs" :key="`${entry.operationId}-${index}`" :class="['console-line', entry.stream]"><time>{{ formatLogTime(entry.timestamp) }}</time><span>{{ entry.line }}</span></div>
           </div>
-          <form v-if="interactiveOperationId" class="interactive-input" @submit.prevent="submitCommandInput"><a-input v-model="commandInput" placeholder="输入初始化向导答案" /><a-button html-type="submit" type="primary">发送</a-button></form>
+          <form v-if="interactiveOperationId" class="interactive-input" @submit.prevent="submitCommandInput"><a-input v-model="commandInput" :placeholder="t('输入初始化向导答案')" /><a-button html-type="submit" type="primary">{{ t("发送") }}</a-button></form>
         </section>
       </template>
 
       <template v-else>
         <section class="settings-grid">
           <article class="settings-card">
-            <div class="section-heading"><div><h2>服务设置</h2><p>管理监听端口和 Dashboard 打开方式</p></div></div>
+            <div class="section-heading"><div><h2>{{ t("服务设置") }}</h2><p>{{ t("管理监听端口和 Dashboard 打开方式") }}</p></div></div>
             <a-form :model="settings" layout="vertical">
-              <a-form-item label="服务端口"><a-input-number v-model="settings.port" :min="1024" :max="65535" /></a-form-item>
-              <a-form-item label="默认打开方式"><a-radio-group v-model="settings.dashboardOpenMode" type="button"><a-radio value="client">客户端窗口</a-radio><a-radio value="browser">系统浏览器</a-radio></a-radio-group></a-form-item>
-              <a-button type="primary" @click="saveSettings"><template #icon><icon-save /></template>保存设置</a-button>
+              <a-form-item :label="t('服务端口')"><a-input-number v-model="settings.port" :min="1024" :max="65535" /></a-form-item>
+              <a-form-item :label="t('默认打开方式')"><a-radio-group v-model="settings.dashboardOpenMode" type="button"><a-radio value="client">{{ t("客户端窗口") }}</a-radio><a-radio value="browser">{{ t("系统浏览器") }}</a-radio></a-radio-group></a-form-item>
+              <a-button type="primary" @click="saveSettings"><template #icon><icon-save /></template>{{ t("保存设置") }}</a-button>
             </a-form>
           </article>
           <article class="settings-card">
-            <div class="section-heading"><div><h2>Switcher 账号迁移</h2><p>读取当前 Switcher 账号并转换为 OpenCodex OAuth 账号</p></div><a-button size="small" :loading="accountScanLoading" @click="scanAccounts"><template #icon><icon-search /></template>扫描</a-button></div>
+            <div class="section-heading"><div><h2>{{ t("Switcher 账号迁移") }}</h2><p>{{ t("读取当前 Switcher 账号并转换为 OpenCodex OAuth 账号") }}</p></div><a-button size="small" :loading="accountScanLoading" @click="scanAccounts"><template #icon><icon-search /></template>{{ t("扫描") }}</a-button></div>
             <div v-if="accountScan" class="scan-summary">
-              <span>发现 <strong>{{ accountScan.totalCount }}</strong> 个账号</span>
-              <span class="scan-ready">可导入 <strong>{{ accountScan.eligibleCount }}</strong> 个</span>
-              <span>已选择 <strong>{{ selectedAccountIds.length }}</strong> 个</span>
+              <span>{{ t("发现") }} <strong>{{ accountScan.totalCount }}</strong> {{ t("个账号") }}</span>
+              <span class="scan-ready">{{ t("可导入") }} <strong>{{ accountScan.eligibleCount }}</strong> {{ t("个") }}</span>
+              <span>{{ t("已选择") }} <strong>{{ selectedAccountIds.length }}</strong> {{ t("个") }}</span>
             </div>
             <div v-if="accountScan?.accounts.length" class="migration-list">
               <article
@@ -887,43 +904,43 @@ onUnmounted(() => unlistenEvents?.());
                 <span class="migration-identity">
                   <span class="migration-account-title">
                     <strong :title="account.email || account.sourceId">{{ account.email || account.sourceId }}</strong>
-                    <span v-if="account.current" class="migration-current-pill">当前</span>
+                    <span v-if="account.current" class="migration-current-pill">{{ t("当前") }}</span>
                     <span v-if="account.plan" class="migration-plan-pill">{{ account.plan }}</span>
                   </span>
-                  <small>账号 ID：{{ shortSourceId(account.sourceId) }}</small>
-                  <span class="migration-reason">{{ account.reason }}</span>
+                  <small>{{ t("账号 ID：") }}{{ shortSourceId(account.sourceId) }}</small>
+                  <span class="migration-reason">{{ t(account.reason) }}</span>
                 </span>
                 <span class="migration-card-actions">
                   <span :class="['migration-status-pill', account.status]">
                     {{ accountStatusLabel(account.status) }}
                   </span>
-                  <a-tooltip v-if="account.deletable" content="从 OpenCodex 删除，保留 Switcher 原账号">
+                  <a-tooltip v-if="account.deletable" :content="t('从 OpenCodex 删除，保留 Switcher 原账号')">
                     <a-button
                       class="migration-delete-button"
                       size="mini"
                       status="danger"
                       :loading="deletingAccountId === account.sourceId"
                       :disabled="Boolean(deletingAccountId) || snapshot?.running"
-                      aria-label="删除 OpenCodex 账号"
+                      :aria-label="t('删除 OpenCodex 账号')"
                       @click.stop="confirmDeleteMigratedAccount(account)"
                       @keydown.stop
                     >
                       <template #icon><icon-delete /></template>
-                      删除
+                      {{ t("删除") }}
                     </a-button>
                   </a-tooltip>
                 </span>
               </article>
             </div>
             <div v-if="accountScan" class="migration-batch-actions">
-              <a-button type="primary" :loading="importingAccounts" :disabled="!selectedImportAccountIds.length || snapshot?.running" @click="importAccounts"><template #icon><icon-import /></template>导入所选（{{ selectedImportAccountIds.length }}）</a-button>
-              <a-button status="danger" :loading="deletingAccountId === '__selected__'" :disabled="!selectedDeleteAccounts.length || Boolean(deletingAccountId) || snapshot?.running" @click="confirmDeleteSelectedAccounts"><template #icon><icon-delete /></template>删除所选（{{ selectedDeleteAccounts.length }}）</a-button>
+              <a-button type="primary" :loading="importingAccounts" :disabled="!selectedImportAccountIds.length || snapshot?.running" @click="importAccounts"><template #icon><icon-import /></template>{{ t("导入所选") }}（{{ selectedImportAccountIds.length }}）</a-button>
+              <a-button status="danger" :loading="deletingAccountId === '__selected__'" :disabled="!selectedDeleteAccounts.length || Boolean(deletingAccountId) || snapshot?.running" @click="confirmDeleteSelectedAccounts"><template #icon><icon-delete /></template>{{ t("删除所选") }}（{{ selectedDeleteAccounts.length }}）</a-button>
             </div>
-            <a-alert v-if="snapshot?.running" type="warning" show-icon>导入前请先停止 OpenCodex 服务，避免配置被运行中的 Engine 覆盖。</a-alert>
+            <a-alert v-if="snapshot?.running" type="warning" show-icon>{{ t("导入前请先停止 OpenCodex 服务，避免配置被运行中的 Engine 覆盖。") }}</a-alert>
           </article>
           <article class="settings-card danger-card">
-            <div class="section-heading"><div><h2>维护与恢复</h2><p>执行前请确认当前没有正在处理的请求</p></div></div>
-            <div class="danger-actions"><a-button status="warning" :disabled="busy || !snapshot?.initialized" @click="run('restore')"><template #icon><icon-undo /></template>恢复原生 Codex</a-button><a-button status="danger" :disabled="busy" @click="run('uninstall')"><template #icon><icon-delete /></template>卸载 OpenCodex</a-button></div>
+            <div class="section-heading"><div><h2>{{ t("维护与恢复") }}</h2><p>{{ t("执行前请确认当前没有正在处理的请求") }}</p></div></div>
+            <div class="danger-actions"><a-button status="warning" :disabled="busy || !snapshot?.initialized" @click="run('restore')"><template #icon><icon-undo /></template>{{ t("恢复原生 Codex") }}</a-button><a-button status="danger" :disabled="busy" @click="run('uninstall')"><template #icon><icon-delete /></template>{{ t("卸载 OpenCodex") }}</a-button></div>
           </article>
         </section>
       </template>
@@ -932,11 +949,11 @@ onUnmounted(() => unlistenEvents?.());
     <InstancePickerModal
       v-model:visible="instancePickerVisible"
       :instances="instances"
-      :title="pendingInstanceAction === 'restore' ? '选择要恢复的实例' : '选择要同步的实例'"
+      :title="t(pendingInstanceAction === 'restore' ? '选择要恢复的实例' : '选择要同步的实例')"
       :description="pendingInstanceAction === 'restore'
-        ? 'OpenCodex 将只恢复所选实例的原生 Codex 配置。'
-        : 'OpenCodex 将只向所选实例同步配置与模型。'"
-      :confirm-text="pendingInstanceAction === 'restore' ? '恢复所选实例' : '同步所选实例'"
+        ? t('OpenCodex 将只恢复所选实例的原生 Codex 配置。')
+        : t('OpenCodex 将只向所选实例同步配置与模型。')"
+      :confirm-text="t(pendingInstanceAction === 'restore' ? '恢复所选实例' : '同步所选实例')"
       @confirm="confirmInstanceAction"
     />
   </section>

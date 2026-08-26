@@ -10,26 +10,36 @@
   </p>
 </div>
 
-Codex Switcher 將多個 Codex 登入設定集中在一個桌面應用程式中。它可以切換目前帳號、將選取的驗證資訊寫回本機 Codex 設定，並提供額度監控、工作階段復原、本機 Token 用量統計與費用預估。
+Codex Switcher 將多個 Codex 登入設定集中在一個桌面應用程式中。它可以切換目前帳號、隔離執行多個 Codex 桌面執行個體、修復本機工作階段、管理 OpenCodex 與 CLIProxyAPI，並提供額度監控、本機 Token 用量統計與費用預估。
 
 ## 應用程式畫面
 
-### 帳號總覽
-
-![已開啟隱私模式的帳號總覽](doc/assets/screenshots/accounts-overview.jpg)
-
-### 用量儀表板
-
-![本機 Token 用量與預估費用儀表板](doc/assets/screenshots/usage-dashboard.jpg)
+<table>
+  <tr>
+    <td width="50%"><strong>帳號總覽與額度監控</strong><br><img src="doc/assets/screenshots/accounts-overview.jpg" alt="已開啟隱私模式的帳號總覽"></td>
+    <td width="50%"><strong>Token 用量與費用預估</strong><br><img src="doc/assets/screenshots/usage-dashboard.jpg" alt="本機 Token 用量與預估費用儀表板"></td>
+  </tr>
+  <tr>
+    <td width="50%"><strong>工作階段內容、附件與修復</strong><br><img src="doc/assets/screenshots/session-content-repair.jpg" alt="包含已復原圖片附件的 Codex 工作階段內容"></td>
+    <td width="50%"><strong>Codex 桌面多開執行個體</strong><br><img src="doc/assets/screenshots/codex-instances.jpg" alt="Codex 多開執行個體管理"></td>
+  </tr>
+  <tr>
+    <td width="50%"><strong>OpenCodex 執行控制台</strong><br><img src="doc/assets/screenshots/opencodex-console.jpg" alt="OpenCodex 服務與 Engine 控制台"></td>
+    <td width="50%"><strong>OpenCodex Web 管理</strong><br><img src="doc/assets/screenshots/opencodex-web.jpg" alt="OpenCodex Web Dashboard 啟動頁"></td>
+  </tr>
+</table>
 
 ## 主要功能
 
-- **OAuth 與 API Key 帳號**：新增、編輯、匯入、匯出、篩選、排序及切換多個帳號。
-- **額度監控**：檢視帳號可用狀態、訂閱有效期限、標準額度週期，以及可選的 GPT 5.3 Codex Spark 額度週期。
-- **工作階段工具**：管理、修復、備份與復原本機 Codex 工作階段。
-- **使用統計**：彙整本機 Token、快取、模型分布及預估費用，並支援自訂模型計價規則。
-- **CLIProxyAPI 整合**：安裝、更新、執行及設定內建 API 服務，並將選取的帳號綁定至服務。
-- **隱私控制**：在介面中隱藏帳號識別資訊，應用程式資料預設保存在本機。
+- **OAuth 與 API Key 帳號**：新增、編輯、匯入、匯出、篩選、排序、重新整理及切換多個帳號。
+- **額度監控與重設**：檢視可用狀態、訂閱有效期限、額度週期、GPT 5.3 Codex Spark 額度、重設紀錄與預約重設。
+- **工作階段管理與修復**：搜尋專案及訊息內容，預覽 Markdown 與附件，刪除單一訊息或完整輪次，備份、復原、修復可見性並恢復遭截斷的工作階段。
+- **Codex 桌面多開（macOS）**：為官方桌面 App 隔離 `CODEX_HOME` 與 Electron 資料，並將帳號切換、工作階段、設定及 OpenCodex 操作導向所選執行個體。
+- **OpenCodex Manager**：初始化及控制代理、管理 Engine 版本、開啟 Web Dashboard、同步模型、設定圖片輸入相容性、匯入 Switcher 帳號、檢視日誌並還原原生 Codex。
+- **使用統計**：彙整本機 Token、快取、模型及來源分布、預估費用，並支援自訂模型計價規則。
+- **CLIProxyAPI 整合**：安裝、更新、執行、設定及管理內建 CPA API 服務版本，並綁定選取的帳號。
+- **設定與備份**：驗證並編輯 `auth.json` 和 `config.toml`、自動備份原始檔案、建立 ZIP 完整備份及復原歷史資料。
+- **本機優先隱私**：隱藏帳號識別資訊、自動遮蔽 OpenCodex 日誌憑證，應用程式資料預設保存在本機。
 - **四種介面語言**：English、简体中文、繁體中文（台灣）與 Русский。
 
 ## 內建 CPA API 服務
@@ -42,6 +52,17 @@ Codex Switcher 將多個 Codex 登入設定集中在一個桌面應用程式中�
 - **版本管理**：檢查官方版本、匯入可信的本機安裝套件、檢視已安裝版本、切換目前版本及刪除非目前版本。
 - **安全切換**：CPA 執行中切換版本時會自動重新啟動；若新版本無法啟動，Codex Switcher 會還原原本的版本。
 - **本機工作區**：執行環境、設定、驗證檔案及下載快取統一保存在 `~/.codex_switcher/api-service`。
+
+## OpenCodex Manager
+
+「OpenCodex」頁面將本機 [OpenCodex](https://github.com/lidge-jun/opencodex) 代理及其 Engine 生命週期整合至 Codex Switcher。
+
+- **執行控制台**：在同一頁完成初始化、啟動、停止、重新啟動、環境診斷、設定同步、健康檢查及遮蔽敏感資訊的日誌檢視。
+- **Engine 生命週期**：偵測穩定版與預覽版、安裝或切換本機版本、刪除非目前版本，並可安全回復至用戶端內建基準版本。
+- **Codex 整合**：向所選 Codex 執行個體同步設定與模型目錄，也可停止代理並還原該執行個體的原生設定。
+- **Web Dashboard**：可在獨立用戶端視窗或系統瀏覽器中開啟 OpenCodex 管理頁面。
+- **圖片輸入相容性**：為純文字模型選擇圖片描述 Sidecar，儲存後自動重新啟動 OpenCodex 並同步模型目錄。
+- **帳號移轉與背景服務**：匯入相容的 Switcher OAuth 帳號，並可將 OpenCodex 註冊為登入後自動執行的背景服務。
 
 ## 安裝
 
@@ -68,6 +89,14 @@ sudo xattr -rd com.apple.quarantine "/Applications/Codex Switcher.app"
 2. 手動重新整理帳號，讀取最新額度或餘額。
 3. 選取帳號並切換，Codex Switcher 會更新本機 Codex 的驗證與設定檔案。
 4. 透過「工作階段管理」、「使用統計」或「API 服務」進行工作階段復原、統計分析與 CLIProxyAPI 管理。
+
+### macOS 多開 Codex 桌面執行個體
+
+進入「Codex 多開」並新增執行個體，可設定 Codex Home、桌面資料目錄、啟動工作區及官方 App；資料路徑留空時會自動產生於 `~/.codex_switcher/instances`。啟動前會檢查官方 App 是否支援獨立桌面資料目錄。永久刪除受管理的執行個體時，應用程式會先停止該執行個體，再刪除其 Codex Home、Electron 資料、工作階段垃圾桶與可確認歸屬的備份；工作區、官方 App、系統預設執行個體及其他執行個體都受到保護。
+
+存在多個執行個體時，帳號切換與重新啟動、OpenCodex 同步或還原都會先要求選擇目標。工作階段可依執行個體瀏覽、管理及複製；設定頁也能切換目前執行個體，檢視或編輯其 Codex 路徑、`auth.json` 與 `config.toml`。
+
+預設完整備份只包含官方預設執行個體的工作階段，不會納入受管理的多開資料。多開執行個體需在「工作階段管理」切換至對應執行個體後手動備份。
 
 ## 本機資料與隱私
 
