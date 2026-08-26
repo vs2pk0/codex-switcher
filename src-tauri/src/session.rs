@@ -928,6 +928,10 @@ impl SessionStore {
         if session_has_open_turn(source_path)? {
             return Err("源会话仍在生成或写入内容，请等待当前对话结束后再复制".to_string());
         }
+        let source_history_mode = rollout_history_mode(source_path);
+        let target_session_paths_before_fork = collect_jsonl_files(&target_store.sessions_dir())?
+            .into_iter()
+            .collect::<HashSet<_>>();
 
         let target_provider = target_store.read_target_provider()?;
         let staged = target_store.stage_fork_source(
@@ -943,14 +947,8 @@ impl SessionStore {
             &target_project_path,
             &target_provider,
         );
-        let (fork, staging_cleanup_warning) = match fork_result {
-            Ok(fork) => {
-                let warning = target_store
-                    .archive_staged_fork_source(&staged)
-                    .err()
-                    .map(|error| format!("隐藏副本历史底稿失败: {error}"));
-                (fork, warning)
-            }
+        let fork = match fork_result {
+            Ok(fork) => fork,
             Err(fork_error) => match target_store.cleanup_staged_fork_source(&staged) {
                 Ok(()) => return Err(fork_error),
                 Err(cleanup_error) => {
@@ -960,26 +958,52 @@ impl SessionStore {
                 }
             },
         };
-        if fork.session_id == source.id {
-            return Err("Codex 返回了源会话 ID，未能创建独立副本".to_string());
-        }
-        if fork.history_mode != "paginated" {
-            return Err(format!(
-                "Codex 创建的副本不是分页会话（history_mode={}），为避免生成无法恢复的会话，本次操作已停止",
-                fork.history_mode
-            ));
-        }
-        if !same_existing_directory(&fork.project_path, &target_project_path) {
-            return Err(format!(
-                "Codex 创建的副本未归属目标目录（实际目录: {}），本次操作未完成",
-                fork.project_path
+        let (validation, should_cleanup_created_fork) =
+            if fork.session_id == source.id || fork.session_id == staged.session.id {
+                (
+                    Err("Codex 返回了已有会话 ID，未能创建独立副本".to_string()),
+                    false,
+                )
+            } else if !fork_history_modes_are_compatible(source_history_mode, &fork.history_mode) {
+                (
+                    Err(format!(
+                        "Codex 创建的副本历史模式不兼容（源会话: {source_history_mode}，副本: {}）",
+                        fork.history_mode
+                    )),
+                    true,
+                )
+            } else if !same_existing_directory(&fork.project_path, &target_project_path) {
+                (
+                    Err(format!(
+                        "Codex 创建的副本未归属目标目录（实际目录: {}），本次操作未完成",
+                        fork.project_path
+                    )),
+                    true,
+                )
+            } else {
+                (Ok(()), false)
+            };
+        if let Err(validation_error) = validation {
+            let cleanup_fork_error = should_cleanup_created_fork
+                .then(|| {
+                    target_store
+                        .cleanup_created_fork(&fork.session_id, &target_session_paths_before_fork)
+                        .err()
+                })
+                .flatten();
+            let cleanup_staged_error = target_store.cleanup_staged_fork_source(&staged).err();
+            return Err(format_copy_validation_failure(
+                &validation_error,
+                should_cleanup_created_fork,
+                cleanup_fork_error.as_deref(),
+                cleanup_staged_error.as_deref(),
             ));
         }
 
         let title = copied_session_title(&source.title, copy_suffix);
         let mut warnings = Vec::new();
-        if let Some(warning) = staging_cleanup_warning {
-            warnings.push(warning);
+        if let Err(error) = target_store.archive_staged_fork_source(&staged) {
+            warnings.push(format!("隐藏副本历史底稿失败: {error}"));
         }
         if let Err(error) = target_store.write_session_title(&fork.session_id, &title) {
             warnings.push(error);
@@ -1119,6 +1143,45 @@ impl SessionStore {
                     staged.path.display()
                 ));
             }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("；"))
+        }
+    }
+
+    fn cleanup_created_fork(
+        &self,
+        session_id: &str,
+        session_paths_before_fork: &HashSet<PathBuf>,
+    ) -> Result<(), String> {
+        let path = self
+            .find_session_path(session_id)
+            .map_err(|error| format!("无法确认未通过校验的副本文件，已停止自动回滚: {error}"))?;
+        if session_paths_before_fork.contains(&path) {
+            return Err(format!(
+                "副本 ID 指向复制前已存在的会话，已停止自动回滚: {}",
+                path.display()
+            ));
+        }
+
+        let mut failures = Vec::new();
+        for db_path in self.staged_thread_cleanup_db_paths() {
+            if let Err(error) = remove_staged_thread_rows(&db_path, session_id) {
+                failures.push(error);
+            }
+        }
+        if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                failures.push(format!(
+                    "删除未通过校验的副本失败 ({}): {error}",
+                    path.display()
+                ));
+            }
+        }
+        if let Err(error) = self.remove_session_index_entries(&[session_id.to_string()]) {
+            failures.push(error);
         }
         if failures.is_empty() {
             Ok(())
@@ -5696,6 +5759,29 @@ struct ForkSourceSegment {
     end_byte_offset: Option<u64>,
 }
 
+fn fork_history_modes_are_compatible(source_mode: &str, fork_mode: &str) -> bool {
+    fork_mode == "paginated" || (source_mode == "legacy" && fork_mode == "legacy")
+}
+
+fn format_copy_validation_failure(
+    validation_error: &str,
+    rollback_attempted: bool,
+    cleanup_fork_error: Option<&str>,
+    cleanup_staged_error: Option<&str>,
+) -> String {
+    let mut message = validation_error.to_string();
+    if rollback_attempted {
+        match cleanup_fork_error {
+            Some(error) => message.push_str(&format!("；回滚新建副本失败: {error}")),
+            None => message.push_str("，本次新建副本已回滚"),
+        }
+    }
+    if let Some(error) = cleanup_staged_error {
+        message.push_str(&format!("；清理临时复制数据失败: {error}"));
+    }
+    message
+}
+
 fn create_staged_fork_rollout(
     source_codex_home: &Path,
     source_path: &Path,
@@ -7451,7 +7537,8 @@ fn now_timestamp() -> i64 {
 mod tests {
     use super::{
         archive_staged_thread_row, copy_history_onto_target, create_staged_fork_rollout,
-        extract_title, find_task_started_offsets_reverse, normalize_copy_target_directory,
+        extract_title, find_task_started_offsets_reverse, fork_history_modes_are_compatible,
+        format_copy_validation_failure, normalize_copy_target_directory,
         parse_codex_thread_fork_response, remove_staged_thread_rows, repair_sqlite_db,
         restore_session_file_if_unchanged, same_existing_directory, session_file_fingerprint,
         sql_quote, SessionRepairRecord, SessionStore,
@@ -7526,6 +7613,141 @@ mod tests {
             parse_codex_thread_fork_response(&json!({ "id": 2, "result": {} }))
                 .expect_err("missing id should fail")
                 .contains("新会话 ID")
+        );
+    }
+
+    #[test]
+    fn imported_legacy_history_accepts_a_legacy_fork_but_paginated_history_does_not() {
+        assert!(fork_history_modes_are_compatible("legacy", "legacy"));
+        assert!(fork_history_modes_are_compatible("legacy", "paginated"));
+        assert!(fork_history_modes_are_compatible("paginated", "paginated"));
+        assert!(!fork_history_modes_are_compatible("paginated", "legacy"));
+        assert!(!fork_history_modes_are_compatible("legacy", "unknown"));
+    }
+
+    #[test]
+    fn failed_fork_validation_reports_whether_the_new_copy_was_rolled_back() {
+        assert_eq!(
+            format_copy_validation_failure("模式错误", true, None, None),
+            "模式错误，本次新建副本已回滚"
+        );
+        let incomplete = format_copy_validation_failure(
+            "模式错误",
+            true,
+            Some("文件仍被占用"),
+            Some("临时索引仍被占用"),
+        );
+        assert!(incomplete.contains("回滚新建副本失败: 文件仍被占用"));
+        assert!(incomplete.contains("清理临时复制数据失败: 临时索引仍被占用"));
+        assert!(!incomplete.contains("已回滚"));
+        assert_eq!(
+            format_copy_validation_failure("ID 重复", false, None, None),
+            "ID 重复"
+        );
+    }
+
+    #[test]
+    fn failed_fork_validation_removes_the_new_file_and_index_rows() {
+        let codex = tempdir().expect("codex home");
+        let sessions_dir = codex.path().join("sessions/2026/08/26");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory");
+        let session_id = "01a03be2-4a51-7df1-82a0-396038f1b0c8";
+        let session_path = sessions_dir.join(format!("rollout-{session_id}.jsonl"));
+        fs::write(
+            &session_path,
+            format!(
+                "{}\n",
+                json!({"type":"session_meta","payload":{"id":session_id}})
+            ),
+        )
+        .expect("fork rollout");
+        let state_db = codex.path().join("state_5.sqlite");
+        run_sqlite_test(
+            &state_db,
+            &format!(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY);\
+                 CREATE TABLE local_thread_catalog (thread_id TEXT PRIMARY KEY);\
+                 INSERT INTO threads VALUES ('{session_id}');\
+                 INSERT INTO local_thread_catalog VALUES ('{session_id}');"
+            ),
+        );
+        let history_db = codex.path().join("thread_history_1.sqlite");
+        run_sqlite_test(
+            &history_db,
+            &format!(
+                "CREATE TABLE thread_items (thread_id TEXT, item_id TEXT);\
+                 CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT);\
+                 CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY);\
+                 INSERT INTO thread_items VALUES ('{session_id}', 'item');\
+                 INSERT INTO thread_turns VALUES ('{session_id}', 'turn');\
+                 INSERT INTO thread_history_projection_state VALUES ('{session_id}');"
+            ),
+        );
+
+        let store = SessionStore::new(codex.path().to_path_buf());
+        store
+            .cleanup_created_fork(session_id, &HashSet::new())
+            .expect("rollback invalid fork");
+
+        assert!(!session_path.exists());
+        assert_eq!(
+            run_sqlite_test_output(
+                &state_db,
+                &format!("SELECT COUNT(*) FROM threads WHERE id = '{session_id}';")
+            )
+            .trim(),
+            "0"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &history_db,
+                &format!(
+                    "SELECT COUNT(*) FROM thread_history_projection_state WHERE thread_id = '{session_id}';"
+                )
+            )
+            .trim(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn failed_fork_validation_never_removes_a_preexisting_session() {
+        let codex = tempdir().expect("codex home");
+        let sessions_dir = codex.path().join("sessions/2026/08/26");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory");
+        let session_id = "01a03be2-4a51-7df1-82a0-396038f1b0c8";
+        let session_path = sessions_dir.join(format!("rollout-{session_id}.jsonl"));
+        fs::write(
+            &session_path,
+            format!(
+                "{}\n",
+                json!({"type":"session_meta","payload":{"id":session_id}})
+            ),
+        )
+        .expect("preexisting rollout");
+        let state_db = codex.path().join("state_5.sqlite");
+        run_sqlite_test(
+            &state_db,
+            &format!(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY);\
+                 INSERT INTO threads VALUES ('{session_id}');"
+            ),
+        );
+
+        let store = SessionStore::new(codex.path().to_path_buf());
+        let error = store
+            .cleanup_created_fork(session_id, &HashSet::from([session_path.clone()]))
+            .expect_err("preexisting session must not be rolled back");
+
+        assert!(error.contains("复制前已存在"));
+        assert!(session_path.exists());
+        assert_eq!(
+            run_sqlite_test_output(
+                &state_db,
+                &format!("SELECT COUNT(*) FROM threads WHERE id = '{session_id}';")
+            )
+            .trim(),
+            "1"
         );
     }
 
