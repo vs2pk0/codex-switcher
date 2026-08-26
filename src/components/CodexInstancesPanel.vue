@@ -13,6 +13,7 @@ import {
   type CodexInstance,
 } from "../services/instances";
 import { openPathInFileManager } from "../services/session";
+import { formatTranslatedText, t } from "../i18n";
 
 const emit = defineEmits<{ (event: "instances-updated", instances: CodexInstance[]): void }>();
 const instances = ref<CodexInstance[]>([]);
@@ -39,7 +40,7 @@ async function refresh(): Promise<void> {
     instances.value = await listCodexInstances();
     emit("instances-updated", instances.value);
   } catch (error) {
-    Message.error(`读取实例失败：${errorText(error)}`);
+    Message.error(formatTranslatedText("读取实例失败：{error}", { error: errorText(error) }));
   } finally {
     loading.value = false;
   }
@@ -50,7 +51,7 @@ function createInstance(): void {
     || "/Applications/ChatGPT.app";
   Object.assign(form, {
     id: "",
-    name: `多开实例 ${Math.max(1, instances.value.length)}`,
+    name: formatTranslatedText("多开实例 {count}", { count: Math.max(1, instances.value.length) }),
     codexHome: "",
     electronData: "",
     appPath: defaultAppPath,
@@ -94,9 +95,9 @@ async function save(): Promise<void> {
     });
     editorVisible.value = false;
     await refresh();
-    Message.success(form.id ? "实例配置已保存" : "多开实例已创建");
+    Message.success(t(form.id ? "实例配置已保存" : "多开实例已创建"));
   } catch (error) {
-    Message.error(`保存实例失败：${errorText(error)}`);
+    Message.error(formatTranslatedText("保存实例失败：{error}", { error: errorText(error) }));
   } finally {
     saving.value = false;
   }
@@ -110,9 +111,12 @@ async function runAction(instance: CodexInstance, action: "launch" | "stop" | "r
     if (action === "stop") await stopCodexInstance(instance.id);
     if (action === "restart") await restartCodexInstance(instance.id);
     await refresh();
-    Message.success(`${instanceDisplayName(instance)}已${action === "launch" ? "启动" : action === "stop" ? "停止" : "重启"}`);
+    Message.success(formatTranslatedText("{name} 已{action}", {
+      name: t(instanceDisplayName(instance)),
+      action: t(action === "launch" ? "启动" : action === "stop" ? "停止" : "重启"),
+    }));
   } catch (error) {
-    Message.error(`实例操作失败：${errorText(error)}`);
+    Message.error(formatTranslatedText("实例操作失败：{error}", { error: errorText(error) }));
   } finally {
     workingId.value = "";
   }
@@ -120,18 +124,20 @@ async function runAction(instance: CodexInstance, action: "launch" | "stop" | "r
 
 function confirmDelete(instance: CodexInstance): void {
   Modal.warning({
-    title: "永久删除多开实例",
+    title: t("永久删除多开实例"),
     content: () => h("div", { style: { display: "grid", gap: "10px" } }, [
-      h("p", { style: { margin: 0 } }, `确认永久删除“${instance.name}”及其全部实例数据？`),
+      h("p", { style: { margin: 0 } }, formatTranslatedText("确认永久删除“{name}”及其全部实例数据？", { name: instance.name })),
       h("div", { style: { display: "grid", gap: "6px" } }, [
         h("div", [h("strong", "Codex Home："), h("code", { style: { wordBreak: "break-all" } }, instance.codexHome)]),
-        h("div", [h("strong", "桌面数据："), h("code", { style: { wordBreak: "break-all" } }, instance.electronData)]),
+        h("div", [h("strong", t("桌面数据：")), h("code", { style: { wordBreak: "break-all" } }, instance.electronData)]),
       ]),
-      h("p", { style: { margin: 0 } }, `同时清理该实例的托管目录、会话回收站、配置备份和可确认归属的手动会话备份。${instance.running ? "实例当前正在运行，将先自动停止。" : ""}`),
-      h("p", { style: { margin: 0, color: "#ef4444", fontWeight: 600 } }, `工作区${instance.workspace ? `（${instance.workspace}）` : ""}、官方 App、系统默认实例和其他实例不会删除。此操作不可恢复。`),
+      h("p", { style: { margin: 0 } }, `${t("同时清理该实例的托管目录、会话回收站、配置备份和可确认归属的手动会话备份。")}${instance.running ? t("实例当前正在运行，将先自动停止。") : ""}`),
+      h("p", { style: { margin: 0, color: "#ef4444", fontWeight: 600 } }, formatTranslatedText("工作区{workspace}、官方 App、系统默认实例和其他实例不会删除。此操作不可恢复。", {
+        workspace: instance.workspace ? `（${instance.workspace}）` : "",
+      })),
     ]),
-    okText: "永久删除",
-    cancelText: "取消",
+    okText: t("永久删除"),
+    cancelText: t("取消"),
     hideCancel: false,
     async onBeforeOk() {
       if (workingId.value) return false;
@@ -139,9 +145,12 @@ function confirmDelete(instance: CodexInstance): void {
       try {
         const result = await deleteCodexInstance(instance.id);
         await refresh();
-        Message.success(`实例已彻底删除：清理 ${result.deletedPaths.length} 个数据目录、${result.deletedBackupCount} 个关联备份`);
+        Message.success(formatTranslatedText("实例已彻底删除：清理 {directoryCount} 个数据目录、{backupCount} 个关联备份", {
+          directoryCount: result.deletedPaths.length,
+          backupCount: result.deletedBackupCount,
+        }));
       } catch (error) {
-        Message.error(`删除实例失败：${errorText(error)}`);
+        Message.error(formatTranslatedText("删除实例失败：{error}", { error: errorText(error) }));
         return false;
       } finally {
         workingId.value = "";
@@ -158,17 +167,17 @@ onMounted(refresh);
   <section class="instances-page">
     <header class="instances-hero">
       <div>
-        <h1>Codex 多开</h1>
-        <p>为每个桌面实例隔离账号、配置、会话、插件与 Electron 数据。</p>
+        <h1>{{ t("Codex 多开") }}</h1>
+        <p>{{ t("为每个桌面实例隔离账号、配置、会话、插件与 Electron 数据。") }}</p>
       </div>
       <div class="instances-hero-actions">
-        <a-button :loading="loading" @click="refresh"><template #icon><icon-refresh /></template>刷新</a-button>
-        <a-button type="primary" @click="createInstance"><template #icon><icon-plus /></template>新建多开实例</a-button>
+        <a-button :loading="loading" @click="refresh"><template #icon><icon-refresh /></template>{{ t("刷新") }}</a-button>
+        <a-button type="primary" @click="createInstance"><template #icon><icon-plus /></template>{{ t("新建多开实例") }}</a-button>
       </div>
     </header>
 
     <a-alert type="info" show-icon>
-      “系统默认实例”代表当前原版 Codex。新增实例会使用独立 CODEX_HOME 和桌面数据目录；删除多开实例会永久清理该实例的数据和关联备份，但不会删除工作区、官方 App、系统默认实例或其他实例。
+      {{ t("“系统默认实例”代表当前原版 Codex。新增实例会使用独立 CODEX_HOME 和桌面数据目录；删除多开实例会永久清理该实例的数据和关联备份，但不会删除工作区、官方 App、系统默认实例或其他实例。") }}
     </a-alert>
 
     <a-spin :loading="loading" dot>
@@ -177,34 +186,34 @@ onMounted(refresh);
           <header>
             <span class="instance-status" />
             <div>
-              <h3>{{ instanceDisplayName(instance) }}</h3>
-              <p>{{ instance.running ? `运行中 · PID ${instance.pid}` : "未运行" }}</p>
+              <h3>{{ t(instanceDisplayName(instance)) }}</h3>
+              <p>{{ instance.running ? `${t("运行中")} · PID ${instance.pid}` : t("未运行") }}</p>
             </div>
-            <a-tag v-if="instance.isDefault" color="blue">默认</a-tag>
+            <a-tag v-if="instance.isDefault" color="blue">{{ t("默认") }}</a-tag>
           </header>
           <dl>
             <div><dt>Codex Home</dt><dd>{{ instance.codexHome }}</dd><button @click="openPathInFileManager(instance.codexHome)"><icon-folder /></button></div>
-            <div><dt>桌面数据</dt><dd>{{ instance.electronData }}</dd><button @click="openPathInFileManager(instance.electronData)"><icon-folder /></button></div>
-            <div><dt>工作区</dt><dd>{{ instance.workspace || "未设置" }}</dd></div>
+            <div><dt>{{ t("桌面数据") }}</dt><dd>{{ instance.electronData }}</dd><button @click="openPathInFileManager(instance.electronData)"><icon-folder /></button></div>
+            <div><dt>{{ t("工作区") }}</dt><dd>{{ instance.workspace || t("未设置") }}</dd></div>
           </dl>
           <footer>
-            <a-button v-if="!instance.running" type="primary" :loading="workingId === instance.id" @click="runAction(instance, 'launch')"><template #icon><icon-play-arrow /></template>启动</a-button>
-            <a-button v-else status="warning" :loading="workingId === instance.id" @click="runAction(instance, 'restart')"><template #icon><icon-refresh /></template>重启</a-button>
-            <a-button v-if="instance.running" :disabled="Boolean(workingId)" @click="runAction(instance, 'stop')"><template #icon><icon-pause /></template>停止</a-button>
-            <a-button v-if="!instance.isDefault" :disabled="instance.running" @click="editInstance(instance)"><template #icon><icon-edit /></template>编辑</a-button>
+            <a-button v-if="!instance.running" type="primary" :loading="workingId === instance.id" @click="runAction(instance, 'launch')"><template #icon><icon-play-arrow /></template>{{ t("启动") }}</a-button>
+            <a-button v-else status="warning" :loading="workingId === instance.id" @click="runAction(instance, 'restart')"><template #icon><icon-refresh /></template>{{ t("重启") }}</a-button>
+            <a-button v-if="instance.running" :disabled="Boolean(workingId)" @click="runAction(instance, 'stop')"><template #icon><icon-pause /></template>{{ t("停止") }}</a-button>
+            <a-button v-if="!instance.isDefault" :disabled="instance.running" @click="editInstance(instance)"><template #icon><icon-edit /></template>{{ t("编辑") }}</a-button>
             <a-button v-if="!instance.isDefault" status="danger" :loading="workingId === instance.id" :disabled="Boolean(workingId)" @click="confirmDelete(instance)"><template #icon><icon-delete /></template></a-button>
           </footer>
         </article>
       </div>
     </a-spin>
 
-    <a-modal v-model:visible="editorVisible" :title="form.id ? '编辑多开实例' : '新建多开实例'" ok-text="保存" cancel-text="取消" :ok-loading="saving" width="720px" @ok="save">
+    <a-modal v-model:visible="editorVisible" :title="t(form.id ? '编辑多开实例' : '新建多开实例')" :ok-text="t('保存')" :cancel-text="t('取消')" :ok-loading="saving" width="720px" @ok="save">
       <a-form :model="form" layout="vertical">
-        <a-form-item label="实例名称" required><a-input v-model="form.name" placeholder="例如：工作账号" /></a-form-item>
-        <a-form-item label="Codex Home"><a-input v-model="form.codexHome" placeholder="留空自动生成"><template #append><a-button @click="chooseDirectory('codexHome')"><icon-folder /></a-button></template></a-input></a-form-item>
-        <a-form-item label="桌面数据目录"><a-input v-model="form.electronData" placeholder="留空自动生成"><template #append><a-button @click="chooseDirectory('electronData')"><icon-folder /></a-button></template></a-input></a-form-item>
-        <a-form-item label="工作区（可选）"><a-input v-model="form.workspace" placeholder="启动时打开的项目目录"><template #append><a-button @click="chooseDirectory('workspace')"><icon-folder /></a-button></template></a-input></a-form-item>
-        <a-form-item label="官方 App"><a-input v-model="form.appPath"><template #append><a-button @click="chooseApp"><icon-folder /></a-button></template></a-input></a-form-item>
+        <a-form-item :label="t('实例名称')" required><a-input v-model="form.name" :placeholder="t('例如：工作账号')" /></a-form-item>
+        <a-form-item label="Codex Home"><a-input v-model="form.codexHome" :placeholder="t('留空自动生成')"><template #append><a-button @click="chooseDirectory('codexHome')"><icon-folder /></a-button></template></a-input></a-form-item>
+        <a-form-item :label="t('桌面数据目录')"><a-input v-model="form.electronData" :placeholder="t('留空自动生成')"><template #append><a-button @click="chooseDirectory('electronData')"><icon-folder /></a-button></template></a-input></a-form-item>
+        <a-form-item :label="t('工作区（可选）')"><a-input v-model="form.workspace" :placeholder="t('启动时打开的项目目录')"><template #append><a-button @click="chooseDirectory('workspace')"><icon-folder /></a-button></template></a-input></a-form-item>
+        <a-form-item :label="t('官方 App')"><a-input v-model="form.appPath"><template #append><a-button @click="chooseApp"><icon-folder /></a-button></template></a-input></a-form-item>
       </a-form>
     </a-modal>
   </section>

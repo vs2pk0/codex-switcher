@@ -49,3 +49,45 @@ test("带账号和错误详情的重置提示会翻译静态文案", () => {
     "demo@example.com 預約重設失敗：network unavailable",
   );
 });
+
+test("英文设置、多开与 OpenCodex 页面不会回退为中文", () => {
+  currentLanguage.value = "en";
+
+  assert.equal(t("当前设置实例"), "Current Settings Instance");
+  assert.equal(t("Codex 多开"), "Codex Instances");
+  assert.equal(t("运行控制台"), "Control Console");
+  assert.equal(t("Web 管理"), "Web Management");
+  assert.equal(t("启动服务后配置图片模型"), "Start the Service to Configure Vision Models");
+  assert.equal(t("后台服务尚未安装"), "The background service is not installed");
+  assert.equal(t("源文件中不存在此账号"), "This account does not exist in the source file");
+  assert.equal(
+    t("请先在“运行控制台”启动服务，再打开 Web 管理页面。"),
+    "Start the service in Control Console before opening Web Management.",
+  );
+});
+
+test("俄语设置、多开与 OpenCodex 页面不会回退为中文", () => {
+  currentLanguage.value = "ru";
+
+  assert.equal(t("当前设置实例"), "Текущий экземпляр настроек");
+  assert.equal(t("Codex 多开"), "Экземпляры Codex");
+  assert.equal(t("运行控制台"), "Панель управления");
+  assert.equal(t("图片模型"), "Модели изображений");
+  assert.equal(t("后台服务尚未安装"), "Фоновая служба не установлена");
+  assert.equal(t("源文件中不存在此账号"), "Этого аккаунта нет в исходном файле");
+  assert.equal(
+    t("启动服务后配置图片模型"),
+    "Запустите сервис для настройки моделей изображений",
+  );
+});
+
+test("繁体中文设置、多开与 OpenCodex 页面不会简繁混排", () => {
+  currentLanguage.value = "zh-TW";
+
+  assert.equal(t("当前设置实例"), "目前設定執行個體");
+  assert.equal(t("启动服务后配置图片模型"), "啟動服務後設定圖片模型");
+  assert.equal(
+    t("为每个桌面实例隔离账号、配置、会话、插件与 Electron 数据。"),
+    "為每個桌面執行個體隔離帳號、設定、會話、外掛與 Electron 資料。",
+  );
+});

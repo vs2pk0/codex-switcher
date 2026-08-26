@@ -10,27 +10,36 @@
   </p>
 </div>
 
-Codex Switcher keeps multiple Codex sign-in profiles in one desktop app. It can switch the active account, write the selected credentials back to the local Codex configuration, monitor quotas, restore sessions, and summarize local token usage and estimated cost.
+Codex Switcher keeps multiple Codex sign-in profiles in one desktop app. It can switch the active account, isolate multiple Codex desktop instances, repair local sessions, manage OpenCodex and CLIProxyAPI, monitor quotas, and summarize local token usage and estimated cost.
 
 ## Screenshots
 
-### Account overview
-
-![Account overview with privacy mode enabled](doc/assets/screenshots/accounts-overview.jpg)
-
-### Usage dashboard
-
-![Local token usage and estimated cost dashboard](doc/assets/screenshots/usage-dashboard.jpg)
+<table>
+  <tr>
+    <td width="50%"><strong>Account overview and quota monitoring</strong><br><img src="doc/assets/screenshots/accounts-overview.jpg" alt="Account overview with privacy mode enabled"></td>
+    <td width="50%"><strong>Token usage and estimated cost</strong><br><img src="doc/assets/screenshots/usage-dashboard.jpg" alt="Local token usage and estimated cost dashboard"></td>
+  </tr>
+  <tr>
+    <td width="50%"><strong>Session content, attachments, and repair</strong><br><img src="doc/assets/screenshots/session-content-repair.jpg" alt="Codex session content with restored image attachments"></td>
+    <td width="50%"><strong>Independent Codex desktop instances</strong><br><img src="doc/assets/screenshots/codex-instances.jpg" alt="Codex multi-instance management"></td>
+  </tr>
+  <tr>
+    <td width="50%"><strong>OpenCodex control console</strong><br><img src="doc/assets/screenshots/opencodex-console.jpg" alt="OpenCodex service and Engine control console"></td>
+    <td width="50%"><strong>OpenCodex Web management</strong><br><img src="doc/assets/screenshots/opencodex-web.jpg" alt="OpenCodex Web dashboard launcher"></td>
+  </tr>
+</table>
 
 ## Highlights
 
-- **OAuth and API Key accounts**: add, edit, import, export, filter, sort, and switch between multiple accounts.
-- **Independent Codex instances (macOS)**: launch multiple official desktop instances with separate `CODEX_HOME` and Electron data directories, then target account switching, OpenCodex sync/restore, and configuration editing to a selected instance.
-- **Quota monitoring**: inspect account availability, subscription periods, standard quota windows, and optional GPT 5.3 Codex Spark quota windows.
-- **Session tools**: manage, repair, back up, and restore local Codex sessions.
-- **Usage analytics**: aggregate local token usage, cache activity, model distribution, and estimated cost with configurable pricing rules.
-- **CLIProxyAPI integration**: install, update, run, configure, and bind selected accounts to the bundled API service.
-- **Privacy controls**: mask account identifiers in the interface and keep application data on the local machine.
+- **OAuth and API Key accounts**: add, edit, import, export, filter, sort, refresh, and switch between multiple accounts.
+- **Quota monitoring and resets**: inspect availability, subscription periods, quota windows, GPT 5.3 Codex Spark quotas, reset history, and scheduled resets.
+- **Session management and repair**: search projects and message content, preview Markdown and attachments, delete individual messages or turns, back up and restore sessions, repair visibility, and recover truncated sessions.
+- **Independent Codex instances (macOS)**: launch official desktop instances with separate `CODEX_HOME` and Electron data, then target account switching, sessions, settings, and OpenCodex actions to a selected instance.
+- **OpenCodex Manager**: initialize and control the proxy, manage Engine versions, open the Web dashboard, synchronize models, configure image-input compatibility, import Switcher accounts, inspect logs, and restore native Codex.
+- **Usage analytics**: aggregate local tokens, cache activity, model and source distribution, estimated cost, and configurable pricing rules.
+- **CLIProxyAPI integration**: install, update, run, configure, version, and bind selected accounts to the bundled CPA API service.
+- **Configuration and backups**: edit `auth.json` and `config.toml` with validation and automatic backups, create ZIP backups, and restore saved data.
+- **Local-first privacy**: mask account identifiers, redact credentials from OpenCodex logs, and keep application data on the local machine.
 - **Four interface languages**: English, Simplified Chinese, Traditional Chinese (Taiwan), and Russian.
 
 ## Built-in CPA API service
@@ -43,6 +52,17 @@ The **API Service** page provides integrated management for the official [CLIPro
 - **Version management**: detect official releases, import a trusted local package, inspect installed versions, switch the active version, and remove inactive versions.
 - **Safer switching**: switching while CPA is running automatically restarts the service; if the selected version cannot start, Codex Switcher restores the previous version.
 - **Local workspace**: runtimes, configuration, authentication files, and download cache are kept under `~/.codex_switcher/api-service`.
+
+## OpenCodex Manager
+
+The **OpenCodex** page integrates the local [OpenCodex](https://github.com/lidge-jun/opencodex) proxy and its Engine lifecycle into Codex Switcher.
+
+- **Service console**: initialize, start, stop, restart, diagnose, synchronize, and inspect health and redacted logs from one page.
+- **Engine lifecycle**: detect stable and preview releases, install or switch local versions, remove inactive versions, and safely return to the bundled baseline.
+- **Codex integration**: synchronize configuration and model catalogs to a selected Codex instance, or stop the proxy and restore that instance's native configuration.
+- **Web dashboard**: open the OpenCodex dashboard inside a client window or in the system browser.
+- **Image-input compatibility**: select text-only models that should use an image-description sidecar, then restart and synchronize the model catalog automatically.
+- **Account migration and background service**: import compatible Switcher OAuth accounts and optionally register OpenCodex as a login background service.
 
 ## Install
 

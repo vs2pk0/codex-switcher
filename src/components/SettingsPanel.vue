@@ -55,7 +55,7 @@ function formatFileSize(bytes: number): string {
 function backupButtonText(): string {
   if (!props.backupWorking) return t("手动备份");
   const progress = Math.max(0, Math.min(100, Math.round(props.backupProgress || 0)));
-  return t(`手动备份 ${progress}%`);
+  return `${t("手动备份")} ${progress}%`;
 }
 
 function changeLanguage(value: unknown): void {
@@ -83,7 +83,7 @@ function changeLanguage(value: unknown): void {
             @change="(value: unknown) => typeof value === 'string' && emit('select-instance', value)"
           >
             <a-option v-for="instance in instances" :key="instance.id" :value="instance.id">
-              {{ instanceDisplayName(instance) }}{{ instance.running ? " · 运行中" : "" }}
+              {{ t(instanceDisplayName(instance)) }}{{ instance.running ? ` · ${t("运行中")}` : "" }}
             </a-option>
           </a-select>
         </div>
