@@ -656,6 +656,7 @@ fn ensure_not_shutting_down(operation: &ApiServiceOperationState) -> Result<(), 
 
 #[tauri::command]
 pub async fn api_service_bind_accounts(
+    process: State<'_, ApiServiceProcessState>,
     operation: State<'_, ApiServiceOperationState>,
     account_ids: Vec<String>,
 ) -> Result<ApiServiceAccountSyncSummary, String> {
@@ -667,6 +668,9 @@ pub async fn api_service_bind_accounts(
         .collect::<Vec<_>>();
     if ids.is_empty() {
         return Err("请选择要绑定到 API 服务的账号".to_string());
+    }
+    if service_pid_for_state(&process)?.is_none() {
+        return Err("请先启动 API 服务，再绑定账号".to_string());
     }
     let dirs = ApiServiceDirs::new()?;
     let initial_settings = read_effective_settings(&dirs)?;
@@ -752,6 +756,9 @@ pub async fn api_service_bind_accounts(
 
     let _guard = lock_operation(&operation)?;
     ensure_not_shutting_down(&operation)?;
+    if service_pid_for_state(&process)?.is_none() {
+        return Err("API 服务已停止，请重新启动后再绑定账号".to_string());
+    }
     ensure_auth_dir_config(&dirs)?;
     let settings = read_effective_settings(&dirs)?;
     for (account, _) in &api_key_bindings {

@@ -15,7 +15,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
@@ -29,6 +29,7 @@ const DEFAULT_PORT: u16 = 15800;
 const START_TIMEOUT: Duration = Duration::from_secs(35);
 const HTTP_TIMEOUT: Duration = Duration::from_millis(750);
 const MANAGED_ENGINE_HISTORY_LIMIT: usize = 3;
+const MANAGER_LOG_TAIL_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 static SECRET_FIELD: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password)(\s*[:=]\s*)([^\s,;]+)")
@@ -47,6 +48,18 @@ struct Launcher {
     working_dir: Option<PathBuf>,
     version: Option<String>,
     source: &'static str,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct InstanceIntegrationResult {
+    success: bool,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountBindingRestartMode {
+    BackgroundService,
+    Standalone,
 }
 
 struct InteractiveProcess {
@@ -361,9 +374,15 @@ impl Backend {
             command.current_dir(working_dir);
         }
         command.env("NO_COLOR", "1").env("FORCE_COLOR", "0");
-        if let Some(path) = codex_home {
+        let effective_codex_home = codex_home
+            .map(Path::to_path_buf)
+            .or_else(|| crate::instances::codex_home_for(None).ok());
+        if let Some(path) = effective_codex_home {
             command.env("CODEX_HOME", path);
+        } else {
+            command.env_remove("CODEX_HOME");
         }
+        hide_command_window(&mut command);
         command
     }
 
@@ -621,39 +640,44 @@ impl Backend {
     }
 
     fn background_service_state(&self) -> BackgroundServiceState {
-        let result = (|| {
-            let engine = self.bundled_engine_dir()?;
-            let runtime = self.bundled_runtime_path()?;
-            let helper = engine.join("manager-service-status.ts");
-            if !helper.is_file() {
-                return Err("客户端缺少后台服务状态组件".to_string());
-            }
-            let output = Command::new(runtime)
-                .arg(helper)
-                .arg("status")
-                .current_dir(engine)
-                .env("NO_COLOR", "1")
-                .env("FORCE_COLOR", "0")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .map_err(|error| format!("无法检测后台服务状态：{error}"))?;
-            if !output.status.success() {
-                let detail = self.redact(String::from_utf8_lossy(&output.stderr).trim());
-                return Err(if detail.is_empty() {
-                    "后台服务状态检测失败".to_string()
-                } else {
-                    detail
-                });
-            }
-            serde_json::from_slice::<BackgroundServiceState>(&output.stdout)
-                .map_err(|error| format!("后台服务状态组件返回无效结果：{error}"))
-        })();
-        result.unwrap_or_else(|summary| BackgroundServiceState {
-            summary,
-            ..BackgroundServiceState::default()
-        })
+        self.query_background_service_state()
+            .unwrap_or_else(|summary| BackgroundServiceState {
+                summary,
+                ..BackgroundServiceState::default()
+            })
+    }
+
+    fn query_background_service_state(&self) -> Result<BackgroundServiceState, String> {
+        let engine = self.bundled_engine_dir()?;
+        let runtime = self.bundled_runtime_path()?;
+        let helper = engine.join("manager-service-status.ts");
+        if !helper.is_file() {
+            return Err("客户端缺少后台服务状态组件".to_string());
+        }
+        let mut command = Command::new(runtime);
+        command
+            .arg(helper)
+            .arg("status")
+            .current_dir(engine)
+            .env("NO_COLOR", "1")
+            .env("FORCE_COLOR", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        hide_command_window(&mut command);
+        let output = command
+            .output()
+            .map_err(|error| format!("无法检测后台服务状态：{error}"))?;
+        if !output.status.success() {
+            let detail = self.redact(String::from_utf8_lossy(&output.stderr).trim());
+            return Err(if detail.is_empty() {
+                "后台服务状态检测失败".to_string()
+            } else {
+                detail
+            });
+        }
+        serde_json::from_slice::<BackgroundServiceState>(&output.stdout)
+            .map_err(|error| format!("后台服务状态组件返回无效结果：{error}"))
     }
 
     fn set_background_service_port(&self, port: u16) -> Result<(), String> {
@@ -664,7 +688,8 @@ impl Backend {
         if !helper.is_file() {
             return Err("客户端缺少后台服务管理组件".to_string());
         }
-        let output = Command::new(runtime)
+        let mut command = Command::new(runtime);
+        command
             .arg(helper)
             .arg("set-port")
             .arg(port.to_string())
@@ -673,7 +698,9 @@ impl Backend {
             .env("FORCE_COLOR", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        hide_command_window(&mut command);
+        let output = command
             .output()
             .map_err(|error| format!("无法同步后台服务端口：{error}"))?;
         if output.status.success() {
@@ -693,6 +720,8 @@ impl Backend {
         request: RunActionRequest,
     ) -> Result<CommandStarted, String> {
         validate_port(request.port)?;
+        let isolated_instance_integration =
+            isolated_instance_integration_action(&request.action, request.instance_id.as_deref());
         let codex_home = if matches!(
             &request.action,
             CommandAction::Sync | CommandAction::Restore
@@ -725,6 +754,7 @@ impl Backend {
                 request.port,
                 launcher,
                 codex_home,
+                isolated_instance_integration,
             )
         });
         Ok(started)
@@ -737,9 +767,18 @@ impl Backend {
         port: u16,
         launcher: Launcher,
         codex_home: Option<PathBuf>,
+        isolated_instance_integration: bool,
     ) {
         let action_label = action.label();
-        let result = if matches!(action, CommandAction::Start) {
+        let result = if isolated_instance_integration {
+            let instance_home = codex_home
+                .as_deref()
+                .ok_or_else(|| "无法定位多开实例 Codex Home".to_string());
+            instance_home.and_then(|home| {
+                self.run_instance_integration_helper(&action, port, home)
+                    .map(|message| (Some(0), message))
+            })
+        } else if matches!(action, CommandAction::Start) {
             if probe_health(port).is_some() {
                 self.emit_log(&operation_id, "system", "OpenCodex 服务已经在运行。");
                 Ok((Some(0), "服务已在运行".to_string()))
@@ -959,14 +998,12 @@ impl Backend {
 
     pub fn read_logs(&self, limit: usize) -> Vec<String> {
         let limit = limit.clamp(1, 2000);
-        let Ok(text) = fs::read_to_string(self.manager_log_path()) else {
+        let Ok(lines) =
+            read_last_log_lines(&self.manager_log_path(), limit, MANAGER_LOG_TAIL_MAX_BYTES)
+        else {
             return Vec::new();
         };
-        let lines: Vec<&str> = text.lines().collect();
-        lines[lines.len().saturating_sub(limit)..]
-            .iter()
-            .map(|line| self.redact(line))
-            .collect()
+        lines.into_iter().map(|line| self.redact(&line)).collect()
     }
 
     pub fn open_dashboard_window(&self, port: u16) -> Result<(), String> {
@@ -1008,17 +1045,7 @@ impl Backend {
         &self,
         request: ImportSwitcherAccountsRequest,
     ) -> Result<SwitcherImportResult, String> {
-        if request.source_ids.is_empty() {
-            return Err("请至少选择一个账号".to_string());
-        }
-        if request.source_ids.len() > 1000
-            || request
-                .source_ids
-                .iter()
-                .any(|id| id.is_empty() || id.len() > 128)
-        {
-            return Err("导入请求包含过多账号或无效账号 ID".to_string());
-        }
+        validate_switcher_import_request(&request)?;
         self.begin_mutation()?;
         let result = (|| {
             if open_codex_service_running() {
@@ -1042,6 +1069,137 @@ impl Backend {
             );
         }
         result
+    }
+
+    pub fn bind_codex_switcher_accounts(
+        &self,
+        request: ImportSwitcherAccountsRequest,
+    ) -> Result<SwitcherImportResult, String> {
+        validate_switcher_import_request(&request)?;
+        self.begin_mutation()?;
+        let result = (|| {
+            let port = running_open_codex_port()
+                .ok_or_else(|| "请先启动 OpenCodex 服务，再绑定账号".to_string())?;
+            let launcher = self.active_launcher()?;
+            let background_service = self.query_background_service_state()?;
+            let restart_mode = account_binding_restart_mode(&background_service);
+            let input = serde_json::to_vec(&request)
+                .map_err(|error| format!("无法生成绑定请求：{error}"))?;
+            if let Err(stop_error) = self.stop_for_account_binding(&launcher, port) {
+                if probe_health(port).is_some() {
+                    return Err(stop_error);
+                }
+                return match self.restart_after_account_binding(&launcher, port, restart_mode) {
+                    Ok(()) => Err(format!("{stop_error}；OpenCodex 已按原运行方式恢复")),
+                    Err(restart_error) => Err(format!(
+                        "{stop_error}；OpenCodex 服务恢复也失败：{restart_error}。请手动启动 OpenCodex"
+                    )),
+                };
+            }
+
+            let import_result =
+                self.run_switcher_helper::<SwitcherImportResult>("import", Some(&input));
+            let restart_result = self.restart_after_account_binding(&launcher, port, restart_mode);
+
+            match (import_result, restart_result) {
+                (Ok(imported), Ok(_)) => Ok(imported),
+                (Ok(_), Err(restart_error)) => Err(format!(
+                    "账号已写入 OpenCodex，但服务恢复失败：{restart_error}。请手动启动 OpenCodex"
+                )),
+                (Err(import_error), Ok(_)) => Err(import_error),
+                (Err(import_error), Err(restart_error)) => Err(format!(
+                    "{import_error}；OpenCodex 服务恢复也失败：{restart_error}。请手动启动 OpenCodex"
+                )),
+            }
+        })();
+        self.finish_mutation();
+        if let Ok(imported) = &result {
+            self.persist_log(
+                "system",
+                &format!(
+                    "已绑定 {} 个 Switcher 账号到 OpenCodex，跳过 {} 个账号，并恢复服务",
+                    imported.imported_count, imported.skipped_count
+                ),
+            );
+        }
+        result
+    }
+
+    fn stop_for_account_binding(&self, launcher: &Launcher, port: u16) -> Result<(), String> {
+        let args = CommandAction::Stop.argv(port);
+        let mut command = self.command(launcher, &args);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = command
+            .output()
+            .map_err(|error| format!("绑定账号前无法停止 OpenCodex：{error}"))?;
+        if !output.status.success() {
+            let detail = self.redact(String::from_utf8_lossy(&output.stderr).trim());
+            return Err(if detail.is_empty() {
+                "绑定账号前停止 OpenCodex 失败".to_string()
+            } else {
+                format!("绑定账号前停止 OpenCodex 失败：{detail}")
+            });
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if probe_health(port).is_none() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(150));
+        }
+        Err("绑定账号前等待 OpenCodex 停止超时".to_string())
+    }
+
+    fn restart_after_account_binding(
+        &self,
+        launcher: &Launcher,
+        port: u16,
+        mode: AccountBindingRestartMode,
+    ) -> Result<(), String> {
+        match mode {
+            AccountBindingRestartMode::BackgroundService => {
+                self.start_background_service_after_binding(launcher, port)
+            }
+            AccountBindingRestartMode::Standalone => self
+                .start_background(launcher, port, launcher.version.as_deref(), None)
+                .map(|_| ()),
+        }
+    }
+
+    fn start_background_service_after_binding(
+        &self,
+        launcher: &Launcher,
+        port: u16,
+    ) -> Result<(), String> {
+        let args = vec!["service".to_string(), "start".to_string()];
+        let mut command = self.command(launcher, &args);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = command
+            .output()
+            .map_err(|error| format!("无法恢复 OpenCodex 后台服务：{error}"))?;
+        let detail = self.redact(String::from_utf8_lossy(&output.stderr).trim());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if probe_health(port).is_some() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        Err(if detail.is_empty() {
+            if output.status.success() {
+                format!("OpenCodex 后台服务未能在端口 {port} 恢复")
+            } else {
+                "OpenCodex 后台服务启动失败".to_string()
+            }
+        } else {
+            format!("OpenCodex 后台服务启动失败：{detail}")
+        })
     }
 
     pub fn delete_codex_switcher_account(
@@ -1246,6 +1404,7 @@ impl Backend {
             } else {
                 Stdio::null()
             });
+        hide_command_window(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| format!("无法启动 Engine 更新器：{error}"))?;
@@ -1270,6 +1429,54 @@ impl Backend {
         }
         serde_json::from_slice(&output.stdout)
             .map_err(|error| format!("Engine 更新器返回了无效结果：{error}"))
+    }
+
+    fn run_instance_integration_helper(
+        &self,
+        action: &CommandAction,
+        port: u16,
+        codex_home: &Path,
+    ) -> Result<String, String> {
+        let action_name = match action {
+            CommandAction::Sync => "sync",
+            CommandAction::Restore => "restore",
+            _ => return Err("多开实例集成操作只支持同步或恢复".to_string()),
+        };
+        let engine = self.bundled_engine_dir()?;
+        let runtime = self.bundled_runtime_path()?;
+        let helper = engine.join("manager-instance-integration.ts");
+        if !helper.is_file() {
+            return Err("客户端缺少多开实例隔离组件，请重新安装完整客户端".to_string());
+        }
+        let mut command = Command::new(runtime);
+        command
+            .arg(helper)
+            .arg(action_name)
+            .arg(port.to_string())
+            .current_dir(&engine)
+            .env("CODEX_HOME", codex_home)
+            .env("NO_COLOR", "1")
+            .env("FORCE_COLOR", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        hide_command_window(&mut command);
+        let output = command
+            .output()
+            .map_err(|error| format!("无法启动多开实例隔离组件：{error}"))?;
+        if let Ok(result) = serde_json::from_slice::<InstanceIntegrationResult>(&output.stdout) {
+            return if result.success {
+                Ok(result.message)
+            } else {
+                Err(result.message)
+            };
+        }
+        let detail = self.redact(String::from_utf8_lossy(&output.stderr).trim());
+        Err(if detail.is_empty() {
+            format!("多开实例 OpenCodex {}失败", display_action(action))
+        } else {
+            detail
+        })
     }
 
     fn run_switcher_helper<T: DeserializeOwned>(
@@ -1304,6 +1511,7 @@ impl Backend {
             } else {
                 Stdio::null()
             });
+        hide_command_window(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| format!("无法启动 Switcher 账号转换器：{error}"))?;
@@ -1398,6 +1606,27 @@ fn read_stream<R: Read + Send + 'static>(
     }
 }
 
+fn read_last_log_lines(path: &Path, limit: usize, max_bytes: u64) -> std::io::Result<Vec<String>> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let start = file_len.saturating_sub(max_bytes.max(1));
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(file_len.saturating_sub(start)).unwrap_or_default());
+    file.read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let text = if start > 0 {
+        text.split_once('\n').map(|(_, tail)| tail).unwrap_or("")
+    } else {
+        text.as_ref()
+    };
+    let lines = text.lines().collect::<Vec<_>>();
+    Ok(lines[lines.len().saturating_sub(limit)..]
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect())
+}
+
 fn append_file(path: PathBuf) -> Result<File, String> {
     OpenOptions::new()
         .create(true)
@@ -1424,6 +1653,16 @@ fn prepare_background_command(command: &mut Command) {
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
 }
+
+#[cfg(windows)]
+fn hide_command_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_command_window(_command: &mut Command) {}
 
 fn validate_port(port: u16) -> Result<(), String> {
     (port >= 1024)
@@ -1644,6 +1883,39 @@ fn open_codex_service_running() -> bool {
         || probe_health(configured_port).is_some()
 }
 
+fn validate_switcher_import_request(request: &ImportSwitcherAccountsRequest) -> Result<(), String> {
+    if request.source_ids.is_empty() {
+        return Err("请至少选择一个账号".to_string());
+    }
+    if request.source_ids.len() > 1000
+        || request
+            .source_ids
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 128)
+    {
+        return Err("导入请求包含过多账号或无效账号 ID".to_string());
+    }
+    Ok(())
+}
+
+fn account_binding_restart_mode(
+    background_service: &BackgroundServiceState,
+) -> AccountBindingRestartMode {
+    if background_service.running {
+        AccountBindingRestartMode::BackgroundService
+    } else {
+        AccountBindingRestartMode::Standalone
+    }
+}
+
+fn isolated_instance_integration_action(action: &CommandAction, instance_id: Option<&str>) -> bool {
+    matches!(action, CommandAction::Sync | CommandAction::Restore)
+        && instance_id.is_some_and(|id| {
+            let id = id.trim();
+            !id.is_empty() && id != crate::instances::DEFAULT_INSTANCE_ID
+        })
+}
+
 fn display_action(action: &CommandAction) -> &'static str {
     match action {
         CommandAction::Init => "初始化",
@@ -1663,11 +1935,13 @@ fn display_action(action: &CommandAction) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_engine_update_catalog, codex_integration_is_enabled, config_is_initialized,
-        configured_sidecar_models, managed_versions_to_remove, package_version,
-        validate_engine_version, validate_managed_package, validate_port, RemoteEngineCatalog,
+        account_binding_restart_mode, build_engine_update_catalog, codex_integration_is_enabled,
+        config_is_initialized, configured_sidecar_models, isolated_instance_integration_action,
+        managed_versions_to_remove, package_version, read_last_log_lines, validate_engine_version,
+        validate_managed_package, validate_port, AccountBindingRestartMode, RemoteEngineCatalog,
         DEFAULT_PORT,
     };
+    use crate::opencodex::models::{BackgroundServiceState, CommandAction};
     use chrono::Utc;
     use std::{
         fs,
@@ -1678,6 +1952,7 @@ mod tests {
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+    use tempfile::tempdir;
 
     #[cfg(unix)]
     fn wait_for_output(receiver: &Receiver<Vec<u8>>, transcript: &mut Vec<u8>, needle: &str) {
@@ -1706,6 +1981,53 @@ mod tests {
             .join("@bitkyc08")
             .join("opencodex");
         assert_eq!(package_version(&package).as_deref(), Some("2.27.0"));
+    }
+
+    #[test]
+    fn reads_only_complete_lines_from_the_bounded_log_tail() {
+        let dir = tempdir().expect("log tempdir");
+        let path = dir.path().join("manager.log");
+        fs::write(&path, "first-line\nsecond-line\nthird-line\nfourth-line\n")
+            .expect("write manager log");
+
+        let lines = read_last_log_lines(&path, 10, 25).expect("read log tail");
+
+        assert_eq!(lines, ["third-line", "fourth-line"]);
+    }
+
+    #[test]
+    fn account_binding_restores_the_original_service_lifecycle_mode() {
+        assert_eq!(
+            account_binding_restart_mode(&BackgroundServiceState {
+                running: true,
+                ..BackgroundServiceState::default()
+            }),
+            AccountBindingRestartMode::BackgroundService
+        );
+        assert_eq!(
+            account_binding_restart_mode(&BackgroundServiceState::default()),
+            AccountBindingRestartMode::Standalone
+        );
+    }
+
+    #[test]
+    fn only_custom_instance_sync_and_restore_use_the_isolated_helper() {
+        assert!(isolated_instance_integration_action(
+            &CommandAction::Sync,
+            Some("instance-custom")
+        ));
+        assert!(isolated_instance_integration_action(
+            &CommandAction::Restore,
+            Some("instance-custom")
+        ));
+        assert!(!isolated_instance_integration_action(
+            &CommandAction::Sync,
+            Some(crate::instances::DEFAULT_INSTANCE_ID)
+        ));
+        assert!(!isolated_instance_integration_action(
+            &CommandAction::Start,
+            Some("instance-custom")
+        ));
     }
 
     #[test]

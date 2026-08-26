@@ -7,8 +7,9 @@ export interface CodexSessionRecord {
   projectPath: string;
   path: string;
   updatedAt: number;
-  messageCount: number;
-  charCount: number;
+  messageCount?: number | null;
+  charCount?: number | null;
+  approximateTokens: number;
   sizeBytes: number;
 }
 

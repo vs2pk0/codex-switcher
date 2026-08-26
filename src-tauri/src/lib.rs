@@ -2687,20 +2687,29 @@ async fn consume_codex_reset_credit(
 }
 
 #[tauri::command]
-fn codex_list_sessions_across_instances(
+async fn codex_list_sessions_across_instances(
     title_query: Option<String>,
     content_query: Option<String>,
     instance_id: Option<String>,
 ) -> Result<Vec<CodexSessionRecord>, String> {
-    session_store_for_instance(instance_id.as_deref())?.list_sessions(title_query, content_query)
+    tauri::async_runtime::spawn_blocking(move || {
+        session_store_for_instance(instance_id.as_deref())?
+            .list_sessions(title_query, content_query)
+    })
+    .await
+    .map_err(|error| format!("加载会话任务失败: {error}"))?
 }
 
 #[tauri::command]
-fn codex_get_session_token_stats_across_instances(
+async fn codex_get_session_token_stats_across_instances(
     session_ids: Vec<String>,
     instance_id: Option<String>,
 ) -> Result<Vec<CodexSessionTokenStats>, String> {
-    session_store_for_instance(instance_id.as_deref())?.token_stats(&session_ids)
+    tauri::async_runtime::spawn_blocking(move || {
+        session_store_for_instance(instance_id.as_deref())?.token_stats(&session_ids)
+    })
+    .await
+    .map_err(|error| format!("统计会话 token 任务失败: {error}"))?
 }
 
 #[tauri::command]
@@ -5460,6 +5469,7 @@ pub fn run() {
             opencodex::opencodex_read_manager_logs,
             opencodex::opencodex_scan_switcher_accounts,
             opencodex::opencodex_import_switcher_accounts,
+            opencodex::opencodex_bind_switcher_accounts,
             opencodex::opencodex_delete_switcher_account,
             opencodex::opencodex_get_engine_update_catalog,
             opencodex::opencodex_install_engine_version,

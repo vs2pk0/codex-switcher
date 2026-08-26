@@ -1,13 +1,13 @@
 {
   "name": "codex-switcher",
   "private": true,
-  "version": "0.1.29",
+  "version": "0.1.30",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "opencodex:prepare": "npm ci --prefix opencodex-engine --omit=dev --no-audit --no-fund",
-    "opencodex:test": "opencodex-engine/node_modules/bun/bin/bun.exe test ./opencodex-engine/manager-engine-update.test.ts ./opencodex-engine/manager-switcher-import.test.ts ./opencodex-engine/manager-service-status.test.ts",
+    "opencodex:test": "opencodex-engine/node_modules/bun/bin/bun.exe test ./opencodex-engine/manager-engine-update.test.ts ./opencodex-engine/manager-switcher-import.test.ts ./opencodex-engine/manager-service-status.test.ts ./opencodex-engine/manager-instance-integration.test.ts",
     "test": "node --test --experimental-strip-types \"tests/**/*.test.ts\"",
     "typecheck": "vue-tsc --noEmit",
     "tauri": "tauri"

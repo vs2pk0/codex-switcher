@@ -485,6 +485,10 @@ function quotaResetDateLabel(value?: string | number): string {
 }
 
 async function openBindAccounts(): Promise<void> {
+  if (!running.value) {
+    Message.warning(t("请先启动 API 服务，再绑定账号"));
+    return;
+  }
   if (!(await loadBoundAccounts())) return;
   const boundAccountIds = new Set(
     boundAccounts.value
