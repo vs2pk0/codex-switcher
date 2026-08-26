@@ -2976,6 +2976,7 @@ fn merge_visibility_repair_summary(
     total.recreated_generated_image_count += next.recreated_generated_image_count;
     total.verified_generated_image_count += next.verified_generated_image_count;
     total.invalid_generated_image_count += next.invalid_generated_image_count;
+    total.reset_history_projection_count += next.reset_history_projection_count;
     total.desktop_reload_required |= next.desktop_reload_required;
     total.desktop_reload_performed |= next.desktop_reload_performed;
     total.backup_dirs.append(&mut next.backup_dirs);

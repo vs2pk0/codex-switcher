@@ -1,6 +1,6 @@
 use crate::account::{replace_file_atomic, write_bytes_atomic};
 use base64::{engine::general_purpose, Engine as _};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -172,6 +172,7 @@ pub struct CodexSessionVisibilityRepairSummary {
     pub recreated_generated_image_count: usize,
     pub verified_generated_image_count: usize,
     pub invalid_generated_image_count: usize,
+    pub reset_history_projection_count: usize,
     pub desktop_reload_required: bool,
     pub desktop_reload_performed: bool,
     pub backup_dirs: Vec<String>,
@@ -266,6 +267,29 @@ struct GeneratedImageRepairResult {
     recreated: usize,
     verified: usize,
     invalid: usize,
+}
+
+impl GeneratedImageRepairResult {
+    fn add(&mut self, other: Self) {
+        self.recreated += other.recreated;
+        self.verified += other.verified;
+        self.invalid += other.invalid;
+    }
+}
+
+#[derive(Debug, Default)]
+struct LocalImageRepairResult {
+    images: GeneratedImageRepairResult,
+    changed_rollout_files: usize,
+    changed_session_ids: HashSet<String>,
+    backup_dirs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaginatedRolloutProjectionTarget {
+    next_byte_offset: i64,
+    next_ordinal: i64,
+    turn_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1519,6 +1543,7 @@ impl SessionStore {
                 recreated_generated_image_count: 0,
                 verified_generated_image_count: 0,
                 invalid_generated_image_count: 0,
+                reset_history_projection_count: 0,
                 desktop_reload_required: false,
                 desktop_reload_performed: false,
                 backup_dirs: Vec::new(),
@@ -1553,7 +1578,7 @@ impl SessionStore {
         let deep = mode
             .map(|value| value.eq_ignore_ascii_case("deep"))
             .unwrap_or(false);
-        let (changed_rollout_files, rollout_backup_dirs) =
+        let (mut changed_rollout_files, mut rollout_backup_dirs) =
             self.repair_rollout_visibility(&target_provider, &repair_records, deep)?;
         let (updated_rows, backup_dirs) =
             self.repair_sqlite_visibility(&target_provider, Some(&repair_records))?;
@@ -1571,16 +1596,34 @@ impl SessionStore {
             ));
         }
         let projects = self.repair_desktop_projects(&repair_records)?;
-        let generated_images = self.repair_generated_images(&repair_records)?;
+        let mut generated_images = self.repair_generated_images(&repair_records)?;
+        let local_images = if deep {
+            self.repair_local_image_attachments(&repair_records)?
+        } else {
+            LocalImageRepairResult::default()
+        };
+        changed_rollout_files += local_images.changed_rollout_files;
+        rollout_backup_dirs.extend(local_images.backup_dirs);
+        generated_images.add(local_images.images);
+        let (reset_history_projections, history_backup_dirs) = if deep {
+            self.reset_stale_thread_history_projections(
+                &repair_records,
+                &local_images.changed_session_ids,
+            )?
+        } else {
+            (0, Vec::new())
+        };
         let repaired = changed_rollout_files
             + updated_rows
             + added_index_entries
             + catalog.updated
             + projects.created
             + projects.updated_assignments
-            + generated_images.recreated;
+            + generated_images.recreated
+            + reset_history_projections;
         let mut all_backup_dirs = rollout_backup_dirs;
         all_backup_dirs.extend(backup_dirs);
+        all_backup_dirs.extend(history_backup_dirs);
         if let Some(backup_dir) = catalog.backup_dir.clone() {
             all_backup_dirs.push(backup_dir);
         }
@@ -1612,6 +1655,7 @@ impl SessionStore {
                 "recreatedGeneratedImages": generated_images.recreated,
                 "verifiedGeneratedImages": generated_images.verified,
                 "invalidGeneratedImages": generated_images.invalid,
+                "resetHistoryProjections": reset_history_projections,
                 "desktopReloadRequired": !sessions.is_empty(),
                 "updatedAt": now_timestamp()
             }))
@@ -1639,6 +1683,7 @@ impl SessionStore {
             recreated_generated_image_count: generated_images.recreated,
             verified_generated_image_count: generated_images.verified,
             invalid_generated_image_count: generated_images.invalid,
+            reset_history_projection_count: reset_history_projections,
             desktop_reload_required: !sessions.is_empty(),
             desktop_reload_performed: false,
             backup_dirs: all_backup_dirs.clone(),
@@ -1655,8 +1700,9 @@ impl SessionStore {
                 running: false,
             }],
             message: format!(
-                "已修复 Codex 会话、项目目录与图片：校正 {} 个会话文件，更新 {} 条线程记录，同步 {} 条侧栏目录，目录校验通过 {} 条；创建 {} 个本地项目，归组 {} 条会话，项目校验通过 {} 个，重建 {} 张生成图片、校验 {} 张，跳过 {} 条非侧栏或无效目录会话；需要重载 ChatGPT/Codex 才会刷新当前侧栏",
+                "已修复 Codex 会话、项目目录与图片：校正 {} 个会话文件，重置 {} 条分页历史投影，更新 {} 条线程记录，同步 {} 条侧栏目录，目录校验通过 {} 条；创建 {} 个本地项目，归组 {} 条会话，项目校验通过 {} 个，恢复 {} 张图片、校验 {} 张，跳过 {} 条非侧栏或无效目录会话；需要重载 ChatGPT/Codex 才会刷新当前侧栏",
                 changed_rollout_files,
+                reset_history_projections,
                 updated_rows,
                 catalog.updated,
                 catalog.verified,
@@ -2134,6 +2180,65 @@ impl SessionStore {
                     result.invalid += 1;
                 }
             }
+        }
+        Ok(result)
+    }
+
+    fn repair_local_image_attachments(
+        &self,
+        sessions: &[SessionRepairRecord],
+    ) -> Result<LocalImageRepairResult, String> {
+        let mut result = LocalImageRepairResult::default();
+        let backup_dir = visibility_backup_dir();
+        let mut backup_created = false;
+        for session in sessions {
+            if !safe_generated_image_id(&session.id) {
+                result.images.invalid += 1;
+                continue;
+            }
+            let content = match fs::read_to_string(&session.path) {
+                Ok(content) => content,
+                Err(_) => continue,
+            };
+            let (rewritten, image_result) =
+                rewrite_local_image_attachments(&content, &self.codex_home, &session.id)?;
+            result.images.add(image_result);
+            let Some(rewritten) = rewritten else {
+                continue;
+            };
+            if !backup_created {
+                fs::create_dir_all(&backup_dir)
+                    .map_err(|error| format!("创建图片恢复备份目录失败: {error}"))?;
+                backup_created = true;
+            }
+            let backup_path = backup_dir.join(
+                session
+                    .path
+                    .file_name()
+                    .and_then(|item| item.to_str())
+                    .unwrap_or("session.jsonl"),
+            );
+            fs::copy(&session.path, &backup_path).map_err(|error| {
+                format!("备份图片会话文件失败 ({}): {error}", session.path.display())
+            })?;
+            write_bytes_atomic(&session.path, rewritten.as_bytes()).map_err(|error| {
+                format!(
+                    "写入图片恢复会话文件失败 ({}): {error}",
+                    session.path.display()
+                )
+            })?;
+            let _ = Command::new("touch")
+                .arg("-r")
+                .arg(&backup_path)
+                .arg(&session.path)
+                .output();
+            result.changed_rollout_files += 1;
+            result.changed_session_ids.insert(session.id.clone());
+        }
+        if backup_created {
+            result
+                .backup_dirs
+                .push(backup_dir.to_string_lossy().to_string());
         }
         Ok(result)
     }
@@ -2795,6 +2900,139 @@ impl SessionStore {
         Ok((repaired, backup_dirs))
     }
 
+    fn reset_stale_thread_history_projections(
+        &self,
+        sessions: &[SessionRepairRecord],
+        force_session_ids: &HashSet<String>,
+    ) -> Result<(usize, Vec<String>), String> {
+        if sessions.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+        let mut targets = Vec::new();
+        for session in sessions {
+            if let Some(target) = paginated_rollout_projection_target(&session.path)? {
+                targets.push((session.id.clone(), target));
+            }
+        }
+        if targets.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+
+        let mut reset_session_ids = HashSet::new();
+        let mut backup_dirs = Vec::new();
+        for db_path in self.thread_history_db_paths() {
+            let connection = Connection::open(&db_path).map_err(|error| {
+                format!(
+                    "打开 Codex 分页历史数据库失败 ({}): {error}",
+                    db_path.display()
+                )
+            })?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| format!("设置分页历史数据库等待时间失败: {error}"))?;
+            if !sqlite_table_exists_with_connection(&connection, "thread_history_projection_state")?
+            {
+                continue;
+            }
+            let has_turns = sqlite_table_exists_with_connection(&connection, "thread_turns")?;
+            let has_items = sqlite_table_exists_with_connection(&connection, "thread_items")?;
+            let mut stale_ids = Vec::new();
+            for (session_id, target) in &targets {
+                let state = connection
+                    .query_row(
+                        "SELECT next_rollout_byte_offset, next_rollout_ordinal FROM thread_history_projection_state WHERE thread_id = ?1",
+                        params![session_id],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()
+                    .map_err(|error| format!("读取分页历史投影状态失败: {error}"))?;
+                let turn_count = if has_turns {
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM thread_turns WHERE thread_id = ?1",
+                            params![session_id],
+                            |row| row.get::<_, usize>(0),
+                        )
+                        .map_err(|error| format!("统计分页历史对话轮次失败: {error}"))?
+                } else {
+                    0
+                };
+                let item_count = if has_items {
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM thread_items WHERE thread_id = ?1",
+                            params![session_id],
+                            |row| row.get::<_, usize>(0),
+                        )
+                        .map_err(|error| format!("统计分页历史项目失败: {error}"))?
+                } else {
+                    0
+                };
+                let state_is_stale = state.is_some_and(|(next_byte_offset, next_ordinal)| {
+                    next_byte_offset != target.next_byte_offset
+                        || next_ordinal != target.next_ordinal
+                });
+                let rows_without_state = state.is_none() && (turn_count > 0 || item_count > 0);
+                let turn_projection_is_stale =
+                    target.turn_count > 0 && turn_count != target.turn_count;
+                if force_session_ids.contains(session_id)
+                    || state_is_stale
+                    || rows_without_state
+                    || turn_projection_is_stale
+                {
+                    stale_ids.push(session_id.clone());
+                }
+            }
+            drop(connection);
+            if stale_ids.is_empty() {
+                continue;
+            }
+
+            backup_dirs.push(backup_sqlite_file(&db_path)?);
+            let mut connection = Connection::open(&db_path).map_err(|error| {
+                format!(
+                    "重新打开 Codex 分页历史数据库失败 ({}): {error}",
+                    db_path.display()
+                )
+            })?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| format!("设置分页历史数据库写入等待时间失败: {error}"))?;
+            let transaction = connection
+                .transaction()
+                .map_err(|error| format!("开启分页历史投影重建事务失败: {error}"))?;
+            for session_id in stale_ids {
+                for table in [
+                    "thread_items",
+                    "thread_turns",
+                    "thread_history_projection_state",
+                ] {
+                    if !sqlite_table_exists_with_connection(&transaction, table)? {
+                        continue;
+                    }
+                    transaction
+                        .execute(
+                            &format!("DELETE FROM {table} WHERE thread_id = ?1"),
+                            params![session_id],
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "清理分页历史投影失败 ({} / {table}): {error}",
+                                db_path.display()
+                            )
+                        })?;
+                }
+                reset_session_ids.insert(session_id);
+            }
+            transaction
+                .commit()
+                .map_err(|error| format!("提交分页历史投影重建失败: {error}"))?;
+        }
+        backup_dirs.sort();
+        backup_dirs.dedup();
+        Ok((reset_session_ids.len(), backup_dirs))
+    }
+
     fn repair_rollout_visibility(
         &self,
         target_provider: &str,
@@ -2883,6 +3121,16 @@ impl SessionStore {
 
     fn staged_thread_cleanup_db_paths(&self) -> Vec<PathBuf> {
         let mut paths = self.sqlite_candidate_paths();
+        for path in self.thread_history_db_paths() {
+            if !paths.iter().any(|item| item == &path) {
+                paths.push(path);
+            }
+        }
+        paths
+    }
+
+    fn thread_history_db_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
         if let Ok(entries) = fs::read_dir(&self.codex_home) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -2892,12 +3140,12 @@ impl SessionStore {
                 if path.is_file()
                     && name.starts_with("thread_history_")
                     && (name.ends_with(".sqlite") || name.ends_with(".db"))
-                    && !paths.iter().any(|item| item == &path)
                 {
                     paths.push(path);
                 }
             }
         }
+        paths.sort();
         paths
     }
 
@@ -3452,6 +3700,65 @@ fn rollout_history_mode(path: &Path) -> &'static str {
         };
     }
     "legacy"
+}
+
+fn paginated_rollout_projection_target(
+    path: &Path,
+) -> Result<Option<PaginatedRolloutProjectionTarget>, String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("读取分页会话文件失败 ({}): {error}", path.display()))?;
+    let mut first_record = true;
+    let mut last_ordinal = None;
+    let mut turn_count = 0usize;
+    for line in BufReader::new(file).lines() {
+        let line =
+            line.map_err(|error| format!("读取分页会话记录失败 ({}): {error}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(&line)
+            .map_err(|error| format!("解析分页会话记录失败 ({}): {error}", path.display()))?;
+        if first_record {
+            first_record = false;
+            if value.get("type").and_then(Value::as_str) != Some("session_meta")
+                || value.get("ordinal").and_then(Value::as_u64).is_none()
+            {
+                return Ok(None);
+            }
+        }
+        let ordinal = value
+            .get("ordinal")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("分页会话记录缺少 ordinal ({})", path.display()))?;
+        last_ordinal = Some(ordinal);
+        if value.get("type").and_then(Value::as_str) == Some("event_msg")
+            && value
+                .get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str)
+                == Some("task_started")
+        {
+            turn_count = turn_count.saturating_add(1);
+        }
+    }
+    let Some(last_ordinal) = last_ordinal else {
+        return Ok(None);
+    };
+    let next_byte_offset = i64::try_from(
+        fs::metadata(path)
+            .map_err(|error| format!("读取分页会话文件大小失败 ({}): {error}", path.display()))?
+            .len(),
+    )
+    .map_err(|_| format!("分页会话文件过大，无法重建历史投影 ({})", path.display()))?;
+    let next_ordinal = last_ordinal
+        .checked_add(1)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or_else(|| format!("分页会话 ordinal 超出范围 ({})", path.display()))?;
+    Ok(Some(PaginatedRolloutProjectionTarget {
+        next_byte_offset,
+        next_ordinal,
+        turn_count,
+    }))
 }
 
 fn metadata_value_to_string(value: &Value) -> Option<String> {
@@ -6887,6 +7194,159 @@ fn desktop_project_id(root: &str) -> String {
 
 const MAX_GENERATED_IMAGE_BYTES: usize = 100 * 1024 * 1024;
 
+fn rewrite_local_image_attachments(
+    content: &str,
+    codex_home: &Path,
+    session_id: &str,
+) -> Result<(Option<String>, GeneratedImageRepairResult), String> {
+    let mut result = GeneratedImageRepairResult::default();
+    let mut pending_inline_images = Vec::<String>::new();
+    let mut rewritten = String::with_capacity(content.len());
+    let mut changed = false;
+
+    for segment in content.split_inclusive('\n') {
+        let (line, newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, ""), |line| (line, "\n"));
+        let mut value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(_) => {
+                rewritten.push_str(segment);
+                continue;
+            }
+        };
+        if let Some(images) = inline_user_image_payloads(&value) {
+            pending_inline_images = images;
+        }
+
+        let mut line_changed = false;
+        if !pending_inline_images.is_empty()
+            && value.get("type").and_then(Value::as_str) == Some("event_msg")
+            && value
+                .get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str)
+                == Some("item_completed")
+            && value
+                .get("payload")
+                .and_then(|payload| payload.get("item"))
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str)
+                == Some("UserMessage")
+        {
+            let item_id = value
+                .get("payload")
+                .and_then(|payload| payload.get("item"))
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("user-message")
+                .to_string();
+            let image_key = if safe_generated_image_id(&item_id) {
+                item_id
+            } else {
+                short_hash(&item_id)
+            };
+            if let Some(items) = value
+                .get_mut("payload")
+                .and_then(|payload| payload.get_mut("item"))
+                .and_then(|item| item.get_mut("content"))
+                .and_then(Value::as_array_mut)
+            {
+                let local_images = items
+                    .iter_mut()
+                    .filter(|item| {
+                        matches!(
+                            item.get("type").and_then(Value::as_str),
+                            Some("local_image" | "localImage")
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for (index, (item, encoded)) in local_images
+                    .into_iter()
+                    .zip(pending_inline_images.iter())
+                    .enumerate()
+                {
+                    let Some((bytes, extension)) = decode_generated_image(encoded) else {
+                        result.invalid += 1;
+                        continue;
+                    };
+                    let image_path = codex_home
+                        .join("generated_images")
+                        .join(session_id)
+                        .join(format!("recovered-{image_key}-{index}.{extension}"));
+                    if generated_image_extension_from_file(&image_path) != Some(extension) {
+                        if let Some(parent) = image_path.parent() {
+                            fs::create_dir_all(parent).map_err(|error| {
+                                format!("创建历史图片恢复目录失败 ({}): {error}", parent.display())
+                            })?;
+                        }
+                        write_bytes_atomic(&image_path, &bytes).map_err(|error| {
+                            format!("恢复历史图片失败 ({}): {error}", image_path.display())
+                        })?;
+                        result.recreated += 1;
+                    }
+                    if generated_image_extension_from_file(&image_path) == Some(extension) {
+                        result.verified += 1;
+                    } else {
+                        result.invalid += 1;
+                        continue;
+                    }
+                    let stable_path = image_path.to_string_lossy().to_string();
+                    if item.get("path").and_then(Value::as_str) != Some(stable_path.as_str()) {
+                        item["path"] = Value::String(stable_path);
+                        line_changed = true;
+                    }
+                }
+            }
+            pending_inline_images.clear();
+        }
+
+        if line_changed {
+            rewritten.push_str(
+                &serde_json::to_string(&value)
+                    .map_err(|error| format!("序列化历史图片恢复记录失败: {error}"))?,
+            );
+            rewritten.push_str(newline);
+            changed = true;
+        } else {
+            rewritten.push_str(segment);
+        }
+    }
+    Ok((changed.then_some(rewritten), result))
+}
+
+fn inline_user_image_payloads(value: &Value) -> Option<Vec<String>> {
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("message")
+        || payload.get("role").and_then(Value::as_str) != Some("user")
+    {
+        return None;
+    }
+    let images = payload
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("input_image" | "image")
+            )
+        })
+        .filter_map(|item| {
+            item.get("image_url")
+                .or_else(|| item.get("imageUrl"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    (!images.is_empty()).then_some(images)
+}
+
 fn generated_image_payload(value: &Value) -> Option<(&str, &str)> {
     let record_type = value.get("type").and_then(Value::as_str)?;
     let payload = value.get("payload")?.as_object()?;
@@ -6997,6 +7457,7 @@ mod tests {
         sql_quote, SessionRepairRecord, SessionStore,
     };
     use serde_json::{json, Value};
+    use std::collections::HashSet;
     use std::fs;
     use std::io::Write;
     use std::path::Path;
@@ -9613,6 +10074,102 @@ mod tests {
     }
 
     #[test]
+    fn deep_repair_persists_inline_user_images_and_rewrites_local_image_paths() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir");
+        let session_path = sessions_dir.join("local-images.jsonl");
+        let png_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        write_jsonl(
+            &session_path,
+            &[
+                json!({
+                    "type": "session_meta",
+                    "payload": {"id": "session-images", "model_provider": "openai"}
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "look at this"},
+                            {"type": "input_image", "image_url": format!("data:image/png;base64,{png_base64}")}
+                        ]
+                    }
+                }),
+                json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "item_completed",
+                        "item": {
+                            "type": "UserMessage",
+                            "id": "user-message-1",
+                            "content": [
+                                {"type": "text", "text": "look at this"},
+                                {"type": "local_image", "path": "/var/folders/demo/codex-clipboard-missing.png"}
+                            ]
+                        }
+                    }
+                }),
+            ],
+        );
+        let records = vec![SessionRepairRecord {
+            id: "session-images".to_string(),
+            title: "Local images".to_string(),
+            path: session_path.clone(),
+            updated_at: 10,
+        }];
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let result = store
+            .repair_local_image_attachments(&records)
+            .expect("repair local images");
+
+        assert_eq!(result.changed_rollout_files, 1);
+        assert_eq!(
+            result.changed_session_ids,
+            HashSet::from(["session-images".to_string()])
+        );
+        assert_eq!(result.images.recreated, 1);
+        assert_eq!(result.images.verified, 1);
+        assert_eq!(result.images.invalid, 0);
+        assert_eq!(result.backup_dirs.len(), 1);
+
+        let repaired = fs::read_to_string(&session_path).expect("read repaired rollout");
+        assert!(repaired.contains(&format!("data:image/png;base64,{png_base64}")));
+        let local_path = repaired
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find_map(|value| {
+                value
+                    .pointer("/payload/item/content/1/path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .expect("rewritten local image path");
+        assert!(local_path.starts_with(
+            codex
+                .path()
+                .join("generated_images/session-images")
+                .to_string_lossy()
+                .as_ref()
+        ));
+        assert_eq!(
+            &fs::read(&local_path).expect("read recovered local image")[..8],
+            b"\x89PNG\r\n\x1a\n"
+        );
+
+        let second = store
+            .repair_local_image_attachments(&records)
+            .expect("verify repaired local images");
+        assert_eq!(second.changed_rollout_files, 0);
+        assert_eq!(second.images.recreated, 0);
+        assert_eq!(second.images.verified, 1);
+        assert!(second.backup_dirs.is_empty());
+    }
+
+    #[test]
     fn repair_visibility_rewrites_rollout_session_meta_provider() {
         let codex = tempdir().expect("codex tempdir");
         let sessions_dir = codex.path().join("sessions");
@@ -9685,6 +10242,162 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(ordinals, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn deep_repair_resets_only_stale_paginated_history_projection() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-stale-projection.jsonl");
+        fs::write(
+            &session_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"target"},"ordinal":0}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"},"ordinal":1}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"},"ordinal":2}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"},"ordinal":3}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2"},"ordinal":4}"#,
+                "\n"
+            ),
+        )
+        .expect("write paginated session");
+        let history_db = codex.path().join("thread_history_1.sqlite");
+        run_sqlite_test(
+            &history_db,
+            r#"
+                CREATE TABLE thread_items (thread_id TEXT NOT NULL, item_id TEXT NOT NULL);
+                CREATE TABLE thread_turns (thread_id TEXT NOT NULL, turn_id TEXT NOT NULL);
+                CREATE TABLE thread_history_projection_state (
+                    thread_id TEXT PRIMARY KEY,
+                    next_rollout_byte_offset INTEGER NOT NULL,
+                    next_rollout_ordinal INTEGER NOT NULL
+                );
+                INSERT INTO thread_items VALUES ('target', 'old-item'), ('unrelated', 'keep-item');
+                INSERT INTO thread_turns VALUES ('target', 'old-turn'), ('unrelated', 'keep-turn');
+                INSERT INTO thread_history_projection_state VALUES
+                    ('target', 120, 3),
+                    ('unrelated', 500, 9);
+            "#,
+        );
+        let records = vec![SessionRepairRecord {
+            id: "target".to_string(),
+            title: "Target".to_string(),
+            path: session_path,
+            updated_at: 10,
+        }];
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let (reset, backup_dirs) = store
+            .reset_stale_thread_history_projections(&records, &HashSet::new())
+            .expect("reset stale history projection");
+
+        assert_eq!(reset, 1);
+        assert_eq!(backup_dirs.len(), 1);
+        for table in [
+            "thread_items",
+            "thread_turns",
+            "thread_history_projection_state",
+        ] {
+            assert_eq!(
+                run_sqlite_test_output(
+                    &history_db,
+                    &format!("SELECT COUNT(*) FROM {table} WHERE thread_id = 'target';")
+                )
+                .trim(),
+                "0"
+            );
+            assert_eq!(
+                run_sqlite_test_output(
+                    &history_db,
+                    &format!("SELECT COUNT(*) FROM {table} WHERE thread_id = 'unrelated';")
+                )
+                .trim(),
+                "1"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_repair_preserves_complete_paginated_history_projection() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-complete-projection.jsonl");
+        fs::write(
+            &session_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"target"},"ordinal":0}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"},"ordinal":1}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"},"ordinal":2}"#,
+                "\n"
+            ),
+        )
+        .expect("write paginated session");
+        let file_size = fs::metadata(&session_path).expect("session metadata").len();
+        let history_db = codex.path().join("thread_history_1.sqlite");
+        run_sqlite_test(
+            &history_db,
+            &format!(
+                r#"
+                    CREATE TABLE thread_items (thread_id TEXT NOT NULL, item_id TEXT NOT NULL);
+                    CREATE TABLE thread_turns (thread_id TEXT NOT NULL, turn_id TEXT NOT NULL);
+                    CREATE TABLE thread_history_projection_state (
+                        thread_id TEXT PRIMARY KEY,
+                        next_rollout_byte_offset INTEGER NOT NULL,
+                        next_rollout_ordinal INTEGER NOT NULL
+                    );
+                    INSERT INTO thread_items VALUES ('target', 'item');
+                    INSERT INTO thread_turns VALUES ('target', 'turn-1');
+                    INSERT INTO thread_history_projection_state VALUES ('target', {file_size}, 3);
+                "#
+            ),
+        );
+        let records = vec![SessionRepairRecord {
+            id: "target".to_string(),
+            title: "Target".to_string(),
+            path: session_path,
+            updated_at: 10,
+        }];
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let (reset, backup_dirs) = store
+            .reset_stale_thread_history_projections(&records, &HashSet::new())
+            .expect("preserve complete history projection");
+
+        assert_eq!(reset, 0);
+        assert!(backup_dirs.is_empty());
+        assert_eq!(
+            run_sqlite_test_output(
+                &history_db,
+                "SELECT COUNT(*) FROM thread_turns WHERE thread_id = 'target';"
+            )
+            .trim(),
+            "1"
+        );
+
+        let (forced_reset, forced_backup_dirs) = store
+            .reset_stale_thread_history_projections(
+                &records,
+                &HashSet::from(["target".to_string()]),
+            )
+            .expect("force reset changed image projection");
+        assert_eq!(forced_reset, 1);
+        assert_eq!(forced_backup_dirs.len(), 1);
+        assert_eq!(
+            run_sqlite_test_output(
+                &history_db,
+                "SELECT COUNT(*) FROM thread_turns WHERE thread_id = 'target';"
+            )
+            .trim(),
+            "0"
+        );
     }
 
     fn run_sqlite_test(db_path: &std::path::Path, sql: &str) {

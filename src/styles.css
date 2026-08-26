@@ -2252,7 +2252,7 @@ textarea {
 
 .session-project-table .session-child-row {
   display: grid;
-  grid-template-columns: 24px minmax(220px, 1fr) 150px 100px 170px 160px;
+  grid-template-columns: 24px minmax(220px, 1fr) 150px 100px 170px 190px;
   min-height: 48px;
   gap: 10px;
   padding: 0 12px;

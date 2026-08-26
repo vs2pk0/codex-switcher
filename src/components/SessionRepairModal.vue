@@ -45,7 +45,7 @@ defineEmits<{
           <span class="modal-eyebrow">{{ t("会话恢复") }}</span>
           <h3>{{ t("把切号后消失的会话重新挂回列表") }}</h3>
           <p>
-            {{ t("会同步整理 Codex 本地索引、项目分组、生成图片与状态库，并自动重启 ChatGPT/Codex 让当前侧栏重新加载；请先等待正在运行的任务结束。") }}
+            {{ t("会同步整理 Codex 本地索引、项目分组、图片附件与状态库，并自动重启 ChatGPT/Codex 让当前侧栏重新加载；请先等待正在运行的任务结束。") }}
           </p>
         </div>
         <div class="repair-summary-card">
@@ -177,6 +177,9 @@ defineEmits<{
         </span>
         <span v-if="repairResult.invalidGeneratedImageCount" class="repair-result-error">
           {{ t("无效图片") }} {{ repairResult.invalidGeneratedImageCount }} {{ t("张") }}
+        </span>
+        <span v-if="repairResult.resetHistoryProjectionCount">
+          {{ t("历史投影") }} {{ repairResult.resetHistoryProjectionCount }} {{ t("条") }}
         </span>
         <span v-if="repairResult.desktopReloadPerformed">
           {{ t("侧栏已重载") }}
