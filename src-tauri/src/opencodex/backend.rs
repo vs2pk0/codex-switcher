@@ -1442,6 +1442,27 @@ impl Backend {
             CommandAction::Restore => "restore",
             _ => return Err("多开实例集成操作只支持同步或恢复".to_string()),
         };
+        if matches!(action, CommandAction::Sync) {
+            let default_home = crate::instances::codex_home_for(None)?;
+            if default_home == codex_home {
+                return Err("目标多开实例与系统默认实例共用 Codex Home，无法安全隔离".to_string());
+            }
+            // OpenCodex resolves OPENCODEX_HOME and CODEX_HOME while loading its
+            // modules. Keep the default restore and custom injection in separate
+            // helper processes so neither process can reuse paths cached for the
+            // other instance.
+            self.run_instance_integration_process("isolate-default", port, &default_home)
+                .map_err(|error| format!("隔离系统默认实例失败：{error}"))?;
+        }
+        self.run_instance_integration_process(action_name, port, codex_home)
+    }
+
+    fn run_instance_integration_process(
+        &self,
+        action_name: &str,
+        port: u16,
+        codex_home: &Path,
+    ) -> Result<String, String> {
         let engine = self.bundled_engine_dir()?;
         let runtime = self.bundled_runtime_path()?;
         let helper = engine.join("manager-instance-integration.ts");
@@ -1473,7 +1494,7 @@ impl Backend {
         }
         let detail = self.redact(String::from_utf8_lossy(&output.stderr).trim());
         Err(if detail.is_empty() {
-            format!("多开实例 OpenCodex {}失败", display_action(action))
+            format!("OpenCodex 实例隔离操作 {action_name} 失败")
         } else {
             detail
         })

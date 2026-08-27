@@ -1025,8 +1025,8 @@ const en: Record<string, string> = {
   "修复可见性": "Repair Visibility",
   "历史投影": "History Projection",
   "恢复完整会话": "Restore Full Conversation",
-  "将修复该会话的分页历史模式、消息序号和本地索引，并自动备份原始文件。修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。":
-    "Repairs this conversation's paginated history mode, message ordinals, and local indexes after backing up the original file. The corresponding Codex instance restarts during repair, so wait for any active task to finish first.",
+  "将修复该会话的分页历史、消息序号和本地索引，清理无法跨实例解密的记录；若上下文过大，会保留界面中的完整历史并生成仅含可读摘要和近期对话的本地压缩快照，然后将模型恢复为 gpt-5.5。原始文件会自动备份；修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。":
+    "Repairs this conversation's paginated history, message ordinals, and local indexes and removes records that cannot be decrypted across instances. If the context is oversized, the full visible history is retained while a local compacted snapshot containing readable summaries and recent messages is created, then the model is reset to gpt-5.5. The original file is backed up automatically. The corresponding Codex instance restarts during repair, so wait for active tasks to finish first.",
   "未找到需要修复的 Codex 实例": "The Codex instance to repair was not found",
   "未找到需要修复的会话，请刷新后重试": "The conversation to repair was not found. Refresh and try again.",
   "完整会话已恢复": "Full conversation restored",
@@ -2044,8 +2044,8 @@ const ru: Record<string, string> = {
   "修复可见性": "Восстановить видимость",
   "历史投影": "Проекция истории",
   "恢复完整会话": "Восстановить полную переписку",
-  "将修复该会话的分页历史模式、消息序号和本地索引，并自动备份原始文件。修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。":
-    "Будут исправлены режим постраничной истории, порядковые номера сообщений и локальные индексы этой сессии. Исходный файл будет сохранён. Во время восстановления соответствующий экземпляр Codex перезапустится — дождитесь завершения текущих задач.",
+  "将修复该会话的分页历史、消息序号和本地索引，清理无法跨实例解密的记录；若上下文过大，会保留界面中的完整历史并生成仅含可读摘要和近期对话的本地压缩快照，然后将模型恢复为 gpt-5.5。原始文件会自动备份；修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。":
+    "Будут исправлены постраничная история, порядковые номера сообщений и локальные индексы, а также удалены записи, которые нельзя расшифровать в другом экземпляре. Если контекст слишком велик, полная видимая история сохранится, а для продолжения будет создан локальный сжатый снимок с читаемыми сводками и недавними сообщениями; модель будет сброшена на gpt-5.5. Исходный файл сохранится автоматически. Во время восстановления экземпляр Codex перезапустится — дождитесь завершения текущих задач.",
   "未找到需要修复的 Codex 实例": "Экземпляр Codex для восстановления не найден",
   "未找到需要修复的会话，请刷新后重试": "Сессия для восстановления не найдена. Обновите список и повторите попытку.",
   "完整会话已恢复": "Полная переписка восстановлена",
@@ -2715,8 +2715,8 @@ const simplifiedToTraditional: Record<string, string> = {
   "历史投影": "歷史投影",
   "恢复完整会话": "還原完整會話",
   "开始修复": "開始修復",
-  "将修复该会话的分页历史模式、消息序号和本地索引，并自动备份原始文件。修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。":
-    "將修復此會話的分頁歷史模式、訊息序號與本機索引，並自動備份原始檔案。修復期間對應的 Codex 執行個體會重新啟動，請先等待進行中的工作完成。",
+  "将修复该会话的分页历史、消息序号和本地索引，清理无法跨实例解密的记录；若上下文过大，会保留界面中的完整历史并生成仅含可读摘要和近期对话的本地压缩快照，然后将模型恢复为 gpt-5.5。原始文件会自动备份；修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。":
+    "將修復此會話的分頁歷史、訊息序號與本機索引，清理無法跨執行個體解密的記錄；若上下文過大，會保留介面中的完整歷史並產生僅含可讀摘要與近期對話的本機壓縮快照，然後將模型還原為 gpt-5.5。原始檔案會自動備份；修復期間對應的 Codex 執行個體會重新啟動，請先等待進行中的工作完成。",
   "未找到需要修复的 Codex 实例": "找不到需要修復的 Codex 執行個體",
   "未找到需要修复的会话，请刷新后重试": "找不到需要修復的會話，請重新整理後再試一次",
   "完整会话已恢复": "完整會話已還原",

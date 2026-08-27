@@ -3914,7 +3914,7 @@ function confirmRepairSingleSessionHistory(session: CodexSessionRecord): void {
   Modal.warning({
     title: t("恢复完整会话"),
     content: t(
-      "将修复该会话的分页历史模式、消息序号和本地索引，并自动备份原始文件。修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。",
+      "将修复该会话的分页历史、消息序号和本地索引，清理无法跨实例解密的记录；若上下文过大，会保留界面中的完整历史并生成仅含可读摘要和近期对话的本地压缩快照，然后将模型恢复为 gpt-5.5。原始文件会自动备份；修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。",
     ),
     okText: t("开始修复"),
     cancelText: t("取消"),
@@ -4846,6 +4846,7 @@ onUnmounted(() => {
       :active="activeView === 'openCodex'"
       :instances="codexInstances"
       @accounts-refreshed="refreshOpenCodexAccountIds"
+      @instances-refreshed="loadCodexInstances"
     />
 
     <CodexInstancesPanel
