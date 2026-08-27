@@ -41,7 +41,10 @@ import type {
 } from "./types";
 
 const props = defineProps<{ active: boolean; instances: CodexInstance[] }>();
-const emit = defineEmits<{ (event: "accounts-refreshed"): void }>();
+const emit = defineEmits<{
+  (event: "accounts-refreshed"): void;
+  (event: "instances-refreshed"): void;
+}>();
 
 const page = ref<OpenCodexPage>("console");
 const snapshot = ref<OpenCodexSystemSnapshot | null>(null);
@@ -576,6 +579,9 @@ onMounted(async () => {
         });
         if (event.success) Message.success(event.message);
         else Message.error(event.message);
+        if (event.action === "sync" || event.action === "restore") {
+          emit("instances-refreshed");
+        }
         void refreshSnapshot(false);
       },
     );

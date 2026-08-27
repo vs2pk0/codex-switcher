@@ -491,7 +491,7 @@ impl SessionStore {
 
         for path in collect_jsonl_files(&self.sessions_dir())? {
             let Some((tmp_path, rewrite_stats)) =
-                prepare_rollout_model_compatibility_rewrite(&path, target_provider)?
+                prepare_rollout_model_compatibility_rewrite(&path, target_provider, None)?
             else {
                 continue;
             };
@@ -1109,6 +1109,7 @@ impl SessionStore {
                 &db_path,
                 target_provider,
                 Some(std::slice::from_ref(&record)),
+                None,
             )? > 0
             {
                 registered = true;
@@ -1646,8 +1647,11 @@ impl SessionStore {
             .unwrap_or(false);
         let (mut changed_rollout_files, mut rollout_backup_dirs) =
             self.repair_rollout_visibility(&target_provider, &repair_records, deep)?;
-        let (updated_rows, backup_dirs) =
-            self.repair_sqlite_visibility(&target_provider, Some(&repair_records))?;
+        let (updated_rows, backup_dirs) = self.repair_sqlite_visibility(
+            &target_provider,
+            Some(&repair_records),
+            deep.then_some("gpt-5.5"),
+        )?;
         let added_index_entries = if deep {
             self.repair_session_index(&repair_records)?
         } else {
@@ -1672,10 +1676,11 @@ impl SessionStore {
         rollout_backup_dirs.extend(local_images.backup_dirs);
         generated_images.add(local_images.images);
         let (reset_history_projections, history_backup_dirs) = if deep {
-            self.reset_stale_thread_history_projections(
-                &repair_records,
-                &local_images.changed_session_ids,
-            )?
+            let mut changed_session_ids = local_images.changed_session_ids.clone();
+            if selected_ids.is_some() {
+                changed_session_ids.extend(repair_records.iter().map(|session| session.id.clone()));
+            }
+            self.reset_stale_thread_history_projections(&repair_records, &changed_session_ids)?
         } else {
             (0, Vec::new())
         };
@@ -2628,7 +2633,7 @@ impl SessionStore {
             })
             .collect::<Vec<_>>();
         let target_provider = self.read_target_provider()?;
-        self.repair_sqlite_visibility(&target_provider, Some(&repair_records))?;
+        self.repair_sqlite_visibility(&target_provider, Some(&repair_records), None)?;
         self.repair_session_index(&repair_records)?;
         let catalog = self.repair_desktop_catalog(&target_provider, &repair_records)?;
         if !catalog.missing_ids.is_empty() {
@@ -2949,6 +2954,7 @@ impl SessionStore {
         &self,
         target_provider: &str,
         sessions: Option<&[SessionRepairRecord]>,
+        forced_model: Option<&str>,
     ) -> Result<(usize, Vec<String>), String> {
         if !sqlite3_available() {
             return Ok((0, Vec::new()));
@@ -2957,7 +2963,7 @@ impl SessionStore {
         let mut backup_dirs = Vec::new();
         for db_path in self.sqlite_candidate_paths() {
             let backup_dir = backup_sqlite_file(&db_path)?;
-            let changed = repair_sqlite_db(&db_path, target_provider, sessions)?;
+            let changed = repair_sqlite_db(&db_path, target_provider, sessions, forced_model)?;
             if changed > 0 {
                 backup_dirs.push(backup_dir);
                 repaired += changed;
@@ -3116,12 +3122,45 @@ impl SessionStore {
                 Ok(content) => content,
                 Err(_) => continue,
             };
+            let compatibility_rewrite = if rewrite_all_meta {
+                prepare_rollout_model_compatibility_rewrite(
+                    &session.path,
+                    target_provider,
+                    Some("gpt-5.5"),
+                )?
+            } else {
+                None
+            };
+            let compatibility_content = match compatibility_rewrite {
+                Some((tmp_path, _)) => {
+                    let result = fs::read_to_string(&tmp_path).map_err(|error| {
+                        format!(
+                            "读取会话模型修复临时文件失败 ({}): {}",
+                            session.path.display(),
+                            error
+                        )
+                    });
+                    let _ = fs::remove_file(&tmp_path);
+                    Some(result?)
+                }
+                None => None,
+            };
+            let base_content = compatibility_content.as_deref().unwrap_or(&content);
             let provider_rewrite =
-                rewrite_session_meta_provider(&content, target_provider, rewrite_all_meta)?;
+                rewrite_session_meta_provider(base_content, target_provider, rewrite_all_meta)?;
             let ordinal_rewrite = normalize_paginated_rollout_ordinals(
-                provider_rewrite.as_deref().unwrap_or(&content),
+                provider_rewrite.as_deref().unwrap_or(base_content),
             )?;
-            let Some(next) = ordinal_rewrite.or(provider_rewrite) else {
+            let visibility_rewrite = ordinal_rewrite
+                .or(provider_rewrite)
+                .or(compatibility_content);
+            let candidate = visibility_rewrite.as_deref().unwrap_or(&content);
+            let local_compaction = if rewrite_all_meta {
+                append_local_recovery_compaction(candidate)?
+            } else {
+                None
+            };
+            let Some(next) = local_compaction.or(visibility_rewrite) else {
                 continue;
             };
             if !backup_created {
@@ -3275,6 +3314,7 @@ fn repair_sqlite_db(
     db_path: &Path,
     target_provider: &str,
     sessions: Option<&[SessionRepairRecord]>,
+    forced_model: Option<&str>,
 ) -> Result<usize, String> {
     if !db_path.exists() {
         return Ok(0);
@@ -3285,20 +3325,38 @@ fn repair_sqlite_db(
     }
     let repaired_history_modes =
         sqlite_repair_paginated_history_modes(db_path, &columns, sessions)?;
-    let before = sqlite_count_repairable_rows(db_path, target_provider, sessions)?;
+    let before = sqlite_count_repairable_rows(db_path, target_provider, sessions, forced_model)?;
     if before == 0 {
-        return sqlite_insert_missing_session_rows(db_path, target_provider, sessions)
-            .map(|inserted| repaired_history_modes + inserted);
+        return sqlite_insert_missing_session_rows(
+            db_path,
+            target_provider,
+            sessions,
+            forced_model,
+        )
+        .map(|inserted| repaired_history_modes + inserted);
     }
     let escaped_provider = sql_quote(target_provider);
-    let set_clause = sqlite_repair_set_clause(&columns, &escaped_provider);
-    let where_clause = sqlite_repair_where_clause(&columns, &escaped_provider, sessions);
+    let forced_model = forced_model.map(|model| model_for_provider(model, target_provider));
+    let escaped_model = forced_model.as_deref().map(sql_quote);
+    let set_clause =
+        sqlite_repair_set_clause(&columns, &escaped_provider, escaped_model.as_deref());
+    let where_clause = sqlite_repair_where_clause(
+        &columns,
+        &escaped_provider,
+        escaped_model.as_deref(),
+        sessions,
+    );
     if set_clause.is_empty() || where_clause.is_empty() {
         return Ok(0);
     }
     let sql = format!("UPDATE threads SET {set_clause} WHERE {where_clause};");
     run_sqlite(db_path, &sql)?;
-    let inserted = sqlite_insert_missing_session_rows(db_path, target_provider, sessions)?;
+    let inserted = sqlite_insert_missing_session_rows(
+        db_path,
+        target_provider,
+        sessions,
+        forced_model.as_deref(),
+    )?;
     Ok(repaired_history_modes + before + inserted)
 }
 
@@ -3345,13 +3403,23 @@ fn sqlite_count_repairable_rows(
     db_path: &Path,
     target_provider: &str,
     sessions: Option<&[SessionRepairRecord]>,
+    forced_model: Option<&str>,
 ) -> Result<usize, String> {
     let columns = sqlite_thread_columns(db_path)?;
     if !columns.contains("id") {
         return Ok(0);
     }
     let escaped_provider = sql_quote(target_provider);
-    let where_clause = sqlite_repair_where_clause(&columns, &escaped_provider, sessions);
+    let escaped_model = forced_model
+        .map(|model| model_for_provider(model, target_provider))
+        .as_deref()
+        .map(sql_quote);
+    let where_clause = sqlite_repair_where_clause(
+        &columns,
+        &escaped_provider,
+        escaped_model.as_deref(),
+        sessions,
+    );
     if where_clause.is_empty() {
         return Ok(0);
     }
@@ -3423,10 +3491,22 @@ fn sidebar_source_kind(source: &str) -> Option<String> {
     Some(source.trim_matches('"').to_string())
 }
 
-fn sqlite_repair_set_clause(columns: &HashSet<String>, escaped_provider: &str) -> String {
+fn sqlite_repair_set_clause(
+    columns: &HashSet<String>,
+    escaped_provider: &str,
+    escaped_model: Option<&str>,
+) -> String {
     let mut assignments = Vec::new();
     if columns.contains("model_provider") {
         assignments.push(format!("model_provider = {escaped_provider}"));
+    }
+    if let Some(escaped_model) = escaped_model {
+        if columns.contains("model") {
+            assignments.push(format!("model = {escaped_model}"));
+        }
+        if columns.contains("reasoning_effort") {
+            assignments.push("reasoning_effort = NULL".to_string());
+        }
     }
     if columns.contains("first_user_message") && columns.contains("title") {
         assignments.push(
@@ -3471,6 +3551,7 @@ fn sqlite_repair_set_clause(columns: &HashSet<String>, escaped_provider: &str) -
 fn sqlite_repair_where_clause(
     columns: &HashSet<String>,
     escaped_provider: &str,
+    escaped_model: Option<&str>,
     sessions: Option<&[SessionRepairRecord]>,
 ) -> String {
     let mut predicates = Vec::new();
@@ -3478,6 +3559,14 @@ fn sqlite_repair_where_clause(
         predicates.push(format!(
             "COALESCE(model_provider, '') <> {escaped_provider}"
         ));
+    }
+    if let Some(escaped_model) = escaped_model {
+        if columns.contains("model") {
+            predicates.push(format!("COALESCE(model, '') <> {escaped_model}"));
+        }
+        if columns.contains("reasoning_effort") {
+            predicates.push("reasoning_effort IS NOT NULL".to_string());
+        }
     }
     if columns.contains("first_user_message") && columns.contains("title") {
         predicates.push(
@@ -3531,6 +3620,7 @@ fn sqlite_insert_missing_session_rows(
     db_path: &Path,
     target_provider: &str,
     sessions: Option<&[SessionRepairRecord]>,
+    forced_model: Option<&str>,
 ) -> Result<usize, String> {
     let Some(sessions) = sessions else {
         return Ok(0);
@@ -3567,6 +3657,10 @@ fn sqlite_insert_missing_session_rows(
             "model_provider",
             target_provider,
         );
+        if let Some(model) = forced_model {
+            let model = model_for_provider(model, target_provider);
+            push_sql_value(&mut names, &mut values, &columns, "model", &model);
+        }
         push_sql_value(
             &mut names,
             &mut values,
@@ -4017,6 +4111,229 @@ fn should_repair_default_instance(
         .unwrap_or(true)
 }
 
+const LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES: usize = 1024 * 1024;
+const LOCAL_RECOVERY_CONTEXT_MAX_BYTES: usize = 384 * 1024;
+const LOCAL_RECOVERY_CONTEXT_MAX_MESSAGES: usize = 48;
+const LOCAL_RECOVERY_MESSAGE_MAX_CHARS: usize = 8 * 1024;
+const LOCAL_RECOVERY_SUMMARY_MAX_CHARS: usize = 16 * 1024;
+
+#[derive(Debug, Default)]
+struct LocalRecoveryContext {
+    active_response_bytes: usize,
+    messages: Vec<Value>,
+    latest_summary: String,
+    latest_timestamp: String,
+}
+
+impl LocalRecoveryContext {
+    fn observe(&mut self, value: &Value) {
+        if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
+            if !timestamp.trim().is_empty() {
+                self.latest_timestamp = timestamp.to_string();
+            }
+        }
+        match value.get("type").and_then(Value::as_str) {
+            Some("compacted") => {
+                let replacement_history = value
+                    .pointer("/payload/replacement_history")
+                    .and_then(Value::as_array);
+                self.active_response_bytes = replacement_history
+                    .and_then(|history| serde_json::to_vec(history).ok())
+                    .map(|serialized| serialized.len())
+                    .unwrap_or(0);
+                self.messages = replacement_history
+                    .into_iter()
+                    .flatten()
+                    .filter_map(portable_recovery_message)
+                    .collect();
+                if let Some(summary) = value
+                    .pointer("/payload/message")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|summary| !summary.is_empty())
+                {
+                    self.latest_summary = truncate_chars(summary, LOCAL_RECOVERY_SUMMARY_MAX_CHARS);
+                }
+            }
+            Some("response_item") => {
+                let Some(payload) = value.get("payload") else {
+                    return;
+                };
+                self.active_response_bytes = self.active_response_bytes.saturating_add(
+                    serde_json::to_vec(payload)
+                        .map(|serialized| serialized.len())
+                        .unwrap_or(0),
+                );
+                if let Some(message) = portable_recovery_message(payload) {
+                    self.messages.push(message);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn build_compaction(&self) -> Option<Value> {
+        if self.active_response_bytes <= LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES {
+            return None;
+        }
+
+        let mut replacement_history = Vec::new();
+        let mut serialized_bytes = 0usize;
+        for message in self.messages.iter().rev() {
+            if replacement_history.len() >= LOCAL_RECOVERY_CONTEXT_MAX_MESSAGES {
+                break;
+            }
+            let message_bytes = serde_json::to_vec(message).ok()?.len();
+            if serialized_bytes.saturating_add(message_bytes) > LOCAL_RECOVERY_CONTEXT_MAX_BYTES {
+                break;
+            }
+            serialized_bytes = serialized_bytes.saturating_add(message_bytes);
+            replacement_history.push(message.clone());
+        }
+        replacement_history.reverse();
+        if let Some(first_user) = replacement_history
+            .iter()
+            .position(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        {
+            replacement_history.drain(..first_user);
+        }
+        if replacement_history.is_empty() {
+            replacement_history.push(serde_json::json!({
+                "type": "message",
+                "id": format!("{:032x}", rand::random::<u128>()),
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "Continue this recovered conversation. Earlier history remains visible locally, but oversized model context was removed.",
+                }],
+            }));
+        }
+
+        let summary = if self.latest_summary.trim().is_empty() {
+            "Earlier messages and oversized tool outputs remain in the local rollout for display, but were compacted into a portable recent-message snapshot so this conversation can continue."
+                .to_string()
+        } else {
+            self.latest_summary.clone()
+        };
+        let timestamp = if self.latest_timestamp.trim().is_empty() {
+            chrono::Utc::now().to_rfc3339()
+        } else {
+            self.latest_timestamp.clone()
+        };
+        Some(json_value_with_type(
+            &timestamp,
+            "compacted",
+            serde_json::json!({
+                "message": summary,
+                "replacement_history": replacement_history,
+            }),
+        ))
+    }
+}
+
+fn portable_recovery_message(payload: &Value) -> Option<Value> {
+    if payload.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    let role = payload.get("role").and_then(Value::as_str)?;
+    if role != "user" && role != "assistant" {
+        return None;
+    }
+    let mut text_parts = Vec::new();
+    let mut image_count = 0usize;
+    for content in payload.get("content").and_then(Value::as_array)? {
+        if let Some(text) = content.get("text").and_then(Value::as_str) {
+            if !text.trim().is_empty() {
+                text_parts.push(text.trim());
+            }
+        } else if content
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.contains("image"))
+        {
+            image_count = image_count.saturating_add(1);
+        }
+    }
+    if image_count > 0 {
+        text_parts.push("[image attachment omitted from recovery context]");
+    }
+    let text = truncate_chars(&text_parts.join("\n\n"), LOCAL_RECOVERY_MESSAGE_MAX_CHARS);
+    if text.trim().is_empty() {
+        return None;
+    }
+    let content_type = if role == "user" {
+        "input_text"
+    } else {
+        "output_text"
+    };
+    Some(serde_json::json!({
+        "type": "message",
+        "id": format!("{:032x}", rand::random::<u128>()),
+        "role": role,
+        "content": [{
+            "type": content_type,
+            "text": text,
+        }],
+    }))
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}\n[… truncated during local conversation recovery …]")
+    } else {
+        truncated
+    }
+}
+
+fn append_local_recovery_compaction(content: &str) -> Result<Option<String>, String> {
+    let mut context = LocalRecoveryContext::default();
+    let mut last_ordinal = None;
+    let mut paginated = false;
+    let mut saw_first_record = false;
+    for line in content.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if !saw_first_record {
+            paginated = value.get("ordinal").and_then(Value::as_u64).is_some();
+            saw_first_record = true;
+        }
+        if let Some(ordinal) = value.get("ordinal").and_then(Value::as_u64) {
+            last_ordinal = Some(last_ordinal.map_or(ordinal, |last: u64| last.max(ordinal)));
+        }
+        context.observe(&value);
+    }
+    let Some(mut compacted) = context.build_compaction() else {
+        return Ok(None);
+    };
+    if paginated {
+        compacted
+            .as_object_mut()
+            .ok_or_else(|| "本地会话压缩记录格式无效".to_string())?
+            .insert(
+                "ordinal".to_string(),
+                Value::from(last_ordinal.unwrap_or(0).saturating_add(1)),
+            );
+    }
+    let mut output = String::with_capacity(
+        content
+            .len()
+            .saturating_add(LOCAL_RECOVERY_CONTEXT_MAX_BYTES),
+    );
+    output.push_str(content);
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(
+        &serde_json::to_string(&compacted)
+            .map_err(|error| format!("生成本地会话压缩记录失败: {}", error))?,
+    );
+    output.push('\n');
+    Ok(Some(output))
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct RolloutModelCompatibilityRewriteStats {
     rewritten_model_fields: usize,
@@ -4044,6 +4361,7 @@ impl RolloutModelCompatibilityRewriteStats {
 fn prepare_rollout_model_compatibility_rewrite(
     path: &Path,
     target_provider: &str,
+    forced_model: Option<&str>,
 ) -> Result<Option<(PathBuf, RolloutModelCompatibilityRewriteStats)>, String> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
@@ -4124,7 +4442,11 @@ fn prepare_rollout_model_compatibility_rewrite(
                     continue;
                 }
             };
-            let line_stats = rewrite_rollout_model_compatibility_value(&mut value, target_provider);
+            let line_stats = rewrite_rollout_model_compatibility_value(
+                &mut value,
+                target_provider,
+                forced_model,
+            );
             if !line_stats.changed() {
                 writer.write_all(&line).map_err(|error| {
                     format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
@@ -4176,6 +4498,7 @@ fn prepare_rollout_model_compatibility_rewrite(
 fn rewrite_rollout_model_compatibility_value(
     value: &mut Value,
     target_provider: &str,
+    forced_model: Option<&str>,
 ) -> RolloutModelCompatibilityRewriteStats {
     let record_type = value
         .get("type")
@@ -4243,6 +4566,7 @@ fn rewrite_rollout_model_compatibility_value(
         ],
         _ => &[],
     };
+    let forced_model = forced_model.map(|model| model_for_provider(model, target_provider));
     for pointer in model_paths {
         let Some(model) = value.pointer_mut(pointer) else {
             continue;
@@ -4250,7 +4574,12 @@ fn rewrite_rollout_model_compatibility_value(
         let Some(current) = model.as_str() else {
             continue;
         };
-        let Some(normalized) = normalize_model_for_provider(current, target_provider) else {
+        let normalized = match forced_model.as_ref() {
+            Some(forced) if current != forced => Some(forced.clone()),
+            Some(_) => None,
+            None => normalize_model_for_provider(current, target_provider),
+        };
+        let Some(normalized) = normalized else {
             continue;
         };
         *model = Value::String(normalized);
@@ -4310,6 +4639,19 @@ fn normalize_model_for_provider(model: &str, target_provider: &str) -> Option<St
         return None;
     }
     Some(format!("{target_provider}/{model_id}"))
+}
+
+fn model_for_provider(model: &str, target_provider: &str) -> String {
+    let model = model
+        .trim()
+        .split_once('/')
+        .map(|(_, model_id)| model_id)
+        .unwrap_or_else(|| model.trim());
+    if target_provider == "openai" {
+        model.to_string()
+    } else {
+        format!("{target_provider}/{model}")
+    }
 }
 
 fn rewrite_session_meta_provider(
@@ -5907,6 +6249,7 @@ fn create_staged_fork_rollout(
         &timestamp,
     )?;
     let mut history_count = 0_u64;
+    let mut recovery_context = LocalRecoveryContext::default();
     let write_result = (|| {
         serde_json::to_writer(&mut writer, &meta)
             .map_err(|error| format!("生成临时会话身份失败: {error}"))?;
@@ -5946,6 +6289,12 @@ fn create_staged_fork_rollout(
                 if value.get("type").and_then(Value::as_str) == Some("session_meta") {
                     continue;
                 }
+                let compatibility =
+                    rewrite_rollout_model_compatibility_value(&mut value, target_provider, None);
+                if compatibility.removed_encrypted_reasoning_items > 0 {
+                    continue;
+                }
+                recovery_context.observe(&value);
                 history_count = history_count.saturating_add(1);
                 value
                     .as_object_mut()
@@ -5960,6 +6309,18 @@ fn create_staged_fork_rollout(
         }
         if history_count == 0 {
             return Err("源会话没有可复制的历史数据".to_string());
+        }
+        if let Some(mut compacted) = recovery_context.build_compaction() {
+            history_count = history_count.saturating_add(1);
+            compacted
+                .as_object_mut()
+                .ok_or_else(|| "本地会话压缩记录格式无效".to_string())?
+                .insert("ordinal".to_string(), Value::from(history_count));
+            serde_json::to_writer(&mut writer, &compacted)
+                .map_err(|error| format!("生成临时会话压缩记录失败: {error}"))?;
+            writer
+                .write_all(b"\n")
+                .map_err(|error| format!("写入临时会话压缩记录失败: {error}"))?;
         }
         writer
             .flush()
@@ -6800,7 +7161,6 @@ fn portable_timestamp_millis(timestamp: &str) -> i64 {
         .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis())
 }
 
-#[cfg(test)]
 fn json_value_with_type(timestamp: &str, record_type: &str, payload: Value) -> Value {
     let timestamp = if timestamp.trim().is_empty() {
         chrono::Utc::now().to_rfc3339()
@@ -7632,7 +7992,8 @@ mod tests {
         format_copy_validation_failure, normalize_copy_target_directory,
         parse_codex_thread_fork_response, remove_staged_thread_rows, repair_sqlite_db,
         restore_session_file_if_unchanged, same_existing_directory, session_file_fingerprint,
-        sql_quote, SessionRepairRecord, SessionStore,
+        sql_quote, SessionRepairRecord, SessionStore, LOCAL_RECOVERY_CONTEXT_MAX_BYTES,
+        LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES,
     };
     use serde_json::{json, Value};
     use std::collections::HashSet;
@@ -7855,6 +8216,10 @@ mod tests {
                 "\n",
                 r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"保留历史"}]},"ordinal":476}"#,
                 "\n",
+                r#"{"type":"response_item","payload":{"type":"reasoning","id":"rs_source-account","encrypted_content":"source-ciphertext"},"ordinal":477}"#,
+                "\n",
+                r#"{"type":"compacted","payload":{"message":"保留摘要","replacement_history":[{"type":"message","id":"visible-summary","role":"user","content":[{"type":"input_text","text":"可读摘要"}]},{"type":"compaction","id":"cmp_source-account","encrypted_content":"source-ciphertext"}]},"ordinal":478}"#,
+                "\n",
                 "not-json\n",
                 r#"{"type":"event_msg","payload":{"type":"task_complete"},"ordinal":627}"#,
                 "\n"
@@ -7881,13 +8246,13 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).expect("valid staged line"))
             .collect::<Vec<_>>();
-        assert_eq!(values.len(), 3);
+        assert_eq!(values.len(), 4);
         assert_eq!(
             values
                 .iter()
                 .map(|value| value["ordinal"].as_u64().expect("ordinal"))
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2]
+            vec![0, 1, 2, 3]
         );
         assert_eq!(values[0]["payload"]["id"], "staged-id");
         assert_eq!(values[0]["payload"]["session_id"], "staged-id");
@@ -7898,7 +8263,107 @@ mod tests {
             target_dir.path().to_string_lossy().as_ref()
         );
         assert_eq!(values[1]["payload"]["type"], "message");
-        assert_eq!(values[2]["payload"]["type"], "task_complete");
+        assert_eq!(values[2]["type"], "compacted");
+        assert_eq!(
+            values[2]["payload"]["replacement_history"]
+                .as_array()
+                .expect("replacement history")
+                .len(),
+            1
+        );
+        assert_eq!(
+            values[2]["payload"]["replacement_history"][0]["id"],
+            "visible-summary"
+        );
+        assert_eq!(values[3]["payload"]["type"], "task_complete");
+        let staged = values
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!staged.contains("rs_source-account"));
+        assert!(!staged.contains("cmp_source-account"));
+        assert!(!staged.contains("source-ciphertext"));
+    }
+
+    #[test]
+    fn stages_an_oversized_fork_with_a_portable_local_compaction() {
+        let source_dir = tempdir().expect("source directory");
+        let target_dir = tempdir().expect("target directory");
+        let source_path = source_dir.path().join("source.jsonl");
+        let staged_path = target_dir.path().join("staged.jsonl");
+        write_jsonl(
+            &source_path,
+            &[
+                json!({
+                    "type": "session_meta",
+                    "payload": {"id": "source", "model_provider": "openai"},
+                    "ordinal": 0
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "保留最近问题"}]
+                    },
+                    "ordinal": 1
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "large-tool-output",
+                        "output": "x".repeat(LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES + 1024)
+                    },
+                    "ordinal": 2
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "保留最近回答"}]
+                    },
+                    "ordinal": 3
+                }),
+            ],
+        );
+
+        create_staged_fork_rollout(
+            source_dir.path(),
+            &source_path,
+            &staged_path,
+            "staged-id",
+            &target_dir.path().to_string_lossy(),
+            "openai",
+            chrono::Utc::now(),
+        )
+        .expect("stage oversized rollout");
+
+        let staged = fs::read_to_string(staged_path).expect("read staged rollout");
+        let values = staged
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid staged line"))
+            .collect::<Vec<_>>();
+        let compacted = values.last().expect("local recovery compaction");
+        assert_eq!(compacted["type"], "compacted");
+        assert_eq!(compacted["ordinal"], 4);
+        assert_eq!(
+            compacted["payload"]["replacement_history"]
+                .as_array()
+                .expect("replacement history")
+                .len(),
+            2
+        );
+        let portable_context = compacted["payload"].to_string();
+        assert!(portable_context.contains("保留最近问题"));
+        assert!(portable_context.contains("保留最近回答"));
+        assert!(!portable_context.contains("large-tool-output"));
+        assert!(
+            portable_context.len() <= LOCAL_RECOVERY_CONTEXT_MAX_BYTES,
+            "portable context must remain bounded"
+        );
     }
 
     #[test]
@@ -8149,7 +8614,7 @@ mod tests {
         ];
 
         assert_eq!(
-            repair_sqlite_db(&db_path, "openai", Some(&records)).expect("repair sqlite"),
+            repair_sqlite_db(&db_path, "openai", Some(&records), None).expect("repair sqlite"),
             3
         );
         let rows = run_sqlite_test_output(
@@ -10613,6 +11078,192 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(ordinals, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn deep_repair_removes_cross_instance_encrypted_items_and_forces_gpt_5_5() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("copied-session.jsonl");
+        fs::write(
+            &session_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"copied","model_provider":"source-provider"},"ordinal":0}"#,
+                "\n",
+                r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"},"ordinal":1}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"保留用户消息"}]},"ordinal":2}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"reasoning","id":"rs_other-instance","encrypted_content":"other-instance-ciphertext"},"ordinal":3}"#,
+                "\n",
+                r#"{"type":"compacted","payload":{"message":"保留压缩摘要","replacement_history":[{"type":"message","id":"summary-message","role":"user","content":[{"type":"input_text","text":"保留可读历史"}]},{"type":"compaction","id":"cmp_other-instance","encrypted_content":"other-instance-ciphertext"}]},"ordinal":4}"#,
+                "\n"
+            ),
+        )
+        .expect("write copied session");
+        let records = vec![SessionRepairRecord {
+            id: "copied".to_string(),
+            title: "Copied".to_string(),
+            path: session_path.clone(),
+            updated_at: 10,
+        }];
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let (changed, backup_dirs) = store
+            .repair_rollout_visibility("openai", &records, true)
+            .expect("deep repair copied session");
+
+        assert_eq!(changed, 1);
+        assert_eq!(backup_dirs.len(), 1);
+        let repaired = fs::read_to_string(&session_path).expect("read repaired session");
+        assert!(repaired.contains(r#""model_provider":"openai""#));
+        assert!(repaired.contains(r#""model":"gpt-5.5""#));
+        assert!(repaired.contains("保留用户消息"));
+        assert!(repaired.contains("保留可读历史"));
+        assert!(!repaired.contains("rs_other-instance"));
+        assert!(!repaired.contains("cmp_other-instance"));
+        assert!(!repaired.contains("other-instance-ciphertext"));
+
+        let (second_changed, second_backup_dirs) = store
+            .repair_rollout_visibility("openai", &records, true)
+            .expect("repeat deep repair");
+        assert_eq!(second_changed, 0);
+        assert!(second_backup_dirs.is_empty());
+    }
+
+    #[test]
+    fn deep_repair_adds_a_bounded_snapshot_when_remote_compaction_would_overflow() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("oversized-context.jsonl");
+        write_jsonl(
+            &session_path,
+            &[
+                json!({
+                    "type": "session_meta",
+                    "payload": {"id": "oversized", "model_provider": "openai"}
+                }),
+                json!({
+                    "type": "compacted",
+                    "payload": {
+                        "message": "保留之前生成的可读摘要",
+                        "replacement_history": [{
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "早期问题"}]
+                        }]
+                    }
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": "oversized-output",
+                        "output": "x".repeat(LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES + 1024)
+                    }
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "最近问题"}]
+                    }
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "最近回答"}]
+                    }
+                }),
+            ],
+        );
+        let records = vec![SessionRepairRecord {
+            id: "oversized".to_string(),
+            title: "Oversized".to_string(),
+            path: session_path.clone(),
+            updated_at: 10,
+        }];
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let (changed, _) = store
+            .repair_rollout_visibility("openai", &records, true)
+            .expect("repair oversized context");
+
+        assert_eq!(changed, 1);
+        let repaired = fs::read_to_string(&session_path).expect("read repaired session");
+        let compacted = repaired
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .rfind(|value| value.get("type").and_then(Value::as_str) == Some("compacted"))
+            .expect("local recovery compaction");
+        assert_eq!(compacted["payload"]["message"], "保留之前生成的可读摘要");
+        let replacement_history = compacted["payload"]["replacement_history"]
+            .as_array()
+            .expect("replacement history");
+        assert_eq!(replacement_history.len(), 3);
+        let portable_context = compacted["payload"].to_string();
+        assert!(portable_context.contains("早期问题"));
+        assert!(portable_context.contains("最近问题"));
+        assert!(portable_context.contains("最近回答"));
+        assert!(!portable_context.contains("oversized-output"));
+
+        let (second_changed, second_backups) = store
+            .repair_rollout_visibility("openai", &records, true)
+            .expect("repeat oversized repair");
+        assert_eq!(second_changed, 0);
+        assert!(second_backups.is_empty());
+    }
+
+    #[test]
+    fn targeted_sqlite_repair_forces_only_selected_session_to_gpt_5_5() {
+        let codex = tempdir().expect("codex tempdir");
+        let db_path = codex.path().join("state_5.sqlite");
+        run_sqlite_test(
+            &db_path,
+            r#"
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    model_provider TEXT,
+                    model TEXT,
+                    reasoning_effort TEXT
+                );
+                INSERT INTO threads VALUES ('selected', 'source-provider', 'gpt-5.6-sol', 'high');
+                INSERT INTO threads VALUES ('untouched', 'source-provider', 'gpt-5.6-sol', 'high');
+            "#,
+        );
+        let records = vec![SessionRepairRecord {
+            id: "selected".to_string(),
+            title: "Selected".to_string(),
+            path: codex.path().join("selected.jsonl"),
+            updated_at: 10,
+        }];
+
+        assert_eq!(
+            repair_sqlite_db(&db_path, "openai", Some(&records), Some("gpt-5.5"),)
+                .expect("repair selected sqlite session"),
+            1
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &db_path,
+                "SELECT model_provider || '|' || model || '|' || (reasoning_effort IS NULL) FROM threads WHERE id = 'selected';"
+            )
+            .trim(),
+            "openai|gpt-5.5|1"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &db_path,
+                "SELECT model_provider || '|' || model || '|' || reasoning_effort FROM threads WHERE id = 'untouched';"
+            )
+            .trim(),
+            "source-provider|gpt-5.6-sol|high"
+        );
     }
 
     #[test]

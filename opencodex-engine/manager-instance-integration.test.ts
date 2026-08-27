@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -98,4 +99,48 @@ test("多开实例恢复使用指定 CODEX_HOME 且保留真实全局开关", as
   expect(result.success).toBe(true);
   expect(JSON.parse(readFileSync(globalConfigPath, "utf8"))).toEqual(globalConfig);
   expect(readFileSync(join(target, "config.toml"), "utf8")).toContain('model_provider = "openai"');
+});
+
+test("多开实例同步前持久关闭默认集成并恢复主实例原生路由", async () => {
+  const source = mkdtempSync(join(tmpdir(), "opencodex-instance-isolate-source-"));
+  const target = mkdtempSync(join(tmpdir(), "opencodex-instance-isolate-target-"));
+  temporaryRoots.push(source, target);
+  const globalConfigPath = join(source, "config.json");
+  writeFileSync(globalConfigPath, JSON.stringify({
+    port: 15800,
+    clientIntegrations: { grok: true },
+    defaultProvider: "ollama",
+    providers: {
+      ollama: { baseUrl: "http://127.0.0.1:11434/v1", authMode: "local", adapter: "openai" },
+    },
+  }));
+  writeFileSync(
+    join(target, "config.toml"),
+    [
+      'model = "gpt-5.5"',
+      "# Auto-injected by opencodex",
+      'openai_base_url = "http://127.0.0.1:15800/v1"',
+      "",
+    ].join("\n"),
+  );
+  const execution = spawnSync(
+    process.execPath,
+    [join(import.meta.dir, "manager-instance-integration.ts"), "isolate-default", "15800"],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        OPENCODEX_HOME: source,
+        CODEX_HOME: target,
+      },
+    },
+  );
+
+  expect(execution.status).toBe(0);
+  expect(JSON.parse(execution.stdout).success).toBe(true);
+  expect(JSON.parse(readFileSync(globalConfigPath, "utf8")).clientIntegrations).toEqual({
+    grok: true,
+    codex: false,
+  });
+  expect(readFileSync(join(target, "config.toml"), "utf8")).not.toContain("openai_base_url");
 });

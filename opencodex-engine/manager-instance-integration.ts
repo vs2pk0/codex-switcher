@@ -21,7 +21,7 @@ const OVERLAY_FILES = [
   "thought-signature-replay.salt",
 ] as const;
 
-type InstanceIntegrationAction = "sync" | "restore";
+type InstanceIntegrationAction = "isolate-default" | "sync" | "restore";
 
 interface InstanceIntegrationResult {
   action: InstanceIntegrationAction;
@@ -119,9 +119,46 @@ export async function restoreInstance(): Promise<InstanceIntegrationResult> {
   });
 }
 
+export async function isolateDefaultInstance(): Promise<InstanceIntegrationResult> {
+  const { setCodexIntegrationEnabled } = await import(
+    "./node_modules/@bitkyc08/opencodex/src/codex/desired-state.ts"
+  );
+  const desired = setCodexIntegrationEnabled(false);
+  if (!desired.ok) {
+    return {
+      action: "isolate-default",
+      success: false,
+      message: `无法保存系统默认实例的 OpenCodex 关闭状态（${desired.reason}）`,
+    };
+  }
+
+  const { restoreNativeCodexAsync } = await import(
+    "./node_modules/@bitkyc08/opencodex/src/codex/inject.ts"
+  );
+  const restored = await restoreNativeCodexAsync({ revalidateDesiredState: true });
+  const routingRestored = restored.artifacts.config.state !== "failed"
+    && restored.artifacts.catalog.state !== "failed";
+  if (!routingRestored) {
+    return {
+      action: "isolate-default",
+      success: false,
+      message: `系统默认实例未能恢复原生配置：${restored.message}`,
+    };
+  }
+
+  const historyWarning = restored.artifacts.history.state === "failed"
+    ? `；会话历史暂未恢复：${restored.artifacts.history.message}`
+    : "";
+  return {
+    action: "isolate-default",
+    success: true,
+    message: `系统默认实例已与 OpenCodex 隔离${historyWarning}`,
+  };
+}
+
 function parseAction(value: string | undefined): InstanceIntegrationAction {
-  if (value === "sync" || value === "restore") return value;
-  throw new Error("多开实例集成操作只支持 sync 或 restore");
+  if (value === "isolate-default" || value === "sync" || value === "restore") return value;
+  throw new Error("多开实例集成操作只支持 isolate-default、sync 或 restore");
 }
 
 function parsePort(value: string | undefined): number {
@@ -134,9 +171,11 @@ function parsePort(value: string | undefined): number {
 
 async function main(): Promise<void> {
   const action = parseAction(process.argv[2]);
-  const result = action === "sync"
-    ? await syncInstance(parsePort(process.argv[3]))
-    : await restoreInstance();
+  const result = action === "isolate-default"
+    ? await isolateDefaultInstance()
+    : action === "sync"
+      ? await syncInstance(parsePort(process.argv[3]))
+      : await restoreInstance();
   process.stdout.write(JSON.stringify(result));
   if (!result.success) process.exitCode = 1;
 }
