@@ -689,8 +689,7 @@ impl SessionStore {
         let content_query = normalize_query(content_query);
         let custom_titles = self.read_session_titles();
         let mut sessions = Vec::new();
-        for path in collect_jsonl_files(&self.sessions_dir())? {
-            let mut record = build_session_record_summary(&path)?;
+        for mut record in self.canonical_session_records()? {
             if let Some(title) = custom_titles.get(&record.id) {
                 record.title = title.clone();
             }
@@ -700,7 +699,7 @@ impl SessionStore {
                 }
             }
             if let Some(query) = content_query.as_deref() {
-                if !session_file_contains_query(&path, query)? {
+                if !session_file_contains_query(Path::new(&record.path), query)? {
                     continue;
                 }
             }
@@ -708,6 +707,24 @@ impl SessionStore {
         }
         sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         Ok(sessions)
+    }
+
+    fn canonical_session_records(&self) -> Result<Vec<CodexSessionRecord>, String> {
+        let mut records = HashMap::<String, CodexSessionRecord>::new();
+        for path in collect_jsonl_files(&self.sessions_dir())? {
+            let candidate = build_session_record_summary(&path)?;
+            match records.entry(candidate.id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(candidate);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if session_record_is_more_complete(&candidate, entry.get()) {
+                        entry.insert(candidate);
+                    }
+                }
+            }
+        }
+        Ok(records.into_values().collect())
     }
 
     pub fn list_session_content(
@@ -2845,12 +2862,11 @@ impl SessionStore {
     }
 
     fn find_session_path(&self, session_id: &str) -> Result<PathBuf, String> {
-        for path in collect_jsonl_files(&self.sessions_dir())? {
-            if session_id_for_path(&path) == session_id || session_file_has_id(&path, session_id)? {
-                return Ok(path);
-            }
-        }
-        Err(format!("会话不存在: {}", session_id))
+        self.canonical_session_records()?
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .map(|session| PathBuf::from(session.path))
+            .ok_or_else(|| format!("会话不存在: {}", session_id))
     }
 
     fn validated_turn_backup_path(
@@ -6040,6 +6056,16 @@ fn build_session_record_summary(path: &Path) -> Result<CodexSessionRecord, Strin
     })
 }
 
+fn session_record_is_more_complete(
+    candidate: &CodexSessionRecord,
+    current: &CodexSessionRecord,
+) -> bool {
+    candidate.size_bytes > current.size_bytes
+        || (candidate.size_bytes == current.size_bytes
+            && (candidate.updated_at > current.updated_at
+                || (candidate.updated_at == current.updated_at && candidate.path > current.path)))
+}
+
 #[derive(Default)]
 struct SessionRecordHeader {
     id: Option<String>,
@@ -7731,13 +7757,25 @@ fn desktop_project_id(root: &str) -> String {
 
 const MAX_GENERATED_IMAGE_BYTES: usize = 100 * 1024 * 1024;
 
+#[derive(Debug)]
+struct InlineUserImagePayload {
+    encoded: String,
+    source_path: Option<String>,
+}
+
+#[derive(Debug)]
+struct RepairedInlineUserImage {
+    source_path: Option<String>,
+    stable_path: Option<String>,
+}
+
 fn rewrite_local_image_attachments(
     content: &str,
     codex_home: &Path,
     session_id: &str,
 ) -> Result<(Option<String>, GeneratedImageRepairResult), String> {
     let mut result = GeneratedImageRepairResult::default();
-    let mut pending_inline_images = Vec::<String>::new();
+    let mut pending_inline_images = Vec::<RepairedInlineUserImage>::new();
     let mut rewritten = String::with_capacity(content.len());
     let mut changed = false;
 
@@ -7752,11 +7790,75 @@ fn rewrite_local_image_attachments(
                 continue;
             }
         };
+        let mut line_changed = false;
         if let Some(images) = inline_user_image_payloads(&value) {
-            pending_inline_images = images;
+            let image_key = value
+                .get("payload")
+                .and_then(|payload| payload.get("id"))
+                .and_then(Value::as_str)
+                .filter(|value| safe_generated_image_id(value))
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    let fingerprint = images
+                        .iter()
+                        .map(|image| {
+                            format!(
+                                "{}:{}",
+                                image.encoded.len(),
+                                image.encoded.chars().take(64).collect::<String>()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(":");
+                    short_hash(&fingerprint)
+                });
+            let mut repaired_images = Vec::with_capacity(images.len());
+            for (index, image) in images.into_iter().enumerate() {
+                let Some((bytes, extension)) = decode_generated_image(&image.encoded) else {
+                    result.invalid += 1;
+                    repaired_images.push(RepairedInlineUserImage {
+                        source_path: image.source_path,
+                        stable_path: None,
+                    });
+                    continue;
+                };
+                let image_path = codex_home
+                    .join("generated_images")
+                    .join(session_id)
+                    .join(format!("recovered-{image_key}-{index}.{extension}"));
+                if generated_image_extension_from_file(&image_path) != Some(extension) {
+                    if let Some(parent) = image_path.parent() {
+                        fs::create_dir_all(parent).map_err(|error| {
+                            format!("创建历史图片恢复目录失败 ({}): {error}", parent.display())
+                        })?;
+                    }
+                    write_bytes_atomic(&image_path, &bytes).map_err(|error| {
+                        format!("恢复历史图片失败 ({}): {error}", image_path.display())
+                    })?;
+                    result.recreated += 1;
+                }
+                if generated_image_extension_from_file(&image_path) != Some(extension) {
+                    result.invalid += 1;
+                    repaired_images.push(RepairedInlineUserImage {
+                        source_path: image.source_path,
+                        stable_path: None,
+                    });
+                    continue;
+                }
+                result.verified += 1;
+                let stable_path = image_path.to_string_lossy().to_string();
+                if let Some(source_path) = image.source_path.as_deref() {
+                    line_changed |=
+                        rewrite_user_message_image_path(&mut value, source_path, &stable_path);
+                }
+                repaired_images.push(RepairedInlineUserImage {
+                    source_path: image.source_path,
+                    stable_path: Some(stable_path),
+                });
+            }
+            pending_inline_images = repaired_images;
         }
 
-        let mut line_changed = false;
         if !pending_inline_images.is_empty()
             && value.get("type").and_then(Value::as_str) == Some("event_msg")
             && value
@@ -7771,18 +7873,6 @@ fn rewrite_local_image_attachments(
                 .and_then(Value::as_str)
                 == Some("UserMessage")
         {
-            let item_id = value
-                .get("payload")
-                .and_then(|payload| payload.get("item"))
-                .and_then(|item| item.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or("user-message")
-                .to_string();
-            let image_key = if safe_generated_image_id(&item_id) {
-                item_id
-            } else {
-                short_hash(&item_id)
-            };
             if let Some(items) = value
                 .get_mut("payload")
                 .and_then(|payload| payload.get_mut("item"))
@@ -7798,43 +7888,27 @@ fn rewrite_local_image_attachments(
                         )
                     })
                     .collect::<Vec<_>>();
-                for (index, (item, encoded)) in local_images
-                    .into_iter()
-                    .zip(pending_inline_images.iter())
-                    .enumerate()
-                {
-                    let Some((bytes, extension)) = decode_generated_image(encoded) else {
-                        result.invalid += 1;
+                for (item, repaired) in local_images.into_iter().zip(pending_inline_images.iter()) {
+                    let Some(stable_path) = repaired.stable_path.as_deref() else {
                         continue;
                     };
-                    let image_path = codex_home
-                        .join("generated_images")
-                        .join(session_id)
-                        .join(format!("recovered-{image_key}-{index}.{extension}"));
-                    if generated_image_extension_from_file(&image_path) != Some(extension) {
-                        if let Some(parent) = image_path.parent() {
-                            fs::create_dir_all(parent).map_err(|error| {
-                                format!("创建历史图片恢复目录失败 ({}): {error}", parent.display())
-                            })?;
-                        }
-                        write_bytes_atomic(&image_path, &bytes).map_err(|error| {
-                            format!("恢复历史图片失败 ({}): {error}", image_path.display())
-                        })?;
-                        result.recreated += 1;
-                    }
-                    if generated_image_extension_from_file(&image_path) == Some(extension) {
-                        result.verified += 1;
-                    } else {
-                        result.invalid += 1;
-                        continue;
-                    }
-                    let stable_path = image_path.to_string_lossy().to_string();
-                    if item.get("path").and_then(Value::as_str) != Some(stable_path.as_str()) {
-                        item["path"] = Value::String(stable_path);
+                    if item.get("path").and_then(Value::as_str) != Some(stable_path) {
+                        item["path"] = Value::String(stable_path.to_string());
                         line_changed = true;
                     }
                 }
             }
+            pending_inline_images.clear();
+        } else if !pending_inline_images.is_empty()
+            && value.get("type").and_then(Value::as_str) == Some("event_msg")
+            && value
+                .get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str)
+                == Some("user_message")
+        {
+            line_changed |=
+                rewrite_event_user_message_image_paths(&mut value, &pending_inline_images);
             pending_inline_images.clear();
         }
 
@@ -7852,7 +7926,7 @@ fn rewrite_local_image_attachments(
     Ok((changed.then_some(rewritten), result))
 }
 
-fn inline_user_image_payloads(value: &Value) -> Option<Vec<String>> {
+fn inline_user_image_payloads(value: &Value) -> Option<Vec<InlineUserImagePayload>> {
     if value.get("type").and_then(Value::as_str) != Some("response_item") {
         return None;
     }
@@ -7862,6 +7936,7 @@ fn inline_user_image_payloads(value: &Value) -> Option<Vec<String>> {
     {
         return None;
     }
+    let source_paths = inline_user_image_source_paths(payload);
     let images = payload
         .get("content")
         .and_then(Value::as_array)
@@ -7880,8 +7955,197 @@ fn inline_user_image_payloads(value: &Value) -> Option<Vec<String>> {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
         })
+        .enumerate()
+        .map(|(index, encoded)| InlineUserImagePayload {
+            encoded,
+            source_path: source_paths.get(index).cloned(),
+        })
         .collect::<Vec<_>>();
     (!images.is_empty()).then_some(images)
+}
+
+fn inline_user_image_source_paths(payload: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    let texts = payload
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("input_text" | "text")
+            )
+        })
+        .filter_map(|item| item.get("text").and_then(Value::as_str));
+    for text in texts {
+        for attachment in extract_mentioned_files(text) {
+            let Some(path) = attachment
+                .source_path
+                .filter(|_| attachment.kind == "image")
+            else {
+                continue;
+            };
+            if seen.insert(path.clone()) {
+                paths.push(path);
+            }
+        }
+        for path in extract_image_marker_paths(text) {
+            if seen.insert(path.clone()) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+fn extract_image_marker_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut remaining = text;
+    while let Some(image_offset) = remaining.find("<image") {
+        remaining = &remaining[image_offset + "<image".len()..];
+        let Some(end_offset) = remaining.find('>') else {
+            break;
+        };
+        let marker = &remaining[..end_offset];
+        let Some(path_offset) = marker.find("path=") else {
+            remaining = &remaining[end_offset + 1..];
+            continue;
+        };
+        let quoted = &marker[path_offset + "path=".len()..];
+        let Some(quote) = quoted
+            .chars()
+            .next()
+            .filter(|quote| matches!(quote, '\'' | '"'))
+        else {
+            remaining = &remaining[end_offset + 1..];
+            continue;
+        };
+        let value = &quoted[quote.len_utf8()..];
+        if let Some(value_end) = value.find(quote) {
+            let path = &value[..value_end];
+            if Path::new(path).is_absolute() && file_attachment(path, None).kind == "image" {
+                paths.push(path.to_string());
+            }
+        }
+        remaining = &remaining[end_offset + 1..];
+    }
+    paths
+}
+
+fn rewrite_user_message_image_path(
+    value: &mut Value,
+    source_path: &str,
+    stable_path: &str,
+) -> bool {
+    if source_path == stable_path {
+        return false;
+    }
+    let Some(content) = value
+        .get_mut("payload")
+        .and_then(|payload| payload.get_mut("content"))
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for item in content {
+        if !matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("input_text" | "text")
+        ) {
+            continue;
+        }
+        let Some(text) = item.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if !text.contains(source_path) {
+            continue;
+        }
+        item["text"] = Value::String(text.replace(source_path, stable_path));
+        changed = true;
+    }
+    changed
+}
+
+fn rewrite_event_user_message_image_paths(
+    value: &mut Value,
+    images: &[RepairedInlineUserImage],
+) -> bool {
+    let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) else {
+        return false;
+    };
+
+    let local_images = payload
+        .get("local_images")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut replacements = images
+        .iter()
+        .filter_map(|image| Some((image.source_path.clone()?, image.stable_path.clone()?)))
+        .collect::<Vec<_>>();
+    for (index, source_path) in local_images.iter().enumerate() {
+        if replacements.iter().any(|(source, _)| source == source_path) {
+            continue;
+        }
+        let stable_path = images
+            .iter()
+            .find(|image| image.source_path.as_deref() == Some(source_path.as_str()))
+            .or_else(|| images.get(index))
+            .and_then(|image| image.stable_path.clone());
+        if let Some(stable_path) = stable_path {
+            replacements.push((source_path.clone(), stable_path));
+        }
+    }
+
+    let mut changed = false;
+    if let Some(message) = payload
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
+        let mut rewritten = message.clone();
+        for (source_path, stable_path) in &replacements {
+            if source_path != stable_path && rewritten.contains(source_path) {
+                rewritten = rewritten.replace(source_path, stable_path);
+            }
+        }
+        if rewritten != message {
+            payload.insert("message".to_string(), Value::String(rewritten));
+            changed = true;
+        }
+    }
+
+    let Some(local_images) = payload
+        .get_mut("local_images")
+        .and_then(Value::as_array_mut)
+    else {
+        return changed;
+    };
+    for item in local_images {
+        let Some(source_path) = item.as_str() else {
+            continue;
+        };
+        let Some((_, stable_path)) = replacements
+            .iter()
+            .find(|(source, _)| source == source_path)
+        else {
+            continue;
+        };
+        if source_path != stable_path {
+            *item = Value::String(stable_path.clone());
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn generated_image_payload(value: &Value) -> Option<(&str, &str)> {
@@ -8654,6 +8918,71 @@ mod tests {
                 "content": content
             }
         })
+    }
+
+    #[test]
+    fn duplicate_session_ids_use_the_largest_rollout_for_listing_and_content() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions/2026/08/26");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let fragment_path = sessions_dir.join("fragment.jsonl");
+        let canonical_path = sessions_dir.join("canonical.jsonl");
+        write_jsonl(
+            &fragment_path,
+            &[
+                json!({
+                    "type":"session_meta",
+                    "payload":{"id":"duplicate-session","cwd":"/tmp/project"}
+                }),
+                task_started("fragment-turn", "2026-08-10T01:00:00Z"),
+                response_message(
+                    "fragment-message",
+                    "user",
+                    "2026-08-10T01:00:01Z",
+                    vec![json!({"type":"input_text","text":"残缺会话"})],
+                ),
+            ],
+        );
+        write_jsonl(
+            &canonical_path,
+            &[
+                json!({
+                    "type":"session_meta",
+                    "payload":{"id":"duplicate-session","cwd":"/tmp/project"}
+                }),
+                task_started("turn-one", "2026-08-10T01:00:00Z"),
+                response_message(
+                    "message-one",
+                    "user",
+                    "2026-08-10T01:00:01Z",
+                    vec![json!({"type":"input_text","text":"完整会话第一轮"})],
+                ),
+                task_complete("turn-one", "2026-08-10T01:00:02Z"),
+                task_started("turn-two", "2026-08-10T02:00:00Z"),
+                response_message(
+                    "message-two",
+                    "user",
+                    "2026-08-10T02:00:01Z",
+                    vec![json!({"type":"input_text","text":"完整会话第二轮"})],
+                ),
+                task_complete("turn-two", "2026-08-10T02:00:02Z"),
+            ],
+        );
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let sessions = store
+            .list_sessions(None, None)
+            .expect("list canonical sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "duplicate-session");
+        assert_eq!(sessions[0].path, canonical_path.to_string_lossy());
+
+        let content = store
+            .list_session_content("duplicate-session", None, Some(20), Some("asc"))
+            .expect("read canonical session content");
+        assert_eq!(content.turns.len(), 2);
+        assert_eq!(content.turns[0].id, "turn-one");
+        assert_eq!(content.turns[1].id, "turn-two");
     }
 
     #[test]
@@ -11003,6 +11332,199 @@ mod tests {
         assert_eq!(second.images.recreated, 0);
         assert_eq!(second.images.verified, 1);
         assert!(second.backup_dirs.is_empty());
+    }
+
+    #[test]
+    fn deep_repair_rewrites_legacy_inline_image_paths_without_item_completed_event() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir");
+        let session_path = sessions_dir.join("legacy-local-images.jsonl");
+        let missing_path = std::env::temp_dir().join("codex-clipboard-legacy-missing.png");
+        let missing_path = missing_path.to_string_lossy().to_string();
+        let png_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        write_jsonl(
+            &session_path,
+            &[
+                json!({
+                    "type": "session_meta",
+                    "payload": {"id": "legacy-session-images", "model_provider": "openai"}
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "id": "legacy-user-message-1",
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": format!(
+                                    "# Files mentioned by the user:\n\n## legacy.png: {missing_path}"
+                                )
+                            },
+                            {
+                                "type": "input_text",
+                                "text": format!("<image name=[Image #1] path=\"{missing_path}\">")
+                            },
+                            {
+                                "type": "input_image",
+                                "image_url": format!("data:image/png;base64,{png_base64}")
+                            }
+                        ]
+                    }
+                }),
+                json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": format!(
+                            "# Files mentioned by the user:\n\n## legacy.png: {missing_path}"
+                        ),
+                        "local_images": [missing_path.clone()]
+                    }
+                }),
+            ],
+        );
+        let records = vec![SessionRepairRecord {
+            id: "legacy-session-images".to_string(),
+            title: "Legacy local images".to_string(),
+            path: session_path.clone(),
+            updated_at: 10,
+        }];
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let result = store
+            .repair_local_image_attachments(&records)
+            .expect("repair legacy local images");
+
+        assert_eq!(result.changed_rollout_files, 1);
+        assert_eq!(result.images.recreated, 1);
+        assert_eq!(result.images.verified, 1);
+        assert_eq!(result.images.invalid, 0);
+        let repaired = fs::read_to_string(&session_path).expect("read repaired rollout");
+        assert!(!repaired.contains(&missing_path));
+        let stable_path = codex
+            .path()
+            .join("generated_images/legacy-session-images/recovered-legacy-user-message-1-0.png");
+        assert!(stable_path.is_file());
+        assert!(
+            repaired
+                .matches(stable_path.to_string_lossy().as_ref())
+                .count()
+                >= 3
+        );
+        let event = repaired
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| {
+                value.get("type").and_then(Value::as_str) == Some("event_msg")
+                    && value
+                        .get("payload")
+                        .and_then(|payload| payload.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("user_message")
+            })
+            .expect("repaired user event");
+        assert_eq!(
+            event["payload"]["local_images"][0].as_str(),
+            Some(stable_path.to_string_lossy().as_ref())
+        );
+
+        let second = store
+            .repair_local_image_attachments(&records)
+            .expect("verify repaired legacy local images");
+        assert_eq!(second.changed_rollout_files, 0);
+        assert_eq!(second.images.recreated, 0);
+        assert_eq!(second.images.verified, 1);
+        assert!(second.backup_dirs.is_empty());
+    }
+
+    #[test]
+    fn deep_repair_finishes_a_partial_inline_image_path_migration() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir");
+        let session_path = sessions_dir.join("partial-local-images.jsonl");
+        let missing_path = std::env::temp_dir().join("codex-clipboard-partial-missing.png");
+        let missing_path = missing_path.to_string_lossy().to_string();
+        let stable_path = codex
+            .path()
+            .join("generated_images/partial-session-images/recovered-partial-user-message-0.png");
+        let stable_path_text = stable_path.to_string_lossy().to_string();
+        let png_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        write_jsonl(
+            &session_path,
+            &[
+                json!({
+                    "type": "session_meta",
+                    "payload": {"id": "partial-session-images", "model_provider": "openai"}
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "id": "partial-user-message",
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": format!(
+                                    "# Files mentioned by the user:\n\n## legacy.png: {stable_path_text}"
+                                )
+                            },
+                            {
+                                "type": "input_image",
+                                "image_url": format!("data:image/png;base64,{png_base64}")
+                            }
+                        ]
+                    }
+                }),
+                json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": format!(
+                            "# Files mentioned by the user:\n\n## legacy.png: {stable_path_text}"
+                        ),
+                        "local_images": [missing_path.clone()]
+                    }
+                }),
+            ],
+        );
+        let records = vec![SessionRepairRecord {
+            id: "partial-session-images".to_string(),
+            title: "Partial local images".to_string(),
+            path: session_path.clone(),
+            updated_at: 10,
+        }];
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let result = store
+            .repair_local_image_attachments(&records)
+            .expect("finish partial local image migration");
+
+        assert_eq!(result.changed_rollout_files, 1);
+        assert_eq!(result.images.recreated, 1);
+        assert!(stable_path.is_file());
+        let repaired = fs::read_to_string(&session_path).expect("read repaired rollout");
+        assert!(!repaired.contains(&missing_path));
+        let event = repaired
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| {
+                value.get("type").and_then(Value::as_str) == Some("event_msg")
+                    && value
+                        .get("payload")
+                        .and_then(|payload| payload.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("user_message")
+            })
+            .expect("repaired user event");
+        assert_eq!(
+            event["payload"]["local_images"][0].as_str(),
+            Some(stable_path_text.as_str())
+        );
     }
 
     #[test]
