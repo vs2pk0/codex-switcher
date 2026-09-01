@@ -123,3 +123,36 @@ test("账号绑定入口与 OpenCodex 绑定提示支持全部界面语言", () 
   assert.equal(t("绑定"), "綁定");
   assert.equal(t("请先启动 OpenCodex 服务，再绑定账号"), "請先啟動 OpenCodex 服務，再綁定帳號");
 });
+
+test("会话统计安全提示不会误报为文件读取失败", () => {
+  const message = "有 1 个会话统计项需要注意，已保留可确认的可信数据。";
+
+  currentLanguage.value = "en";
+  assert.equal(
+    t(message),
+    "Session usage warnings: 1. Verified data has been preserved.",
+  );
+
+  currentLanguage.value = "ru";
+  assert.equal(
+    t(message),
+    "Предупреждения статистики сеансов: 1. Подтвержденные данные сохранены.",
+  );
+
+  currentLanguage.value = "zh-TW";
+  assert.equal(t(message), "有 1 個會話統計項需要注意，已保留可確認的可信資料。");
+});
+
+test("统计实例范围支持全部界面语言", () => {
+  currentLanguage.value = "en";
+  assert.equal(t("统计范围"), "Statistics Scope");
+  assert.equal(t("全部实例"), "All Instances");
+
+  currentLanguage.value = "ru";
+  assert.equal(t("统计范围"), "Область статистики");
+  assert.equal(t("全部实例"), "Все экземпляры");
+
+  currentLanguage.value = "zh-TW";
+  assert.equal(t("统计范围"), "統計範圍");
+  assert.equal(t("全部实例"), "全部執行個體");
+});

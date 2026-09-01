@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { t } from "../i18n";
 
+export const DEFAULT_CODEX_INSTANCE_ID = "default";
+
 export interface CodexInstance {
   id: string;
   name: string;

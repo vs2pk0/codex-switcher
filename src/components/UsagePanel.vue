@@ -26,6 +26,11 @@ import {
   formatLocalizedNumber,
   t,
 } from "../i18n";
+import {
+  DEFAULT_CODEX_INSTANCE_ID,
+  instanceDisplayName,
+  type CodexInstance,
+} from "../services/instances";
 
 type UsageRange = "today" | "yesterday" | "beforeYesterday" | "thisMonth" | "lastMonth" | "custom";
 type UsageTooltipParam = {
@@ -56,8 +61,12 @@ type AutoRefreshOption = {
 
 const props = withDefaults(defineProps<{
   active?: boolean;
+  instances?: CodexInstance[];
+  currentInstanceId?: string;
 }>(), {
   active: true,
+  instances: () => [],
+  currentInstanceId: DEFAULT_CODEX_INSTANCE_ID,
 });
 
 const pageSize = 20;
@@ -99,6 +108,8 @@ const rangeOptions: Array<{ value: UsageRange; label: string }> = [
   { value: "lastMonth", label: "上月" },
 ];
 const autoRefreshStorageKey = "codex-switcher:usage-auto-refresh-ms";
+const usageInstanceStorageKey = "codex-switcher:usage-instance-scope";
+const allInstancesScope = "__all__";
 const autoRefreshOptions: AutoRefreshOption[] = [
   { value: 0, label: "关闭" },
   { value: 5_000, label: "5s" },
@@ -107,6 +118,9 @@ const autoRefreshOptions: AutoRefreshOption[] = [
   { value: 60_000, label: "60s" },
 ];
 const autoRefreshIntervalMs = ref(readAutoRefreshInterval());
+const selectedUsageInstanceId = ref(readUsageInstanceScope(props.currentInstanceId));
+
+const hasManagedInstances = computed(() => props.instances.some((instance) => !instance.isDefault));
 
 const summary = computed(() => dashboard.value?.summary);
 const logs = computed(() => dashboard.value?.logs ?? []);
@@ -291,6 +305,34 @@ function readAutoRefreshInterval(): number {
   }
 }
 
+function readUsageInstanceScope(fallbackInstanceId: string): string {
+  try {
+    return window.localStorage.getItem(usageInstanceStorageKey)?.trim()
+      || fallbackInstanceId.trim()
+      || DEFAULT_CODEX_INSTANCE_ID;
+  } catch {
+    return fallbackInstanceId.trim() || DEFAULT_CODEX_INSTANCE_ID;
+  }
+}
+
+function persistUsageInstanceScope(value: string): void {
+  try {
+    window.localStorage.setItem(usageInstanceStorageKey, value);
+  } catch {
+    // localStorage 不可用时只在当前页面生命周期内生效。
+  }
+}
+
+function usageInstanceQuery(): { instanceId: string | null; allInstances: boolean } {
+  if (selectedUsageInstanceId.value === allInstancesScope) {
+    return { instanceId: null, allInstances: true };
+  }
+  return {
+    instanceId: selectedUsageInstanceId.value || DEFAULT_CODEX_INSTANCE_ID,
+    allInstances: false,
+  };
+}
+
 function errorText(error: unknown): string {
   return String(error instanceof Error ? error.message : error).replace(/^Error:\s*/, "");
 }
@@ -436,12 +478,16 @@ async function loadUsage(
   try {
     const nextDashboard = await getCodexUsageDashboard({
       ...resolveRange(),
+      ...usageInstanceQuery(),
       page: page.value,
       pageSize,
       refresh,
     });
     let activityError: unknown;
-    const nextActivity = await getCodexUsageActivity({ refresh: false }).catch((error) => {
+    const nextActivity = await getCodexUsageActivity({
+      refresh: false,
+      ...usageInstanceQuery(),
+    }).catch((error) => {
       activityError = error;
       return null;
     });
@@ -542,6 +588,21 @@ function changeCustomRange(value: unknown): void {
 function refreshUsage(): void {
   page.value = 1;
   void loadUsage(true);
+}
+
+function changeUsageInstance(value: unknown): void {
+  if (typeof value !== "string" || !value.trim()) return;
+  const next = value.trim();
+  if (
+    next !== allInstancesScope
+    && !props.instances.some((instance) => instance.id === next)
+  ) {
+    return;
+  }
+  selectedUsageInstanceId.value = next;
+  persistUsageInstanceScope(next);
+  page.value = 1;
+  void loadUsage(false, { notify: false });
 }
 
 function changeAutoRefreshInterval(value: unknown): void {
@@ -1055,6 +1116,22 @@ onMounted(() => {
 watch([trends, isHourlyTrend, currentLanguage], renderUsageChart, { deep: true });
 
 watch(
+  () => props.instances.map((instance) => instance.id).join("\u0000"),
+  () => {
+    if (!props.instances.length || selectedUsageInstanceId.value === allInstancesScope) return;
+    if (props.instances.some((instance) => instance.id === selectedUsageInstanceId.value)) return;
+    selectedUsageInstanceId.value =
+      props.instances.find((instance) => instance.id === props.currentInstanceId)?.id
+      ?? props.instances.find((instance) => instance.isDefault)?.id
+      ?? DEFAULT_CODEX_INSTANCE_ID;
+    persistUsageInstanceScope(selectedUsageInstanceId.value);
+    page.value = 1;
+    if (lastLoadedAt.value > 0) void loadUsage(false, { notify: false });
+  },
+  { immediate: true },
+);
+
+watch(
   () => props.active,
   (active) => {
     if (active) {
@@ -1090,6 +1167,19 @@ onBeforeUnmount(() => {
         <p>{{ t("从本机会话记录汇总 Tokens、缓存复用和预估费用") }}</p>
       </div>
       <div class="usage-controls">
+        <a-select
+          v-if="hasManagedInstances"
+          :model-value="selectedUsageInstanceId"
+          class="usage-instance-select"
+          :placeholder="t('统计范围')"
+          @change="changeUsageInstance"
+        >
+          <template #prefix><icon-apps /></template>
+          <a-option :value="allInstancesScope">{{ t("全部实例") }}</a-option>
+          <a-option v-for="instance in props.instances" :key="instance.id" :value="instance.id">
+            {{ instanceDisplayName(instance) }}
+          </a-option>
+        </a-select>
         <a-radio-group :model-value="range" type="button" @change="changeRange">
           <a-radio v-for="item in rangeOptions" :key="item.value" :value="item.value">
             {{ t(item.label) }}
@@ -1126,7 +1216,7 @@ onBeforeUnmount(() => {
       show-icon
       class="usage-session-warning"
     >
-      {{ t(`有 ${dashboard.errors.length} 个会话文件暂时无法读取，已跳过这些文件。`) }}
+      {{ t(`有 ${dashboard.errors.length} 个会话统计项需要注意，已保留可确认的可信数据。`) }}
     </a-alert>
 
     <a-spin :loading="loading" dot>

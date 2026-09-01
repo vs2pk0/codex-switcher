@@ -3317,6 +3317,7 @@ textarea {
 .usage-controls {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   justify-content: flex-end;
   gap: 10px;
 }
@@ -3327,6 +3328,10 @@ textarea {
 
 .usage-range-picker {
   width: 390px;
+}
+
+.usage-instance-select {
+  width: 230px;
 }
 
 .usage-auto-refresh-select {
@@ -4134,7 +4139,8 @@ textarea {
     align-items: stretch;
   }
 
-  .usage-range-picker {
+  .usage-range-picker,
+  .usage-instance-select {
     width: 100%;
   }
 

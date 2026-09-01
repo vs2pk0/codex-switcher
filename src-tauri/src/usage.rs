@@ -251,6 +251,8 @@ struct FileParseState {
     session_started_at: Option<i64>,
     last_valid_event_at: Option<i64>,
     owned_task_started: bool,
+    has_usage_event_at_or_after_session_start: bool,
+    has_usage_event_without_comparable_timestamp: bool,
     current_model: String,
     prev_total: Option<CumulativeTokens>,
     event_index: u32,
@@ -263,6 +265,7 @@ struct ParsedUsageFile {
     parent_rollout_id: Option<String>,
     events: Vec<ParsedUsageEvent>,
     is_fork: bool,
+    confirmed_replay_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -272,8 +275,28 @@ struct ParsedUsageEvent {
     after_owned_task_start: bool,
 }
 
+#[derive(Debug, Clone)]
+struct UsageInstanceTarget {
+    id: String,
+    name: String,
+    codex_home: PathBuf,
+    database_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UsageEventIdentity {
+    request_id: String,
+    session_id: String,
+    rollout_id: String,
+    model: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    created_at: i64,
+}
+
 const PROVENANCE_USAGE_CACHE_VERSION: u32 = 4;
-const USAGE_CACHE_VERSION: u32 = 5;
+const USAGE_CACHE_VERSION: u32 = 6;
 const PRICING_DEFAULTS_VERSION: u32 = 1;
 const GPT_56_DEFAULT_MODEL_IDS: [&str; 3] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 static USAGE_DATA_LOCK: Mutex<()> = Mutex::new(());
@@ -285,15 +308,17 @@ pub(super) fn lock_usage_data() -> Result<MutexGuard<'static, ()>, String> {
 }
 
 pub(super) fn checkpoint_usage_database_for_backup() -> Result<(), String> {
-    let path = usage_db_path();
-    if !path.is_file() {
-        return Ok(());
+    for path in usage_database_paths() {
+        if !path.is_file() {
+            continue;
+        }
+        let connection = Connection::open(&path)
+            .map_err(|error| format!("打开统计数据库失败 ({}): {}", path.display(), error))?;
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|error| format!("整理统计数据库失败 ({}): {}", path.display(), error))?;
     }
-    let connection =
-        Connection::open(&path).map_err(|error| format!("打开统计数据库失败: {}", error))?;
-    connection
-        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .map_err(|error| format!("整理统计数据库失败: {}", error))
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -310,17 +335,36 @@ pub fn get_codex_usage_dashboard(
     page: Option<usize>,
     page_size: Option<usize>,
     refresh: Option<bool>,
+    instance_id: Option<String>,
+    all_instances: Option<bool>,
 ) -> Result<CodexUsageDashboard, String> {
     let _data_guard = lock_usage_data()?;
-    let (conn, cache) = ensure_usage_cache_db(refresh.unwrap_or(false))?;
+    let targets = resolve_usage_targets(instance_id.as_deref(), all_instances.unwrap_or(false))?;
     let pricing = load_pricing()?;
     let pricing_configs = load_pricing_configs()?;
     let cost_multiplier = pricing_config_multiplier(&pricing_configs);
-    let errors = cache.errors;
-
     let start = start_date.unwrap_or(i64::MIN);
     let end = end_date.unwrap_or(i64::MAX);
-    let mut logs = read_usage_logs_db_range(&conn, start, end)?;
+    let multiple_targets = targets.len() > 1;
+    let mut logs_by_instance = Vec::new();
+    let mut errors = Vec::new();
+    let mut files_scanned = 0;
+    for target in &targets {
+        let (conn, cache) = ensure_usage_cache_db(target, refresh.unwrap_or(false))?;
+        files_scanned += cache.files.len();
+        errors.extend(cache.errors.into_iter().map(|error| {
+            if multiple_targets {
+                format!("{}: {}", target.name, error)
+            } else {
+                error
+            }
+        }));
+        logs_by_instance.push((
+            target.id.clone(),
+            read_usage_logs_db_range(&conn, start, end)?,
+        ));
+    }
+    let mut logs = aggregate_instance_usage_logs(logs_by_instance);
     logs.sort_by_key(|log| std::cmp::Reverse(log.created_at));
 
     let total_logs = logs.len();
@@ -341,18 +385,30 @@ pub fn get_codex_usage_dashboard(
         model_stats: build_model_stats(&logs, &pricing, cost_multiplier),
         logs: page_logs,
         total_logs,
-        files_scanned: cache.files.len(),
+        files_scanned,
         errors,
-        cache_path: usage_db_path().to_string_lossy().to_string(),
+        cache_path: usage_cache_display_path(&targets),
         pricing_configs,
     })
 }
 
-pub fn get_codex_usage_activity(refresh: Option<bool>) -> Result<CodexUsageActivity, String> {
+pub fn get_codex_usage_activity(
+    refresh: Option<bool>,
+    instance_id: Option<String>,
+    all_instances: Option<bool>,
+) -> Result<CodexUsageActivity, String> {
     let _data_guard = lock_usage_data()?;
-    let (conn, _) = ensure_usage_cache_db(refresh.unwrap_or(false))?;
+    let targets = resolve_usage_targets(instance_id.as_deref(), all_instances.unwrap_or(false))?;
     let start = local_day_start_timestamp(usage_activity_start_date(Local::now().date_naive()));
-    let logs = read_usage_logs_db_range(&conn, start, i64::MAX)?;
+    let mut logs_by_instance = Vec::new();
+    for target in &targets {
+        let (conn, _) = ensure_usage_cache_db(target, refresh.unwrap_or(false))?;
+        logs_by_instance.push((
+            target.id.clone(),
+            read_usage_logs_db_range(&conn, start, i64::MAX)?,
+        ));
+    }
+    let logs = aggregate_instance_usage_logs(logs_by_instance);
     Ok(build_usage_activity(&logs))
 }
 
@@ -420,6 +476,8 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
         session_started_at: None,
         last_valid_event_at: None,
         owned_task_started: false,
+        has_usage_event_at_or_after_session_start: false,
+        has_usage_event_without_comparable_timestamp: false,
         current_model: "unknown".to_string(),
         prev_total: None,
         event_index: 0,
@@ -566,6 +624,13 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
                     cached_input: delta.cached_input.min(delta.input),
                     ..delta
                 };
+                match (event_timestamp, state.session_started_at) {
+                    (Some(event_at), Some(session_at)) if event_at >= session_at => {
+                        state.has_usage_event_at_or_after_session_start = true;
+                    }
+                    (Some(_), Some(_)) => {}
+                    _ => state.has_usage_event_without_comparable_timestamp = true,
+                }
                 state.event_index += 1;
                 let session_id = state.session_id.as_deref().unwrap_or("unknown");
                 let rollout_id = state
@@ -613,12 +678,18 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
         .or(path_rollout_id)
         .or_else(|| state.session_id.clone())
         .unwrap_or_else(|| "unknown".to_string());
+    let confirmed_replay_only = state.is_fork
+        && !events.is_empty()
+        && !state.owned_task_started
+        && !state.has_usage_event_at_or_after_session_start
+        && !state.has_usage_event_without_comparable_timestamp;
     Ok(ParsedUsageFile {
         source_path: path.to_string_lossy().to_string(),
         rollout_id,
         parent_rollout_id: state.parent_rollout_id,
         events,
         is_fork: state.is_fork,
+        confirmed_replay_only,
     })
 }
 
@@ -682,20 +753,65 @@ fn compute_delta(prev: &Option<CumulativeTokens>, current: &CumulativeTokens) ->
     }
 }
 
-fn ensure_usage_cache_db(force_refresh: bool) -> Result<(Connection, UsageCache), String> {
-    let mut conn = open_usage_db()?;
-    migrate_usage_json_cache_if_needed(&mut conn)?;
+fn resolve_usage_targets(
+    instance_id: Option<&str>,
+    all_instances: bool,
+) -> Result<Vec<UsageInstanceTarget>, String> {
+    let instances = crate::instances::resolve_usage_instance_locations(instance_id, all_instances)?;
+    Ok(instances
+        .into_iter()
+        .map(|instance| UsageInstanceTarget {
+            database_path: usage_db_path_for_instance(&instance.id),
+            id: instance.id,
+            name: instance.name,
+            codex_home: instance.codex_home,
+        })
+        .collect())
+}
+
+fn usage_cache_display_path(targets: &[UsageInstanceTarget]) -> String {
+    if targets.len() == 1 {
+        targets[0].database_path.to_string_lossy().to_string()
+    } else {
+        instance_usage_statistics_dir()
+            .to_string_lossy()
+            .to_string()
+    }
+}
+
+fn ensure_usage_cache_db(
+    target: &UsageInstanceTarget,
+    force_refresh: bool,
+) -> Result<(Connection, UsageCache), String> {
+    let mut conn = open_usage_db_at(&target.database_path)?;
+    if target.id == crate::instances::DEFAULT_INSTANCE_ID {
+        migrate_usage_json_cache_if_needed(&mut conn)?;
+    }
+    let codex_home_identity = target.codex_home.to_string_lossy().to_string();
+    let stored_codex_home = read_usage_meta(&conn, "codexHome")?;
+    let scope_changed = stored_codex_home
+        .as_deref()
+        .is_some_and(|stored| stored != codex_home_identity);
     let previous_cache_meta = read_usage_cache_meta_db(&conn)?;
     if let Some(cache) = previous_cache_meta.as_ref() {
-        let files_match = cache.files == current_usage_cache_files();
-        if !should_rebuild_usage_cache(force_refresh, cache.version, files_match) {
+        let files_match = cache.files == current_usage_cache_files(&target.codex_home);
+        if !scope_changed && !should_rebuild_usage_cache(force_refresh, cache.version, files_match)
+        {
+            if stored_codex_home.is_none() {
+                write_usage_meta(&conn, "codexHome", &codex_home_identity)?;
+            }
             return Ok((conn, cache.clone()));
         }
     }
     // A rebuild must retain records whose source JSONL has already rotated away.  Current
     // files replace matching request IDs below, which also repairs v2 fork-overwrite rows.
-    let previous_cache = read_usage_cache_db(&conn)?;
-    let cache = rebuild_usage_cache_db(&mut conn, previous_cache)?;
+    let previous_cache = if scope_changed {
+        None
+    } else {
+        read_usage_cache_db(&conn)?
+    };
+    let cache = rebuild_usage_cache_db(&mut conn, &target.codex_home, previous_cache)?;
+    write_usage_meta(&conn, "codexHome", &codex_home_identity)?;
     Ok((conn, cache))
 }
 
@@ -703,8 +819,8 @@ fn should_rebuild_usage_cache(force_refresh: bool, cache_version: u32, files_mat
     force_refresh || cache_version != USAGE_CACHE_VERSION || !files_match
 }
 
-fn current_usage_cache_files() -> Vec<UsageCacheFile> {
-    collect_codex_session_files(&default_codex_home())
+fn current_usage_cache_files(codex_home: &Path) -> Vec<UsageCacheFile> {
+    collect_codex_session_files(codex_home)
         .iter()
         .filter_map(|path| usage_cache_file(path))
         .collect()
@@ -718,11 +834,11 @@ fn read_usage_json_cache(path: &Path) -> Result<UsageCache, String> {
 
 fn rebuild_usage_cache_db(
     conn: &mut Connection,
+    codex_home: &Path,
     previous_cache: Option<UsageCache>,
 ) -> Result<UsageCache, String> {
     fs::create_dir_all(statistics_dir()).map_err(|error| format!("创建统计目录失败: {}", error))?;
-    let codex_home = default_codex_home();
-    let files = collect_codex_session_files(&codex_home);
+    let files = collect_codex_session_files(codex_home);
     let file_meta = files
         .iter()
         .filter_map(|path| usage_cache_file(path))
@@ -818,6 +934,10 @@ fn parse_codex_usage_files(
                 ));
                 None
             }
+        } else if file.confirmed_replay_only {
+            // Every usage event predates this fork's own session timestamp, so the file is
+            // a replay-only snapshot. It owns no usage and can safely replace stale cache rows.
+            Some(file.events.len())
         } else {
             // If the parent JSONL has rotated away, only an explicit task_started whose
             // started_at belongs to this rollout is a safe ownership boundary. Otherwise
@@ -856,10 +976,12 @@ fn common_event_prefix_len(parent: &[ParsedUsageEvent], child: &[ParsedUsageEven
         .count()
 }
 
-fn open_usage_db() -> Result<Connection, String> {
-    fs::create_dir_all(statistics_dir()).map_err(|error| format!("创建统计目录失败: {}", error))?;
-    let conn = Connection::open(usage_db_path())
-        .map_err(|error| format!("打开统计数据库失败: {}", error))?;
+fn open_usage_db_at(path: &Path) -> Result<Connection, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "统计数据库目录无效".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| format!("创建统计目录失败: {}", error))?;
+    let conn = Connection::open(path).map_err(|error| format!("打开统计数据库失败: {}", error))?;
     init_usage_db(&conn)?;
     Ok(conn)
 }
@@ -1340,6 +1462,53 @@ fn dedupe_usage_logs_preferred(mut logs: Vec<ParsedUsageLog>) -> Vec<ParsedUsage
             .then_with(|| left.cache_read_tokens.cmp(&right.cache_read_tokens))
     });
     logs.dedup_by(|left, right| left.request_id == right.request_id);
+    logs.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.request_id.cmp(&right.request_id))
+    });
+    logs
+}
+
+fn aggregate_instance_usage_logs(
+    mut groups: Vec<(String, Vec<ParsedUsageLog>)>,
+) -> Vec<ParsedUsageLog> {
+    if groups.len() <= 1 {
+        return groups
+            .pop()
+            .map(|(_, logs)| dedupe_usage_logs_preferred(logs))
+            .unwrap_or_default();
+    }
+
+    let mut merged = HashMap::<UsageEventIdentity, (String, ParsedUsageLog)>::new();
+    for (instance_id, logs) in groups {
+        for log in logs {
+            let identity = UsageEventIdentity {
+                request_id: log.request_id.clone(),
+                session_id: log.session_id.clone(),
+                rollout_id: log.rollout_id.clone(),
+                model: log.model.clone(),
+                input_tokens: log.input_tokens,
+                output_tokens: log.output_tokens,
+                cache_read_tokens: log.cache_read_tokens,
+                created_at: log.created_at,
+            };
+            match merged.get(&identity) {
+                Some((_, previous))
+                    if previous.source_kind.priority() >= log.source_kind.priority() => {}
+                _ => {
+                    merged.insert(identity, (instance_id.clone(), log));
+                }
+            }
+        }
+    }
+    let mut logs = merged
+        .into_values()
+        .map(|(instance_id, mut log)| {
+            log.request_id = format!("codex_instance:{}:{}", instance_id, log.request_id);
+            log
+        })
+        .collect::<Vec<_>>();
     logs.sort_by(|left, right| {
         left.created_at
             .cmp(&right.created_at)
@@ -3052,13 +3221,6 @@ fn format_cost(value: f64) -> String {
     format!("{:.6}", value.max(0.0))
 }
 
-fn default_codex_home() -> PathBuf {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
-        .unwrap_or_else(|| PathBuf::from(".codex"))
-}
-
 fn switcher_root_dir() -> PathBuf {
     dirs::home_dir()
         .map(|home| home.join(".codex_switcher"))
@@ -3077,6 +3239,39 @@ fn usage_db_path() -> PathBuf {
     statistics_dir().join("usage.sqlite")
 }
 
+fn instance_usage_statistics_dir() -> PathBuf {
+    statistics_dir().join("instances")
+}
+
+fn usage_db_path_for_instance(instance_id: &str) -> PathBuf {
+    if instance_id == crate::instances::DEFAULT_INSTANCE_ID {
+        usage_db_path()
+    } else {
+        instance_usage_statistics_dir()
+            .join(instance_id)
+            .join("usage.sqlite")
+    }
+}
+
+pub(crate) fn instance_usage_cache_dir(instance_id: &str) -> Option<PathBuf> {
+    (instance_id != crate::instances::DEFAULT_INSTANCE_ID)
+        .then(|| instance_usage_statistics_dir().join(instance_id))
+}
+
+fn usage_database_paths() -> Vec<PathBuf> {
+    let mut paths = vec![usage_db_path()];
+    let root = instance_usage_statistics_dir();
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path().join("usage.sqlite");
+            if path.is_file() {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
 fn pricing_path() -> PathBuf {
     statistics_dir().join("pricing.json")
 }
@@ -3092,6 +3287,95 @@ fn pricing_defaults_version_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_usage_databases_keep_the_default_cache_compatible_and_custom_caches_isolated() {
+        assert_eq!(
+            usage_db_path_for_instance(crate::instances::DEFAULT_INSTANCE_ID),
+            usage_db_path()
+        );
+        assert_eq!(
+            usage_db_path_for_instance("instance-demo")
+                .strip_prefix(instance_usage_statistics_dir())
+                .expect("custom database under instance statistics root"),
+            Path::new("instance-demo/usage.sqlite")
+        );
+    }
+
+    #[test]
+    fn changing_a_custom_instance_home_discards_the_previous_directory_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let database_path = temp.path().join("usage.sqlite");
+        let first_target = UsageInstanceTarget {
+            id: "instance-demo".to_string(),
+            name: "demo".to_string(),
+            codex_home: temp.path().join("first-home"),
+            database_path: database_path.clone(),
+        };
+        let (mut conn, _) = ensure_usage_cache_db(&first_target, false).expect("first cache");
+        let stale = sample_log(
+            "codex_rollout:old-home:1",
+            "old-session",
+            "old-home",
+            UsageLogSourceKind::CanonicalRoot,
+            120,
+        );
+        write_usage_cache_db(
+            &mut conn,
+            &UsageCache {
+                version: USAGE_CACHE_VERSION,
+                updated_at: 1,
+                files: Vec::new(),
+                logs: vec![stale],
+                errors: Vec::new(),
+            },
+        )
+        .expect("seed old home cache");
+        drop(conn);
+
+        let second_target = UsageInstanceTarget {
+            codex_home: temp.path().join("second-home"),
+            ..first_target
+        };
+        let (_, cache) = ensure_usage_cache_db(&second_target, false).expect("second cache");
+        assert!(cache.logs.is_empty());
+    }
+
+    #[test]
+    fn all_instance_aggregation_deduplicates_copied_rollout_requests() {
+        let copied = sample_log(
+            "codex_rollout:shared:1",
+            "shared-session",
+            "shared",
+            UsageLogSourceKind::CanonicalRoot,
+            120,
+        );
+        let unique = sample_log(
+            "codex_rollout:unique:1",
+            "unique-session",
+            "unique",
+            UsageLogSourceKind::CanonicalRoot,
+            80,
+        );
+        let mut divergent = copied.clone();
+        divergent.input_tokens += 1;
+        let logs = aggregate_instance_usage_logs(vec![
+            ("default".to_string(), vec![copied.clone()]),
+            (
+                "instance-demo".to_string(),
+                vec![copied, divergent.clone(), unique.clone()],
+            ),
+        ]);
+        assert_eq!(logs.len(), 3);
+        assert!(logs
+            .iter()
+            .any(|log| log.rollout_id == unique.rollout_id
+                && log.input_tokens == unique.input_tokens));
+        assert!(logs.iter().any(|log| {
+            log.input_tokens == divergent.input_tokens
+                && log.request_id.starts_with("codex_instance:instance-demo:")
+        }));
+    }
 
     #[test]
     fn computes_delta_from_cumulative_usage() {
@@ -3890,6 +4174,47 @@ mod tests {
             &replace_ids,
         );
         assert!(merged.contains(&previous));
+    }
+
+    #[test]
+    fn missing_parent_replay_only_snapshot_clears_stale_cache_without_warning() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let replay = temp.path().join("replay-only.jsonl");
+        fs::write(
+            &replay,
+            [
+                usage_meta(
+                    "2026-07-11T03:00:00Z",
+                    "session",
+                    "replay-only",
+                    Some("rotated-parent"),
+                ),
+                token_event(Some("2026-07-11T01:00:00Z"), (100, 20, 5), (100, 20, 5)),
+                token_event(Some("2026-07-11T02:00:00Z"), (150, 30, 10), (50, 10, 5)),
+            ]
+            .join("\n"),
+        )
+        .expect("write replay-only fork");
+
+        let (logs, replace_ids, errors) = parse_codex_usage_files(&[replay]);
+
+        assert!(logs.is_empty());
+        assert!(errors.is_empty());
+        assert!(replace_ids.contains("replay-only"));
+        let previous = sample_log(
+            "codex_rollout:replay-only:1",
+            "session",
+            "replay-only",
+            UsageLogSourceKind::Fork,
+            75,
+        );
+        let merged = merge_usage_logs(
+            Some(vec![previous]),
+            Some(USAGE_CACHE_VERSION),
+            logs,
+            &replace_ids,
+        );
+        assert!(merged.is_empty());
     }
 
     #[test]

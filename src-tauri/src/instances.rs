@@ -57,6 +57,13 @@ pub struct CodexInstanceCapabilities {
     pub managed_instances_supported: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexInstanceLocation {
+    pub id: String,
+    pub name: String,
+    pub codex_home: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteCodexInstanceResult {
@@ -834,6 +841,14 @@ fn public_instance(instance: StoredCodexInstance) -> CodexInstance {
     }
 }
 
+fn instance_location(instance: StoredCodexInstance) -> CodexInstanceLocation {
+    CodexInstanceLocation {
+        id: instance.id,
+        name: instance.name,
+        codex_home: PathBuf::from(instance.codex_home),
+    }
+}
+
 fn codex_home_has_opencodex_routing(codex_home: &Path) -> bool {
     let Ok(config) = fs::read_to_string(codex_home.join("config.toml")) else {
         return false;
@@ -921,6 +936,22 @@ pub fn codex_home_for(instance_id: Option<&str>) -> Result<PathBuf, String> {
     ))
 }
 
+pub(crate) fn resolve_usage_instance_locations(
+    instance_id: Option<&str>,
+    all_instances: bool,
+) -> Result<Vec<CodexInstanceLocation>, String> {
+    if !all_instances {
+        return stored_instance(instance_id.unwrap_or(DEFAULT_INSTANCE_ID))
+            .map(instance_location)
+            .map(|instance| vec![instance]);
+    }
+    let mut instances = vec![default_instance()];
+    if managed_instances_supported() {
+        instances.extend(read_stored_instances()?);
+    }
+    Ok(instances.into_iter().map(instance_location).collect())
+}
+
 #[tauri::command]
 pub fn list_codex_instances() -> Result<Vec<CodexInstance>, String> {
     let mut result = vec![public_instance(default_instance())];
@@ -1003,7 +1034,7 @@ pub fn delete_codex_instance(instance_id: String) -> Result<DeleteCodexInstanceR
     let session_hashes = collect_session_path_hashes(&codex_home)?;
     let session_backups = attributed_session_backups(&instance.id)?;
     let session_edit_backups = attributed_session_edit_backups(&session_hashes)?;
-    let related_directories = [
+    let mut related_directories = vec![
         crate::switcher_data_dir()
             .join("config-backups")
             .join(short_path_hash(&codex_home)),
@@ -1011,8 +1042,12 @@ pub fn delete_codex_instance(instance_id: String) -> Result<DeleteCodexInstanceR
             .join("session-trash")
             .join(short_path_hash(&codex_home)),
     ];
+    if let Some(path) = crate::usage::instance_usage_cache_dir(&instance.id) {
+        related_directories.push(path);
+    }
 
     stop_stored(&instance)?;
+    let _usage_guard = crate::usage::lock_usage_data()?;
 
     let mut deleted_paths = Vec::new();
     for path in deletion_roots.iter().chain(related_directories.iter()) {
