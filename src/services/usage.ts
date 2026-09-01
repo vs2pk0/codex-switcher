@@ -101,6 +101,8 @@ export interface CodexUsageQuery {
   page?: number;
   pageSize?: number;
   refresh?: boolean;
+  instanceId?: string | null;
+  allInstances?: boolean;
 }
 
 export interface CodexUsagePricing {
@@ -127,14 +129,18 @@ export function getCodexUsageDashboard(
     page: query.page ?? 1,
     pageSize: query.pageSize ?? 20,
     refresh: query.refresh ?? false,
+    instanceId: query.instanceId ?? null,
+    allInstances: query.allInstances ?? false,
   });
 }
 
 export function getCodexUsageActivity(
-  query: Pick<CodexUsageQuery, "refresh"> = {},
+  query: Pick<CodexUsageQuery, "refresh" | "instanceId" | "allInstances"> = {},
 ): Promise<CodexUsageActivity> {
   return invoke("codex_get_usage_activity", {
     refresh: query.refresh ?? false,
+    instanceId: query.instanceId ?? null,
+    allInstances: query.allInstances ?? false,
   });
 }
 

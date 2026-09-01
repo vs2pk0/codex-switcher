@@ -2125,19 +2125,35 @@ async fn codex_get_usage_dashboard(
     page: Option<usize>,
     page_size: Option<usize>,
     refresh: Option<bool>,
+    instance_id: Option<String>,
+    all_instances: Option<bool>,
 ) -> Result<CodexUsageDashboard, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        usage::get_codex_usage_dashboard(start_date, end_date, page, page_size, refresh)
+        usage::get_codex_usage_dashboard(
+            start_date,
+            end_date,
+            page,
+            page_size,
+            refresh,
+            instance_id,
+            all_instances,
+        )
     })
     .await
     .map_err(|error| format!("统计任务执行失败: {}", error))?
 }
 
 #[tauri::command]
-async fn codex_get_usage_activity(refresh: Option<bool>) -> Result<CodexUsageActivity, String> {
-    tauri::async_runtime::spawn_blocking(move || usage::get_codex_usage_activity(refresh))
-        .await
-        .map_err(|error| format!("活动统计任务执行失败: {}", error))?
+async fn codex_get_usage_activity(
+    refresh: Option<bool>,
+    instance_id: Option<String>,
+    all_instances: Option<bool>,
+) -> Result<CodexUsageActivity, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        usage::get_codex_usage_activity(refresh, instance_id, all_instances)
+    })
+    .await
+    .map_err(|error| format!("活动统计任务执行失败: {}", error))?
 }
 
 #[tauri::command]

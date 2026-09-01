@@ -4827,6 +4827,8 @@ onUnmounted(() => {
       v-if="usagePanelMounted"
       v-show="activeView === 'usage'"
       :active="activeView === 'usage'"
+      :instances="codexInstances"
+      :current-instance-id="sessionInstanceId"
     />
 
     <ApiServicePanel

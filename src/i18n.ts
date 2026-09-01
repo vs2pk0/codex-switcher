@@ -474,6 +474,8 @@ const en: Record<string, string> = {
   "绑定 OAuth": "Bind OAuth",
   "未绑定": "Unbound",
   "消耗看板": "Usage Dashboard",
+  "统计范围": "Statistics Scope",
+  "全部实例": "All Instances",
   "从本机会话记录汇总 Tokens、缓存复用和预估费用":
     "Summarize tokens, cache reuse, and estimated cost from local sessions.",
   "当天": "Today",
@@ -1500,6 +1502,8 @@ const ru: Record<string, string> = {
   "绑定 OAuth": "Привязать OAuth",
   "未绑定": "Не привязан",
   "消耗看板": "Панель расхода",
+  "统计范围": "Область статистики",
+  "全部实例": "Все экземпляры",
   "从本机会话记录汇总 Tokens、缓存复用和预估费用":
     "Сводка токенов, повторного использования кэша и примерной стоимости по локальным сессиям.",
   "当天": "Сегодня",
@@ -2928,14 +2932,16 @@ const simplifiedToTraditional: Record<string, string> = {
   "更新于": "更新於",
   "不限量": "不限量",
   "从本机会话记录汇总 Tokens、缓存复用和预估费用": "從本機會話紀錄彙整 Tokens、快取重用和預估費用",
+  "统计范围": "統計範圍",
+  "全部实例": "全部執行個體",
   "请选择有效的开始和结束时间，日期必须真实存在且开始时间不能晚于结束时间。":
     "請選擇有效的開始與結束時間，日期必須真實存在，且開始時間不能晚於結束時間。",
   "恢复内置 GPT/Codex 单价会覆盖当前 pricing.json，确定继续？":
     "還原內建 GPT/Codex 單價會覆寫目前的 pricing.json，確定要繼續嗎？",
   "维护 Codex 统计使用的模型单价和倍率": "維護 Codex 統計使用的模型單價和倍率",
   "设置统计倍率与模型识别来源": "設定統計倍率與模型識別來源",
-  "有 {count} 个会话文件暂时无法读取，已跳过这些文件。":
-    "有 {count} 個會話檔案暫時無法讀取，已略過這些檔案。",
+  "有 {count} 个会话统计项需要注意，已保留可确认的可信数据。":
+    "有 {count} 個會話統計項目需要注意，已保留可確認的可信資料。",
   "新增输入 Tokens": "新增輸入 Tokens",
   "输出 Tokens": "輸出 Tokens",
   "缓存写入": "快取寫入",
@@ -3634,11 +3640,13 @@ function translateDynamicText(text: string, dict: Record<string, string>): strin
       : `Восстановлено ${restoredSessions[1]} сессий`;
   }
 
-  const unreadableSessions = text.match(/^有\s*(\d+)\s*个会话文件暂时无法读取，已跳过这些文件。$/);
-  if (unreadableSessions) {
+  const usageWarnings = text.match(
+    /^有\s*(\d+)\s*个会话统计项需要注意，已保留可确认的可信数据。$/,
+  );
+  if (usageWarnings) {
     return isEnglish
-      ? `${unreadableSessions[1]} session files could not be read and were skipped.`
-      : `${unreadableSessions[1]} файлов сессий не удалось прочитать, они пропущены.`;
+      ? `Session usage warnings: ${usageWarnings[1]}. Verified data has been preserved.`
+      : `Предупреждения статистики сеансов: ${usageWarnings[1]}. Подтвержденные данные сохранены.`;
   }
 
   const updateTitle = text.match(/^发现新版本\s+(.+)$/);
