@@ -170,3 +170,16 @@ test("账号 JSON 格式标签支持全部界面语言", () => {
   assert.equal(t("Switcher JSON"), "Switcher JSON");
   assert.equal(t("Token JSON"), "Token JSON");
 });
+
+test("API 服务绑定停服提示支持全部界面语言", () => {
+  const message = "本次确认会先清空 API 服务中的现有账号，再写入所选账号。OAuth 账号会写入认证目录，API Key 账号会写入 CLIProxyAPI 上游配置。绑定期间服务会短暂停止并自动重启。";
+
+  currentLanguage.value = "en";
+  assert.match(t(message), /briefly stops and restarts automatically/);
+
+  currentLanguage.value = "ru";
+  assert.match(t(message), /автоматически перезапустится/);
+
+  currentLanguage.value = "zh-TW";
+  assert.match(t(message), /綁定期間服務會短暫停止並自動重新啟動/);
+});

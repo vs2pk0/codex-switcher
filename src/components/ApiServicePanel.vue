@@ -1338,7 +1338,7 @@ onUnmounted(() => {
       :footer="false"
     >
       <div class="api-service-account-modal">
-        <p>{{ t("本次确认会先清空 API 服务中的现有账号，再写入所选账号。OAuth 账号会写入认证目录，API Key 账号会写入 CLIProxyAPI 上游配置。") }}</p>
+        <p>{{ t("本次确认会先清空 API 服务中的现有账号，再写入所选账号。OAuth 账号会写入认证目录，API Key 账号会写入 CLIProxyAPI 上游配置。绑定期间服务会短暂停止并自动重启。") }}</p>
         <a-input
           v-model="bindSearchKeyword"
           allow-clear
