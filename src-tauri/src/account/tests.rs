@@ -704,6 +704,64 @@ fn updates_phone_and_exports_cockpit_tools_json() {
 }
 
 #[test]
+fn exports_switcher_and_token_json_formats() {
+    let (_storage, _codex, store) = test_store();
+    let first = store
+        .import_from_json(
+            &json!({
+                "email": "first@example.com",
+                "tokens": {
+                    "id_token": "first-id-token",
+                    "access_token": "first-access-token",
+                    "refresh_token": "first-refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import first account")
+        .remove(0);
+    let second = store
+        .import_from_json(
+            &json!({
+                "email": "second@example.com",
+                "tokens": {
+                    "id_token": "second-id-token",
+                    "access_token": "second-access-token",
+                    "refresh_token": "second-refresh-token"
+                }
+            })
+            .to_string(),
+        )
+        .expect("import second account")
+        .remove(0);
+
+    let switcher = store
+        .export_accounts(std::slice::from_ref(&first.id), Some("switcher_json"))
+        .expect("export switcher json");
+    let switcher: serde_json::Value = serde_json::from_str(&switcher).expect("parse switcher json");
+    assert_eq!(switcher["format"], "codex-switcher.accounts");
+    assert_eq!(switcher["accounts"][0]["id"], first.id);
+
+    let single_token = store
+        .export_accounts(std::slice::from_ref(&first.id), Some("token_json"))
+        .expect("export single token json");
+    let single_token: serde_json::Value =
+        serde_json::from_str(&single_token).expect("parse single token json");
+    assert!(single_token.get("accounts").is_none());
+    assert_eq!(single_token["id"], first.id);
+    assert_eq!(single_token["tokens"]["access_token"], "first-access-token");
+
+    let batch_token = store
+        .export_accounts(&[first.id, second.id], Some("token_json"))
+        .expect("export batch token json");
+    let batch_token: serde_json::Value =
+        serde_json::from_str(&batch_token).expect("parse batch token json");
+    assert_eq!(batch_token.as_array().map(Vec::len), Some(2));
+    assert_eq!(batch_token[0]["email"], "first@example.com");
+    assert_eq!(batch_token[1]["email"], "second@example.com");
+}
+
+#[test]
 fn updates_account_profile_name_for_oauth_account() {
     let (_storage, _codex, store) = test_store();
     let account = store

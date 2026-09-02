@@ -56,6 +56,7 @@ const commandInput = ref("");
 const catalog = ref<OpenCodexEngineCatalog | null>(null);
 const catalogLoading = ref(false);
 const selectedVersion = ref("");
+const installingVersion = ref("");
 const accountScan = ref<OpenCodexSwitcherAccountScan | null>(null);
 const accountScanLoading = ref(false);
 const selectedAccountIds = ref<string[]>([]);
@@ -255,6 +256,7 @@ async function applyRelease(release: OpenCodexEngineRelease): Promise<void> {
     return;
   }
   busy.value = true;
+  installingVersion.value = release.version;
   try {
     const result = await installOpenCodexEngine(release.version);
     Message.success(result.message);
@@ -262,6 +264,7 @@ async function applyRelease(release: OpenCodexEngineRelease): Promise<void> {
   } catch (error) {
     Message.error(formatTranslatedText("安装 Engine 失败：{error}", { error: errorText(error) }));
   } finally {
+    installingVersion.value = "";
     busy.value = false;
   }
 }
@@ -272,6 +275,7 @@ async function rollbackEngine(): Promise<void> {
     return;
   }
   busy.value = true;
+  installingVersion.value = "__bundled__";
   try {
     const result = await activateBundledOpenCodexEngine();
     Message.success(result.message);
@@ -279,6 +283,7 @@ async function rollbackEngine(): Promise<void> {
   } catch (error) {
     Message.error(formatTranslatedText("回退 Engine 失败：{error}", { error: errorText(error) }));
   } finally {
+    installingVersion.value = "";
     busy.value = false;
   }
 }
@@ -289,6 +294,7 @@ async function switchInstalledVersion(version: string): Promise<void> {
     return;
   }
   busy.value = true;
+  installingVersion.value = version;
   try {
     const result = await installOpenCodexEngine(version);
     Message.success(result.message);
@@ -296,6 +302,7 @@ async function switchInstalledVersion(version: string): Promise<void> {
   } catch (error) {
     Message.error(formatTranslatedText("切换 Engine 失败：{error}", { error: errorText(error) }));
   } finally {
+    installingVersion.value = "";
     busy.value = false;
   }
 }
@@ -762,7 +769,7 @@ onUnmounted(() => unlistenEvents?.());
           <div v-if="catalog?.latestStable" class="latest-release">
             <span class="release-icon"><icon-download /></span>
             <div><a-tag :color="catalog.latestStable.newerThanCurrent ? 'orange' : 'green'">{{ t(catalog.latestStable.newerThanCurrent ? "发现新版本" : "已是最新稳定版") }}</a-tag><h3>OpenCodex Engine v{{ catalog.latestStable.version }}</h3><p>{{ t("内置版本始终保留，可随时安全回退。") }}</p></div>
-            <a-button type="primary" :disabled="busy || snapshot?.running || !catalog.latestStable.newerThanCurrent" @click="applyRelease(catalog.latestStable)">{{ t("更新到最新版") }}</a-button>
+            <a-button type="primary" :loading="installingVersion === catalog.latestStable.version" :disabled="busy || snapshot?.running || !catalog.latestStable.newerThanCurrent" @click="applyRelease(catalog.latestStable)">{{ t("更新到最新版") }}</a-button>
           </div>
           <div class="local-version-section">
             <div class="local-version-heading">
@@ -773,7 +780,7 @@ onUnmounted(() => unlistenEvents?.());
               <div v-for="version in catalog.installedVersions" :key="version" class="local-version-row">
                 <div><strong>Engine v{{ version }}</strong><span>{{ t(catalog.currentVersion === version ? "当前使用" : "本地已安装") }}</span></div>
                 <div class="local-version-actions">
-                  <a-button size="small" :disabled="busy || snapshot?.running || catalog.currentVersion === version" @click="switchInstalledVersion(version)">{{ t("切换") }}</a-button>
+                  <a-button size="small" :loading="installingVersion === version" :disabled="busy || snapshot?.running || catalog.currentVersion === version" @click="switchInstalledVersion(version)">{{ t("切换") }}</a-button>
                   <a-button size="small" status="danger" :disabled="busy || snapshot?.running || catalog.currentVersion === version" @click="confirmDeleteInstalledVersion(version)"><template #icon><icon-delete /></template>{{ t("删除") }}</a-button>
                 </div>
               </div>
@@ -786,8 +793,8 @@ onUnmounted(() => unlistenEvents?.());
             <a-select v-model="selectedVersion" :placeholder="t('选择 Engine 版本')" :loading="catalogLoading">
               <a-option v-for="release in catalog?.releases || []" :key="release.version" :value="release.version">v{{ release.version }} · {{ t(release.prerelease ? "预览" : "稳定") }}{{ release.active ? ` · ${t("当前")}` : release.installed ? ` · ${t("已安装")}` : "" }}</a-option>
             </a-select>
-            <a-button :disabled="busy || !selectedRelease || selectedRelease.active || snapshot?.running" @click="selectedRelease && applyRelease(selectedRelease)">{{ t(selectedRelease?.installed ? "切换版本" : "下载并使用") }}</a-button>
-            <a-button v-if="snapshot?.engineSource === 'managed'" :disabled="busy || snapshot?.running" @click="rollbackEngine"><template #icon><icon-undo /></template>{{ t("回退内置版本") }}</a-button>
+            <a-button :loading="Boolean(selectedRelease && installingVersion === selectedRelease.version)" :disabled="busy || !selectedRelease || selectedRelease.active || snapshot?.running" @click="selectedRelease && applyRelease(selectedRelease)">{{ t(selectedRelease?.installed ? "切换版本" : "下载并使用") }}</a-button>
+            <a-button v-if="snapshot?.engineSource === 'managed'" :loading="installingVersion === '__bundled__'" :disabled="busy || snapshot?.running" @click="rollbackEngine"><template #icon><icon-undo /></template>{{ t("回退内置版本") }}</a-button>
           </div>
           </div>
         </section>

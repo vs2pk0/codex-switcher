@@ -1391,9 +1391,26 @@ impl AccountStore {
                     .cloned()
             })
             .collect();
-        let export_value = match format.unwrap_or("cockpit_tools") {
+        let export_value = match format.unwrap_or("switcher_json") {
+            "token_json" => {
+                if selected.len() == 1 {
+                    serde_json::to_value(&selected[0])
+                        .map_err(|error| format!("序列化失败: {}", error))?
+                } else {
+                    serde_json::to_value(&selected)
+                        .map_err(|error| format!("序列化失败: {}", error))?
+                }
+            }
             "sub2api" => export_sub2api_accounts(&selected, &database.accounts),
             "cpa" => export_cpa_accounts(&selected, &database.accounts),
+            // Keep the old format key as an alias for previously integrated callers.
+            "switcher_json" | "cockpit_tools" => serde_json::json!({
+                "app": "Codex Switcher",
+                "format": "codex-switcher.accounts",
+                "version": 1,
+                "exported_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "accounts": selected
+            }),
             _ => serde_json::json!({
                 "app": "Codex Switcher",
                 "format": "codex-switcher.accounts",
