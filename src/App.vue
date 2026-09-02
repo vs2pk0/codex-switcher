@@ -344,7 +344,8 @@ const apiKeyForm = reactive({
 const editVisible = ref(false);
 const editingAccount = ref<CodexAccount | null>(null);
 const editTab = ref("form");
-const editJsonText = ref("");
+const editSwitcherJsonText = ref("");
+const editTokenJsonText = ref("");
 const editForm = reactive({
   accountName: "",
   tags: [] as string[],
@@ -360,13 +361,14 @@ const exportVisible = ref(false);
 const exportAccount = ref<CodexAccount | null>(null);
 const exportText = ref("");
 const exportPreviewVisible = ref(false);
-const exportFormat = ref<CodexExportFormat>("cockpit_tools");
+const exportFormat = ref<CodexExportFormat>("switcher_json");
 const exportingId = ref("");
 const batchExportVisible = ref(false);
 const batchExportText = ref("");
 const batchExportPreviewVisible = ref(false);
 const exportFormatOptions: { label: string; value: CodexExportFormat }[] = [
-  { label: "Codex Switcher", value: "cockpit_tools" },
+  { label: "Switcher JSON", value: "switcher_json" },
+  { label: "Token JSON", value: "token_json" },
   { label: "sub2api 格式", value: "sub2api" },
   { label: "cpa 格式", value: "cpa" },
 ];
@@ -2857,7 +2859,7 @@ function downloadJsonText(content: string, filename: string): void {
 }
 
 function downloadBatchExportText(): void {
-  const suffix = exportFormat.value === "cockpit_tools" ? "" : `_${exportFormat.value}`;
+  const suffix = exportFormat.value === "switcher_json" ? "" : `_${exportFormat.value}`;
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   downloadJsonText(batchExportText.value, `codex-switcher-batch${suffix}_${timestamp}.json`);
 }
@@ -3318,7 +3320,8 @@ async function handleOAuthCallbackSubmit(): Promise<void> {
 async function openEdit(account: CodexAccount): Promise<void> {
   editingAccount.value = account;
   editTab.value = "form";
-  editJsonText.value = JSON.stringify(account, null, 2);
+  editSwitcherJsonText.value = JSON.stringify({ accounts: [account] }, null, 2);
+  editTokenJsonText.value = JSON.stringify(account, null, 2);
   editForm.accountName = account.account_name ?? "";
   editForm.tags = accountTags(account);
   editForm.isHidden = Boolean(account.is_hidden);
@@ -3328,7 +3331,12 @@ async function openEdit(account: CodexAccount): Promise<void> {
   editForm.apiOfficialUrl = account.api_official_url ?? account.apiOfficialUrl ?? "";
   editVisible.value = true;
   try {
-    editJsonText.value = await exportCodexAccounts([account.id], "cockpit_tools");
+    const [switcherJson, tokenJson] = await Promise.all([
+      exportCodexAccounts([account.id], "switcher_json"),
+      exportCodexAccounts([account.id], "token_json"),
+    ]);
+    editSwitcherJsonText.value = switcherJson;
+    editTokenJsonText.value = tokenJson;
   } catch (error) {
     Message.warning(`读取完整 JSON 失败，已使用当前缓存：${errorText(error)}`);
   }
@@ -3345,15 +3353,19 @@ function hasPreviewJsonPlaceholders(value: string): boolean {
 
 async function handleEditSave(): Promise<void> {
   if (!editingAccount.value) return;
+  const editingJson = editTab.value === "switcher-json" || editTab.value === "token-json";
+  const activeJsonText = editTab.value === "token-json"
+    ? editTokenJsonText.value
+    : editSwitcherJsonText.value;
   if (editTab.value === "form" && isApiKeyAccount(editingAccount.value) && !editForm.apiKey.trim()) {
     Message.error("请输入 API Key");
     return;
   }
-  if (editTab.value === "json" && !editJsonText.value.trim()) {
+  if (editingJson && !activeJsonText.trim()) {
     Message.error("JSON 不能为空");
     return;
   }
-  if (editTab.value === "json" && hasPreviewJsonPlaceholders(editJsonText.value)) {
+  if (editingJson && hasPreviewJsonPlaceholders(activeJsonText)) {
     Message.error("当前内容像是预览 JSON，包含省略或隐藏字段，请粘贴完整 JSON 后保存");
     return;
   }
@@ -3361,10 +3373,10 @@ async function handleEditSave(): Promise<void> {
   try {
     const account = editingAccount.value;
     let updated: CodexAccount;
-    if (editTab.value === "json") {
+    if (editingJson) {
       updated = await updateCodexAccountFromJson({
         accountId: account.id,
-        jsonContent: editJsonText.value.trim(),
+        jsonContent: activeJsonText.trim(),
       });
     } else if (isApiKeyAccount(account)) {
       updated = await updateCodexApiKeyCredentials({
@@ -3441,7 +3453,7 @@ async function openExport(account: CodexAccount): Promise<void> {
   exportingId.value = account.id;
   try {
     exportAccount.value = account;
-    exportFormat.value = "cockpit_tools";
+    exportFormat.value = "switcher_json";
     exportText.value = await exportCodexAccounts([account.id], exportFormat.value);
     exportPreviewVisible.value = false;
     exportVisible.value = true;
@@ -3473,7 +3485,7 @@ async function copyExportText(): Promise<void> {
 
 function downloadExportText(): void {
   const name = exportAccount.value ? displayName(exportAccount.value).replace(/[^\w.-]+/g, "_") : "codex-account";
-  const suffix = exportFormat.value === "cockpit_tools" ? "" : `_${exportFormat.value}`;
+  const suffix = exportFormat.value === "switcher_json" ? "" : `_${exportFormat.value}`;
   downloadJsonText(exportText.value, `${name}${suffix}.json`);
 }
 
@@ -4995,12 +5007,14 @@ onUnmounted(() => {
       :active-tab="editTab"
       :editing-account="editingAccount"
       :edit-form="editForm"
-      :edit-json-text="editJsonText"
+      :edit-switcher-json-text="editSwitcherJsonText"
+      :edit-token-json-text="editTokenJsonText"
       :editing="editing"
       :tag-options="allAccountTags"
       :is-api-key-account="isApiKeyAccount"
       @update:active-tab="editTab = $event"
-      @update:edit-json-text="editJsonText = $event"
+      @update:edit-switcher-json-text="editSwitcherJsonText = $event"
+      @update:edit-token-json-text="editTokenJsonText = $event"
       @save="handleEditSave"
     />
 

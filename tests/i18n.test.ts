@@ -156,3 +156,17 @@ test("统计实例范围支持全部界面语言", () => {
   assert.equal(t("统计范围"), "統計範圍");
   assert.equal(t("全部实例"), "全部執行個體");
 });
+
+test("账号 JSON 格式标签支持全部界面语言", () => {
+  currentLanguage.value = "en";
+  assert.equal(t("Switcher JSON"), "Switcher JSON");
+  assert.equal(t("Token JSON"), "Token JSON");
+
+  currentLanguage.value = "ru";
+  assert.equal(t("Switcher JSON"), "JSON Switcher");
+  assert.equal(t("Token JSON"), "JSON токена");
+
+  currentLanguage.value = "zh-TW";
+  assert.equal(t("Switcher JSON"), "Switcher JSON");
+  assert.equal(t("Token JSON"), "Token JSON");
+});

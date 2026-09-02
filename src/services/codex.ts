@@ -2,7 +2,12 @@ import { invoke } from "@tauri-apps/api/core";
 import type { CodexAccount } from "../types/codex";
 import type { CodexSessionVisibilityRepairSummary } from "./session";
 
-export type CodexExportFormat = "cockpit_tools" | "sub2api" | "cpa";
+export type CodexExportFormat =
+  | "switcher_json"
+  | "token_json"
+  | "cockpit_tools"
+  | "sub2api"
+  | "cpa";
 
 export interface CodexOAuthLoginStartResponse {
   loginId: string;
@@ -306,7 +311,7 @@ export function updateCodexAccountPhone(input: {
 
 export function exportCodexAccounts(
   accountIds: string[],
-  format: CodexExportFormat = "cockpit_tools",
+  format: CodexExportFormat = "switcher_json",
 ): Promise<string> {
   return invoke("export_codex_accounts", { accountIds, format });
 }

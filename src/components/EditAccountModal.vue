@@ -16,7 +16,8 @@ defineProps<{
     apiProviderName: string;
     apiOfficialUrl: string;
   };
-  editJsonText: string;
+  editSwitcherJsonText: string;
+  editTokenJsonText: string;
   editing: boolean;
   tagOptions: string[];
   isApiKeyAccount: (account: CodexAccount) => boolean;
@@ -25,7 +26,8 @@ defineProps<{
 defineEmits<{
   (event: "update:visible", value: boolean): void;
   (event: "update:active-tab", value: string): void;
-  (event: "update:edit-json-text", value: string): void;
+  (event: "update:edit-switcher-json-text", value: string): void;
+  (event: "update:edit-token-json-text", value: string): void;
   (event: "save"): void;
 }>();
 </script>
@@ -82,12 +84,20 @@ defineEmits<{
             </a-form-item>
           </a-form>
         </a-tab-pane>
-        <a-tab-pane key="json" :title="t('JSON')">
+        <a-tab-pane key="switcher-json" :title="t('Switcher JSON')">
           <a-textarea
-            :model-value="editJsonText"
+            :model-value="editSwitcherJsonText"
             class="token-textarea json-edit-area"
             :auto-size="{ minRows: 12, maxRows: 20 }"
-            @input="$emit('update:edit-json-text', String($event))"
+            @input="$emit('update:edit-switcher-json-text', String($event))"
+          />
+        </a-tab-pane>
+        <a-tab-pane key="token-json" :title="t('Token JSON')">
+          <a-textarea
+            :model-value="editTokenJsonText"
+            class="token-textarea json-edit-area"
+            :auto-size="{ minRows: 12, maxRows: 20 }"
+            @input="$emit('update:edit-token-json-text', String($event))"
           />
         </a-tab-pane>
       </a-tabs>

@@ -109,18 +109,24 @@ pub fn opencodex_delete_switcher_account(
 }
 
 #[tauri::command]
-pub fn opencodex_get_engine_update_catalog(
+pub async fn opencodex_get_engine_update_catalog(
     backend: State<'_, Arc<OpenCodexBackend>>,
 ) -> Result<EngineUpdateCatalog, String> {
-    backend.get_engine_update_catalog()
+    let backend = Arc::clone(backend.inner());
+    tauri::async_runtime::spawn_blocking(move || backend.get_engine_update_catalog())
+        .await
+        .map_err(|error| format!("检测 OpenCodex Engine 更新任务失败：{error}"))?
 }
 
 #[tauri::command]
-pub fn opencodex_install_engine_version(
+pub async fn opencodex_install_engine_version(
     backend: State<'_, Arc<OpenCodexBackend>>,
     request: InstallEngineVersionRequest,
 ) -> Result<EngineInstallResult, String> {
-    backend.install_engine_version(request)
+    let backend = Arc::clone(backend.inner());
+    tauri::async_runtime::spawn_blocking(move || backend.install_engine_version(request))
+        .await
+        .map_err(|error| format!("安装 OpenCodex Engine 任务失败：{error}"))?
 }
 
 #[tauri::command]

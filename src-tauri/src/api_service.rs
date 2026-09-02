@@ -320,15 +320,18 @@ pub fn api_service_update_settings(
 }
 
 #[tauri::command]
-pub fn api_service_start(
-    app: AppHandle,
-    process: State<'_, ApiServiceProcessState>,
-    download: State<'_, ApiServiceDownloadState>,
-    operation: State<'_, ApiServiceOperationState>,
-) -> Result<ApiServiceState, String> {
-    let _guard = lock_operation(&operation)?;
-    ensure_not_shutting_down(&operation)?;
-    start_service_impl(&app, &process, &download, &operation)
+pub async fn api_service_start(app: AppHandle) -> Result<ApiServiceState, String> {
+    let task_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let process = task_app.state::<ApiServiceProcessState>();
+        let download = task_app.state::<ApiServiceDownloadState>();
+        let operation = task_app.state::<ApiServiceOperationState>();
+        let _guard = lock_operation(&operation)?;
+        ensure_not_shutting_down(&operation)?;
+        start_service_impl(&task_app, &process, &download, &operation)
+    })
+    .await
+    .map_err(|error| format!("启动 API 服务任务失败: {error}"))?
 }
 
 #[tauri::command]
@@ -369,12 +372,16 @@ pub fn api_service_reset(
 }
 
 #[tauri::command]
-pub fn api_service_check_update(
-    operation: State<'_, ApiServiceOperationState>,
-) -> Result<UpdateInfo, String> {
-    let _guard = lock_operation(&operation)?;
-    ensure_not_shutting_down(&operation)?;
-    check_update_impl()
+pub async fn api_service_check_update(app: AppHandle) -> Result<UpdateInfo, String> {
+    let task_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let operation = task_app.state::<ApiServiceOperationState>();
+        let _guard = lock_operation(&operation)?;
+        ensure_not_shutting_down(&operation)?;
+        check_update_impl()
+    })
+    .await
+    .map_err(|error| format!("检测 API 服务更新任务失败: {error}"))?
 }
 
 fn check_update_impl() -> Result<UpdateInfo, String> {
@@ -393,15 +400,18 @@ fn check_update_with_release_impl() -> Result<(GitHubRelease, UpdateInfo), Strin
 }
 
 #[tauri::command]
-pub fn api_service_download_update(
-    app: AppHandle,
-    process: State<'_, ApiServiceProcessState>,
-    download: State<'_, ApiServiceDownloadState>,
-    operation: State<'_, ApiServiceOperationState>,
-) -> Result<ApiServiceState, String> {
-    let _guard = lock_operation(&operation)?;
-    ensure_not_shutting_down(&operation)?;
-    download_update_impl(&app, &process, &download, &operation)
+pub async fn api_service_download_update(app: AppHandle) -> Result<ApiServiceState, String> {
+    let task_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let process = task_app.state::<ApiServiceProcessState>();
+        let download = task_app.state::<ApiServiceDownloadState>();
+        let operation = task_app.state::<ApiServiceOperationState>();
+        let _guard = lock_operation(&operation)?;
+        ensure_not_shutting_down(&operation)?;
+        download_update_impl(&task_app, &process, &download, &operation)
+    })
+    .await
+    .map_err(|error| format!("下载 API 服务更新任务失败: {error}"))?
 }
 
 #[tauri::command]

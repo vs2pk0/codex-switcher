@@ -50,7 +50,7 @@ function handleFormatChange(value: unknown): void {
               :key="option.value"
               :value="option.value"
             >
-              {{ option.label }}
+              {{ t(option.label) }}
             </a-option>
           </a-select>
         </div>
