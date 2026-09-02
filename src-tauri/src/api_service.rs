@@ -666,7 +666,9 @@ fn ensure_not_shutting_down(operation: &ApiServiceOperationState) -> Result<(), 
 
 #[tauri::command]
 pub async fn api_service_bind_accounts(
+    app: AppHandle,
     process: State<'_, ApiServiceProcessState>,
+    download: State<'_, ApiServiceDownloadState>,
     operation: State<'_, ApiServiceOperationState>,
     account_ids: Vec<String>,
 ) -> Result<ApiServiceAccountSyncSummary, String> {
@@ -796,6 +798,17 @@ pub async fn api_service_bind_accounts(
     let manifest_path = managed_api_key_bindings_path(&dirs);
     let config_snapshot = read_optional_file(&config_path)?;
     let manifest_snapshot = read_optional_file(&manifest_path)?;
+    if let Err(error) = stop_service_impl(&process) {
+        let recovery = if operation.shutting_down.load(Ordering::SeqCst) {
+            "应用正在退出，未重新启动 API 服务".to_string()
+        } else {
+            match start_service_impl(&app, &process, &download, &operation) {
+                Ok(_) => "API 服务已恢复运行".to_string(),
+                Err(restart_error) => format!("恢复运行 API 服务失败: {restart_error}"),
+            }
+        };
+        return Err(format!("绑定账号前停止 API 服务失败: {error}；{recovery}"));
+    }
     let update_result = (|| {
         clear_managed_api_key_bindings(&dirs)?;
         if !api_key_bindings.is_empty() {
@@ -810,13 +823,28 @@ pub async fn api_service_bind_accounts(
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+        let mut recovery_errors = Vec::new();
         if !rollback_errors.is_empty() {
-            return Err(format!(
-                "{error}；回滚 API Key 配置失败: {}",
+            recovery_errors.push(format!(
+                "回滚 API Key 配置失败: {}",
                 rollback_errors.join("；")
             ));
         }
-        return Err(error);
+        if operation.shutting_down.load(Ordering::SeqCst) {
+            recovery_errors.push("应用正在退出，未重新启动 API 服务".to_string());
+        } else if let Err(restart_error) = start_service_impl(&app, &process, &download, &operation)
+        {
+            recovery_errors.push(format!("恢复运行 API 服务失败: {restart_error}"));
+        }
+        return if recovery_errors.is_empty() {
+            Err(error)
+        } else {
+            Err(format!("{error}；{}", recovery_errors.join("；")))
+        };
+    }
+
+    if let Err(error) = start_service_impl(&app, &process, &download, &operation) {
+        return Err(format!("账号已写入 API 服务，但自动重新启动失败: {error}"));
     }
 
     let oauth_count = oauth_bindings.len();
