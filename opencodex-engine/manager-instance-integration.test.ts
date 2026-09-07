@@ -1,23 +1,79 @@
 import { afterEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   restoreInstance,
+  resolveOpenCodexPackageRoot,
+  syncInstance,
   withIsolatedOpenCodexConfig,
 } from "./manager-instance-integration.ts";
 
 const temporaryRoots: string[] = [];
 const originalOpenCodexHome = process.env.OPENCODEX_HOME;
 const originalCodexHome = process.env.CODEX_HOME;
+const originalOpenCodexPackageRoot = process.env.OPENCODEX_PACKAGE_ROOT;
 
 afterEach(() => {
   if (originalOpenCodexHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = originalOpenCodexHome;
   if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
   else process.env.CODEX_HOME = originalCodexHome;
+  if (originalOpenCodexPackageRoot === undefined) delete process.env.OPENCODEX_PACKAGE_ROOT;
+  else process.env.OPENCODEX_PACKAGE_ROOT = originalOpenCodexPackageRoot;
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+function writeActiveEnginePackage(root: string): void {
+  const codexDir = join(root, "src", "codex");
+  mkdirSync(codexDir, { recursive: true });
+  writeFileSync(join(root, "src", "config.ts"), [
+    "export function loadConfig() { return {}; }",
+    "export function applyProxyEnv() {}",
+    "",
+  ].join("\n"));
+  writeFileSync(join(codexDir, "inject.ts"), [
+    'import { writeFileSync } from "node:fs";',
+    'import { join } from "node:path";',
+    "export async function injectCodexConfig(port: number, _config: unknown, options: { validateOnly?: boolean }) {",
+    "  if (!options.validateOnly) writeFileSync(join(process.env.CODEX_HOME!, \"active-engine-marker\"), String(port));",
+    "  return { success: true, message: \"active engine package used\" };",
+    "}",
+    "export async function restoreNativeCodexAsync() { return { success: true, message: \"restored\", artifacts: {} }; }",
+    "",
+  ].join("\n"));
+  writeFileSync(join(codexDir, "refresh.ts"), [
+    "export async function refreshCodexModelCatalog() { return { catalogExists: false, path: \"\" }; }",
+    "",
+  ].join("\n"));
+  writeFileSync(join(codexDir, "desired-state.ts"), [
+    "export function setCodexIntegrationEnabled() { return { ok: true }; }",
+    "",
+  ].join("\n"));
+}
+
+test("多开同步优先加载当前激活的 OpenCodex Engine 包，并兼容回退内置包", async () => {
+  const source = mkdtempSync(join(tmpdir(), "opencodex-instance-active-source-"));
+  const target = mkdtempSync(join(tmpdir(), "opencodex-instance-active-target-"));
+  const activePackage = mkdtempSync(join(tmpdir(), "opencodex-instance-active-package-"));
+  temporaryRoots.push(source, target, activePackage);
+  writeFileSync(join(source, "config.json"), JSON.stringify({ clientIntegrations: {} }));
+  writeActiveEnginePackage(activePackage);
+  process.env.OPENCODEX_HOME = source;
+  process.env.CODEX_HOME = target;
+  process.env.OPENCODEX_PACKAGE_ROOT = activePackage;
+
+  const result = await syncInstance(15800);
+
+  expect(result).toEqual({ action: "sync", success: true, message: "active engine package used" });
+  expect(readFileSync(join(target, "active-engine-marker"), "utf8")).toBe("15800");
+  expect(resolveOpenCodexPackageRoot(join(activePackage, "missing"))).toBe(resolve(
+    import.meta.dir,
+    "node_modules",
+    "@bitkyc08",
+    "opencodex",
+  ));
 });
 
 test("多开实例同步只修改临时集成状态，不污染真实 OpenCodex 配置", async () => {

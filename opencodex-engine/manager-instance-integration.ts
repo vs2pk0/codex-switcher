@@ -11,8 +11,22 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const MAX_CONFIG_FILE_BYTES = 32 * 1024 * 1024;
+const OPENCODEX_PACKAGE_ROOT_ENV = "OPENCODEX_PACKAGE_ROOT";
+const BUNDLED_OPENCODEX_PACKAGE_ROOT = resolve(
+  import.meta.dir,
+  "node_modules",
+  "@bitkyc08",
+  "opencodex",
+);
+const REQUIRED_OPENCODEX_MODULES = [
+  ["src", "config.ts"],
+  ["src", "codex", "desired-state.ts"],
+  ["src", "codex", "inject.ts"],
+  ["src", "codex", "refresh.ts"],
+] as const;
 const OVERLAY_FILES = [
   "config.json",
   "auth.json",
@@ -32,6 +46,37 @@ interface InstanceIntegrationResult {
 function sourceConfigDir(): string {
   const configured = process.env.OPENCODEX_HOME?.trim();
   return resolve(configured || join(homedir(), ".opencodex"));
+}
+
+function isOpenCodexPackageRoot(path: string): boolean {
+  return REQUIRED_OPENCODEX_MODULES.every((segments) => existsSync(join(path, ...segments)));
+}
+
+/**
+ * The manager helper ships with the application, while the service may run a
+ * newer managed OpenCodex package. Prefer the package root passed by the
+ * backend and retain the bundled package as a compatibility fallback.
+ */
+export function resolveOpenCodexPackageRoot(
+  configuredRoot = process.env[OPENCODEX_PACKAGE_ROOT_ENV],
+): string {
+  const requested = configuredRoot?.trim();
+  if (requested) {
+    const activeRoot = resolve(requested);
+    if (isOpenCodexPackageRoot(activeRoot)) return activeRoot;
+  }
+  if (isOpenCodexPackageRoot(BUNDLED_OPENCODEX_PACKAGE_ROOT)) {
+    return BUNDLED_OPENCODEX_PACKAGE_ROOT;
+  }
+  throw new Error("客户端内置 OpenCodex Engine 缺失，请重新安装完整客户端");
+}
+
+function openCodexModuleUrl(packageRoot: string, segments: readonly string[]): string {
+  return pathToFileURL(join(packageRoot, ...segments)).href;
+}
+
+async function importOpenCodexModule(packageRoot: string, segments: readonly string[]) {
+  return import(openCodexModuleUrl(packageRoot, segments));
 }
 
 function copyRegularConfigFile(sourceDir: string, overlayDir: string, name: string): void {
@@ -86,11 +131,12 @@ export async function withIsolatedOpenCodexConfig<T>(
 
 export async function syncInstance(port: number): Promise<InstanceIntegrationResult> {
   return withIsolatedOpenCodexConfig(sourceConfigDir(), true, async () => {
+    const packageRoot = resolveOpenCodexPackageRoot();
     const [{ applyProxyEnv, loadConfig }, { injectCodexConfig }, { refreshCodexModelCatalog }] =
       await Promise.all([
-        import("./node_modules/@bitkyc08/opencodex/src/config.ts"),
-        import("./node_modules/@bitkyc08/opencodex/src/codex/inject.ts"),
-        import("./node_modules/@bitkyc08/opencodex/src/codex/refresh.ts"),
+        importOpenCodexModule(packageRoot, ["src", "config.ts"]),
+        importOpenCodexModule(packageRoot, ["src", "codex", "inject.ts"]),
+        importOpenCodexModule(packageRoot, ["src", "codex", "refresh.ts"]),
       ]);
     const config = loadConfig();
     const preflight = await injectCodexConfig(port, config, { validateOnly: true });
@@ -111,8 +157,9 @@ export async function syncInstance(port: number): Promise<InstanceIntegrationRes
 
 export async function restoreInstance(): Promise<InstanceIntegrationResult> {
   return withIsolatedOpenCodexConfig(sourceConfigDir(), false, async () => {
-    const { restoreNativeCodexAsync } = await import(
-      "./node_modules/@bitkyc08/opencodex/src/codex/inject.ts"
+    const { restoreNativeCodexAsync } = await importOpenCodexModule(
+      resolveOpenCodexPackageRoot(),
+      ["src", "codex", "inject.ts"],
     );
     const restored = await restoreNativeCodexAsync();
     return { action: "restore", success: restored.success, message: restored.message };
@@ -120,8 +167,10 @@ export async function restoreInstance(): Promise<InstanceIntegrationResult> {
 }
 
 export async function isolateDefaultInstance(): Promise<InstanceIntegrationResult> {
-  const { setCodexIntegrationEnabled } = await import(
-    "./node_modules/@bitkyc08/opencodex/src/codex/desired-state.ts"
+  const packageRoot = resolveOpenCodexPackageRoot();
+  const { setCodexIntegrationEnabled } = await importOpenCodexModule(
+    packageRoot,
+    ["src", "codex", "desired-state.ts"],
   );
   const desired = setCodexIntegrationEnabled(false);
   if (!desired.ok) {
@@ -132,8 +181,9 @@ export async function isolateDefaultInstance(): Promise<InstanceIntegrationResul
     };
   }
 
-  const { restoreNativeCodexAsync } = await import(
-    "./node_modules/@bitkyc08/opencodex/src/codex/inject.ts"
+  const { restoreNativeCodexAsync } = await importOpenCodexModule(
+    packageRoot,
+    ["src", "codex", "inject.ts"],
   );
   const restored = await restoreNativeCodexAsync({ revalidateDesiredState: true });
   const routingRestored = restored.artifacts.config.state !== "failed"

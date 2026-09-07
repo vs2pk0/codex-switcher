@@ -14,6 +14,10 @@ const instancePickerSource = readFileSync(
   new URL("../src/components/InstancePickerModal.vue", import.meta.url),
   "utf8",
 );
+const openCodexBackendSource = readFileSync(
+  new URL("../src-tauri/src/opencodex/backend.rs", import.meta.url),
+  "utf8",
+);
 
 test("实例状态公开并展示 OpenCodex 接入标识", () => {
   assert.match(instanceServiceSource, /openCodexConnected: boolean/);
@@ -27,4 +31,15 @@ test("实例卡片和选择弹窗保持等高及状态列对齐", () => {
   assert.match(instancePickerSource, /grid-template-columns: minmax\(0, 1fr\) 156px/);
   assert.match(instancePickerSource, /\.instance-picker-runtime[^}]*width: 156px/);
   assert.doesNotMatch(instancePickerSource, /\.instance-picker-option span\s*\{/);
+});
+
+test("多开同步将服务当前激活的 Engine 包根目录传给集成 helper", () => {
+  assert.match(
+    openCodexBackendSource,
+    /let active_package_root = self\s*\.active_launcher\(\)\?\s*\.working_dir/,
+  );
+  assert.match(
+    openCodexBackendSource,
+    /\.env\("OPENCODEX_PACKAGE_ROOT", &active_package_root\)/,
+  );
 });

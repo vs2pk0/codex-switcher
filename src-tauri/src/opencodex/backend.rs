@@ -1465,6 +1465,10 @@ impl Backend {
     ) -> Result<String, String> {
         let engine = self.bundled_engine_dir()?;
         let runtime = self.bundled_runtime_path()?;
+        let active_package_root = self
+            .active_launcher()?
+            .working_dir
+            .ok_or_else(|| "无法定位当前激活的 OpenCodex Engine".to_string())?;
         let helper = engine.join("manager-instance-integration.ts");
         if !helper.is_file() {
             return Err("客户端缺少多开实例隔离组件，请重新安装完整客户端".to_string());
@@ -1476,6 +1480,7 @@ impl Backend {
             .arg(port.to_string())
             .current_dir(&engine)
             .env("CODEX_HOME", codex_home)
+            .env("OPENCODEX_PACKAGE_ROOT", &active_package_root)
             .env("NO_COLOR", "1")
             .env("FORCE_COLOR", "0")
             .stdin(Stdio::null())
