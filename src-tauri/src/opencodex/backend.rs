@@ -1,7 +1,8 @@
+use super::engine_switch::{switch_engine, SwitchStep};
 use super::models::{
     BackgroundServiceState, CommandAction, CommandFinishedEvent, CommandLogEvent, CommandStarted,
     DeleteEngineVersionRequest, DeleteSwitcherAccountRequest, EngineDeleteResult,
-    EngineInstallResult, EngineRelease, EngineUpdateCatalog, HealthBody,
+    EngineInstallResult, EngineProgress, EngineRelease, EngineUpdateCatalog, HealthBody,
     ImportSwitcherAccountsRequest, InstallEngineVersionRequest, RunActionRequest,
     SwitcherAccountScan, SwitcherDeleteResult, SwitcherImportResult, SystemSnapshot,
     UpdateVisionModelsRequest, VisionModel, VisionModelCatalog, VisionModelsUpdateResult,
@@ -15,7 +16,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
@@ -195,6 +196,30 @@ impl Backend {
         );
     }
 
+    fn emit_engine_progress(&self, operation_id: &str, version: &str, progress: EngineProgress) {
+        let _ = self.app.emit(
+            "opencodex-engine-progress",
+            serde_json::json!({
+                "operationId": operation_id,
+                "version": version,
+                "stage": progress.stage,
+                "downloadedBytes": progress.downloaded_bytes,
+                "totalBytes": progress.total_bytes,
+            }),
+        );
+    }
+
+    fn engine_stage(&self, operation_id: &str, version: &str, stage: &str) {
+        self.emit_engine_progress(
+            operation_id,
+            version,
+            EngineProgress {
+                stage: stage.to_string(),
+                ..EngineProgress::default()
+            },
+        );
+    }
+
     fn active_launcher(&self) -> Result<Launcher, String> {
         let program = self.bundled_runtime_path()?;
         let (package_root, source) = self
@@ -332,8 +357,12 @@ impl Backend {
         let removable =
             managed_versions_to_remove(&installed, active_version, MANAGED_ENGINE_HISTORY_LIMIT);
         let mut removed = Vec::new();
+        let service = self.query_background_service_state()?;
         for version in removable {
             let directory = self.managed_engine_root().join(&version);
+            if service_references_directory(&service, &directory) {
+                continue;
+            }
             fs::remove_dir_all(&directory)
                 .map_err(|error| format!("清理旧 Engine v{version} 失败：{error}"))?;
             removed.push(version);
@@ -648,6 +677,13 @@ impl Backend {
     }
 
     fn query_background_service_state(&self) -> Result<BackgroundServiceState, String> {
+        self.run_background_service_helper("status")
+    }
+
+    fn run_background_service_helper(
+        &self,
+        action: &str,
+    ) -> Result<BackgroundServiceState, String> {
         let engine = self.bundled_engine_dir()?;
         let runtime = self.bundled_runtime_path()?;
         let helper = engine.join("manager-service-status.ts");
@@ -657,13 +693,14 @@ impl Backend {
         let mut command = Command::new(runtime);
         command
             .arg(helper)
-            .arg("status")
+            .arg(action)
             .current_dir(engine)
             .env("NO_COLOR", "1")
             .env("FORCE_COLOR", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command.env("CODEX_HOME", crate::instances::codex_home_for(None)?);
         hide_command_window(&mut command);
         let output = command
             .output()
@@ -699,6 +736,7 @@ impl Backend {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command.env("CODEX_HOME", crate::instances::codex_home_for(None)?);
         hide_command_window(&mut command);
         let output = command
             .output()
@@ -1134,13 +1172,13 @@ impl Backend {
             .stderr(Stdio::piped());
         let output = command
             .output()
-            .map_err(|error| format!("绑定账号前无法停止 OpenCodex：{error}"))?;
+            .map_err(|error| format!("无法停止 OpenCodex：{error}"))?;
         if !output.status.success() {
             let detail = self.redact(String::from_utf8_lossy(&output.stderr).trim());
             return Err(if detail.is_empty() {
-                "绑定账号前停止 OpenCodex 失败".to_string()
+                "停止 OpenCodex 失败".to_string()
             } else {
-                format!("绑定账号前停止 OpenCodex 失败：{detail}")
+                format!("停止 OpenCodex 失败：{detail}")
             });
         }
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1150,7 +1188,7 @@ impl Backend {
             }
             thread::sleep(Duration::from_millis(150));
         }
-        Err("绑定账号前等待 OpenCodex 停止超时".to_string())
+        Err("等待 OpenCodex 停止超时".to_string())
     }
 
     fn restart_after_account_binding(
@@ -1239,7 +1277,7 @@ impl Backend {
             .ok()
             .and_then(|package| package_version(&package));
         let installed_versions = self.installed_managed_versions();
-        let remote = self.run_engine_update_helper::<RemoteEngineCatalog>("catalog", None);
+        let remote = self.run_engine_update_helper::<RemoteEngineCatalog>("catalog", None, None);
         Ok(build_engine_update_catalog(
             current_version,
             current_source,
@@ -1254,26 +1292,25 @@ impl Backend {
         request: InstallEngineVersionRequest,
     ) -> Result<EngineInstallResult, String> {
         let version = validate_engine_version(&request.version)?;
+        if request.operation_id.is_empty() || request.operation_id.len() > 128 {
+            return Err("Engine 操作 ID 无效".to_string());
+        }
         self.begin_mutation()?;
+        let operation_id = &request.operation_id;
+        self.engine_stage(operation_id, &version, "checking");
         let result = (|| {
-            if open_codex_service_running() {
-                return Err("更新或切换 Engine 前请先停止 OpenCodex 服务".to_string());
-            }
             let bundled_version = package_version(&self.bundled_package_root()?);
             if bundled_version.as_deref() == Some(version.as_str()) {
-                self.write_active_engine(None)?;
-                match self.prune_managed_engine_history("") {
-                    Ok(removed) if !removed.is_empty() => self.persist_log(
-                        "system",
-                        &format!("已清理旧 Engine 版本：{}", removed.join("、")),
-                    ),
-                    Err(error) => self.persist_log("stderr", &error),
-                    _ => {}
-                }
+                let restarted = self.activate_engine_safely(None, &version, operation_id)?;
                 return Ok(EngineInstallResult {
                     version,
                     source: "bundled".to_string(),
-                    message: "已切换到客户端内置 Engine".to_string(),
+                    message: if restarted {
+                        "已切换到客户端内置 Engine，服务已自动重启"
+                    } else {
+                        "已切换到客户端内置 Engine"
+                    }
+                    .to_string(),
                 });
             }
 
@@ -1285,37 +1322,187 @@ impl Backend {
                     "engineRoot": self.managed_engine_root(),
                 }))
                 .map_err(|error| format!("无法生成 Engine 安装请求：{error}"))?;
-                let installed: EngineHelperInstallResult =
-                    self.run_engine_update_helper("install", Some(&input))?;
+                let installed: EngineHelperInstallResult = self.run_engine_update_helper(
+                    "install",
+                    Some(&input),
+                    Some((operation_id, &version)),
+                )?;
                 if installed.version != version {
                     return Err("Engine 更新器返回了错误的版本".to_string());
                 }
                 validate_managed_package(&package, &version)?;
             }
-            self.write_active_engine(Some(&version))?;
-            match self.prune_managed_engine_history(&version) {
-                Ok(removed) if !removed.is_empty() => self.persist_log(
-                    "system",
-                    &format!("已清理旧 Engine 版本：{}", removed.join("、")),
-                ),
-                Err(error) => self.persist_log("stderr", &error),
-                _ => {}
-            }
+            let restarted = self.activate_engine_safely(Some(&version), &version, operation_id)?;
             Ok(EngineInstallResult {
                 version: version.clone(),
                 source: "managed".to_string(),
-                message: if already_installed {
+                message: if restarted {
+                    format!("已切换到 Engine v{version}，服务已自动重启并通过健康检查")
+                } else if already_installed {
                     format!("已切换到 Engine v{version}")
                 } else {
                     format!("Engine v{version} 下载、校验并激活完成")
                 },
             })
         })();
+        self.engine_stage(
+            operation_id,
+            &request.version,
+            if result.is_ok() { "complete" } else { "error" },
+        );
         self.finish_mutation();
         if let Ok(value) = &result {
             self.persist_log("system", &value.message);
         }
         result
+    }
+
+    fn activate_engine_safely(
+        &self,
+        managed_version: Option<&str>,
+        version: &str,
+        operation_id: &str,
+    ) -> Result<bool, String> {
+        let old_launcher = self.active_launcher()?;
+        let old_version = if old_launcher.source == "managed" {
+            old_launcher.version.as_deref()
+        } else {
+            None
+        };
+        let service = self.query_background_service_state()?;
+        if service.conflict {
+            return Err("后台服务存在冲突，请先修复后台服务后再切换 Engine".to_string());
+        }
+        let running_port = running_open_codex_port();
+        let port = running_port.unwrap_or_else(|| read_configured_port().unwrap_or(DEFAULT_PORT));
+        if running_port
+            .and_then(probe_health)
+            .is_some_and(|health| health.version != old_launcher.version)
+        {
+            return Err("运行中的 Engine 与当前版本记录不一致，请先停止服务再切换".to_string());
+        }
+        let was_running = running_port.is_some() || service.running;
+        let needs_stop = was_running;
+        let mut next_launcher: Option<Launcher> = None;
+        switch_engine(needs_stop, |step| {
+            match step {
+                SwitchStep::StopOld => {
+                    self.engine_stage(operation_id, version, "stopping");
+                    self.stop_for_account_binding(&old_launcher, port)
+                }
+                SwitchStep::ActivateNew => {
+                    self.engine_stage(operation_id, version, "activating");
+                    self.write_active_engine(managed_version)?;
+                    next_launcher = Some(self.active_launcher()?);
+                    Ok(())
+                }
+                SwitchStep::StartNew => {
+                    if was_running {
+                        self.engine_stage(operation_id, version, "restarting");
+                    }
+                    self.restore_engine_runtime(
+                        next_launcher.as_ref().ok_or("无法定位新 Engine")?,
+                        port,
+                        was_running,
+                        &service,
+                    )
+                }
+                SwitchStep::StopNew => {
+                    self.engine_stage(operation_id, version, "recovering");
+                    if needs_stop {
+                        self.stop_for_account_binding(
+                            next_launcher.as_ref().unwrap_or(&old_launcher),
+                            port,
+                        )
+                    } else {
+                        Ok(())
+                    }
+                }
+                SwitchStep::ActivateOld => self.write_active_engine(old_version),
+                SwitchStep::RecoverOld => {
+                    self.engine_stage(operation_id, version, "recovering");
+                    // A failed stop can leave the original service untouched.
+                    if was_running
+                        && probe_health(port)
+                            .is_some_and(|health| health.version == old_launcher.version)
+                        && (!service.running || {
+                            let current = self.query_background_service_state()?;
+                            current.running && current.enabled == service.enabled
+                        })
+                    {
+                        return Ok(());
+                    }
+                    self.restore_engine_runtime(&old_launcher, port, was_running, &service)
+                }
+            }
+        })?;
+        // Prune only after successful activation and recovery checks.
+        match self.prune_managed_engine_history(managed_version.unwrap_or("")) {
+            Ok(removed) if !removed.is_empty() => self.persist_log(
+                "system",
+                &format!("已清理旧 Engine 版本：{}", removed.join("、")),
+            ),
+            Err(error) => self.persist_log("stderr", &error),
+            _ => {}
+        }
+        Ok(was_running)
+    }
+
+    fn restore_engine_runtime(
+        &self,
+        launcher: &Launcher,
+        port: u16,
+        was_running: bool,
+        service: &BackgroundServiceState,
+    ) -> Result<(), String> {
+        // Leave stopped/disabled registrations untouched. Their referenced Engine
+        // stays protected from deletion until the registration is repaired.
+        if !was_running {
+            return Ok(());
+        }
+        if service.running {
+            // `start` alone reuses the old baked CLI path. `repair` preserves the
+            // installed backend and rewrites its entrypoint without re-registering.
+            self.set_background_service_port(port)?;
+            let output = self
+                .command(launcher, &["service".into(), "repair".into()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|error| format!("更新后台服务启动路径失败：{error}"))?;
+            if service.backend.as_deref() == Some("systemd") && !service.enabled {
+                self.run_background_service_helper("restore-disabled-autostart")?;
+            }
+            if !output.status.success() {
+                let detail = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stderr),
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                return Err(format!(
+                    "更新后台服务启动路径失败：{}",
+                    self.redact(detail.trim())
+                ));
+            }
+        } else {
+            self.start_background(launcher, port, launcher.version.as_deref(), None)?;
+        }
+        self.wait_engine_version(launcher, port)
+    }
+
+    fn wait_engine_version(&self, launcher: &Launcher, port: u16) -> Result<(), String> {
+        let deadline = Instant::now() + START_TIMEOUT;
+        while Instant::now() < deadline {
+            if probe_health(port).is_some_and(|health| health.version == launcher.version) {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        Err(format!(
+            "Engine v{} 未通过端口 {port} 的版本健康检查",
+            launcher.version.as_deref().unwrap_or("?")
+        ))
     }
 
     pub fn delete_engine_version(
@@ -1325,11 +1512,21 @@ impl Backend {
         let version = validate_engine_version(&request.version)?;
         self.begin_mutation()?;
         let result = (|| {
-            if open_codex_service_running() {
-                return Err("删除 Engine 版本前请先停止 OpenCodex 服务".to_string());
-            }
             if self.active_managed_version().as_deref() == Some(version.as_str()) {
                 return Err("当前正在使用的 Engine 版本不能删除，请先切换到其他版本".to_string());
+            }
+            if running_open_codex_port()
+                .and_then(probe_health)
+                .is_some_and(|health| health.version.as_deref() == Some(&version))
+            {
+                return Err("该 Engine 版本仍在运行，不能删除".to_string());
+            }
+            // A stopped service can still reference an older managed directory.
+            if service_references_directory(
+                &self.query_background_service_state()?,
+                &self.managed_engine_root().join(&version),
+            ) {
+                return Err("后台服务仍引用该版本，请先重新注册后台服务以更新启动路径".to_string());
             }
             let directory = self.managed_engine_root().join(&version);
             if !validate_managed_package(&self.managed_package_root(&version), &version).is_ok() {
@@ -1349,40 +1546,23 @@ impl Backend {
         result
     }
 
-    pub fn activate_bundled_engine(&self) -> Result<EngineInstallResult, String> {
-        self.begin_mutation()?;
-        let result = (|| {
-            if open_codex_service_running() {
-                return Err("回退 Engine 前请先停止 OpenCodex 服务".to_string());
-            }
-            let version = package_version(&self.bundled_package_root()?)
-                .ok_or_else(|| "无法读取客户端内置 Engine 版本".to_string())?;
-            self.write_active_engine(None)?;
-            match self.prune_managed_engine_history("") {
-                Ok(removed) if !removed.is_empty() => self.persist_log(
-                    "system",
-                    &format!("已清理旧 Engine 版本：{}", removed.join("、")),
-                ),
-                Err(error) => self.persist_log("stderr", &error),
-                _ => {}
-            }
-            Ok(EngineInstallResult {
-                version: version.clone(),
-                source: "bundled".to_string(),
-                message: format!("已回退到客户端内置 Engine v{version}"),
-            })
-        })();
-        self.finish_mutation();
-        if let Ok(value) = &result {
-            self.persist_log("system", &value.message);
-        }
-        result
+    pub fn activate_bundled_engine(
+        &self,
+        operation_id: String,
+    ) -> Result<EngineInstallResult, String> {
+        let version = package_version(&self.bundled_package_root()?)
+            .ok_or_else(|| "无法读取客户端内置 Engine 版本".to_string())?;
+        self.install_engine_version(InstallEngineVersionRequest {
+            version,
+            operation_id,
+        })
     }
 
     fn run_engine_update_helper<T: DeserializeOwned>(
         &self,
         action: &str,
         input: Option<&[u8]>,
+        progress: Option<(&str, &str)>,
     ) -> Result<T, String> {
         let engine = self.bundled_engine_dir()?;
         let runtime = self.bundled_runtime_path()?;
@@ -1409,25 +1589,67 @@ impl Backend {
             .spawn()
             .map_err(|error| format!("无法启动 Engine 更新器：{error}"))?;
         if let Some(bytes) = input {
-            child
+            let sent = child
                 .stdin
                 .take()
                 .ok_or_else(|| "无法打开 Engine 更新器输入".to_string())?
                 .write_all(bytes)
-                .map_err(|error| format!("无法发送 Engine 更新请求：{error}"))?;
+                .map_err(|error| format!("无法发送 Engine 更新请求：{error}"));
+            if let Err(error) = sent {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
         }
-        let output = child
-            .wait_with_output()
+        let mut stdout = child.stdout.take().ok_or("无法读取 Engine 更新器输出")?;
+        let stderr = child.stderr.take().ok_or("无法读取 Engine 更新器进度")?;
+        let (output, errors) = thread::scope(|scope| {
+            let reader = scope.spawn(move || {
+                let mut output = Vec::new();
+                stdout.read_to_end(&mut output).map(|_| output)
+            });
+            let mut errors = String::new();
+            for line in BufReader::new(stderr).lines() {
+                let line = match line {
+                    Ok(line) => line,
+                    Err(error) => {
+                        let _ = child.kill();
+                        errors.push_str(&format!("读取更新进度失败：{error}"));
+                        break;
+                    }
+                };
+                if let Some(event) = parse_engine_progress(&line) {
+                    if let Some((operation_id, version)) = progress {
+                        self.emit_engine_progress(operation_id, version, event);
+                    }
+                } else {
+                    if errors.len() > 8192 {
+                        errors.clear();
+                    }
+                    errors.push_str(&line);
+                    errors.push('\n');
+                }
+            }
+            (
+                reader
+                    .join()
+                    .unwrap_or_else(|_| Err(std::io::Error::other("更新输出线程失败"))),
+                errors,
+            )
+        });
+        let status = child
+            .wait()
             .map_err(|error| format!("等待 Engine 更新器失败：{error}"))?;
-        if !output.status.success() {
-            let detail = self.redact(String::from_utf8_lossy(&output.stderr).trim());
+        if !status.success() {
+            let detail = self.redact(errors.trim());
             return Err(if detail.is_empty() {
                 "Engine 更新失败".to_string()
             } else {
                 detail
             });
         }
-        serde_json::from_slice(&output.stdout)
+        let output = output.map_err(|error| format!("读取 Engine 更新结果失败：{error}"))?;
+        serde_json::from_slice(&output)
             .map_err(|error| format!("Engine 更新器返回了无效结果：{error}"))
     }
 
@@ -1592,6 +1814,7 @@ fn build_engine_update_catalog(
     let latest_preview = releases.iter().find(|release| release.prerelease).cloned();
     EngineUpdateCatalog {
         current_version,
+        bundled_version,
         current_source,
         latest_stable,
         latest_preview,
@@ -1958,8 +2181,77 @@ fn display_action(action: &CommandAction) -> &'static str {
     }
 }
 
+fn service_references_directory(service: &BackgroundServiceState, directory: &Path) -> bool {
+    if !service.installed {
+        return false;
+    }
+    if service.references_unknown || service.referenced_cli_paths.is_empty() {
+        return true;
+    }
+    service.referenced_cli_paths.iter().any(|path| {
+        if cfg!(windows) {
+            Path::new(&path.to_lowercase()).starts_with(directory.to_string_lossy().to_lowercase())
+        } else {
+            Path::new(path).starts_with(directory)
+        }
+    })
+}
+
+fn parse_engine_progress(line: &str) -> Option<EngineProgress> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let progress: EngineProgress =
+        serde_json::from_value(value.get("engineProgress")?.clone()).ok()?;
+    matches!(
+        progress.stage.as_str(),
+        "checking" | "downloading" | "dependencies" | "validating"
+    )
+    .then_some(progress)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn engine_progress_accepts_only_helper_download_stages() {
+        let progress = super::parse_engine_progress(
+            r#"{"engineProgress":{"stage":"downloading","downloadedBytes":10,"totalBytes":20}}"#,
+        )
+        .unwrap();
+        assert_eq!(progress.downloaded_bytes, Some(10));
+        assert_eq!(progress.total_bytes, Some(20));
+        assert!(super::parse_engine_progress("network error").is_none());
+        assert!(
+            super::parse_engine_progress(r#"{"engineProgress":{"stage":"complete"}}"#).is_none()
+        );
+    }
+
+    #[test]
+    fn inactive_versions_referenced_by_service_are_protected() {
+        let service = BackgroundServiceState {
+            installed: true,
+            referenced_cli_paths: vec!["/engines/2.40.0/node_modules/opencodex/cli.ts".into()],
+            ..BackgroundServiceState::default()
+        };
+        assert!(super::service_references_directory(
+            &service,
+            std::path::Path::new("/engines/2.40.0")
+        ));
+        assert!(!super::service_references_directory(
+            &service,
+            std::path::Path::new("/engines/2.4")
+        ));
+        assert!(!super::service_references_directory(
+            &service,
+            std::path::Path::new("/engines/2.39.0")
+        ));
+        assert!(super::service_references_directory(
+            &BackgroundServiceState {
+                references_unknown: true,
+                ..service
+            },
+            std::path::Path::new("/engines/2.39.0")
+        ));
+    }
+
     use super::{
         account_binding_restart_mode, build_engine_update_catalog, codex_integration_is_enabled,
         config_is_initialized, configured_sidecar_models, isolated_instance_integration_action,

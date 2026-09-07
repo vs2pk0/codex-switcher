@@ -157,6 +157,16 @@ test("统计实例范围支持全部界面语言", () => {
   assert.equal(t("全部实例"), "全部執行個體");
 });
 
+test("统计刷新修复结果支持全部界面语言", () => {
+  const warning = "消耗数据已刷新，仍有统计项无法自动修复，请查看异常详情";
+  for (const language of ["en", "ru", "zh-TW"] as const) {
+    currentLanguage.value = language;
+    assert.notEqual(t(warning), warning);
+    assert.notEqual(t("异常详情"), "异常详情");
+    assert.notEqual(t("消耗数据已刷新"), "消耗数据已刷新");
+  }
+});
+
 test("账号 JSON 格式标签支持全部界面语言", () => {
   currentLanguage.value = "en";
   assert.equal(t("Switcher JSON"), "Switcher JSON");

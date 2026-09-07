@@ -5,6 +5,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import InstancePickerModal from "../components/InstancePickerModal.vue";
 import type { CodexInstance } from "../services/instances";
 import { currentLanguage, formatTranslatedText, t } from "../i18n";
+import { filterMigrationAccounts, toggleVisibleAccounts } from "./accounts";
 import {
   activateBundledOpenCodexEngine,
   deleteOpenCodexSwitcherAccount,
@@ -19,6 +20,7 @@ import {
   runOpenCodexAction,
   scanOpenCodexSwitcherAccounts,
   subscribeOpenCodexEvents,
+  subscribeOpenCodexEngineProgress,
   updateOpenCodexVisionModels,
   writeOpenCodexInput,
 } from "./service";
@@ -33,6 +35,7 @@ import type {
   OpenCodexCommandLogEvent,
   OpenCodexEngineCatalog,
   OpenCodexEngineRelease,
+  OpenCodexEngineProgress,
   OpenCodexPage,
   OpenCodexSettings,
   OpenCodexSwitcherAccountScan,
@@ -57,11 +60,16 @@ const catalog = ref<OpenCodexEngineCatalog | null>(null);
 const catalogLoading = ref(false);
 const selectedVersion = ref("");
 const installingVersion = ref("");
+const engineProgress = ref<OpenCodexEngineProgress | null>(null);
+const engineError = ref("");
 const accountScan = ref<OpenCodexSwitcherAccountScan | null>(null);
 const accountScanLoading = ref(false);
 const selectedAccountIds = ref<string[]>([]);
 const importingAccounts = ref(false);
 const deletingAccountId = ref("");
+const accountSearch = ref("");
+const accountStatus = ref("");
+const accountPlan = ref("");
 const visionCatalog = ref<OpenCodexVisionModelCatalog | null>(null);
 const visionLoading = ref(false);
 const visionSaving = ref(false);
@@ -70,6 +78,8 @@ const selectedVisionModels = ref<string[]>([]);
 const instancePickerVisible = ref(false);
 const pendingInstanceAction = ref<"sync" | "restore" | null>(null);
 let unlistenEvents: UnlistenFn | undefined;
+let unlistenEngine: UnlistenFn | undefined;
+let disposed = false;
 const answeredPortPrompts = new Set<string>();
 
 function loadSettings(): OpenCodexSettings {
@@ -87,6 +97,32 @@ const recentLogs = computed(() => logs.value.slice(-14));
 const selectedRelease = computed(
   () => catalog.value?.releases.find((release) => release.version === selectedVersion.value) ?? null,
 );
+const accountMutationBusy = computed(() => busy.value || importingAccounts.value || Boolean(deletingAccountId.value));
+const filteredAccounts = computed(() => filterMigrationAccounts(
+  accountScan.value?.accounts ?? [], accountSearch.value, accountStatus.value, accountPlan.value,
+));
+const accountPlans = computed(() => [...new Set((accountScan.value?.accounts ?? []).map((account) => account.plan || "__unknown__"))].sort());
+const visibleSelectable = computed(() => filteredAccounts.value.filter((account) => account.eligible || account.deletable));
+const visibleSelectedCount = computed(() => visibleSelectable.value.filter((account) => selectedAccountIds.value.includes(account.sourceId)).length);
+const allVisibleSelected = computed(() => visibleSelectable.value.length > 0 && visibleSelectedCount.value === visibleSelectable.value.length);
+const hiddenSelectedCount = computed(() => selectedAccountIds.value.filter((id) => !filteredAccounts.value.some((account) => account.sourceId === id)).length);
+const engineStageLabel = computed(() => t(({
+  checking: "检查版本", downloading: "下载 Engine 包", dependencies: "安装依赖",
+  validating: "校验 Engine", stopping: "停止当前服务", activating: "切换 Engine",
+  restarting: "重启并检查服务", recovering: "恢复原 Engine", complete: "Engine 更新完成", error: "Engine 操作失败",
+})[engineProgress.value?.stage ?? "checking"]));
+const engineDownloadPercent = computed(() => {
+  const progress = engineProgress.value;
+  return progress?.stage === "downloading" && progress.totalBytes && progress.totalBytes > 0
+    ? Math.min(1, Math.max(0, (progress.downloadedBytes ?? 0) / progress.totalBytes)) : null;
+});
+function formatBytes(bytes: number): string {
+  return bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+function selectVisibleAccounts(checked: boolean | (string | number | boolean)[]): void {
+  if (accountMutationBusy.value || accountScanLoading.value) return;
+  selectedAccountIds.value = toggleVisibleAccounts(selectedAccountIds.value, filteredAccounts.value, checked === true);
+}
 const selectedImportAccountIds = computed(() => selectedAccountIds.value.filter((sourceId) =>
   accountScan.value?.accounts.some((account) => account.sourceId === sourceId && account.eligible),
 ));
@@ -126,15 +162,15 @@ function appendLog(event: OpenCodexCommandLogEvent): void {
   }
 }
 
-async function refreshSnapshot(showError = true): Promise<void> {
-  loading.value = true;
+async function refreshSnapshot(showError = true, quiet = false): Promise<void> {
+  if (!quiet) loading.value = true;
   try {
     snapshot.value = await getOpenCodexSnapshot();
     if (snapshot.value.running && snapshot.value.port) settings.value.port = snapshot.value.port;
   } catch (error) {
     if (showError) Message.error(formatTranslatedText("读取 OpenCodex 状态失败：{error}", { error: errorText(error) }));
   } finally {
-    loading.value = false;
+    if (!quiet) loading.value = false;
   }
 }
 
@@ -251,63 +287,45 @@ async function checkVersions(): Promise<void> {
 }
 
 async function applyRelease(release: OpenCodexEngineRelease): Promise<void> {
-  if (snapshot.value?.running) {
-    Message.warning(t("请先停止 OpenCodex 服务，再更新或切换 Engine"));
-    return;
-  }
-  busy.value = true;
-  installingVersion.value = release.version;
-  try {
-    const result = await installOpenCodexEngine(release.version);
-    Message.success(result.message);
-    await Promise.all([refreshSnapshot(false), checkVersions()]);
-  } catch (error) {
-    Message.error(formatTranslatedText("安装 Engine 失败：{error}", { error: errorText(error) }));
-  } finally {
-    installingVersion.value = "";
-    busy.value = false;
-  }
+  await maintainEngine(release.version);
 }
 
 async function rollbackEngine(): Promise<void> {
-  if (snapshot.value?.running) {
-    Message.warning(t("请先停止 OpenCodex 服务，再回退 Engine"));
-    return;
-  }
-  busy.value = true;
-  installingVersion.value = "__bundled__";
-  try {
-    const result = await activateBundledOpenCodexEngine();
-    Message.success(result.message);
-    await Promise.all([refreshSnapshot(false), checkVersions()]);
-  } catch (error) {
-    Message.error(formatTranslatedText("回退 Engine 失败：{error}", { error: errorText(error) }));
-  } finally {
-    installingVersion.value = "";
-    busy.value = false;
-  }
+  await maintainEngine(catalog.value?.bundledVersion || "", true);
 }
 
 async function switchInstalledVersion(version: string): Promise<void> {
-  if (snapshot.value?.running) {
-    Message.warning(t("请先停止 OpenCodex 服务，再切换 Engine"));
-    return;
-  }
+  await maintainEngine(version);
+}
+
+async function maintainEngine(version: string, bundled = false): Promise<void> {
+  if (accountMutationBusy.value || !version) return;
+  const operationId = crypto.randomUUID();
   busy.value = true;
-  installingVersion.value = version;
+  installingVersion.value = bundled ? "__bundled__" : version;
+  engineError.value = "";
+  engineProgress.value = { operationId, version, stage: "checking" };
   try {
-    const result = await installOpenCodexEngine(version);
+    unlistenEngine = await subscribeOpenCodexEngineProgress(operationId, (progress) => { engineProgress.value = progress; });
+    if (disposed) return;
+    const result = bundled ? await activateBundledOpenCodexEngine(operationId) : await installOpenCodexEngine(version, operationId);
+    engineProgress.value = { operationId, version: result.version, stage: "complete" };
     Message.success(result.message);
-    await Promise.all([refreshSnapshot(false), checkVersions()]);
   } catch (error) {
-    Message.error(formatTranslatedText("切换 Engine 失败：{error}", { error: errorText(error) }));
+    engineProgress.value = { operationId, version, stage: "error" };
+    engineError.value = errorText(error);
+    Message.error(formatTranslatedText("安装 Engine 失败：{error}", { error: engineError.value }));
   } finally {
+    unlistenEngine?.();
+    unlistenEngine = undefined;
+    if (!disposed) await Promise.all([refreshSnapshot(false, true), checkVersions()]);
     installingVersion.value = "";
     busy.value = false;
   }
 }
 
 function confirmDeleteInstalledVersion(version: string): void {
+  if (accountMutationBusy.value || catalog.value?.currentVersion === version) return;
   Modal.warning({
     title: t("删除本地 Engine"),
     content: formatTranslatedText("确认删除本地 Engine v{version}？删除后仍可从 GitHub 版本列表重新下载安装。", { version }),
@@ -315,6 +333,7 @@ function confirmDeleteInstalledVersion(version: string): void {
     cancelText: t("取消"),
     hideCancel: false,
     async onOk() {
+      if (accountMutationBusy.value) return false;
       busy.value = true;
       try {
         const result = await deleteOpenCodexEngine(version);
@@ -342,11 +361,13 @@ function saveSettings(): void {
 }
 
 async function scanAccounts(): Promise<void> {
+  if (accountScanLoading.value) return;
   accountScanLoading.value = true;
   try {
+    const initial = !accountScan.value;
     accountScan.value = await scanOpenCodexSwitcherAccounts();
     selectedAccountIds.value = accountScan.value.accounts
-      .filter((account) => account.eligible)
+      .filter((account) => initial ? account.eligible : (account.eligible || account.deletable) && selectedAccountIds.value.includes(account.sourceId))
       .map((account) => account.sourceId);
   } catch (error) {
     Message.error(formatTranslatedText("扫描 Switcher 账号失败：{error}", { error: errorText(error) }));
@@ -413,6 +434,7 @@ async function saveVisionModels(): Promise<void> {
 }
 
 async function importAccounts(): Promise<void> {
+  if (accountMutationBusy.value || accountScanLoading.value || snapshot.value?.running) return;
   if (!selectedImportAccountIds.value.length) {
     Message.warning(t("请至少选择一个可导入账号"));
     return;
@@ -434,6 +456,7 @@ async function importAccounts(): Promise<void> {
 }
 
 function confirmDeleteSelectedAccounts(): void {
+  if (accountMutationBusy.value || accountScanLoading.value) return;
   const selected = [...selectedDeleteAccounts.value];
   if (!selected.length || deletingAccountId.value) {
     Message.warning(t("请至少选择一个已导入且可删除的账号"));
@@ -450,6 +473,7 @@ function confirmDeleteSelectedAccounts(): void {
     cancelText: t("取消"),
     hideCancel: false,
     onOk: async () => {
+      if (accountMutationBusy.value || snapshot.value?.running) return false;
       deletingAccountId.value = "__selected__";
       try {
         const results = [];
@@ -478,6 +502,7 @@ function confirmDeleteSelectedAccounts(): void {
 function confirmDeleteMigratedAccount(
   account: OpenCodexSwitcherAccountScan["accounts"][number],
 ): void {
+  if (accountMutationBusy.value || accountScanLoading.value) return;
   if (!account.deletable || deletingAccountId.value) return;
   if (snapshot.value?.running) {
     Message.warning(t("请先停止 OpenCodex 服务，再删除账号"));
@@ -490,6 +515,7 @@ function confirmDeleteMigratedAccount(
     cancelText: t("取消"),
     hideCancel: false,
     onOk: async () => {
+      if (accountMutationBusy.value || snapshot.value?.running) return false;
       deletingAccountId.value = account.sourceId;
       try {
         const result = await deleteOpenCodexSwitcherAccount(account.sourceId);
@@ -512,15 +538,6 @@ function formatLogTime(value: string): string {
   return Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString(locale, { hour12: false });
 }
 
-function accountInitial(email: string): string {
-  const initial = email.replace(/[^a-zA-Z0-9\u4e00-\u9fff]/g, "").charAt(0);
-  return initial ? initial.toUpperCase() : "C";
-}
-
-function shortSourceId(sourceId: string): string {
-  return sourceId.length > 16 ? `${sourceId.slice(0, 8)}…${sourceId.slice(-5)}` : sourceId;
-}
-
 function accountStatusLabel(status: string): string {
   if (status === "ready") return t("待导入");
   if (status === "already_imported") return t("已导入");
@@ -541,6 +558,7 @@ function backgroundServiceSummary(): string {
 }
 
 function toggleMigrationAccount(account: OpenCodexSwitcherAccountScan["accounts"][number]): void {
+  if (accountMutationBusy.value || accountScanLoading.value) return;
   if (!account.eligible && !account.deletable) return;
   selectedAccountIds.value = selectedAccountIds.value.includes(account.sourceId)
     ? selectedAccountIds.value.filter((id) => id !== account.sourceId)
@@ -551,7 +569,7 @@ watch(
   () => props.active,
   (active) => {
     if (active) {
-      void refreshSnapshot(false);
+      void refreshSnapshot(false, Boolean(installingVersion.value));
       return;
     }
     instancePickerVisible.value = false;
@@ -576,7 +594,7 @@ onMounted(async () => {
     unlistenEvents = await subscribeOpenCodexEvents(
       appendLog,
       (event) => {
-        busy.value = false;
+        if (!installingVersion.value) busy.value = false;
         if (interactiveOperationId.value === event.operationId) interactiveOperationId.value = "";
         appendLog({
           operationId: event.operationId,
@@ -589,16 +607,17 @@ onMounted(async () => {
         if (event.action === "sync" || event.action === "restore") {
           emit("instances-refreshed");
         }
-        void refreshSnapshot(false);
+        void refreshSnapshot(false, true);
       },
     );
+    if (disposed) { unlistenEvents(); return; }
     await refreshSnapshot(false);
   } catch (error) {
     Message.error(formatTranslatedText("初始化 OpenCodex 管理模块失败：{error}", { error: errorText(error) }));
   }
 });
 
-onUnmounted(() => unlistenEvents?.());
+onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
 </script>
 
 <template>
@@ -642,6 +661,14 @@ onUnmounted(() => unlistenEvents?.());
         <icon-settings />{{ t("设置") }}
       </button>
     </nav>
+
+    <section v-if="engineProgress" class="engine-progress" :class="engineProgress.stage" aria-live="polite">
+      <div class="engine-progress-heading"><strong>{{ engineStageLabel }}</strong><span>Engine v{{ engineProgress.version }}</span><span v-if="engineProgress.stage === 'downloading' && engineProgress.downloadedBytes != null">{{ formatBytes(engineProgress.downloadedBytes) }}<template v-if="engineProgress.totalBytes"> / {{ formatBytes(engineProgress.totalBytes) }}</template></span></div>
+      <a-progress v-if="engineDownloadPercent !== null" :percent="engineDownloadPercent" animation />
+      <a-progress v-else-if="engineProgress.stage === 'complete'" :percent="1" status="success" />
+      <div v-else-if="engineProgress.stage !== 'error'" class="engine-indeterminate" role="progressbar" :aria-label="engineStageLabel"><a-progress :percent="0.3" :show-text="false" aria-hidden="true" /></div>
+      <p v-if="engineError" class="engine-error">{{ engineError }}</p>
+    </section>
 
     <a-spin :loading="loading" class="opencodex-content" :tip="t('正在读取 OpenCodex 状态…')">
       <template v-if="page === 'console'">
@@ -769,7 +796,7 @@ onUnmounted(() => unlistenEvents?.());
           <div v-if="catalog?.latestStable" class="latest-release">
             <span class="release-icon"><icon-download /></span>
             <div><a-tag :color="catalog.latestStable.newerThanCurrent ? 'orange' : 'green'">{{ t(catalog.latestStable.newerThanCurrent ? "发现新版本" : "已是最新稳定版") }}</a-tag><h3>OpenCodex Engine v{{ catalog.latestStable.version }}</h3><p>{{ t("内置版本始终保留，可随时安全回退。") }}</p></div>
-            <a-button type="primary" :loading="installingVersion === catalog.latestStable.version" :disabled="busy || snapshot?.running || !catalog.latestStable.newerThanCurrent" @click="applyRelease(catalog.latestStable)">{{ t("更新到最新版") }}</a-button>
+            <a-button type="primary" :loading="installingVersion === catalog.latestStable.version" :disabled="accountMutationBusy || !catalog.latestStable.newerThanCurrent" @click="applyRelease(catalog.latestStable)">{{ t("更新到最新版") }}</a-button>
           </div>
           <div class="local-version-section">
             <div class="local-version-heading">
@@ -780,8 +807,8 @@ onUnmounted(() => unlistenEvents?.());
               <div v-for="version in catalog.installedVersions" :key="version" class="local-version-row">
                 <div><strong>Engine v{{ version }}</strong><span>{{ t(catalog.currentVersion === version ? "当前使用" : "本地已安装") }}</span></div>
                 <div class="local-version-actions">
-                  <a-button size="small" :loading="installingVersion === version" :disabled="busy || snapshot?.running || catalog.currentVersion === version" @click="switchInstalledVersion(version)">{{ t("切换") }}</a-button>
-                  <a-button size="small" status="danger" :disabled="busy || snapshot?.running || catalog.currentVersion === version" @click="confirmDeleteInstalledVersion(version)"><template #icon><icon-delete /></template>{{ t("删除") }}</a-button>
+                  <a-button size="small" :loading="installingVersion === version" :disabled="accountMutationBusy || catalog.currentVersion === version" @click="switchInstalledVersion(version)">{{ t("切换") }}</a-button>
+                  <a-button size="small" status="danger" :disabled="accountMutationBusy || catalog.currentVersion === version" @click="confirmDeleteInstalledVersion(version)"><template #icon><icon-delete /></template>{{ t("删除") }}</a-button>
                 </div>
               </div>
             </div>
@@ -790,11 +817,11 @@ onUnmounted(() => unlistenEvents?.());
           <div class="github-version-section">
             <div class="local-version-heading"><div><h3>{{ t("GitHub 版本") }}</h3><p>{{ t("选择官方 Release；未安装时下载并使用，已安装时直接切换。") }}</p></div></div>
           <div class="release-picker">
-            <a-select v-model="selectedVersion" :placeholder="t('选择 Engine 版本')" :loading="catalogLoading">
+            <a-select v-model="selectedVersion" :placeholder="t('选择 Engine 版本')" :loading="catalogLoading" :disabled="accountMutationBusy">
               <a-option v-for="release in catalog?.releases || []" :key="release.version" :value="release.version">v{{ release.version }} · {{ t(release.prerelease ? "预览" : "稳定") }}{{ release.active ? ` · ${t("当前")}` : release.installed ? ` · ${t("已安装")}` : "" }}</a-option>
             </a-select>
-            <a-button :loading="Boolean(selectedRelease && installingVersion === selectedRelease.version)" :disabled="busy || !selectedRelease || selectedRelease.active || snapshot?.running" @click="selectedRelease && applyRelease(selectedRelease)">{{ t(selectedRelease?.installed ? "切换版本" : "下载并使用") }}</a-button>
-            <a-button v-if="snapshot?.engineSource === 'managed'" :loading="installingVersion === '__bundled__'" :disabled="busy || snapshot?.running" @click="rollbackEngine"><template #icon><icon-undo /></template>{{ t("回退内置版本") }}</a-button>
+            <a-button :loading="Boolean(selectedRelease && installingVersion === selectedRelease.version)" :disabled="accountMutationBusy || !selectedRelease || selectedRelease.active" @click="selectedRelease && applyRelease(selectedRelease)">{{ t(selectedRelease?.installed ? "切换版本" : "下载并使用") }}</a-button>
+            <a-button v-if="snapshot?.engineSource === 'managed'" :loading="installingVersion === '__bundled__'" :disabled="accountMutationBusy" @click="rollbackEngine"><template #icon><icon-undo /></template>{{ t("回退内置版本") }}</a-button>
           </div>
           </div>
         </section>
@@ -872,86 +899,69 @@ onUnmounted(() => unlistenEvents?.());
       </template>
 
       <template v-else>
-        <section class="settings-grid">
-          <article class="settings-card">
+        <section class="opencodex-settings-grid">
+          <article class="opencodex-settings-section service-settings">
             <div class="section-heading"><div><h2>{{ t("服务设置") }}</h2><p>{{ t("管理监听端口和 Dashboard 打开方式") }}</p></div></div>
-            <a-form :model="settings" layout="vertical">
+            <a-form :model="settings" layout="vertical" size="small">
               <a-form-item :label="t('服务端口')"><a-input-number v-model="settings.port" :min="1024" :max="65535" /></a-form-item>
               <a-form-item :label="t('默认打开方式')"><a-radio-group v-model="settings.dashboardOpenMode" type="button"><a-radio value="client">{{ t("客户端窗口") }}</a-radio><a-radio value="browser">{{ t("系统浏览器") }}</a-radio></a-radio-group></a-form-item>
-              <a-button type="primary" @click="saveSettings"><template #icon><icon-save /></template>{{ t("保存设置") }}</a-button>
+              <a-button type="primary" size="small" @click="saveSettings"><template #icon><icon-save /></template>{{ t("保存设置") }}</a-button>
             </a-form>
           </article>
-          <article class="settings-card">
-            <div class="section-heading"><div><h2>{{ t("Switcher 账号迁移") }}</h2><p>{{ t("读取当前 Switcher 账号并转换为 OpenCodex OAuth 账号") }}</p></div><a-button size="small" :loading="accountScanLoading" @click="scanAccounts"><template #icon><icon-search /></template>{{ t("扫描") }}</a-button></div>
+          <article class="opencodex-settings-section migration-settings">
+            <div class="section-heading">
+              <div><h2>{{ t("Switcher 账号迁移") }}</h2></div>
+              <a-button size="small" :loading="accountScanLoading" :disabled="accountMutationBusy" @click="scanAccounts"><template #icon><icon-refresh /></template>{{ t("扫描") }}</a-button>
+            </div>
             <div v-if="accountScan" class="scan-summary">
               <span>{{ t("发现") }} <strong>{{ accountScan.totalCount }}</strong> {{ t("个账号") }}</span>
               <span class="scan-ready">{{ t("可导入") }} <strong>{{ accountScan.eligibleCount }}</strong> {{ t("个") }}</span>
               <span>{{ t("已选择") }} <strong>{{ selectedAccountIds.length }}</strong> {{ t("个") }}</span>
             </div>
-            <div v-if="accountScan?.accounts.length" class="migration-list">
-              <article
-                v-for="account in accountScan.accounts"
-                :key="account.sourceId"
-                class="migration-account-card"
-                :class="{
-                  selected: selectedAccountIds.includes(account.sourceId),
-                  current: account.current,
-                  unavailable: !account.eligible && !account.deletable,
-                }"
-                :role="account.eligible || account.deletable ? 'checkbox' : undefined"
-                :aria-checked="account.eligible || account.deletable ? selectedAccountIds.includes(account.sourceId) : undefined"
-                :aria-disabled="!account.eligible && !account.deletable"
-                :tabindex="account.eligible || account.deletable ? 0 : -1"
-                @click="toggleMigrationAccount(account)"
-                @keydown.space.prevent="toggleMigrationAccount(account)"
-                @keydown.enter.prevent="toggleMigrationAccount(account)"
-              >
-                <span class="migration-check" @click.stop>
-                  <a-checkbox
-                    :model-value="selectedAccountIds.includes(account.sourceId)"
-                    :disabled="!account.eligible && !account.deletable"
-                    @change="toggleMigrationAccount(account)"
-                  />
-                </span>
-                <span class="migration-avatar">{{ accountInitial(account.email) }}</span>
-                <span class="migration-identity">
-                  <span class="migration-account-title">
-                    <strong :title="account.email || account.sourceId">{{ account.email || account.sourceId }}</strong>
-                    <span v-if="account.current" class="migration-current-pill">{{ t("当前") }}</span>
-                    <span v-if="account.plan" class="migration-plan-pill">{{ account.plan }}</span>
-                  </span>
-                  <small>{{ t("账号 ID：") }}{{ shortSourceId(account.sourceId) }}</small>
-                  <span class="migration-reason">{{ t(account.reason) }}</span>
-                </span>
-                <span class="migration-card-actions">
-                  <span :class="['migration-status-pill', account.status]">
-                    {{ accountStatusLabel(account.status) }}
-                  </span>
-                  <a-tooltip v-if="account.deletable" :content="t('从 OpenCodex 删除，保留 Switcher 原账号')">
-                    <a-button
-                      class="migration-delete-button"
-                      size="mini"
-                      status="danger"
-                      :loading="deletingAccountId === account.sourceId"
-                      :disabled="Boolean(deletingAccountId) || snapshot?.running"
-                      :aria-label="t('删除 OpenCodex 账号')"
-                      @click.stop="confirmDeleteMigratedAccount(account)"
-                      @keydown.stop
-                    >
-                      <template #icon><icon-delete /></template>
-                      {{ t("删除") }}
-                    </a-button>
-                  </a-tooltip>
-                </span>
-              </article>
+            <div class="migration-toolbar">
+              <a-input v-model="accountSearch" size="small" allow-clear :placeholder="t('搜索邮箱或账号 ID')" :aria-label="t('搜索邮箱或账号 ID')"><template #prefix><icon-search /></template></a-input>
+              <a-select v-model="accountStatus" size="small" :aria-label="t('账号状态')">
+                <a-option value="">{{ t("全部状态") }}</a-option>
+                <a-option v-for="status in ['ready', 'already_imported', 'unsupported', 'invalid']" :key="status" :value="status">{{ accountStatusLabel(status) }}</a-option>
+              </a-select>
+              <a-select v-model="accountPlan" size="small" :aria-label="t('套餐')">
+                <a-option value="">{{ t("全部套餐") }}</a-option>
+                <a-option v-for="plan in accountPlans" :key="plan" :value="plan">{{ plan === '__unknown__' ? t('未知套餐') : plan }}</a-option>
+              </a-select>
             </div>
+            <div v-if="accountScan" class="migration-selection-bar">
+              <a-checkbox :model-value="allVisibleSelected" :indeterminate="visibleSelectedCount > 0 && !allVisibleSelected" :disabled="!visibleSelectable.length || accountMutationBusy || accountScanLoading" @change="selectVisibleAccounts">{{ t("全选筛选结果") }}</a-checkbox>
+              <span>{{ formatTranslatedText("显示 {visible} / {total} 个账号", { visible: filteredAccounts.length, total: accountScan.totalCount }) }}</span>
+              <span v-if="hiddenSelectedCount" class="hidden-selection">{{ formatTranslatedText("另有 {count} 个已选账号被筛选隐藏", { count: hiddenSelectedCount }) }}</span>
+              <a-button type="text" size="small" :disabled="!selectedAccountIds.length || accountMutationBusy || accountScanLoading" @click="selectedAccountIds = []">{{ t("清空选择") }}</a-button>
+            </div>
+            <a-spin :loading="accountScanLoading" class="migration-results">
+              <div v-if="filteredAccounts.length" class="migration-table-scroll">
+                <table class="migration-table">
+                  <thead><tr><th class="migration-check-column"><span class="sr-only">{{ t("选择") }}</span></th><th>{{ t("账号") }}</th><th>{{ t("套餐") }}</th><th>{{ t("状态") }}</th><th>{{ t("操作") }}</th></tr></thead>
+                  <tbody>
+                    <tr v-for="account in filteredAccounts" :key="account.sourceId" :class="{ selected: selectedAccountIds.includes(account.sourceId) }">
+                      <td><a-checkbox :model-value="selectedAccountIds.includes(account.sourceId)" :disabled="accountMutationBusy || accountScanLoading || (!account.eligible && !account.deletable)" :aria-label="account.email || account.sourceId" @change="toggleMigrationAccount(account)" /></td>
+                      <td class="migration-identity">
+                        <div><a-tooltip :content="account.email || account.sourceId"><strong>{{ account.email || account.sourceId }}</strong></a-tooltip><a-tag v-if="account.current" size="small" color="blue">{{ t("当前") }}</a-tag></div>
+                        <a-tooltip :content="account.sourceId"><small>{{ account.sourceId }}</small></a-tooltip>
+                      </td>
+                      <td class="migration-plan"><a-tooltip :content="account.plan || t('未知套餐')"><span>{{ account.plan || t("未知套餐") }}</span></a-tooltip></td>
+                      <td><a-tooltip :content="accountStatusLabel(account.status)"><span :class="['migration-status-pill', account.status]">{{ accountStatusLabel(account.status) }}</span></a-tooltip><a-tooltip :content="t(account.reason)"><p class="migration-reason">{{ t(account.reason) }}</p></a-tooltip></td>
+                      <td><a-tooltip v-if="account.deletable" :content="t('从 OpenCodex 删除，保留 Switcher 原账号')"><a-button type="text" size="small" status="danger" :loading="deletingAccountId === account.sourceId" :disabled="accountMutationBusy || snapshot?.running" :aria-label="t('删除 OpenCodex 账号')" @click="confirmDeleteMigratedAccount(account)"><template #icon><icon-delete /></template></a-button></a-tooltip><span v-else class="migration-no-action">-</span></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <a-empty v-else :description="t(!accountScan ? '尚未扫描账号' : !accountScan.accounts.length ? '暂无账号' : '没有符合筛选条件的账号')" />
+            </a-spin>
             <div v-if="accountScan" class="migration-batch-actions">
-              <a-button type="primary" :loading="importingAccounts" :disabled="!selectedImportAccountIds.length || snapshot?.running" @click="importAccounts"><template #icon><icon-import /></template>{{ t("导入所选") }}（{{ selectedImportAccountIds.length }}）</a-button>
-              <a-button status="danger" :loading="deletingAccountId === '__selected__'" :disabled="!selectedDeleteAccounts.length || Boolean(deletingAccountId) || snapshot?.running" @click="confirmDeleteSelectedAccounts"><template #icon><icon-delete /></template>{{ t("删除所选") }}（{{ selectedDeleteAccounts.length }}）</a-button>
+              <a-button type="primary" size="small" :loading="importingAccounts" :disabled="accountMutationBusy || accountScanLoading || !selectedImportAccountIds.length || snapshot?.running" @click="importAccounts"><template #icon><icon-import /></template>{{ t("导入所选") }}（{{ selectedImportAccountIds.length }}）</a-button>
+              <a-button status="danger" size="small" :loading="deletingAccountId === '__selected__'" :disabled="accountMutationBusy || accountScanLoading || !selectedDeleteAccounts.length || snapshot?.running" @click="confirmDeleteSelectedAccounts"><template #icon><icon-delete /></template>{{ t("删除所选") }}（{{ selectedDeleteAccounts.length }}）</a-button>
             </div>
             <a-alert v-if="snapshot?.running" type="warning" show-icon>{{ t("导入前请先停止 OpenCodex 服务，避免配置被运行中的 Engine 覆盖。") }}</a-alert>
           </article>
-          <article class="settings-card danger-card">
+          <article class="opencodex-settings-section danger-card">
             <div class="section-heading"><div><h2>{{ t("维护与恢复") }}</h2><p>{{ t("执行前请确认当前没有正在处理的请求") }}</p></div></div>
             <div class="danger-actions"><a-button status="warning" :disabled="busy || !snapshot?.initialized" @click="run('restore')"><template #icon><icon-undo /></template>{{ t("恢复原生 Codex") }}</a-button><a-button status="danger" :disabled="busy" @click="run('uninstall')"><template #icon><icon-delete /></template>{{ t("卸载 OpenCodex") }}</a-button></div>
           </article>
@@ -973,11 +983,12 @@ onUnmounted(() => unlistenEvents?.());
 </template>
 
 <style scoped>
-.opencodex-page { display: grid; gap: 18px; color: #101827; }
+.opencodex-page { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; gap: 18px; color: #101827; container-type: inline-size; }
+.opencodex-page > * { min-width: 0; }
 .opencodex-hero { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
 .opencodex-title-row { display: flex; align-items: center; gap: 14px; }
 .opencodex-brand-mark { display: grid; width: 52px; height: 52px; place-items: center; border-radius: 16px; color: #fff; background: linear-gradient(145deg, #0f766e, #16a085); box-shadow: 0 14px 32px rgba(15, 118, 110, .22); font-size: 17px; font-weight: 900; }
-.opencodex-title-row h1 { margin: 0; font-size: clamp(28px, 3vw, 42px); letter-spacing: -.04em; }
+.opencodex-title-row h1 { margin: 0; font-size: 24px; letter-spacing: 0; overflow-wrap: anywhere; }
 .opencodex-title-row p { margin: 5px 0 0; color: #66758c; font-size: 15px; }
 .opencodex-status-strip { display: flex; min-height: 54px; align-items: center; gap: 16px; padding: 0 20px; border: 1px solid rgba(85, 113, 156, .18); border-radius: 14px; background: rgba(255, 255, 255, .78); box-shadow: 0 12px 30px rgba(31, 55, 88, .06); color: #65748a; white-space: nowrap; }
 .opencodex-status-strip > span:not(.status-dot) { padding-left: 16px; border-left: 1px solid rgba(85, 113, 156, .14); }
@@ -985,7 +996,7 @@ onUnmounted(() => unlistenEvents?.());
 .opencodex-tabs { display: flex; gap: 6px; padding: 6px; border: 1px solid rgba(85, 113, 156, .16); border-radius: 14px; background: rgba(255, 255, 255, .62); }
 .opencodex-tabs button { display: flex; min-height: 40px; align-items: center; gap: 8px; padding: 0 16px; border: 0; border-radius: 9px; color: #596981; background: transparent; font-weight: 760; cursor: pointer; }.opencodex-tabs button.active { color: #0f766e; background: #e8f7f4; box-shadow: 0 6px 16px rgba(15, 118, 110, .09); }
 .opencodex-content { display: block; min-height: 460px; }
-.service-control-card, .quick-card, .console-card, .version-manager-card, .logs-card, .settings-card, .web-management-card { border: 1px solid rgba(85, 113, 156, .17); border-radius: 16px; background: rgba(255, 255, 255, .82); box-shadow: 0 14px 34px rgba(30, 53, 84, .06); }
+.service-control-card, .quick-card, .console-card, .version-manager-card, .logs-card, .web-management-card { border: 1px solid rgba(85, 113, 156, .17); border-radius: 16px; background: rgba(255, 255, 255, .82); box-shadow: 0 14px 34px rgba(30, 53, 84, .06); }
 .service-control-card { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 18px; }.service-actions { display: flex; flex-wrap: wrap; gap: 10px; }.health-indicator { display: flex; align-items: center; gap: 10px; color: #0f766e; }.health-indicator span { display: grid; }.health-indicator small { color: #718096; }.health-indicator strong { font-size: 15px; }
 .overview-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-top: 16px; }.overview-card { position: relative; min-width: 0; padding: 20px; border: 1px solid rgba(85, 113, 156, .17); border-radius: 15px; background: rgba(255, 255, 255, .8); box-shadow: 0 12px 28px rgba(30, 53, 84, .05); }.overview-card > small { display: block; color: #66758c; font-weight: 700; }.overview-card > strong { display: block; overflow: hidden; margin-top: 9px; font-size: 21px; text-overflow: ellipsis; white-space: nowrap; }.overview-card > p { display: flex; gap: 12px; margin: 9px 0 0; color: #78879a; }.overview-icon { position: absolute; top: 17px; right: 17px; display: grid; width: 38px; height: 38px; place-items: center; border-radius: 12px; }.overview-icon.green { color: #07866f; background: #e1f5ef; }.overview-icon.blue { color: #2563eb; background: #e9f1ff; }.overview-icon.cyan { color: #0891b2; background: #e3f7fb; }.overview-icon.violet { color: #7c3aed; background: #f1eaff; }
 .quick-card, .console-card, .version-manager-card, .logs-card { margin-top: 16px; padding: 18px; }.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 14px; }.section-heading h2 { margin: 0; font-size: 18px; }.section-heading p { margin: 4px 0 0; color: #718096; }.quick-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }.quick-grid button { display: flex; min-width: 0; align-items: center; gap: 13px; padding: 14px; border: 1px solid rgba(85, 113, 156, .16); border-radius: 12px; color: #172033; background: rgba(249, 252, 255, .86); text-align: left; cursor: pointer; }.quick-grid button:hover:not(:disabled) { border-color: rgba(15, 118, 110, .3); background: #f0fbf8; }.quick-grid button:disabled { opacity: .48; cursor: not-allowed; }.quick-grid button > span { display: grid; width: 38px; height: 38px; flex: 0 0 auto; place-items: center; border-radius: 11px; color: #0f766e; background: #e7f6f3; }.quick-grid button > div { display: grid; flex: 1; }.quick-grid small { margin-top: 3px; color: #718096; }
@@ -997,17 +1008,72 @@ onUnmounted(() => unlistenEvents?.());
 .vision-toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) auto auto auto; gap: 8px; padding: 16px 18px; border-bottom: 1px solid rgba(85, 113, 156, .12); }.vision-model-list { display: grid; max-height: min(52vh, 560px); overflow-y: auto; padding: 8px 18px 18px; }.vision-model-row { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; min-width: 0; align-items: center; gap: 10px; min-height: 58px; padding: 8px 10px; border-bottom: 1px solid rgba(85, 113, 156, .1); cursor: pointer; }.vision-model-row:hover:not(.disabled):not(.native), .vision-model-row.selected { background: rgba(236, 253, 245, .74); }.vision-model-row.native { cursor: default; }.vision-model-row.disabled { opacity: .52; cursor: not-allowed; }.vision-native-check { display: grid; width: 22px; height: 22px; place-items: center; border-radius: 50%; color: #fff; background: #16a34a; font-size: 12px; }.vision-model-identity { display: grid; min-width: 0; gap: 3px; }.vision-model-identity strong, .vision-model-identity small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.vision-model-identity strong { color: #172033; font-size: 14px; }.vision-model-identity small { color: #718096; font-size: 11px; }.vision-mode-pill { display: inline-flex; min-width: 76px; height: 25px; align-items: center; justify-content: center; padding: 0 9px; border-radius: 999px; font-size: 10px; font-weight: 820; }.vision-mode-pill.native { color: #047857; background: #d1fae5; }.vision-mode-pill.sidecar { color: #1d4ed8; background: #dbeafe; }.vision-mode-pill.text { color: #64748b; background: #eef2f7; }.vision-mode-pill.disabled { color: #9f1239; background: #ffe4e6; }.vision-save-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 20px; border-top: 1px solid rgba(85, 113, 156, .14); background: #f8fafc; }.vision-save-bar > div { display: grid; gap: 3px; }.vision-save-bar span { color: #718096; font-size: 12px; }
 .version-header-card { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; border: 1px solid rgba(85, 113, 156, .17); border-radius: 16px; background: rgba(255, 255, 255, .82); }.version-header-card > div { display: grid; gap: 6px; padding: 22px; }.version-header-card > div + div { border-left: 1px solid rgba(85, 113, 156, .14); }.version-header-card small, .version-header-card span { color: #718096; }.version-header-card strong { font-size: 26px; }.latest-release { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 20px; border-radius: 14px; background: linear-gradient(135deg, #effaf7, #eef6ff); }.release-icon { display: grid; width: 58px; height: 58px; place-items: center; border-radius: 18px; color: #0f766e; background: #fff; font-size: 24px; }.latest-release h3 { margin: 8px 0 4px; font-size: 21px; }.latest-release p { margin: 0; color: #66758c; }.release-picker { display: flex; gap: 10px; margin-top: 14px; }.release-picker .arco-select { flex: 1; }
 .local-version-section, .github-version-section { margin-top: 18px; padding-top: 18px; border-top: 1px solid rgba(85, 113, 156, .14); }.local-version-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; }.local-version-heading h3 { margin: 0; font-size: 16px; }.local-version-heading p { margin: 4px 0 0; color: #718096; }.local-version-list { display: grid; gap: 8px; margin-top: 12px; }.local-version-row { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 12px; border: 1px solid rgba(85, 113, 156, .14); border-radius: 10px; background: rgba(248, 251, 255, .86); }.local-version-row > div:first-child { display: grid; gap: 3px; min-width: 0; }.local-version-row span { color: #718096; font-size: 12px; }.local-version-actions { display: flex; flex: 0 0 auto; gap: 6px; }
-.full-log { max-height: calc(100vh - 330px); min-height: 420px; }.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }.settings-card { padding: 20px; }.settings-card :deep(.arco-input-number) { width: 100%; }.danger-card { grid-column: 1 / -1; border-color: rgba(245, 158, 11, .28); }.danger-actions { display: flex; gap: 10px; }
-.scan-summary { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; color: #52637b; }.scan-summary > span { display: inline-flex; height: 28px; align-items: center; gap: 4px; padding: 0 10px; border: 1px solid rgba(85, 113, 156, .16); border-radius: 999px; background: rgba(248, 250, 252, .9); font-size: 12px; }.scan-summary .scan-ready { color: #047857; border-color: rgba(16, 185, 129, .2); background: rgba(236, 253, 245, .92); }
-.migration-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: 340px; gap: 10px; overflow: auto; margin: 14px 0; padding: 3px 6px 3px 3px; scrollbar-gutter: stable; }
-.migration-account-card { position: relative; display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; align-items: center; gap: 11px; min-width: 0; min-height: 104px; padding: 13px 12px; border: 1px solid rgba(113, 128, 150, .18); border-radius: 8px; background: rgba(255, 255, 255, .96); box-shadow: 0 10px 24px rgba(28, 45, 74, .07); cursor: pointer; transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease; }
-.migration-account-card:hover:not(.unavailable) { border-color: rgba(37, 99, 235, .4); box-shadow: 0 16px 34px rgba(28, 45, 74, .11); transform: translateY(-1px); }.migration-account-card:focus-visible { outline: 2px solid rgba(37, 99, 235, .55); outline-offset: 2px; }.migration-account-card.selected { border-color: rgba(37, 99, 235, .76); box-shadow: 0 16px 38px rgba(37, 99, 235, .12), inset 0 0 0 1px rgba(37, 99, 235, .12); }.migration-account-card.current { background: linear-gradient(180deg, rgba(239, 246, 255, .96), rgba(255, 255, 255, .96)); }.migration-account-card.unavailable { cursor: default; }
-.migration-check { display: inline-flex; width: 28px; height: 36px; align-items: center; justify-content: center; }.migration-avatar { display: grid; width: 42px; height: 42px; place-items: center; border-radius: 13px; color: #0f766e; background: linear-gradient(145deg, #dcf7ef, #e7f3ff); font-size: 15px; font-weight: 850; box-shadow: inset 0 0 0 1px rgba(15, 118, 110, .08); }.migration-account-card.selected .migration-avatar { color: #fff; background: linear-gradient(145deg, #2563eb, #0f766e); }
-.migration-identity { display: grid; min-width: 0; gap: 5px; }.migration-account-title { display: flex; min-width: 0; align-items: center; gap: 6px; }.migration-account-title > strong { overflow: hidden; min-width: 0; color: #172033; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }.migration-identity > small { overflow: hidden; color: #6b7a90; font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }.migration-reason { overflow: hidden; color: #718096; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.migration-current-pill, .migration-plan-pill, .migration-status-pill { display: inline-flex; flex: 0 0 auto; height: 22px; align-items: center; justify-content: center; padding: 0 8px; border-radius: 999px; font-size: 10px; font-weight: 800; line-height: 1; }.migration-current-pill { color: #1d4ed8; border: 1px solid rgba(37, 99, 235, .2); background: #eff6ff; }.migration-plan-pill { max-width: 74px; overflow: hidden; color: #0369a1; border: 1px solid rgba(14, 165, 233, .2); background: #f0f9ff; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }.migration-status-pill { color: #475569; background: #f1f5f9; }.migration-status-pill.ready { color: #047857; background: #ecfdf5; }.migration-status-pill.already_imported { color: #1d4ed8; background: #eff6ff; }.migration-status-pill.unsupported { color: #b45309; background: #fffbeb; }.migration-status-pill.invalid { color: #be123c; background: #fff1f2; }
-.migration-card-actions { display: grid; min-width: 82px; justify-items: end; gap: 8px; }.migration-delete-button { color: #be123c; border-color: transparent; background: rgba(255, 241, 242, .94); }.migration-delete-button:hover:not(:disabled) { color: #fff; background: #e11d48; }
-.migration-batch-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.full-log { max-height: calc(100vh - 330px); min-height: 420px; }
+.danger-card { grid-column: 1 / -1; border-top: 1px solid #e5e7eb; }
+.danger-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.engine-progress { padding: 14px 0; border-block: 1px solid #e5e7eb; }
+.engine-progress-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 8px; font-size: 13px; }
+.engine-progress-heading span { color: #6b7280; }
+.engine-indeterminate { overflow: hidden; }
+.engine-indeterminate :deep(.arco-progress-line-bar) { animation: engine-pending 1.5s ease-in-out infinite; }
+.engine-error { margin: 0; color: #c4233b; white-space: pre-wrap; overflow-wrap: anywhere; }
+@keyframes engine-pending { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+@media (prefers-reduced-motion: reduce) { .engine-indeterminate :deep(.arco-progress-line-bar) { animation-duration: 4s; } }
+.version-manager-card { border: 0; border-radius: 0; box-shadow: none; background: transparent; padding: 18px 0; }
+.version-header-card { border-radius: 8px; }
+.version-header-card strong { font-size: 22px; }
+.latest-release { padding: 16px 0; background: transparent; border-radius: 0; border-block: 1px solid #e5e7eb; }
+.latest-release h3 { font-size: 18px; }
+.local-version-list { gap: 0; }
+.local-version-row { border: 0; border-bottom: 1px solid #e5e7eb; border-radius: 0; background: transparent; }
+.opencodex-settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 16px 24px; }
+.opencodex-settings-section { min-width: 0; padding: 12px 0; }
+.opencodex-settings-section .section-heading { min-height: 28px; margin-bottom: 12px; gap: 8px; }
+.opencodex-settings-section .section-heading h2 { font-size: 16px; overflow-wrap: anywhere; }
+.opencodex-settings-section .section-heading p { font-size: 12px; line-height: 1.5; }
+.opencodex-settings-section .section-heading > .arco-btn { flex: 0 0 auto; }
+.service-settings :deep(.arco-form) { max-width: 360px; }
+.service-settings :deep(.arco-form-item) { margin-bottom: 16px; }
+.service-settings :deep(.arco-input-number) { width: 100%; }
+.service-settings :deep(.arco-form > .arco-btn) { width: auto; }
+.migration-settings { padding-left: 24px; border-left: 1px solid #e5e7eb; }
+.scan-summary { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 0 0 10px; color: #667085; font-size: 12px; }
+.scan-summary strong { color: #1d2939; font-variant-numeric: tabular-nums; }
+.scan-summary .scan-ready strong { color: #12805c; }
+.migration-toolbar { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 4px; }
+.migration-toolbar > :first-child { grid-column: 1 / -1; }
+.migration-selection-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 6px 0; color: #667085; font-size: 12px; }
+.migration-selection-bar :deep(.arco-checkbox-label) { font-size: 12px; }
+.migration-selection-bar > .arco-btn { margin-left: auto; padding-inline: 4px; }
+.hidden-selection { color: #ad6510; }
+.migration-results { display: block; min-height: 130px; }
+.migration-table-scroll { max-height: 260px; overflow: auto; border-block: 1px solid #e5e7eb; }
+.migration-table { width: 100%; min-width: 340px; border-collapse: separate; border-spacing: 0; table-layout: fixed; font-size: 13px; text-align: left; }
+.migration-table th { position: sticky; top: 0; z-index: 1; padding: 6px; background: #f5f6f8; color: #667085; font-size: 12px; font-weight: 500; }
+.migration-table th:first-child { width: 32px; }
+.migration-table th:nth-child(3) { width: 58px; }
+.migration-table th:nth-child(4) { width: 28%; }
+.migration-table th:last-child { width: 40px; }
+.migration-table td { padding: 6px; border-top: 1px solid #eef0f3; vertical-align: middle; background: #fff; }
+.migration-table tbody tr:hover td { background: #f8fafb; }
+.migration-table tr.selected td { background: #f0f7ff; }
+.migration-identity > div { display: flex; align-items: center; gap: 4px; }
+.migration-identity strong { display: block; min-width: 0; font-weight: 500; color: #1d2939; line-height: 18px; }
+.migration-identity :deep(.arco-tag) { flex: 0 0 auto; }
+.migration-identity small { display: block; margin-top: 2px; color: #86909c; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 16px; }
+.migration-plan > span { display: block; color: #667085; font-size: 12px; }
+.migration-reason { margin: 2px 0 0; color: #667085; font-size: 12px; line-height: 16px; }
+.migration-identity strong, .migration-identity small, .migration-plan > span, .migration-reason, .migration-status-pill { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.migration-status-pill { display: inline-block; max-width: 100%; padding: 1px 5px; border-radius: 4px; background: #f2f3f5; color: #667085; font-size: 12px; line-height: 18px; vertical-align: middle; }
+.migration-status-pill.ready { color: #12805c; background: #e8f7ee; }
+.migration-status-pill.already_imported { color: #245cb9; background: #eaf1ff; }
+.migration-status-pill.unsupported { color: #ad6510; background: #fff5df; }
+.migration-status-pill.invalid { color: #c4233b; background: #fff0f0; }
+.migration-no-action { color: #c0c4cc; }
+.migration-batch-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 0; }
+.migration-settings :deep(.arco-alert) { padding: 8px 10px; font-size: 12px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+@container (max-width: 780px) { .opencodex-settings-grid { grid-template-columns: minmax(0, 1fr); gap: 8px; } .migration-settings { padding-left: 0; border-left: 0; border-top: 1px solid #e5e7eb; } }
 @media (max-width: 1080px) { .opencodex-hero { align-items: flex-start; flex-direction: column; }.opencodex-status-strip { width: 100%; overflow-x: auto; }.overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 900px) { .migration-list { grid-template-columns: 1fr; } }
-@media (max-width: 760px) { .opencodex-tabs { overflow-x: auto; }.opencodex-tabs button { flex: 0 0 auto; }.overview-grid, .quick-grid, .settings-grid, .version-header-card, .vision-manager-header { grid-template-columns: 1fr; }.version-header-card > div + div { border-top: 1px solid rgba(85, 113, 156, .14); border-left: 0; }.latest-release { grid-template-columns: 1fr; }.release-picker, .web-actions { align-items: stretch; flex-direction: column; }.local-version-row, .local-version-heading, .vision-save-bar { align-items: stretch; flex-direction: column; }.local-version-actions { justify-content: flex-end; }.migration-account-card { grid-template-columns: auto auto minmax(0, 1fr); }.migration-card-actions { grid-column: 2 / -1; display: flex; min-width: 0; align-items: center; justify-content: space-between; }.vision-toolbar { grid-template-columns: 1fr 1fr; }.vision-toolbar .arco-input-wrapper { grid-column: 1 / -1; } }
+@media (max-width: 760px) { .opencodex-tabs { overflow-x: auto; }.opencodex-tabs button { flex: 0 0 auto; }.overview-grid, .quick-grid, .version-header-card, .vision-manager-header { grid-template-columns: 1fr; }.version-header-card > div + div { border-top: 1px solid rgba(85, 113, 156, .14); border-left: 0; }.latest-release { grid-template-columns: 1fr; }.release-picker, .web-actions { align-items: stretch; flex-direction: column; }.local-version-row, .local-version-heading, .vision-save-bar { align-items: stretch; flex-direction: column; }.local-version-actions { justify-content: flex-end; }.vision-toolbar { grid-template-columns: 1fr 1fr; }.vision-toolbar .arco-input-wrapper { grid-column: 1 / -1; } }
 </style>

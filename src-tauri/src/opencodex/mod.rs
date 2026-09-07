@@ -1,4 +1,5 @@
 mod backend;
+mod engine_switch;
 mod models;
 
 use backend::Backend;
@@ -130,18 +131,25 @@ pub async fn opencodex_install_engine_version(
 }
 
 #[tauri::command]
-pub fn opencodex_activate_bundled_engine(
+pub async fn opencodex_activate_bundled_engine(
     backend: State<'_, Arc<OpenCodexBackend>>,
+    operation_id: String,
 ) -> Result<EngineInstallResult, String> {
-    backend.activate_bundled_engine()
+    let backend = Arc::clone(backend.inner());
+    tauri::async_runtime::spawn_blocking(move || backend.activate_bundled_engine(operation_id))
+        .await
+        .map_err(|error| format!("回退 Engine 任务失败：{error}"))?
 }
 
 #[tauri::command]
-pub fn opencodex_delete_engine_version(
+pub async fn opencodex_delete_engine_version(
     backend: State<'_, Arc<OpenCodexBackend>>,
     request: DeleteEngineVersionRequest,
 ) -> Result<EngineDeleteResult, String> {
-    backend.delete_engine_version(request)
+    let backend = Arc::clone(backend.inner());
+    tauri::async_runtime::spawn_blocking(move || backend.delete_engine_version(request))
+        .await
+        .map_err(|error| format!("删除 Engine 任务失败：{error}"))?
 }
 
 #[tauri::command]

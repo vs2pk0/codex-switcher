@@ -8,6 +8,7 @@ import type {
   OpenCodexEngineCatalog,
   OpenCodexEngineDeleteResult,
   OpenCodexEngineInstallResult,
+  OpenCodexEngineProgress,
   OpenCodexSwitcherAccountScan,
   OpenCodexSwitcherDeleteResult,
   OpenCodexSwitcherImportResult,
@@ -52,12 +53,21 @@ export function getOpenCodexEngineCatalog(): Promise<OpenCodexEngineCatalog> {
   return invoke("opencodex_get_engine_update_catalog");
 }
 
-export function installOpenCodexEngine(version: string): Promise<OpenCodexEngineInstallResult> {
-  return invoke("opencodex_install_engine_version", { request: { version } });
+export function installOpenCodexEngine(version: string, operationId: string): Promise<OpenCodexEngineInstallResult> {
+  return invoke("opencodex_install_engine_version", { request: { version, operationId } });
 }
 
-export function activateBundledOpenCodexEngine(): Promise<OpenCodexEngineInstallResult> {
-  return invoke("opencodex_activate_bundled_engine");
+export function activateBundledOpenCodexEngine(operationId: string): Promise<OpenCodexEngineInstallResult> {
+  return invoke("opencodex_activate_bundled_engine", { operationId });
+}
+
+export function subscribeOpenCodexEngineProgress(
+  operationId: string,
+  onProgress: (event: OpenCodexEngineProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<OpenCodexEngineProgress>("opencodex-engine-progress", ({ payload }) => {
+    if (payload.operationId === operationId) onProgress(payload);
+  });
 }
 
 export function deleteOpenCodexEngine(version: string): Promise<OpenCodexEngineDeleteResult> {

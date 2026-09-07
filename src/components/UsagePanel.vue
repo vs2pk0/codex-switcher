@@ -502,7 +502,13 @@ async function loadUsage(
       pricingConfigs.value = nextDashboard.pricingConfigs;
       originalPricingConfigs.value = nextDashboard.pricingConfigs.map((item) => ({ ...item }));
     }
-    if (refresh && notify && !silent) Message.success("消耗数据已刷新");
+    if (refresh && notify && !silent) {
+      if (nextDashboard.errors.length) {
+        Message.warning(t("消耗数据已刷新，仍有统计项无法自动修复，请查看异常详情"));
+      } else {
+        Message.success(t("消耗数据已刷新"));
+      }
+    }
   } catch (error) {
     if (serial !== loadSerial) return;
     if (!silent) Message.error(`加载消耗数据失败：${errorText(error)}`);
@@ -1217,6 +1223,12 @@ onBeforeUnmount(() => {
       class="usage-session-warning"
     >
       {{ t(`有 ${dashboard.errors.length} 个会话统计项需要注意，已保留可确认的可信数据。`) }}
+      <details class="usage-warning-details">
+        <summary>{{ t("异常详情") }}</summary>
+        <ul>
+          <li v-for="(error, index) in dashboard.errors" :key="index">{{ error }}</li>
+        </ul>
+      </details>
     </a-alert>
 
     <a-spin :loading="loading" dot>

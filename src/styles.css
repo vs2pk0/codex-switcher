@@ -3326,6 +3326,22 @@ textarea {
   margin-bottom: 16px;
 }
 
+.usage-warning-details {
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+}
+
+.usage-warning-details summary {
+  cursor: pointer;
+}
+
+.usage-warning-details ul {
+  max-height: 180px;
+  overflow-y: auto;
+  margin: 8px 0 0;
+  padding-left: 20px;
+}
+
 .usage-range-picker {
   width: 390px;
 }

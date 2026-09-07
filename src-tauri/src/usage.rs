@@ -247,6 +247,7 @@ struct FileParseState {
     rollout_id: Option<String>,
     parent_rollout_id: Option<String>,
     is_fork: bool,
+    has_external_history_base: bool,
     is_canonical_root: bool,
     session_started_at: Option<i64>,
     last_valid_event_at: Option<i64>,
@@ -296,7 +297,7 @@ struct UsageEventIdentity {
 }
 
 const PROVENANCE_USAGE_CACHE_VERSION: u32 = 4;
-const USAGE_CACHE_VERSION: u32 = 6;
+const USAGE_CACHE_VERSION: u32 = 7;
 const PRICING_DEFAULTS_VERSION: u32 = 1;
 const GPT_56_DEFAULT_MODEL_IDS: [&str; 3] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 static USAGE_DATA_LOCK: Mutex<()> = Mutex::new(());
@@ -472,6 +473,7 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
         rollout_id: None,
         parent_rollout_id: None,
         is_fork: false,
+        has_external_history_base: false,
         is_canonical_root: false,
         session_started_at: None,
         last_valid_event_at: None,
@@ -531,6 +533,8 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
                     .and_then(|payload| payload.get("forked_from_id"))
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
+                state.has_external_history_base =
+                    has_external_history_base(&value, state.parent_rollout_id.as_deref());
                 let has_fork_parent = state.parent_rollout_id.is_some();
                 let has_distinct_rollout_id = match (&raw_session_id, &state.rollout_id) {
                     (Some(session_id), Some(rollout_id)) => session_id != rollout_id,
@@ -564,16 +568,25 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
                     continue;
                 };
                 if payload.get("type").and_then(Value::as_str) == Some("task_started") {
-                    if state.is_fork
-                        && !state.owned_task_started
-                        && task_started_at(payload)
+                    if state.is_fork && !state.owned_task_started {
+                        state.owned_task_started = task_started_at(payload)
                             .zip(state.session_started_at)
                             .is_some_and(|(task_at, session_at)| {
-                                (session_at.saturating_sub(1)..=session_at.saturating_add(1))
-                                    .contains(&task_at)
-                            })
-                    {
-                        state.owned_task_started = true;
+                                let initial_task = (session_at.saturating_sub(1)
+                                    ..=session_at.saturating_add(1))
+                                    .contains(&task_at);
+                                // Referenced history lives in a separate rollout. Its first
+                                // local task may start long after the fork was created; only
+                                // accept this boundary before any local usage was observed.
+                                let delayed_local_task = state.has_external_history_base
+                                    && events.is_empty()
+                                    && task_at >= session_at
+                                    && parse_event_timestamp(&value).is_some_and(|event_at| {
+                                        (task_at.saturating_sub(1)..=task_at.saturating_add(1))
+                                            .contains(&event_at)
+                                    });
+                                initial_task || delayed_local_task
+                            });
                     }
                     continue;
                 }
@@ -608,6 +621,9 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
                     // root still owns its complete initial cumulative total.
                     let delta = match state.prev_total.as_ref() {
                         Some(_) => compute_delta(&state.prev_total, &total),
+                        None if state.has_external_history_base && last.is_none() => {
+                            return Err("引用历史的会话首条用量缺少 last_token_usage，无法区分继承消耗，已保留上次可信缓存".to_string());
+                        }
                         None if state.is_fork => {
                             compute_delta(&None, last.as_ref().unwrap_or(&total))
                         }
@@ -913,9 +929,9 @@ fn parse_codex_usage_files(
         let inherited_count = if !file.is_fork {
             Some(0)
         } else if let Some(boundary) = explicit_boundary {
-            // A task_started stamped at this rollout's own creation second is the strongest
-            // ownership signal. Forks can replay only a suffix of the parent (LCP = 0), and
-            // an owned call can coincidentally share the parent's next token fingerprint.
+            // An initial task or a verified first local task after external history is an
+            // ownership boundary. Forks can replay only a suffix of the parent (LCP = 0),
+            // and an owned call can share the parent's next token fingerprint.
             Some(boundary)
         } else if let Some(parent) = file
             .parent_rollout_id
@@ -3167,6 +3183,28 @@ fn task_started_at(payload: &Value) -> Option<i64> {
         .or_else(|| value.as_str().and_then(parse_rfc3339_timestamp))
 }
 
+fn has_external_history_base(meta: &Value, parent_rollout_id: Option<&str>) -> bool {
+    let Some(parent_id) = parent_rollout_id.filter(|id| !id.trim().is_empty()) else {
+        return false;
+    };
+    let Some(payload) = meta.get("payload") else {
+        return false;
+    };
+    if payload.get("id").and_then(Value::as_str) == Some(parent_id) {
+        return false;
+    }
+    payload
+        .get("history_base")
+        .or_else(|| meta.get("history_base"))
+        .is_some_and(|base| {
+            base.get("thread_id").and_then(Value::as_str) == Some(parent_id)
+                && base
+                    .get("end_byte_offset")
+                    .and_then(Value::as_u64)
+                    .is_some()
+        })
+}
+
 fn token_usage_fingerprint(
     total: Option<&CumulativeTokens>,
     last: Option<&CumulativeTokens>,
@@ -3480,6 +3518,265 @@ mod tests {
             "payload": { "type": "task_started", "started_at": started_at },
         })
         .to_string()
+    }
+
+    fn history_base_meta(timestamp: &str, rollout_id: &str, parent: &str) -> String {
+        let mut meta: Value =
+            serde_json::from_str(&usage_meta(timestamp, rollout_id, rollout_id, Some(parent)))
+                .expect("parse meta");
+        meta["payload"]["history_base"] = serde_json::json!({
+            "thread_id": parent,
+            "end_byte_offset": 1024,
+            "end_ordinal_exclusive": 10,
+        });
+        meta.to_string()
+    }
+
+    #[test]
+    fn referenced_history_accepts_delayed_first_task_without_counting_parent_totals() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent = temp.path().join("parent.jsonl");
+        let child = temp.path().join("child.jsonl");
+        let first = token_event(Some("2026-07-12T02:00:10Z"), (1050, 410, 104), (50, 10, 4));
+        fs::write(
+            &parent,
+            [
+                usage_meta("2026-07-11T01:00:00Z", "parent", "parent", None),
+                token_event(None, (100, 20, 5), (100, 20, 5)),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        for (task_timestamp, parent_present) in [
+            ("2026-07-11T02:05:00Z", true),
+            ("2026-07-12T02:00:00Z", false),
+        ] {
+            let task_at = parse_rfc3339_timestamp(task_timestamp).unwrap();
+            fs::write(
+                &child,
+                [
+                    history_base_meta("2026-07-11T02:00:00Z", "child", "parent"),
+                    task_started(task_timestamp, task_at),
+                    first.clone(),
+                    token_event(Some("2026-07-12T02:00:20Z"), (1090, 420, 109), (40, 10, 5)),
+                ]
+                .join("\n"),
+            )
+            .unwrap();
+            let files = if parent_present {
+                vec![parent.clone(), child.clone()]
+            } else {
+                vec![child.clone()]
+            };
+            let (logs, replaced, errors) = parse_codex_usage_files(&files);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(replaced.contains("child"));
+            let owned = logs
+                .iter()
+                .filter(|log| log.rollout_id == "child")
+                .collect::<Vec<_>>();
+            assert_eq!(owned.len(), 2);
+            assert_eq!(owned[0].input_tokens + owned[1].input_tokens, 90);
+            assert_eq!(owned[0].output_tokens + owned[1].output_tokens, 9);
+            assert_eq!(owned[0].cache_read_tokens + owned[1].cache_read_tokens, 20);
+        }
+    }
+
+    #[test]
+    fn delayed_task_requires_valid_external_history_and_no_prior_usage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let child = temp.path().join("child.jsonl");
+        let session_at = parse_rfc3339_timestamp("2026-07-11T02:00:00Z").unwrap();
+        let valid_meta: Value = serde_json::from_str(&history_base_meta(
+            "2026-07-11T02:00:00Z",
+            "child",
+            "parent",
+        ))
+        .unwrap();
+        let mut missing_meta = valid_meta.clone();
+        missing_meta["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("history_base");
+        let mut mismatched_meta = valid_meta.clone();
+        mismatched_meta["payload"]["history_base"]["thread_id"] =
+            Value::String("unrelated".to_string());
+        let mut malformed_meta = valid_meta.clone();
+        malformed_meta["payload"]["history_base"]["end_byte_offset"] =
+            Value::String("invalid".to_string());
+        for (meta, prior_usage, task_at) in [
+            (missing_meta, false, session_at + 60),
+            (mismatched_meta, false, session_at + 60),
+            (malformed_meta, false, session_at + 60),
+            (valid_meta.clone(), true, session_at + 60),
+            (valid_meta.clone(), false, session_at + 120),
+            (valid_meta, false, session_at - 60),
+        ] {
+            let mut lines = vec![meta.to_string()];
+            if prior_usage {
+                lines.push(token_event(None, (1000, 400, 100), (100, 40, 10)));
+            }
+            lines.push(task_started("2026-07-11T02:01:00Z", task_at));
+            lines.push(token_event(None, (1050, 410, 104), (50, 10, 4)));
+            fs::write(&child, lines.join("\n")).unwrap();
+            let (logs, replaced, errors) = parse_codex_usage_files(std::slice::from_ref(&child));
+            assert!(logs.is_empty());
+            assert!(!replaced.contains("child"));
+            assert_eq!(errors.len(), 1);
+        }
+    }
+
+    #[test]
+    fn external_history_reference_validates_parent_and_supports_top_level_metadata() {
+        let mut meta: Value = serde_json::from_str(&history_base_meta(
+            "2026-07-11T02:00:00Z",
+            "child",
+            "parent",
+        ))
+        .unwrap();
+        assert!(has_external_history_base(&meta, Some("parent")));
+        assert!(!has_external_history_base(&meta, None));
+        assert!(!has_external_history_base(&meta, Some("")));
+        assert!(!has_external_history_base(&meta, Some("unrelated")));
+        meta["history_base"] = meta["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("history_base")
+            .unwrap();
+        assert!(has_external_history_base(&meta, Some("parent")));
+        meta["payload"]["id"] = Value::String("parent".to_string());
+        assert!(!has_external_history_base(&meta, Some("parent")));
+    }
+
+    #[test]
+    fn external_history_zero_initial_usage_sets_baseline_without_creating_a_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let child = temp.path().join("child.jsonl");
+        fs::write(
+            &child,
+            [
+                history_base_meta("2026-07-11T02:00:00Z", "child", "parent"),
+                task_started(
+                    "2026-07-12T02:00:00Z",
+                    parse_rfc3339_timestamp("2026-07-12T02:00:00Z").unwrap(),
+                ),
+                token_event(Some("2026-07-12T02:00:01Z"), (1000, 400, 100), (0, 0, 0)),
+                token_event(Some("2026-07-12T02:00:10Z"), (1050, 410, 104), (50, 10, 4)),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let (logs, replaced, errors) = parse_codex_usage_files(&[child]);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(replaced.contains("child"));
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].input_tokens, 50);
+        assert_eq!(logs[0].cache_read_tokens, 10);
+        assert_eq!(logs[0].output_tokens, 4);
+    }
+
+    #[test]
+    fn external_history_without_initial_last_usage_preserves_trusted_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let child = temp.path().join("child.jsonl");
+        let mut event: Value =
+            serde_json::from_str(&token_event(None, (1000, 400, 100), (50, 10, 4))).unwrap();
+        event["payload"]["info"]
+            .as_object_mut()
+            .unwrap()
+            .remove("last_token_usage");
+        fs::write(
+            &child,
+            [
+                history_base_meta("2026-07-11T02:00:00Z", "child", "parent"),
+                task_started(
+                    "2026-07-11T02:05:00Z",
+                    parse_rfc3339_timestamp("2026-07-11T02:05:00Z").unwrap(),
+                ),
+                event.to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let (logs, replaced, errors) = parse_codex_usage_files(&[child]);
+        assert!(logs.is_empty());
+        assert!(!replaced.contains("child"));
+        assert!(errors[0].contains("last_token_usage"));
+    }
+
+    #[test]
+    fn refresh_repairs_stale_fork_warnings_without_rewriting_sessions_or_losing_rotated_logs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        fs::create_dir_all(codex_home.join("sessions")).unwrap();
+        let child = codex_home.join("sessions/child.jsonl");
+        let content = [
+            history_base_meta("2026-07-11T02:00:00Z", "child", "parent"),
+            task_started(
+                "2026-07-11T02:05:00Z",
+                parse_rfc3339_timestamp("2026-07-11T02:05:00Z").unwrap(),
+            ),
+            token_event(Some("2026-07-11T02:05:10Z"), (1050, 410, 104), (50, 10, 4)),
+        ]
+        .join("\n");
+        fs::write(&child, &content).unwrap();
+        let target = UsageInstanceTarget {
+            id: "instance-demo".to_string(),
+            name: "demo".to_string(),
+            codex_home,
+            database_path: temp.path().join("usage.sqlite"),
+        };
+        let rotated = sample_log(
+            "codex_rollout:rotated:1",
+            "rotated",
+            "rotated",
+            UsageLogSourceKind::CanonicalRoot,
+            75,
+        );
+        for (version, refresh) in [(USAGE_CACHE_VERSION, true), (6, false)] {
+            let mut conn = open_usage_db_at(&target.database_path).unwrap();
+            write_usage_cache_db(
+                &mut conn,
+                &UsageCache {
+                    version,
+                    updated_at: 1,
+                    files: current_usage_cache_files(&target.codex_home),
+                    logs: vec![
+                        rotated.clone(),
+                        sample_log(
+                            "codex_rollout:child:1",
+                            "child",
+                            "child",
+                            UsageLogSourceKind::Fork,
+                            1000,
+                        ),
+                    ],
+                    errors: vec!["child: 缺少可信自有事件边界".to_string()],
+                },
+            )
+            .unwrap();
+            drop(conn);
+            let (conn, cache) = ensure_usage_cache_db(&target, refresh).unwrap();
+            assert!(cache.errors.is_empty());
+            assert_eq!(cache.version, USAGE_CACHE_VERSION);
+            assert!(cache.logs.contains(&rotated));
+            assert_eq!(cache.logs.len(), 2);
+            assert_eq!(
+                cache
+                    .logs
+                    .iter()
+                    .find(|log| log.rollout_id == "child")
+                    .unwrap()
+                    .input_tokens,
+                50
+            );
+            assert_eq!(fs::read_to_string(&child).unwrap(), content);
+            assert!(read_usage_errors_db(&conn).unwrap().is_empty());
+            drop(conn);
+            let (_, repeated) = ensure_usage_cache_db(&target, true).unwrap();
+            assert_eq!(cache.logs, repeated.logs);
+            assert!(repeated.errors.is_empty());
+        }
     }
 
     #[test]

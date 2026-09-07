@@ -31,6 +31,10 @@ pub struct BackgroundServiceState {
     pub conflict: bool,
     pub backend: Option<String>,
     pub summary: String,
+    #[serde(default)]
+    pub referenced_cli_paths: Vec<String>,
+    #[serde(default)]
+    pub references_unknown: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -231,6 +235,7 @@ pub struct EngineRelease {
 #[serde(rename_all = "camelCase")]
 pub struct EngineUpdateCatalog {
     pub current_version: Option<String>,
+    pub bundled_version: Option<String>,
     pub current_source: String,
     pub latest_stable: Option<EngineRelease>,
     pub latest_preview: Option<EngineRelease>,
@@ -243,6 +248,15 @@ pub struct EngineUpdateCatalog {
 #[serde(rename_all = "camelCase")]
 pub struct InstallEngineVersionRequest {
     pub version: String,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineProgress {
+    pub stage: String,
+    pub downloaded_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

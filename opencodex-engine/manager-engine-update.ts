@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 
 const REPOSITORY = "lidge-jun/opencodex";
 const PACKAGE_NAME = "@bitkyc08/opencodex";
@@ -8,6 +9,47 @@ const REGISTRY_API = "https://registry.npmjs.org/@bitkyc08%2Fopencodex";
 const REGISTRY_ORIGIN = "https://registry.npmjs.org/";
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_RELEASES = 30;
+const MAX_PACKAGE_BYTES = 256 * 1024 * 1024;
+
+export interface EngineProgress {
+  stage: "checking" | "downloading" | "dependencies" | "validating";
+  downloadedBytes?: number;
+  totalBytes?: number;
+}
+
+function reportProgress(progress: EngineProgress): void {
+  console.error(JSON.stringify({ engineProgress: progress }));
+}
+
+export async function readVerifiedPackage(
+  response: Response,
+  integrity: string,
+  report: (progress: EngineProgress) => void,
+): Promise<Buffer> {
+  if (!response.ok || !response.body) throw new Error(`Engine 下载失败（HTTP ${response.status}）`);
+  const length = Number(response.headers.get("content-length"));
+  const totalBytes = Number.isSafeInteger(length) && length > 0 ? length : undefined;
+  if (totalBytes && totalBytes > MAX_PACKAGE_BYTES) throw new Error("Engine 包超过大小限制");
+  const hash = createHash("sha512");
+  const chunks: Uint8Array[] = [];
+  let downloadedBytes = 0;
+  let lastReport = 0;
+  report({ stage: "downloading", downloadedBytes, totalBytes });
+  for await (const chunk of response.body) {
+    downloadedBytes += chunk.byteLength;
+    if (downloadedBytes > MAX_PACKAGE_BYTES) throw new Error("Engine 包超过大小限制");
+    hash.update(chunk);
+    chunks.push(chunk);
+    if (Date.now() - lastReport >= 100) {
+      report({ stage: "downloading", downloadedBytes, totalBytes });
+      lastReport = Date.now();
+    }
+  }
+  if (totalBytes && downloadedBytes !== totalBytes) throw new Error("Engine 包下载不完整");
+  if (`sha512-${hash.digest("base64")}` !== integrity) throw new Error("Engine 包完整性校验失败");
+  report({ stage: "downloading", downloadedBytes, totalBytes: downloadedBytes });
+  return Buffer.concat(chunks);
+}
 
 export interface EngineRelease {
   version: string;
@@ -92,7 +134,8 @@ function validateInstalledPackage(directory: string, expectedVersion: string): v
   if (!existsSync(join(packageRoot, "src", "cli", "index.ts"))) throw new Error("下载后的 Engine 缺少 CLI 入口");
 }
 
-async function installVersion(request: InstallRequest): Promise<{ version: string; integrity: string; releaseUrl: string }> {
+export async function installVersion(request: InstallRequest): Promise<{ version: string; integrity: string; releaseUrl: string }> {
+  reportProgress({ stage: "checking" });
   const version = normalizeReleaseVersion(requiredText(request.version, "版本号"));
   if (!version || version !== request.version) throw new Error("版本号格式无效");
   const engineRoot = requiredText(request.engineRoot, "Engine 目录");
@@ -126,12 +169,16 @@ async function installVersion(request: InstallRequest): Promise<{ version: strin
   const tempDir = join(engineRoot, `.install-${version}-${crypto.randomUUID()}`);
   mkdirSync(tempDir, { recursive: true });
   try {
+    const archive = join(tempDir, "engine.tgz");
+    const response = await fetch(tarball, { signal: AbortSignal.timeout(5 * 60_000), redirect: "error" });
+    writeFileSync(archive, await readVerifiedPackage(response, integrity, reportProgress));
     writeFileSync(join(tempDir, "package.json"), JSON.stringify({
       name: "opencodex-manager-managed-engine",
       private: true,
       version,
-      dependencies: { [PACKAGE_NAME]: version },
+      dependencies: { [PACKAGE_NAME]: "file:./engine.tgz" },
     }, null, 2));
+    reportProgress({ stage: "dependencies" });
     const child = Bun.spawn([
       process.execPath,
       "install",
@@ -148,14 +195,17 @@ async function installVersion(request: InstallRequest): Promise<{ version: strin
       stdout: "pipe",
       stderr: "pipe",
     });
+    const timeout = setTimeout(() => child.kill(), 10 * 60_000);
     const [exitCode, stderr] = await Promise.all([
       child.exited,
       new Response(child.stderr).text(),
-    ]);
+      new Response(child.stdout).text(),
+    ]).finally(() => clearTimeout(timeout));
     if (exitCode !== 0) {
       const safeDetail = stderr.replace(/https?:\/\/[^\s]+/g, "[URL]").trim().slice(-1200);
       throw new Error(safeDetail ? `Engine 下载失败：${safeDetail}` : "Engine 下载失败");
     }
+    reportProgress({ stage: "validating" });
     validateInstalledPackage(tempDir, version);
     writeFileSync(join(tempDir, ".install.json"), JSON.stringify({
       version,

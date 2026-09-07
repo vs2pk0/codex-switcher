@@ -77,6 +77,7 @@ export interface OpenCodexEngineRelease {
 
 export interface OpenCodexEngineCatalog {
   currentVersion?: string | null;
+  bundledVersion?: string | null;
   currentSource: string;
   latestStable?: OpenCodexEngineRelease | null;
   latestPreview?: OpenCodexEngineRelease | null;
@@ -89,6 +90,14 @@ export interface OpenCodexEngineInstallResult {
   version: string;
   source: string;
   message: string;
+}
+
+export interface OpenCodexEngineProgress {
+  operationId: string;
+  version: string;
+  stage: "checking" | "downloading" | "dependencies" | "validating" | "stopping" | "activating" | "restarting" | "recovering" | "complete" | "error";
+  downloadedBytes?: number | null;
+  totalBytes?: number | null;
 }
 
 export interface OpenCodexEngineDeleteResult {
