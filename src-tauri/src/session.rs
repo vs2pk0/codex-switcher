@@ -353,6 +353,214 @@ impl SessionStore {
         Self { codex_home }
     }
 
+    /// Repair only the removed OpenCodex provider. Never retag unrelated providers
+    /// or rewrite message/image content. Include archived and empty conversations,
+    /// which older Engine history migrations did not cover.
+    pub(crate) fn repair_missing_opencodex_provider(&self) -> Result<(), String> {
+        let config_path = self.codex_home.join("config.toml");
+        let content = match fs::read_to_string(&config_path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(format!("读取实例配置失败：{error}")),
+        };
+        let mut config = content
+            .parse::<toml_edit::Document>()
+            .map_err(|error| format!("实例 config.toml 无效：{error}"))?;
+        if config
+            .get("model_providers")
+            .and_then(|item| item.get("opencodex"))
+            .is_some()
+        {
+            return Ok(());
+        }
+        let mut config_changed = false;
+        if config
+            .get("model_provider")
+            .and_then(toml_edit::Item::as_str)
+            == Some("opencodex")
+        {
+            config["model_provider"] = toml_edit::value("openai");
+            config_changed = true;
+        }
+        if let Some(profiles) = config
+            .get_mut("profiles")
+            .and_then(toml_edit::Item::as_table_like_mut)
+        {
+            for (_, profile) in profiles.iter_mut() {
+                if profile
+                    .get("model_provider")
+                    .and_then(toml_edit::Item::as_str)
+                    == Some("opencodex")
+                {
+                    profile["model_provider"] = toml_edit::value("openai");
+                    config_changed = true;
+                }
+            }
+        }
+        if config_changed {
+            let backup = self.codex_home.join(format!(
+                "config.toml.opencodex-repair-{:016x}.bak",
+                rand::random::<u64>()
+            ));
+            fs::copy(&config_path, backup).map_err(|error| format!("备份实例配置失败：{error}"))?;
+            write_bytes_atomic(&config_path, config.to_string().as_bytes())?;
+        }
+
+        let token = regex::Regex::new(r#""model_provider"\s*:\s*"opencodex""#)
+            .map_err(|error| error.to_string())?;
+        let mut directories = vec![
+            self.sessions_dir(),
+            self.codex_home.join("archived_sessions"),
+        ];
+        while let Some(directory) = directories.pop() {
+            if !directory.exists()
+                || fs::symlink_metadata(&directory)
+                    .map_err(|e| e.to_string())?
+                    .file_type()
+                    .is_symlink()
+            {
+                continue;
+            }
+            for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let kind = entry.file_type().map_err(|e| e.to_string())?;
+                let path = entry.path();
+                if kind.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                if !kind.is_file()
+                    || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+                {
+                    continue;
+                }
+                let input = fs::File::open(&path).map_err(|e| e.to_string())?;
+                let mut reader = BufReader::new(input);
+                let mut line = String::new();
+                let mut offset = 0u64;
+                let mut output: Option<fs::File> = None;
+                loop {
+                    line.clear();
+                    let bytes = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+                    if bytes == 0 {
+                        break;
+                    }
+                    if let Ok(mut value) = serde_json::from_str::<Value>(&line) {
+                        if value.get("type").and_then(Value::as_str) == Some("session_meta")
+                            && value
+                                .pointer("/payload/model_provider")
+                                .and_then(Value::as_str)
+                                == Some("opencodex")
+                        {
+                            value["payload"]["model_provider"] = Value::String("openai".into());
+                            for found in token.find_iter(&line) {
+                                let replacement = format!(
+                                    "{}{}",
+                                    r#""model_provider":"openai""#,
+                                    " ".repeat(found.len() - r#""model_provider":"openai""#.len())
+                                );
+                                let mut repaired = line.clone();
+                                repaired.replace_range(found.range(), &replacement);
+                                // Verify the exact payload change, not a token in quoted user text.
+                                if serde_json::from_str::<Value>(&repaired).ok().as_ref()
+                                    != Some(&value)
+                                {
+                                    continue;
+                                }
+                                if output.is_none() {
+                                    let backup = path.with_extension(format!(
+                                        "jsonl.opencodex-repair-{:016x}.bak",
+                                        rand::random::<u64>()
+                                    ));
+                                    fs::copy(&path, backup)
+                                        .map_err(|e| format!("备份会话失败：{e}"))?;
+                                    output = Some(
+                                        fs::OpenOptions::new()
+                                            .write(true)
+                                            .open(&path)
+                                            .map_err(|e| e.to_string())?,
+                                    );
+                                }
+                                let file = output.as_mut().unwrap();
+                                // Fixed-length in-place token patch preserves append handles and
+                                // offsets used by running clients; never truncate or replace a rollout.
+                                file.seek(SeekFrom::Start(offset + found.start() as u64))
+                                    .map_err(|e| e.to_string())?;
+                                file.write_all(replacement.as_bytes())
+                                    .map_err(|e| e.to_string())?;
+                                break;
+                            }
+                        }
+                    }
+                    offset += bytes as u64;
+                }
+                if let Some(file) = output {
+                    file.sync_all().map_err(|e| e.to_string())?;
+                }
+            }
+        }
+
+        let canonical_home = fs::canonicalize(&self.codex_home).map_err(|e| e.to_string())?;
+        for path in self.sqlite_candidate_paths() {
+            let canonical_path = fs::canonicalize(&path).map_err(|e| e.to_string())?;
+            if !canonical_path.starts_with(&canonical_home) {
+                return Err(format!(
+                    "会话数据库指向实例目录之外，已停止修复：{}",
+                    path.display()
+                ));
+            }
+            let mut connection = Connection::open(&path).map_err(|e| e.to_string())?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|e| e.to_string())?;
+            let mut updates = Vec::new();
+            for table in ["threads", "local_thread_catalog"] {
+                let columns = sqlite_table_columns_with_connection(&connection, table)?;
+                if !columns.contains("model_provider") {
+                    continue;
+                }
+                let local = if table == "local_thread_catalog" && columns.contains("host_id") {
+                    " AND host_id = 'local'"
+                } else {
+                    ""
+                };
+                let predicate = format!("model_provider = 'opencodex'{local}");
+                let count: usize = connection
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                if count > 0 {
+                    updates.push(format!(
+                        "UPDATE {table} SET model_provider = 'openai' WHERE {predicate}"
+                    ));
+                }
+            }
+            if updates.is_empty() {
+                continue;
+            }
+            // VACUUM INTO includes committed WAL pages, unlike copying only the DB file.
+            let backup = path.with_extension(format!(
+                "sqlite.opencodex-repair-{:016x}.bak",
+                rand::random::<u64>()
+            ));
+            connection
+                .execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
+                .map_err(|e| format!("备份会话数据库失败：{e}"))?;
+            let transaction = connection.transaction().map_err(|e| e.to_string())?;
+            for sql in updates {
+                transaction.execute(&sql, []).map_err(|e| e.to_string())?;
+            }
+            if sqlite_table_exists_with_connection(&transaction, "local_thread_catalog_metadata")? {
+                transaction.execute("UPDATE local_thread_catalog_metadata SET catalog_revision = catalog_revision + 1 WHERE id = 1", []).map_err(|e| e.to_string())?;
+            }
+            transaction.commit().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn repair_visibility(&self) -> Result<CodexSessionVisibilityRepairSummary, String> {
         self.repair_visibility_with_options(None, None, None, None, None)
@@ -8266,6 +8474,173 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
     use tempfile::tempdir;
+
+    #[test]
+    fn missing_opencodex_repair_covers_empty_archived_and_local_catalog_only() {
+        let home = tempdir().unwrap();
+        let store = SessionStore::new(home.path().to_path_buf());
+        fs::write(home.path().join("config.toml"), "model_provider = 'opencodex'\n[profiles.old]\nmodel_provider = 'opencodex'\n[model_providers.other]\nname = 'Keep me'\n").unwrap();
+        let mut files = Vec::new();
+        for dir in ["sessions", "archived_sessions"] {
+            fs::create_dir(home.path().join(dir)).unwrap();
+            let path = home.path().join(dir).join("test.jsonl");
+            let metadata =
+                json!({"type":"session_meta", "payload":{"id":dir,"model_provider":"opencodex"}});
+            let image = json!({"type":"response_item","payload":{"content":[{"type":"input_image","image_url":"data:image/png;base64,KEEP"}]}});
+            write_jsonl(&path, &[metadata.clone(), image, metadata]);
+            files.push((path.clone(), fs::read(&path).unwrap()));
+        }
+        let db = home.path().join("state_5.sqlite");
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+            CREATE TABLE threads (id TEXT, model_provider TEXT, first_user_message TEXT);
+            INSERT INTO threads VALUES ('empty', 'opencodex', ''), ('other', 'other', 'keep');
+            CREATE TABLE local_thread_catalog (host_id TEXT, model_provider TEXT);
+            INSERT INTO local_thread_catalog VALUES ('local','opencodex'), ('remote','opencodex');
+            CREATE TABLE local_thread_catalog_metadata (id INTEGER, catalog_revision INTEGER);
+            INSERT INTO local_thread_catalog_metadata VALUES (1, 0);",
+            )
+            .unwrap();
+        store.repair_missing_opencodex_provider().unwrap();
+        let config = fs::read_to_string(home.path().join("config.toml"))
+            .unwrap()
+            .parse::<toml_edit::Document>()
+            .unwrap();
+        assert_eq!(config["model_provider"].as_str(), Some("openai"));
+        assert_eq!(
+            config["profiles"]["old"]["model_provider"].as_str(),
+            Some("openai")
+        );
+        assert_eq!(
+            config["model_providers"]["other"]["name"].as_str(),
+            Some("Keep me")
+        );
+        for (path, original) in &files {
+            let repaired = fs::read(path).unwrap();
+            assert_eq!(original.len(), repaired.len());
+            let old: Vec<Value> = String::from_utf8(original.clone())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let new: Vec<Value> = String::from_utf8(repaired)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(new[1], old[1]);
+            assert_eq!(new[0]["payload"]["model_provider"], "openai");
+            assert_eq!(new[2]["payload"]["model_provider"], "openai");
+        }
+        let query = |sql: &str| {
+            connection
+                .query_row(sql, [], |row| row.get::<_, String>(0))
+                .unwrap()
+        };
+        assert_eq!(
+            query("SELECT model_provider FROM threads WHERE id = 'empty'"),
+            "openai"
+        );
+        assert_eq!(
+            query("SELECT model_provider FROM threads WHERE id = 'other'"),
+            "other"
+        );
+        assert_eq!(
+            query("SELECT model_provider FROM local_thread_catalog WHERE host_id = 'remote'"),
+            "opencodex"
+        );
+        assert_eq!(
+            query("SELECT model_provider FROM local_thread_catalog WHERE host_id = 'local'"),
+            "openai"
+        );
+        let backup = fs::read_dir(home.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("state_5.sqlite.opencodex-repair-")
+            })
+            .unwrap();
+        let backup_db = rusqlite::Connection::open(backup).unwrap();
+        assert_eq!(
+            backup_db
+                .query_row(
+                    "SELECT model_provider FROM threads WHERE id = 'empty'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "opencodex"
+        );
+        store.repair_missing_opencodex_provider().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT catalog_revision FROM local_thread_catalog_metadata",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn missing_opencodex_repair_preserves_defined_provider_and_other_instance() {
+        let home = tempdir().unwrap();
+        fs::write(home.path().join("config.toml"), "model_provider = 'opencodex'\n[model_providers.opencodex]\nbase_url = 'http://127.0.0.1:15800/v1'\n").unwrap();
+        fs::create_dir(home.path().join("sessions")).unwrap();
+        let path = home.path().join("sessions/test.jsonl");
+        write_jsonl(
+            &path,
+            &[json!({"type":"session_meta","payload":{"model_provider":"opencodex"}})],
+        );
+        let original = fs::read(&path).unwrap();
+        SessionStore::new(home.path().to_path_buf())
+            .repair_missing_opencodex_provider()
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        #[cfg(unix)]
+        {
+            let other = tempdir().unwrap();
+            fs::create_dir(other.path().join("sessions")).unwrap();
+            std::os::unix::fs::symlink(
+                home.path().join("sessions"),
+                other.path().join("sessions/foreign"),
+            )
+            .unwrap();
+            SessionStore::new(other.path().to_path_buf())
+                .repair_missing_opencodex_provider()
+                .unwrap();
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_opencodex_repair_rejects_foreign_database_links() {
+        let home = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        let db = other.path().join("state_5.sqlite");
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection.execute_batch("CREATE TABLE threads(model_provider TEXT); INSERT INTO threads VALUES('opencodex');").unwrap();
+        std::os::unix::fs::symlink(&db, home.path().join("state_5.sqlite")).unwrap();
+        let error = SessionStore::new(home.path().to_path_buf())
+            .repair_missing_opencodex_provider()
+            .unwrap_err();
+        assert!(error.contains("实例目录之外"));
+        assert_eq!(
+            connection
+                .query_row("SELECT model_provider FROM threads", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "opencodex"
+        );
+    }
 
     fn write_jsonl(path: &Path, items: &[Value]) {
         let mut content = items

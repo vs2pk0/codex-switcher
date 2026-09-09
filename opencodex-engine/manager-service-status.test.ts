@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readServiceReferences, restoreDisabledAutostart, setConfiguredServicePort } from "./manager-service-status.ts";
-import type { ServiceDiagnostic } from "./node_modules/@bitkyc08/opencodex/src/service.ts";
+type ServiceDiagnostic = { installed: boolean; conflict: boolean; backend: string; enabled: boolean };
 
 const temporaryRoots: string[] = [];
 const originalOpenCodexHome = process.env.OPENCODEX_HOME;

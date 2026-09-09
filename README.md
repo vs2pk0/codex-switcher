@@ -58,7 +58,7 @@ The **API Service** page provides integrated management for the official [CLIPro
 The **OpenCodex** page integrates the local [OpenCodex](https://github.com/lidge-jun/opencodex) proxy and its Engine lifecycle into Codex Switcher.
 
 - **Service console**: initialize, start, stop, restart, diagnose, synchronize, and inspect health and redacted logs from one page.
-- **Engine lifecycle**: detect stable and preview releases, install or switch local versions, remove inactive versions, and safely return to the bundled baseline.
+- **Engine lifecycle**: download an Engine before first use, detect stable and preview releases, switch installed versions, and remove inactive versions. No Engine is bundled or used as a fallback; only the Bun runtime and manager helpers ship with the client.
 - **Codex integration**: synchronize configuration and model catalogs to a selected Codex instance, or stop the proxy and restore that instance's native configuration.
 - **Web dashboard**: open the OpenCodex dashboard inside a client window or in the system browser.
 - **Image-input compatibility**: select text-only models that should use an image-description sidecar, then restart and synchronize the model catalog automatically.
@@ -139,6 +139,7 @@ Thank you for supporting Codex Switcher. Donations help cover ongoing maintenanc
 
 ```bash
 npm ci
+npm run opencodex:prepare
 npm run tauri -- dev
 ```
 
@@ -151,3 +152,7 @@ npm run tauri -- build
 ```
 
 The desktop application is built with Tauri 2, Vue 3, TypeScript, Rust, Arco Design, and ECharts.
+
+`opencodex:prepare` installs only Bun and manager resources, not an Engine. In the app, open **OpenCodex → Version Manager** to download and activate an Engine before using it. Already downloaded versions remain available offline.
+
+Engine integration tests require a separately downloaded package. Set `OPENCODEX_PACKAGE_ROOT` to its absolute package directory (the directory containing `package.json` and `src`), then run `npm run opencodex:test`. Tests use isolated configuration directories; they do not activate that version in the running application.

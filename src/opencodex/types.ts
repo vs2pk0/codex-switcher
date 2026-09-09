@@ -16,7 +16,7 @@ export type OpenCodexAction =
 export interface OpenCodexSystemSnapshot {
   desktopVersion: string;
   engineVersion?: string | null;
-  engineSource: "bundled" | "managed" | "missing";
+  engineSource: "managed" | "missing";
   platform: string;
   installed: boolean;
   initialized: boolean;
@@ -77,7 +77,6 @@ export interface OpenCodexEngineRelease {
 
 export interface OpenCodexEngineCatalog {
   currentVersion?: string | null;
-  bundledVersion?: string | null;
   currentSource: string;
   latestStable?: OpenCodexEngineRelease | null;
   latestPreview?: OpenCodexEngineRelease | null;

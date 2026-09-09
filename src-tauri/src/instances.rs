@@ -849,7 +849,7 @@ fn instance_location(instance: StoredCodexInstance) -> CodexInstanceLocation {
     }
 }
 
-fn codex_home_has_opencodex_routing(codex_home: &Path) -> bool {
+pub(crate) fn codex_home_has_opencodex_routing(codex_home: &Path) -> bool {
     let Ok(config) = fs::read_to_string(codex_home.join("config.toml")) else {
         return false;
     };
@@ -1288,6 +1288,26 @@ pub fn run_with_instance_restarted<T>(
             stored.name
         )),
     }
+}
+
+/// Explicit sync opens even a previously closed instance, but never launches
+/// a client against configuration that failed reset/sync/validation.
+pub(crate) fn run_with_instance_opened_on_success<T>(
+    instance_id: &str,
+    action: impl FnOnce(&CodexInstance) -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = INSTANCE_OPERATION_LOCK
+        .lock()
+        .map_err(|_| "Codex 实例操作锁已损坏".to_string())?;
+    let stored = stored_instance(instance_id)?;
+    let public = public_instance(stored.clone());
+    if public.running {
+        stop_stored(&stored)?;
+    }
+    let value =
+        action(&public).map_err(|error| format!("{error}；目标实例未自动打开，请修复后重试"))?;
+    launch_stored(&stored).map_err(|error| format!("配置已同步，但实例打开失败：{error}"))?;
+    Ok(value)
 }
 
 #[cfg(test)]

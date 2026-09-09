@@ -57,10 +57,6 @@ export function installOpenCodexEngine(version: string, operationId: string): Pr
   return invoke("opencodex_install_engine_version", { request: { version, operationId } });
 }
 
-export function activateBundledOpenCodexEngine(operationId: string): Promise<OpenCodexEngineInstallResult> {
-  return invoke("opencodex_activate_bundled_engine", { operationId });
-}
-
 export function subscribeOpenCodexEngineProgress(
   operationId: string,
   onProgress: (event: OpenCodexEngineProgress) => void,
@@ -102,8 +98,9 @@ export function getOpenCodexVisionModels(): Promise<OpenCodexVisionModelCatalog>
 
 export function updateOpenCodexVisionModels(
   models: Array<{ provider: string; id: string }>,
+  instanceId?: string,
 ): Promise<OpenCodexVisionModelsUpdateResult> {
-  return invoke("opencodex_update_vision_models", { request: { models } });
+  return invoke("opencodex_update_vision_models", { request: { models, instanceId } });
 }
 
 export async function subscribeOpenCodexEvents(

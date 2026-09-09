@@ -1,4 +1,5 @@
 mod backend;
+pub(crate) mod config_repair;
 mod engine_switch;
 mod models;
 
@@ -128,17 +129,6 @@ pub async fn opencodex_install_engine_version(
     tauri::async_runtime::spawn_blocking(move || backend.install_engine_version(request))
         .await
         .map_err(|error| format!("安装 OpenCodex Engine 任务失败：{error}"))?
-}
-
-#[tauri::command]
-pub async fn opencodex_activate_bundled_engine(
-    backend: State<'_, Arc<OpenCodexBackend>>,
-    operation_id: String,
-) -> Result<EngineInstallResult, String> {
-    let backend = Arc::clone(backend.inner());
-    tauri::async_runtime::spawn_blocking(move || backend.activate_bundled_engine(operation_id))
-        .await
-        .map_err(|error| format!("回退 Engine 任务失败：{error}"))?
 }
 
 #[tauri::command]

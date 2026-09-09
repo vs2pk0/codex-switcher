@@ -18,6 +18,53 @@ fn test_store() -> (tempfile::TempDir, tempfile::TempDir, AccountStore) {
 }
 
 #[test]
+fn oauth_and_bound_api_key_projections_include_native_account_id() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let (_storage, codex, store) = test_store();
+    let token = format!(
+        "e30.{}.fixture",
+        URL_SAFE_NO_PAD.encode(
+            json!({"https://api.openai.com/auth":{"chatgpt_account_id":"native-account"}})
+                .to_string()
+        )
+    );
+    let oauth = store
+        .import_from_json(
+            &json!({
+                "email":"fixture@example.com",
+                "tokens":{"id_token":token,"access_token":token,"refresh_token":"keep-refresh"}
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .remove(0);
+    store.switch_account(&oauth.id).unwrap();
+    let check = || {
+        let auth: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(codex.path().join("auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(auth["tokens"]["account_id"], "native-account");
+        assert_eq!(auth["tokens"]["access_token"], token);
+        assert_eq!(auth["tokens"]["refresh_token"], "keep-refresh");
+    };
+    check();
+    let api = store
+        .add_api_key_account(
+            "sk-fixture".to_string(),
+            Some("https://relay.example/v1".to_string()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    store
+        .update_api_key_bound_oauth_account(&api.id, Some(oauth.id), false)
+        .unwrap();
+    store.switch_account(&api.id).unwrap();
+    check();
+}
+
+#[test]
 fn database_failure_rolls_back_the_model_config() {
     let codex = tempdir().expect("codex tempdir");
     let config_path = codex.path().join("config.toml");

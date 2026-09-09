@@ -4021,20 +4021,21 @@ async function saveConfigEditorContent(): Promise<void> {
 }
 
 function confirmResetConfig(): void {
+  const targetInstanceId = settingsInstanceId.value;
   const instanceName = codexInstances.value.find(
-    (instance) => instance.id === settingsInstanceId.value,
+    (instance) => instance.id === targetInstanceId,
   )?.name || "默认实例";
   Modal.warning({
     title: "重置 config.toml",
-    content: `确认将“${instanceName}”的 config.toml 恢复为内置基础配置？当前文件会先自动备份。`,
+    content: `确认先移除“${instanceName}”的 OpenCodex 接入设置，再将 config.toml 恢复为内置基础配置并修复旧会话引用？当前文件会先自动备份，不卸载其他实例共用的服务。`,
     okText: "恢复基础配置",
     cancelText: "取消",
     hideCancel: false,
     onOk: async () => {
       try {
-        await resetCodexConfigToml(settingsInstanceId.value);
-        await loadAccounts();
-        Message.success("已将 config.toml 恢复为基础配置");
+        await resetCodexConfigToml(targetInstanceId);
+        await Promise.all([loadAccounts(), loadCodexInstances()]);
+        Message.success("已移除所选实例的 OpenCodex 接入设置，恢复基础配置并检查旧会话引用；请重新打开实例");
       } catch (error) {
         Message.error(`重置失败：${errorText(error)}`);
       }

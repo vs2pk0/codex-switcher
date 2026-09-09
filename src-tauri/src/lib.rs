@@ -2022,7 +2022,22 @@ fn default_codex_config_content(codex_home: &Path) -> Result<String, String> {
 
 fn reset_codex_config_toml_in(codex_home: &Path) -> Result<CodexConfigFileContent, String> {
     let content = default_codex_config_content(codex_home)?;
-    write_codex_config_file_to(codex_home, CodexConfigFileKind::ConfigToml, &content)
+    // Keep old generated artifacts as backups, but do not allow an old Engine
+    // restore journal/profile to resurrect the routing after this explicit reset.
+    for name in ["opencodex-journal.json", "opencodex.config.toml"] {
+        let path = codex_home.join(name);
+        if path.exists() {
+            std::fs::rename(
+                &path,
+                codex_home.join(format!("{name}.reset-{:016x}.bak", rand::random::<u64>())),
+            )
+            .map_err(|e| format!("备份 OpenCodex 接入设置失败：{e}"))?;
+        }
+    }
+    let restored =
+        write_codex_config_file_to(codex_home, CodexConfigFileKind::ConfigToml, &content)?;
+    session::SessionStore::new(codex_home.to_path_buf()).repair_missing_opencodex_provider()?;
+    Ok(restored)
 }
 
 fn delete_codex_config_toml_from(codex_home: &Path) -> Result<bool, String> {
@@ -2087,14 +2102,24 @@ fn write_codex_config_file(
 }
 
 #[tauri::command]
-fn reset_codex_config_toml(instance_id: Option<String>) -> Result<CodexConfigFileContent, String> {
+async fn reset_codex_config_toml(
+    backend: tauri::State<'_, Arc<opencodex::OpenCodexBackend>>,
+    instance_id: Option<String>,
+) -> Result<CodexConfigFileContent, String> {
     let instance_id = instance_id.unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
-    let codex_home = instances::codex_home_for(Some(&instance_id))?;
+    let backend = Arc::clone(backend.inner());
+    tauri::async_runtime::spawn_blocking(move || backend.reset_instance_config(&instance_id))
+        .await
+        .map_err(|e| format!("重置配置任务失败：{e}"))?
+}
+
+fn reset_codex_config_for_instance(instance_id: &str) -> Result<CodexConfigFileContent, String> {
+    let codex_home = instances::codex_home_for(Some(instance_id))?;
     let path = codex_home.join("config.toml");
     let snapshot = read_file_snapshot(&path)?;
     let restored = reset_codex_config_toml_in(&codex_home)?;
     rollback_file_on_error(
-        AccountStore::new_for_instance(switcher_account_dir(), codex_home.clone(), &instance_id)
+        AccountStore::new_for_instance(switcher_account_dir(), codex_home.clone(), instance_id)
             .release_current_api_key_default_model(),
         &path,
         snapshot.as_deref(),
@@ -4819,6 +4844,48 @@ mod tests {
     }
 
     #[test]
+    fn config_reset_removes_empty_catalog_and_stale_integration_artifacts() {
+        let home = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        std::fs::write(
+            other.path().join("config.toml"),
+            "model_provider = 'opencodex'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "model_provider = 'opencodex'\nmodel_catalog_json = 'empty.json'\n",
+        )
+        .unwrap();
+        std::fs::write(home.path().join("empty.json"), r#"{"models":[]}"#).unwrap();
+        std::fs::write(home.path().join("opencodex-journal.json"), "old routing").unwrap();
+        std::fs::write(home.path().join("opencodex.config.toml"), "old profile").unwrap();
+        std::fs::create_dir(home.path().join("sessions")).unwrap();
+        std::fs::write(
+            home.path().join("sessions/old.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"opencodex\"}}\n",
+        )
+        .unwrap();
+        let reset = reset_codex_config_toml_in(home.path()).unwrap();
+        assert!(!reset.content.contains("model_catalog_json"));
+        assert!(!reset.content.contains("opencodex"));
+        assert!(!home.path().join("opencodex-journal.json").exists());
+        assert!(!home.path().join("opencodex.config.toml").exists());
+        assert!(home.path().join("empty.json").exists());
+        assert!(
+            std::fs::read_to_string(home.path().join("sessions/old.jsonl"))
+                .unwrap()
+                .contains("openai")
+        );
+        assert_eq!(
+            std::fs::read_to_string(other.path().join("config.toml")).unwrap(),
+            "model_provider = 'opencodex'\n"
+        );
+        std::fs::write(home.path().join("config.toml"), "[broken").unwrap();
+        assert!(reset_codex_config_toml_in(home.path()).is_ok());
+    }
+
+    #[test]
     fn codex_config_editor_rejects_invalid_content_and_formats_json() {
         let codex = tempdir().expect("codex tempdir");
         assert!(write_codex_config_file_to(
@@ -5489,7 +5556,6 @@ pub fn run() {
             opencodex::opencodex_delete_switcher_account,
             opencodex::opencodex_get_engine_update_catalog,
             opencodex::opencodex_install_engine_version,
-            opencodex::opencodex_activate_bundled_engine,
             opencodex::opencodex_delete_engine_version,
             opencodex::opencodex_get_vision_models,
             opencodex::opencodex_update_vision_models,

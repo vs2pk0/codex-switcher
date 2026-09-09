@@ -1,13 +1,14 @@
-import { diagnoseService } from "./node_modules/@bitkyc08/opencodex/src/service.ts";
+import { importEngineModule } from "./manager-engine-package.ts";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
-import {
+const { diagnoseService } = await importEngineModule("src/service.ts");
+const {
   getConfigDir,
   loadConfig,
   saveConfig,
-} from "./node_modules/@bitkyc08/opencodex/src/config.ts";
+} = await importEngineModule("src/config.ts");
 
 export function readServiceReferences(paths: string[]) {
   const referencedCliPaths: string[] = [];

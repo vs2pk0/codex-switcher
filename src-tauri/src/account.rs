@@ -2968,6 +2968,7 @@ fn write_codex_auth_projection(
                 "tokens": {
                     "id_token": oauth_account.tokens.id_token,
                     "access_token": oauth_account.tokens.access_token,
+                    "account_id": chatgpt_account_id(oauth_account).unwrap_or_default(),
                     "refresh_token": oauth_account.tokens.refresh_token.clone().unwrap_or_default()
                 },
                 "last_refresh": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
@@ -2987,6 +2988,7 @@ fn write_codex_auth_projection(
             "tokens": {
                 "id_token": account.tokens.id_token,
                 "access_token": account.tokens.access_token,
+                "account_id": chatgpt_account_id(account).unwrap_or_default(),
                 "refresh_token": account.tokens.refresh_token.clone().unwrap_or_default()
             },
             "last_refresh": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()

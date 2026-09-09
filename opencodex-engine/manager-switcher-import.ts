@@ -2,32 +2,43 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import {
+import { importEngineModule } from "./manager-engine-package.ts";
+const {
   getConfigDir,
   loadConfig,
   saveConfigPreservingClaudeCode,
   withConfigMutationLockSync,
-} from "./node_modules/@bitkyc08/opencodex/src/config.ts";
-import {
+} = await importEngineModule("src/config.ts");
+const {
   loadCodexAccountStore,
   removeCodexAccountCredential,
   saveCodexAccountCredential,
-} from "./node_modules/@bitkyc08/opencodex/src/codex/account-store.ts";
-import { deleteCodexAccount } from "./node_modules/@bitkyc08/opencodex/src/codex/account-lifecycle.ts";
-import { runtimeRequest } from "./node_modules/@bitkyc08/opencodex/src/cli/runtime-api.ts";
-import { findLiveProxy } from "./node_modules/@bitkyc08/opencodex/src/server/proxy-liveness.ts";
-import { isValidCodexAccountId } from "./node_modules/@bitkyc08/opencodex/src/codex/account-id.ts";
-import { withCodexAccountLogLabel } from "./node_modules/@bitkyc08/opencodex/src/codex/account-label.ts";
-import { appendDefaultCodexAccountNamespace } from "./node_modules/@bitkyc08/opencodex/src/codex/account-namespaces.ts";
-import {
+} = await importEngineModule("src/codex/account-store.ts");
+const { deleteCodexAccount } = await importEngineModule("src/codex/account-lifecycle.ts");
+const { runtimeRequest } = await importEngineModule("src/cli/runtime-api.ts");
+const { findLiveProxy } = await importEngineModule("src/server/proxy-liveness.ts");
+const { isValidCodexAccountId } = await importEngineModule("src/codex/account-id.ts");
+const { withCodexAccountLogLabel } = await importEngineModule("src/codex/account-label.ts");
+const { appendDefaultCodexAccountNamespace } = await importEngineModule("src/codex/account-namespaces.ts");
+const {
   decodeJwtPayload,
   extractAccountId,
   extractEmail,
-} from "./node_modules/@bitkyc08/opencodex/src/oauth/chatgpt.ts";
-import type {
-  CodexAccountCredentials,
-  OcxConfig,
-} from "./node_modules/@bitkyc08/opencodex/src/types.ts";
+} = await importEngineModule("src/oauth/chatgpt.ts");
+
+// Structural boundary types: Engine declarations are not shipped in the client.
+interface CodexAccountCredentials {
+  accessToken: string;
+  refreshToken: string;
+  idToken?: string;
+  expiresAt: number;
+  chatgptAccountId?: string;
+}
+interface OcxConfig {
+  codexAccounts?: Array<{ id: string; email?: string; [key: string]: unknown }>;
+  codexAccountNamespaces?: Record<string, unknown>;
+  [key: string]: unknown;
+}
 
 const MAX_SOURCE_BYTES = 16 * 1024 * 1024;
 const MAX_SOURCE_ACCOUNTS = 2_000;

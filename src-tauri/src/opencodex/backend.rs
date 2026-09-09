@@ -222,18 +222,17 @@ impl Backend {
 
     fn active_launcher(&self) -> Result<Launcher, String> {
         let program = self.bundled_runtime_path()?;
-        let (package_root, source) = self
-            .active_managed_version()
-            .and_then(|version| {
-                let package = self.managed_package_root(&version);
-                (package_version(&package).as_deref() == Some(version.as_str())
-                    && package.join("src").join("cli").join("index.ts").is_file())
-                .then_some((package, "managed"))
-            })
-            .unwrap_or((self.bundled_package_root()?, "bundled"));
+        let version = self.active_managed_version().ok_or_else(|| {
+            "尚未安装或选择 OpenCodex Engine，请先在版本管理中下载并激活版本".to_string()
+        })?;
+        let package_root = self.managed_package_root(&version);
+        validate_managed_package(&package_root, &version)?;
         let cli = package_root.join("src").join("cli").join("index.ts");
         if !cli.is_file() {
-            return Err(format!("客户端内置 OpenCodex 源码缺失：{}", cli.display()));
+            return Err(format!(
+                "所选 OpenCodex Engine 文件缺失，请重新下载：{}",
+                cli.display()
+            ));
         }
         let version = package_version(&package_root);
         Ok(Launcher {
@@ -241,7 +240,7 @@ impl Backend {
             prefix_args: vec![cli.into_os_string()],
             working_dir: Some(package_root),
             version,
-            source,
+            source: "managed",
         })
     }
 
@@ -256,18 +255,6 @@ impl Backend {
             .is_file()
             .then_some(runtime)
             .ok_or_else(|| "客户端内置 Bun 运行时缺失，请重新安装完整客户端".to_string())
-    }
-
-    fn bundled_package_root(&self) -> Result<PathBuf, String> {
-        let package = self
-            .bundled_engine_dir()?
-            .join("node_modules")
-            .join("@bitkyc08")
-            .join("opencodex");
-        package
-            .is_dir()
-            .then_some(package)
-            .ok_or_else(|| "客户端内置 OpenCodex Engine 缺失，请重新安装完整客户端".to_string())
     }
 
     fn managed_engine_root(&self) -> PathBuf {
@@ -384,7 +371,7 @@ impl Backend {
         if development.join("node_modules").is_dir() {
             return Ok(development);
         }
-        Err("客户端内置 Engine 资源不存在，请重新安装完整客户端".to_string())
+        Err("客户端管理组件资源不存在，请重新安装完整客户端".to_string())
     }
 
     fn command(&self, launcher: &Launcher, args: &[String]) -> Command {
@@ -554,6 +541,7 @@ impl Backend {
         &self,
         request: UpdateVisionModelsRequest,
     ) -> Result<VisionModelsUpdateResult, String> {
+        let codex_home = crate::instances::codex_home_for(request.instance_id.as_deref())?;
         let live = self.get_vision_models()?;
         let known = live
             .models
@@ -650,6 +638,15 @@ impl Backend {
                     });
                 }
             }
+            // Provider capabilities belong to the shared service, but the
+            // catalog/routing destination is the explicitly selected instance.
+            self.run_instance_integration_helper(
+                &CommandAction::Sync,
+                read_runtime_port()
+                    .or_else(read_configured_port)
+                    .unwrap_or(DEFAULT_PORT),
+                &codex_home,
+            )?;
             let count = selected.len();
             Ok(VisionModelsUpdateResult {
                 selected_count: count,
@@ -684,6 +681,18 @@ impl Backend {
         &self,
         action: &str,
     ) -> Result<BackgroundServiceState, String> {
+        let package = self
+            .active_launcher()?
+            .working_dir
+            .ok_or("无法定位所选 Engine")?;
+        self.run_background_service_helper_for(action, &package)
+    }
+
+    fn run_background_service_helper_for(
+        &self,
+        action: &str,
+        package: &Path,
+    ) -> Result<BackgroundServiceState, String> {
         let engine = self.bundled_engine_dir()?;
         let runtime = self.bundled_runtime_path()?;
         let helper = engine.join("manager-service-status.ts");
@@ -695,6 +704,7 @@ impl Backend {
             .arg(helper)
             .arg(action)
             .current_dir(engine)
+            .env("OPENCODEX_PACKAGE_ROOT", package)
             .env("NO_COLOR", "1")
             .env("FORCE_COLOR", "0")
             .stdin(Stdio::null())
@@ -719,6 +729,10 @@ impl Backend {
 
     fn set_background_service_port(&self, port: u16) -> Result<(), String> {
         validate_port(port)?;
+        let package = self
+            .active_launcher()?
+            .working_dir
+            .ok_or("无法定位所选 Engine")?;
         let engine = self.bundled_engine_dir()?;
         let runtime = self.bundled_runtime_path()?;
         let helper = engine.join("manager-service-status.ts");
@@ -731,6 +745,7 @@ impl Backend {
             .arg("set-port")
             .arg(port.to_string())
             .current_dir(engine)
+            .env("OPENCODEX_PACKAGE_ROOT", package)
             .env("NO_COLOR", "1")
             .env("FORCE_COLOR", "0")
             .stdin(Stdio::null())
@@ -813,8 +828,19 @@ impl Backend {
                 .as_deref()
                 .ok_or_else(|| "无法定位多开实例 Codex Home".to_string());
             instance_home.and_then(|home| {
-                self.run_instance_integration_helper(&action, port, home)
-                    .map(|message| (Some(0), message))
+                (if matches!(action, CommandAction::Sync) {
+                    let instance = crate::instances::list_codex_instances()?
+                        .into_iter()
+                        .find(|instance| Path::new(&instance.codex_home) == home)
+                        .ok_or_else(|| "目标实例不存在，请刷新后重试".to_string())?;
+                    crate::instances::run_with_instance_opened_on_success(&instance.id, |_| {
+                        self.reset_instance_config_inner(&instance.id)?;
+                        self.run_instance_integration_helper(&action, port, home)
+                    })
+                } else {
+                    self.run_instance_integration_helper(&action, port, home)
+                })
+                .map(|message| (Some(0), message))
             })
         } else if matches!(action, CommandAction::Start) {
             if probe_health(port).is_some() {
@@ -838,6 +864,23 @@ impl Backend {
                     &format!("同步后台服务端口：{port}"),
                 );
                 self.set_background_service_port(port)
+            } else if matches!(
+                action,
+                CommandAction::Uninstall | CommandAction::ServiceUninstall
+            ) {
+                crate::instances::list_codex_instances().and_then(|instances| {
+                    for instance in instances {
+                        self.run_instance_integration_helper(
+                            &CommandAction::Restore,
+                            port,
+                            Path::new(&instance.codex_home),
+                        )
+                        .map_err(|error| {
+                            format!("实例 {} 恢复失败，已中止卸载：{error}", instance.name)
+                        })?;
+                    }
+                    Ok(())
+                })
             } else {
                 Ok(())
             };
@@ -1272,16 +1315,11 @@ impl Backend {
             .as_ref()
             .map_or("missing", |item| item.source)
             .to_string();
-        let bundled_version = self
-            .bundled_package_root()
-            .ok()
-            .and_then(|package| package_version(&package));
         let installed_versions = self.installed_managed_versions();
         let remote = self.run_engine_update_helper::<RemoteEngineCatalog>("catalog", None, None);
         Ok(build_engine_update_catalog(
             current_version,
             current_source,
-            bundled_version,
             installed_versions,
             remote,
         ))
@@ -1299,21 +1337,6 @@ impl Backend {
         let operation_id = &request.operation_id;
         self.engine_stage(operation_id, &version, "checking");
         let result = (|| {
-            let bundled_version = package_version(&self.bundled_package_root()?);
-            if bundled_version.as_deref() == Some(version.as_str()) {
-                let restarted = self.activate_engine_safely(None, &version, operation_id)?;
-                return Ok(EngineInstallResult {
-                    version,
-                    source: "bundled".to_string(),
-                    message: if restarted {
-                        "已切换到客户端内置 Engine，服务已自动重启"
-                    } else {
-                        "已切换到客户端内置 Engine"
-                    }
-                    .to_string(),
-                });
-            }
-
             let package = self.managed_package_root(&version);
             let already_installed = validate_managed_package(&package, &version).is_ok();
             if !already_installed {
@@ -1332,7 +1355,7 @@ impl Backend {
                 }
                 validate_managed_package(&package, &version)?;
             }
-            let restarted = self.activate_engine_safely(Some(&version), &version, operation_id)?;
+            let restarted = self.activate_engine_safely(&version, operation_id)?;
             Ok(EngineInstallResult {
                 version: version.clone(),
                 source: "managed".to_string(),
@@ -1357,18 +1380,28 @@ impl Backend {
         result
     }
 
-    fn activate_engine_safely(
-        &self,
-        managed_version: Option<&str>,
-        version: &str,
-        operation_id: &str,
-    ) -> Result<bool, String> {
-        let old_launcher = self.active_launcher()?;
-        let old_version = if old_launcher.source == "managed" {
-            old_launcher.version.as_deref()
-        } else {
-            None
+    fn activate_engine_safely(&self, version: &str, operation_id: &str) -> Result<bool, String> {
+        let old_launcher = match self.active_launcher() {
+            Ok(launcher) => launcher,
+            Err(_) => {
+                // A first download has no old Engine to query or restore. Use the
+                // newly verified package only for read-only service inspection.
+                let package = self.managed_package_root(version);
+                validate_managed_package(&package, version)?;
+                let service = self.run_background_service_helper_for("status", &package)?;
+                if running_open_codex_port().is_some()
+                    || service.installed
+                    || service.running
+                    || service.conflict
+                {
+                    return Err("检测到未受当前版本记录管理的 OpenCodex 服务，请先停止并解除后台服务注册，再激活下载版本".to_string());
+                }
+                self.write_active_engine(Some(version))?;
+                self.active_launcher()?;
+                return Ok(false);
+            }
         };
+        let old_version = old_launcher.version.as_deref();
         let service = self.query_background_service_state()?;
         if service.conflict {
             return Err("后台服务存在冲突，请先修复后台服务后再切换 Engine".to_string());
@@ -1392,7 +1425,7 @@ impl Backend {
                 }
                 SwitchStep::ActivateNew => {
                     self.engine_stage(operation_id, version, "activating");
-                    self.write_active_engine(managed_version)?;
+                    self.write_active_engine(Some(version))?;
                     next_launcher = Some(self.active_launcher()?);
                     Ok(())
                 }
@@ -1437,7 +1470,7 @@ impl Backend {
             }
         })?;
         // Prune only after successful activation and recovery checks.
-        match self.prune_managed_engine_history(managed_version.unwrap_or("")) {
+        match self.prune_managed_engine_history(version) {
             Ok(removed) if !removed.is_empty() => self.persist_log(
                 "system",
                 &format!("已清理旧 Engine 版本：{}", removed.join("、")),
@@ -1546,18 +1579,6 @@ impl Backend {
         result
     }
 
-    pub fn activate_bundled_engine(
-        &self,
-        operation_id: String,
-    ) -> Result<EngineInstallResult, String> {
-        let version = package_version(&self.bundled_package_root()?)
-            .ok_or_else(|| "无法读取客户端内置 Engine 版本".to_string())?;
-        self.install_engine_version(InstallEngineVersionRequest {
-            version,
-            operation_id,
-        })
-    }
-
     fn run_engine_update_helper<T: DeserializeOwned>(
         &self,
         action: &str,
@@ -1653,7 +1674,53 @@ impl Backend {
             .map_err(|error| format!("Engine 更新器返回了无效结果：{error}"))
     }
 
+    pub(crate) fn reset_instance_config(
+        &self,
+        instance_id: &str,
+    ) -> Result<crate::CodexConfigFileContent, String> {
+        self.begin_mutation()?;
+        let result = self.reset_instance_config_inner(instance_id);
+        self.finish_mutation();
+        result
+    }
+
+    fn reset_instance_config_inner(
+        &self,
+        instance_id: &str,
+    ) -> Result<crate::CodexConfigFileContent, String> {
+        let home = crate::instances::codex_home_for(Some(instance_id))?;
+        let has_integration_settings = config_dir()
+            .is_some_and(|dir| dir.join("config.json").exists())
+            || home.join(".switcher-opencodex/config.json").exists();
+        if has_integration_settings {
+            self.run_instance_integration_process("disable", DEFAULT_PORT, &home)?;
+        }
+        crate::reset_codex_config_for_instance(instance_id)
+    }
+
     fn run_instance_integration_helper(
+        &self,
+        action: &CommandAction,
+        port: u16,
+        codex_home: &Path,
+    ) -> Result<String, String> {
+        let result = self.apply_instance_integration(action, port, codex_home);
+        if matches!(action, CommandAction::Sync) && result.is_err() {
+            // Do not leave desired=ON after a failed catalog sync: the default
+            // service's convergence loop would otherwise inject it again.
+            self.run_instance_integration_process("disable", port, codex_home)
+                .map_err(|error| {
+                    format!(
+                        "{}；同步失败后的接入关闭也失败：{error}",
+                        result.as_ref().unwrap_err()
+                    )
+                })?;
+            super::config_repair::repair_invalid_catalog_references(codex_home)?;
+        }
+        result
+    }
+
+    fn apply_instance_integration(
         &self,
         action: &CommandAction,
         port: u16,
@@ -1664,19 +1731,37 @@ impl Backend {
             CommandAction::Restore => "restore",
             _ => return Err("多开实例集成操作只支持同步或恢复".to_string()),
         };
-        if matches!(action, CommandAction::Sync) {
-            let default_home = crate::instances::codex_home_for(None)?;
-            if default_home == codex_home {
-                return Err("目标多开实例与系统默认实例共用 Codex Home，无法安全隔离".to_string());
-            }
-            // OpenCodex resolves OPENCODEX_HOME and CODEX_HOME while loading its
-            // modules. Keep the default restore and custom injection in separate
-            // helper processes so neither process can reuse paths cached for the
-            // other instance.
-            self.run_instance_integration_process("isolate-default", port, &default_home)
-                .map_err(|error| format!("隔离系统默认实例失败：{error}"))?;
+        super::config_repair::repair_invalid_catalog_references(codex_home)?;
+        let result = self.run_instance_integration_process(action_name, port, codex_home);
+        let invalid_catalog_removed =
+            super::config_repair::repair_invalid_catalog_references(codex_home)?;
+        // An Engine restore can remove routing and then fail its history phase.
+        // Still repair dangling references, but keep the original failure visible.
+        if matches!(action, CommandAction::Restore) {
+            crate::session::SessionStore::new(codex_home.to_path_buf())
+                .repair_missing_opencodex_provider()
+                .map_err(|error| format!("恢复后的旧会话修复失败：{error}"))?;
         }
-        self.run_instance_integration_process(action_name, port, codex_home)
+        let message = result?;
+        if matches!(action, CommandAction::Sync) && invalid_catalog_removed {
+            return Err("同步生成了无效或空的模型目录，已移除该引用，未自动打开实例。请检查服务模型列表后重试。".to_string());
+        }
+        if matches!(action, CommandAction::Sync)
+            && !crate::instances::codex_home_has_opencodex_routing(codex_home)
+        {
+            return Err(format!(
+                "目标实例没有接入 OpenCodex，未将此次操作标记为同步成功：{message}"
+            ));
+        }
+        if matches!(action, CommandAction::Sync) {
+            crate::session::SessionStore::new(codex_home.to_path_buf())
+                .repair_missing_opencodex_provider()?;
+        } else if crate::instances::codex_home_has_opencodex_routing(codex_home) {
+            return Err(
+                "目标实例仍有 OpenCodex 路由，恢复未完成；为避免配置丢失，不会继续卸载".to_string(),
+            );
+        }
+        Ok(message)
     }
 
     fn run_instance_integration_process(
@@ -1687,31 +1772,65 @@ impl Backend {
     ) -> Result<String, String> {
         let engine = self.bundled_engine_dir()?;
         let runtime = self.bundled_runtime_path()?;
-        let active_package_root = self
-            .active_launcher()?
-            .working_dir
-            .ok_or_else(|| "无法定位当前激活的 OpenCodex Engine".to_string())?;
+        // Reset must remain available after migration away from the bundled
+        // Engine. Disabling intent alone needs only the packaged helper/runtime.
+        let active_package_root = if action_name == "disable" {
+            self.active_launcher()
+                .ok()
+                .and_then(|launcher| launcher.working_dir)
+        } else {
+            Some(
+                self.active_launcher()?
+                    .working_dir
+                    .ok_or_else(|| "无法定位当前激活的 OpenCodex Engine".to_string())?,
+            )
+        };
         let helper = engine.join("manager-instance-integration.ts");
         if !helper.is_file() {
             return Err("客户端缺少多开实例隔离组件，请重新安装完整客户端".to_string());
         }
         let mut command = Command::new(runtime);
+        let source_home = config_dir().ok_or("无法定位 OpenCodex 配置目录")?;
+        let is_default = codex_home == crate::instances::codex_home_for(None)?;
+        let integration_home = if is_default {
+            source_home.clone()
+        } else {
+            codex_home.join(".switcher-opencodex")
+        };
         command
             .arg(helper)
             .arg(action_name)
             .arg(port.to_string())
             .current_dir(&engine)
             .env("CODEX_HOME", codex_home)
-            .env("OPENCODEX_PACKAGE_ROOT", &active_package_root)
+            // Engine Workers import configuration before receiving their env
+            // message. Give the process its final instance home from startup.
+            .env("OPENCODEX_HOME", integration_home)
+            .env("OPENCODEX_MANAGER_SOURCE_HOME", source_home)
+            .env(
+                "OPENCODEX_MANAGER_DEFAULT_INSTANCE",
+                if is_default { "1" } else { "0" },
+            )
             .env("NO_COLOR", "1")
             .env("FORCE_COLOR", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(package) = active_package_root {
+            command.env("OPENCODEX_PACKAGE_ROOT", package);
+        } else {
+            command.env_remove("OPENCODEX_PACKAGE_ROOT");
+        }
         hide_command_window(&mut command);
         let output = command
             .output()
             .map_err(|error| format!("无法启动多开实例隔离组件：{error}"))?;
+        let detail = self.redact(String::from_utf8_lossy(&output.stderr).trim());
+        if !detail.is_empty() {
+            // Discovery warnings explain empty/no-write catalogs. Preserve them
+            // even when the helper returns a structured failure on stdout.
+            self.persist_log("stderr", &detail);
+        }
         if let Ok(result) = serde_json::from_slice::<InstanceIntegrationResult>(&output.stdout) {
             return if result.success {
                 Ok(result.message)
@@ -1719,7 +1838,6 @@ impl Backend {
                 Err(result.message)
             };
         }
-        let detail = self.redact(String::from_utf8_lossy(&output.stderr).trim());
         Err(if detail.is_empty() {
             format!("OpenCodex 实例隔离操作 {action_name} 失败")
         } else {
@@ -1732,6 +1850,10 @@ impl Backend {
         action: &str,
         input: Option<&[u8]>,
     ) -> Result<T, String> {
+        let package = self
+            .active_launcher()?
+            .working_dir
+            .ok_or("无法定位所选 Engine")?;
         let engine = self.bundled_engine_dir()?;
         let runtime = engine
             .join("node_modules")
@@ -1750,6 +1872,7 @@ impl Backend {
             .arg(helper)
             .arg(action)
             .current_dir(&engine)
+            .env("OPENCODEX_PACKAGE_ROOT", package)
             .env("NO_COLOR", "1")
             .env("FORCE_COLOR", "0")
             .stdout(Stdio::piped())
@@ -1791,7 +1914,6 @@ impl Backend {
 fn build_engine_update_catalog(
     current_version: Option<String>,
     current_source: String,
-    bundled_version: Option<String>,
     installed_versions: Vec<String>,
     remote: Result<RemoteEngineCatalog, String>,
 ) -> EngineUpdateCatalog {
@@ -1806,15 +1928,13 @@ fn build_engine_update_catalog(
         release.newer_than_current = current_semver.as_ref().is_none_or(|current| {
             Version::parse(&release.version).is_ok_and(|next| next > *current)
         });
-        release.installed = installed_versions.contains(&release.version)
-            || bundled_version.as_deref() == Some(release.version.as_str());
+        release.installed = installed_versions.contains(&release.version);
         release.active = current_version.as_deref() == Some(release.version.as_str());
     }
     let latest_stable = releases.iter().find(|release| !release.prerelease).cloned();
     let latest_preview = releases.iter().find(|release| release.prerelease).cloned();
     EngineUpdateCatalog {
         current_version,
-        bundled_version,
         current_source,
         latest_stable,
         latest_preview,
@@ -2157,12 +2277,11 @@ fn account_binding_restart_mode(
     }
 }
 
-fn isolated_instance_integration_action(action: &CommandAction, instance_id: Option<&str>) -> bool {
+fn isolated_instance_integration_action(
+    action: &CommandAction,
+    _instance_id: Option<&str>,
+) -> bool {
     matches!(action, CommandAction::Sync | CommandAction::Restore)
-        && instance_id.is_some_and(|id| {
-            let id = id.trim();
-            !id.is_empty() && id != crate::instances::DEFAULT_INSTANCE_ID
-        })
 }
 
 fn display_action(action: &CommandAction) -> &'static str {
@@ -2255,50 +2374,29 @@ mod tests {
     use super::{
         account_binding_restart_mode, build_engine_update_catalog, codex_integration_is_enabled,
         config_is_initialized, configured_sidecar_models, isolated_instance_integration_action,
-        managed_versions_to_remove, package_version, read_last_log_lines, validate_engine_version,
+        managed_versions_to_remove, read_last_log_lines, validate_engine_version,
         validate_managed_package, validate_port, AccountBindingRestartMode, RemoteEngineCatalog,
         DEFAULT_PORT,
     };
     use crate::opencodex::models::{BackgroundServiceState, CommandAction};
     use chrono::Utc;
+    #[cfg(unix)]
+    use std::process::Command;
     use std::{
         fs,
-        io::{Read, Write},
         path::PathBuf,
-        process::{Command, Stdio},
-        sync::mpsc::{self, Receiver},
-        thread,
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        time::{SystemTime, UNIX_EPOCH},
     };
     use tempfile::tempdir;
 
-    #[cfg(unix)]
-    fn wait_for_output(receiver: &Receiver<Vec<u8>>, transcript: &mut Vec<u8>, needle: &str) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if String::from_utf8_lossy(transcript).contains(needle) {
-                return;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let chunk = receiver.recv_timeout(remaining).unwrap_or_else(|error| {
-                panic!(
-                    "did not receive {needle:?}: {error}; output: {}",
-                    String::from_utf8_lossy(transcript)
-                )
-            });
-            transcript.extend_from_slice(&chunk);
-        }
-    }
-
     #[test]
-    fn reads_the_pinned_bundled_engine_version() {
-        let package = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("opencodex-engine")
-            .join("node_modules")
-            .join("@bitkyc08")
-            .join("opencodex");
-        assert_eq!(package_version(&package).as_deref(), Some("2.27.0"));
+    fn desktop_runtime_manifest_does_not_embed_an_engine() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../../opencodex-engine/package.json")).unwrap();
+        assert!(manifest["dependencies"]
+            .get("@bitkyc08/opencodex")
+            .is_none());
+        assert!(manifest["dependencies"]["bun"].is_string());
     }
 
     #[test]
@@ -2329,7 +2427,7 @@ mod tests {
     }
 
     #[test]
-    fn only_custom_instance_sync_and_restore_use_the_isolated_helper() {
+    fn all_instance_sync_and_restore_use_the_scoped_helper() {
         assert!(isolated_instance_integration_action(
             &CommandAction::Sync,
             Some("instance-custom")
@@ -2338,7 +2436,7 @@ mod tests {
             &CommandAction::Restore,
             Some("instance-custom")
         ));
-        assert!(!isolated_instance_integration_action(
+        assert!(isolated_instance_integration_action(
             &CommandAction::Sync,
             Some(crate::instances::DEFAULT_INSTANCE_ID)
         ));
@@ -2372,7 +2470,6 @@ mod tests {
         let catalog = build_engine_update_catalog(
             Some("2.31.0".to_string()),
             "managed".to_string(),
-            Some("2.27.0".to_string()),
             vec!["2.31.0".to_string(), "2.30.0".to_string()],
             Err("GitHub unavailable".to_string()),
         );
@@ -2447,7 +2544,7 @@ mod tests {
     }
 
     #[test]
-    fn retains_three_recent_managed_versions_when_using_bundled_engine() {
+    fn retains_three_recent_managed_versions_when_no_engine_is_active() {
         let installed = ["2.32.0", "2.31.0", "2.30.0", "2.29.0"].map(ToString::to_string);
         assert_eq!(managed_versions_to_remove(&installed, "", 3), ["2.29.0"]);
     }
@@ -2519,95 +2616,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn bundled_init_completes_without_node_or_npm_on_path() {
-        let engine = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("opencodex-engine");
-        let package = engine
-            .join("node_modules")
-            .join("@bitkyc08")
-            .join("opencodex");
-        let runtime = engine
-            .join("node_modules")
-            .join("bun")
-            .join("bin")
-            .join("bun.exe");
-        let cli = package.join("src").join("cli").join("index.ts");
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock is after Unix epoch")
-            .as_nanos();
-        let config_dir = std::env::temp_dir().join(format!(
-            "opencodex-manager-init-test-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&config_dir).expect("create isolated config directory");
-
-        let mut child = Command::new(runtime)
-            .arg(cli)
-            .arg("init")
-            .current_dir(package)
-            .env("OPENCODEX_HOME", &config_dir)
+    fn bundled_runtime_runs_without_node_or_npm_on_path() {
+        let runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../opencodex-engine/node_modules/bun/bin/bun.exe");
+        let output = Command::new(runtime)
+            .arg("--version")
             .env("PATH", "/usr/bin:/bin")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start bundled Engine init");
-
-        let mut stdout = child.stdout.take().expect("open Engine stdout");
-        let (stdout_sender, stdout_receiver) = mpsc::channel();
-        let stdout_reader = thread::spawn(move || {
-            let mut collected = Vec::new();
-            let mut buffer = [0_u8; 2048];
-            loop {
-                let size = stdout.read(&mut buffer).expect("read Engine stdout");
-                if size == 0 {
-                    return collected;
-                }
-                let chunk = buffer[..size].to_vec();
-                collected.extend_from_slice(&chunk);
-                let _ = stdout_sender.send(chunk);
-            }
-        });
-        let mut stderr = child.stderr.take().expect("open Engine stderr");
-        let stderr_reader = thread::spawn(move || {
-            let mut collected = Vec::new();
-            stderr
-                .read_to_end(&mut collected)
-                .expect("read Engine stderr");
-            collected
-        });
-
-        let mut stdin = child.stdin.take().expect("open Engine stdin");
-        let mut transcript = Vec::new();
-        for (prompt, answer) in [
-            ("Select default provider (number): ", "24"),
-            ("API key (usually blank — press Enter): ", ""),
-            ("Default model (optional): ", ""),
-            ("Proxy port [10100]: ", ""),
-            ("Inject into Codex config.toml? [Y/n]: ", "n"),
-            ("Install Codex autostart shim? [Y/n]: ", "n"),
-        ] {
-            wait_for_output(&stdout_receiver, &mut transcript, prompt);
-            writeln!(stdin, "{answer}").expect("answer isolated init prompt");
-            stdin.flush().expect("flush isolated init answer");
-        }
-        wait_for_output(&stdout_receiver, &mut transcript, "Setup complete");
-        drop(stdin);
-        let status = child.wait().expect("wait for Engine init");
-        let stdout = stdout_reader.join().expect("join stdout reader");
-        let stderr = stderr_reader.join().expect("join stderr reader");
-        let _ = fs::remove_dir_all(&config_dir);
-
-        assert!(
-            status.success(),
-            "init stderr: {}",
-            String::from_utf8_lossy(&stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&stdout).contains("Setup complete"),
-            "init did not reach completion"
-        );
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(!output.stdout.is_empty());
     }
 }

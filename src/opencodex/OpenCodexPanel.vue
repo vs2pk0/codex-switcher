@@ -2,12 +2,11 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import InstancePickerModal from "../components/InstancePickerModal.vue";
+import { instanceDisplayName } from "../services/instances";
 import type { CodexInstance } from "../services/instances";
 import { currentLanguage, formatTranslatedText, t } from "../i18n";
 import { filterMigrationAccounts, toggleVisibleAccounts } from "./accounts";
 import {
-  activateBundledOpenCodexEngine,
   deleteOpenCodexSwitcherAccount,
   deleteOpenCodexEngine,
   getOpenCodexEngineCatalog,
@@ -75,8 +74,11 @@ const visionLoading = ref(false);
 const visionSaving = ref(false);
 const visionSearch = ref("");
 const selectedVisionModels = ref<string[]>([]);
-const instancePickerVisible = ref(false);
-const pendingInstanceAction = ref<"sync" | "restore" | null>(null);
+const selectedInstanceId = ref("default");
+const selectedInstance = computed(() => props.instances.find((instance) => instance.id === selectedInstanceId.value));
+watch(() => props.instances, (instances) => {
+  if (!instances.some((instance) => instance.id === selectedInstanceId.value)) selectedInstanceId.value = "default";
+}, { immediate: true });
 let unlistenEvents: UnlistenFn | undefined;
 let unlistenEngine: UnlistenFn | undefined;
 let disposed = false;
@@ -166,6 +168,7 @@ async function refreshSnapshot(showError = true, quiet = false): Promise<void> {
   if (!quiet) loading.value = true;
   try {
     snapshot.value = await getOpenCodexSnapshot();
+    if (!quiet) emit("instances-refreshed");
     if (snapshot.value.running && snapshot.value.port) settings.value.port = snapshot.value.port;
   } catch (error) {
     if (showError) Message.error(formatTranslatedText("读取 OpenCodex 状态失败：{error}", { error: errorText(error) }));
@@ -186,12 +189,12 @@ async function executeAction(action: OpenCodexAction, instanceId?: string): Prom
       const confirmation = action === "restore"
         ? {
             title: t("恢复原生 Codex"),
-            content: t("将停止 OpenCodex 服务并恢复原生 Codex 配置，是否继续？"),
+            content: `${selectedInstance.value ? instanceDisplayName(selectedInstance.value) : t("系统默认实例（原版）")}：${t("仅恢复所选实例的原生配置，其他实例和共享服务不受影响。是否继续？")}`,
           }
         : action === "uninstall"
           ? {
               title: t("卸载 OpenCodex"),
-              content: t("将执行 OpenCodex 官方卸载流程。配置备份仍由 OpenCodex 自身策略处理，是否继续？"),
+              content: t("将先恢复所有实例的原生 Codex 配置，再卸载共享 OpenCodex 服务。任一实例恢复失败时将中止卸载。是否继续？"),
             }
           : action === "service_install"
             ? {
@@ -200,7 +203,7 @@ async function executeAction(action: OpenCodexAction, instanceId?: string): Prom
               }
             : {
                 title: t("取消后台服务"),
-                content: t("将停止并移除 OpenCodex 后台服务，同时恢复原生 Codex 配置；账号和 OpenCodex 配置仍会保留。是否继续？"),
+                content: t("将先恢复所有实例，再停止并移除 OpenCodex 后台服务；账号和 OpenCodex 配置仍会保留。是否继续？"),
               };
       Modal.warning({
         title: confirmation.title,
@@ -228,23 +231,16 @@ async function executeAction(action: OpenCodexAction, instanceId?: string): Prom
 
 async function run(action: OpenCodexAction): Promise<void> {
   if (busy.value) return;
+  if (!snapshot.value?.installed) {
+    Message.warning(t("尚未安装或选择 OpenCodex Engine，请先在版本管理中下载并激活版本"));
+    page.value = "versions";
+    return;
+  }
   if (action === "sync" || action === "restore") {
-    if (props.instances.length <= 1) {
-      await executeAction(action, props.instances[0]?.id || "default");
-      return;
-    }
-    pendingInstanceAction.value = action;
-    instancePickerVisible.value = true;
+    await executeAction(action, selectedInstanceId.value);
     return;
   }
   await executeAction(action);
-}
-
-async function confirmInstanceAction(instanceId: string): Promise<void> {
-  const action = pendingInstanceAction.value;
-  instancePickerVisible.value = false;
-  pendingInstanceAction.value = null;
-  if (action) await executeAction(action, instanceId);
 }
 
 async function submitCommandInput(): Promise<void> {
@@ -290,25 +286,21 @@ async function applyRelease(release: OpenCodexEngineRelease): Promise<void> {
   await maintainEngine(release.version);
 }
 
-async function rollbackEngine(): Promise<void> {
-  await maintainEngine(catalog.value?.bundledVersion || "", true);
-}
-
 async function switchInstalledVersion(version: string): Promise<void> {
   await maintainEngine(version);
 }
 
-async function maintainEngine(version: string, bundled = false): Promise<void> {
+async function maintainEngine(version: string): Promise<void> {
   if (accountMutationBusy.value || !version) return;
   const operationId = crypto.randomUUID();
   busy.value = true;
-  installingVersion.value = bundled ? "__bundled__" : version;
+  installingVersion.value = version;
   engineError.value = "";
   engineProgress.value = { operationId, version, stage: "checking" };
   try {
     unlistenEngine = await subscribeOpenCodexEngineProgress(operationId, (progress) => { engineProgress.value = progress; });
     if (disposed) return;
-    const result = bundled ? await activateBundledOpenCodexEngine(operationId) : await installOpenCodexEngine(version, operationId);
+    const result = await installOpenCodexEngine(version, operationId);
     engineProgress.value = { operationId, version: result.version, stage: "complete" };
     Message.success(result.message);
   } catch (error) {
@@ -416,7 +408,8 @@ async function saveVisionModels(): Promise<void> {
     .map((model) => ({ provider: model.provider, id: model.id }));
   visionSaving.value = true;
   try {
-    const result = await updateOpenCodexVisionModels(models);
+    const result = await updateOpenCodexVisionModels(models, selectedInstanceId.value);
+    emit("instances-refreshed");
     Message.success(result.message);
     await Promise.all([refreshSnapshot(false), loadVisionModels()]);
     if (result.changedProviders.length) {
@@ -572,8 +565,6 @@ watch(
       void refreshSnapshot(false, Boolean(installingVersion.value));
       return;
     }
-    instancePickerVisible.value = false;
-    pendingInstanceAction.value = null;
   },
 );
 
@@ -604,7 +595,7 @@ onMounted(async () => {
         });
         if (event.success) Message.success(event.message);
         else Message.error(event.message);
-        if (event.action === "sync" || event.action === "restore") {
+        if (["sync", "restore", "uninstall", "service_uninstall"].includes(event.action)) {
           emit("instances-refreshed");
         }
         void refreshSnapshot(false, true);
@@ -662,6 +653,11 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
       </button>
     </nav>
 
+    <a-alert v-if="snapshot && !snapshot.installed" type="warning">
+      {{ t("尚未安装或选择 OpenCodex Engine，请先在版本管理中下载并激活版本") }}
+      <a-button type="text" @click="page = 'versions'">{{ t("版本管理") }}</a-button>
+    </a-alert>
+
     <section v-if="engineProgress" class="engine-progress" :class="engineProgress.stage" aria-live="polite">
       <div class="engine-progress-heading"><strong>{{ engineStageLabel }}</strong><span>Engine v{{ engineProgress.version }}</span><span v-if="engineProgress.stage === 'downloading' && engineProgress.downloadedBytes != null">{{ formatBytes(engineProgress.downloadedBytes) }}<template v-if="engineProgress.totalBytes"> / {{ formatBytes(engineProgress.totalBytes) }}</template></span></div>
       <a-progress v-if="engineDownloadPercent !== null" :percent="engineDownloadPercent" animation />
@@ -671,7 +667,6 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
     </section>
 
     <a-spin :loading="loading" class="opencodex-content" :tip="t('正在读取 OpenCodex 状态…')">
-      <template v-if="page === 'console'">
         <section class="service-control-card">
           <div class="service-actions">
             <a-button type="primary" :disabled="busy || snapshot?.running || !snapshot?.initialized" @click="run('start')">
@@ -690,18 +685,25 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
               <template #icon><icon-sync /></template>{{ t("刷新状态") }}
             </a-button>
           </div>
+          <div class="instance-target-bar" :title="t('同步、恢复及图片模型同步作用于所选实例；服务由所有实例共享。')">
+            <label for="opencodex-instance-target">{{ t("目标实例") }}</label>
+            <a-select id="opencodex-instance-target" v-model="selectedInstanceId" :disabled="busy || visionSaving" :style="{ width: '230px', maxWidth: '100%' }">
+              <a-option v-if="!instances.some(instance => instance.id === 'default')" value="default">{{ t("系统默认实例（原版）") }}</a-option>
+              <a-option v-for="instance in instances" :key="instance.id" :value="instance.id">{{ instanceDisplayName(instance) }}</a-option>
+            </a-select>
+          </div>
           <div class="health-indicator">
             <icon-heart-fill />
             <span><small>{{ t("服务健康") }}</small><strong>{{ t(snapshot?.ready ? "正常" : snapshot?.running ? "正在就绪" : "未运行") }}</strong></span>
           </div>
         </section>
-
+      <template v-if="page === 'console'">
         <section class="overview-grid">
           <article class="overview-card">
             <span class="overview-icon green"><icon-apps /></span>
             <small>{{ t("Engine 版本") }}</small>
             <strong>{{ snapshot?.engineVersion ? `v${snapshot.engineVersion}` : t("资源不可用") }}</strong>
-            <p>{{ t(snapshot?.engineSource === "managed" ? "在线安装版本" : "客户端内置基线") }}</p>
+            <p>{{ t(snapshot?.installed ? "在线安装版本" : "请先下载 Engine") }}</p>
           </article>
           <article class="overview-card">
             <span class="overview-icon blue"><icon-thunderbolt /></span>
@@ -721,7 +723,7 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
           <article class="overview-card">
             <span class="overview-icon violet"><icon-link /></span>
             <small>{{ t("Codex 集成") }}</small>
-            <strong>{{ t(snapshot?.integrationStatus || "等待检测") }}</strong>
+            <strong>{{ t(selectedInstance?.openCodexConnected ? "已同步" : "未同步") }}</strong>
             <p>{{ t(snapshot?.initialized ? "配置与模型可同步" : "需要完成首次初始化") }}</p>
           </article>
         </section>
@@ -730,7 +732,7 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
           <div class="section-heading"><div><h2>{{ t("快捷操作") }}</h2><p>{{ t("所有命令均经过 Rust 白名单和参数校验") }}</p></div></div>
           <div class="quick-grid">
             <button :disabled="busy || !snapshot?.initialized" @click="run('doctor')"><span><icon-bug /></span><div><strong>{{ t("环境诊断") }}</strong><small>{{ t("检查运行环境与配置") }}</small></div><icon-right /></button>
-            <button :disabled="busy || !snapshot?.initialized" @click="run('sync')"><span><icon-sync /></span><div><strong>{{ t("同步配置") }}</strong><small>{{ t("重新同步 Codex 模型") }}</small></div><icon-right /></button>
+            <button :disabled="busy || !snapshot?.initialized" @click="run('sync')"><span><icon-sync /></span><div><strong>{{ t("同步配置") }}</strong><small>{{ t("恢复基础配置，同步后自动打开实例") }}</small></div><icon-right /></button>
             <button
               :class="{ 'toggle-enabled': snapshot?.backgroundService?.installed }"
               :disabled="busy || !snapshot?.initialized || snapshot?.backgroundService?.supported === false"
@@ -746,7 +748,7 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
                 {{ t(snapshot?.backgroundService?.installed ? "已开启" : "未开启") }}
               </em>
             </button>
-            <button :disabled="busy || !snapshot?.initialized" @click="run('restore')"><span><icon-undo /></span><div><strong>{{ t("恢复 Codex") }}</strong><small>{{ t("停止服务并还原配置") }}</small></div><icon-right /></button>
+            <button :disabled="busy || !snapshot?.initialized" @click="run('restore')"><span><icon-undo /></span><div><strong>{{ t("恢复 Codex") }}</strong><small>{{ t("仅还原所选实例配置") }}</small></div><icon-right /></button>
           </div>
         </section>
 
@@ -784,7 +786,7 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
 
       <template v-else-if="page === 'versions'">
         <section class="version-header-card">
-          <div><small>{{ t("当前 Engine") }}</small><strong>{{ snapshot?.engineVersion ? `v${snapshot.engineVersion}` : t("不可用") }}</strong><span>{{ t(snapshot?.engineSource === "managed" ? "在线版本" : "内置基线") }}</span></div>
+          <div><small>{{ t("当前 Engine") }}</small><strong>{{ snapshot?.engineVersion ? `v${snapshot.engineVersion}` : t("不可用") }}</strong><span>{{ t(snapshot?.installed ? "在线版本" : "请先下载 Engine") }}</span></div>
           <div><small>{{ t("最新稳定版") }}</small><strong>{{ catalog?.latestStable ? `v${catalog.latestStable.version}` : t("等待检测") }}</strong><span>GitHub Release</span></div>
           <div><small>{{ t("桌面客户端") }}</small><strong>v{{ snapshot?.desktopVersion || "-" }}</strong><span>{{ snapshot?.platform }}</span></div>
         </section>
@@ -795,7 +797,7 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
           </div>
           <div v-if="catalog?.latestStable" class="latest-release">
             <span class="release-icon"><icon-download /></span>
-            <div><a-tag :color="catalog.latestStable.newerThanCurrent ? 'orange' : 'green'">{{ t(catalog.latestStable.newerThanCurrent ? "发现新版本" : "已是最新稳定版") }}</a-tag><h3>OpenCodex Engine v{{ catalog.latestStable.version }}</h3><p>{{ t("内置版本始终保留，可随时安全回退。") }}</p></div>
+            <div><a-tag :color="catalog.latestStable.newerThanCurrent ? 'orange' : 'green'">{{ t(catalog.latestStable.newerThanCurrent ? "发现新版本" : "已是最新稳定版") }}</a-tag><h3>OpenCodex Engine v{{ catalog.latestStable.version }}</h3><p>{{ t("Engine 需单独下载；已安装的历史版本可在下方切换。") }}</p></div>
             <a-button type="primary" :loading="installingVersion === catalog.latestStable.version" :disabled="accountMutationBusy || !catalog.latestStable.newerThanCurrent" @click="applyRelease(catalog.latestStable)">{{ t("更新到最新版") }}</a-button>
           </div>
           <div class="local-version-section">
@@ -821,7 +823,6 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
               <a-option v-for="release in catalog?.releases || []" :key="release.version" :value="release.version">v{{ release.version }} · {{ t(release.prerelease ? "预览" : "稳定") }}{{ release.active ? ` · ${t("当前")}` : release.installed ? ` · ${t("已安装")}` : "" }}</a-option>
             </a-select>
             <a-button :loading="Boolean(selectedRelease && installingVersion === selectedRelease.version)" :disabled="accountMutationBusy || !selectedRelease || selectedRelease.active" @click="selectedRelease && applyRelease(selectedRelease)">{{ t(selectedRelease?.installed ? "切换版本" : "下载并使用") }}</a-button>
-            <a-button v-if="snapshot?.engineSource === 'managed'" :loading="installingVersion === '__bundled__'" :disabled="accountMutationBusy" @click="rollbackEngine"><template #icon><icon-undo /></template>{{ t("回退内置版本") }}</a-button>
           </div>
           </div>
         </section>
@@ -879,7 +880,7 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
           </a-spin>
           <footer class="vision-save-bar">
             <div><strong>{{ t("已选择") }} {{ selectedVisionCount }} {{ t("个兼容模型") }}</strong><span>{{ t("保存会自动重启 OpenCodex 并同步 Codex 模型目录") }}</span></div>
-            <a-button type="primary" size="large" :loading="visionSaving" :disabled="visionLoading" @click="saveVisionModels"><template #icon><icon-save /></template>{{ t("保存并同步") }}</a-button>
+            <a-button type="primary" size="large" :loading="visionSaving" :disabled="visionLoading || busy" @click="saveVisionModels"><template #icon><icon-save /></template>{{ t("保存并同步") }}</a-button>
           </footer>
         </section>
       </template>
@@ -969,20 +970,13 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
       </template>
     </a-spin>
 
-    <InstancePickerModal
-      v-model:visible="instancePickerVisible"
-      :instances="instances"
-      :title="t(pendingInstanceAction === 'restore' ? '选择要恢复的实例' : '选择要同步的实例')"
-      :description="pendingInstanceAction === 'restore'
-        ? t('OpenCodex 将只恢复所选实例的原生 Codex 配置。')
-        : t('OpenCodex 将只向所选实例同步配置与模型。')"
-      :confirm-text="t(pendingInstanceAction === 'restore' ? '恢复所选实例' : '同步所选实例')"
-      @confirm="confirmInstanceAction"
-    />
   </section>
 </template>
 
 <style scoped>
+.instance-target-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-left: auto; min-width: 0; }
+.instance-target-bar label { white-space: nowrap; font-size: 12px; color: #718096; }
+.service-control-card { flex-wrap: wrap; }
 .opencodex-page { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; gap: 18px; color: #101827; container-type: inline-size; }
 .opencodex-page > * { min-width: 0; }
 .opencodex-hero { display: flex; align-items: center; justify-content: space-between; gap: 20px; }

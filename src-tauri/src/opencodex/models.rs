@@ -235,7 +235,6 @@ pub struct EngineRelease {
 #[serde(rename_all = "camelCase")]
 pub struct EngineUpdateCatalog {
     pub current_version: Option<String>,
-    pub bundled_version: Option<String>,
     pub current_source: String,
     pub latest_stable: Option<EngineRelease>,
     pub latest_preview: Option<EngineRelease>,
@@ -319,6 +318,7 @@ pub struct VisionModelSelection {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateVisionModelsRequest {
     pub models: Vec<VisionModelSelection>,
+    pub instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
