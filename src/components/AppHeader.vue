@@ -145,7 +145,7 @@ const sidebarCollapsed = ref(true);
     </button>
   </aside>
 
-  <header class="topbar">
+  <header v-if="activeView !== 'openCodex' && activeView !== 'instances'" class="topbar">
     <div class="brand">
       <h1>Codex Switcher</h1>
       <p>{{ t("管理 OAuth 与 API Key 登录态，并写回本机 Codex 配置。") }}</p>

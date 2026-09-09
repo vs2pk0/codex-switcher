@@ -2107,10 +2107,21 @@ async fn reset_codex_config_toml(
     instance_id: Option<String>,
 ) -> Result<CodexConfigFileContent, String> {
     let instance_id = instance_id.unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
-    let backend = Arc::clone(backend.inner());
+    let backend = backend.inner().for_instance(Some(&instance_id))?;
     tauri::async_runtime::spawn_blocking(move || backend.reset_instance_config(&instance_id))
         .await
         .map_err(|e| format!("重置配置任务失败：{e}"))?
+}
+
+#[tauri::command]
+async fn delete_codex_instance(
+    backend: tauri::State<'_, Arc<opencodex::OpenCodexBackend>>,
+    instance_id: String,
+) -> Result<instances::DeleteCodexInstanceResult, String> {
+    let backend = Arc::clone(backend.inner());
+    tauri::async_runtime::spawn_blocking(move || backend.delete_instance(&instance_id))
+        .await
+        .map_err(|e| format!("删除实例任务失败：{e}"))?
 }
 
 fn reset_codex_config_for_instance(instance_id: &str) -> Result<CodexConfigFileContent, String> {
@@ -5483,7 +5494,7 @@ pub fn run() {
             instances::get_codex_instance_capabilities,
             instances::list_codex_instances,
             instances::save_codex_instance,
-            instances::delete_codex_instance,
+            delete_codex_instance,
             instances::launch_codex_instance,
             instances::stop_codex_instance,
             instances::restart_codex_instance,
@@ -5545,6 +5556,7 @@ pub fn run() {
             codex_list_session_visibility_repair_instances,
             codex_list_session_visibility_repair_providers,
             opencodex::opencodex_get_system_snapshot,
+            opencodex::opencodex_transfer_data,
             opencodex::opencodex_run_action,
             opencodex::opencodex_write_command_input,
             opencodex::opencodex_open_dashboard_window,
@@ -5559,6 +5571,8 @@ pub fn run() {
             opencodex::opencodex_delete_engine_version,
             opencodex::opencodex_get_vision_models,
             opencodex::opencodex_update_vision_models,
+            opencodex::opencodex_get_vision_sidecar_settings,
+            opencodex::opencodex_update_vision_sidecar_settings,
         ])
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {

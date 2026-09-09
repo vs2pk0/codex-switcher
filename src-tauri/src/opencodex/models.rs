@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemSnapshot {
+    pub instance_id: String,
+    pub data_dir: String,
     pub desktop_version: String,
     pub engine_version: Option<String>,
     pub engine_source: String,
@@ -262,6 +264,8 @@ pub struct EngineProgress {
 #[serde(rename_all = "camelCase")]
 pub struct DeleteEngineVersionRequest {
     pub version: String,
+    #[serde(default)]
+    pub remove_data: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +323,14 @@ pub struct VisionModelSelection {
 pub struct UpdateVisionModelsRequest {
     pub models: Vec<VisionModelSelection>,
     pub instance_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VisionSidecarUpdate {
+    pub model: String,
+    pub backend: Option<String>,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -1,4 +1,4 @@
-export type OpenCodexPage = "console" | "web" | "vision" | "versions" | "logs" | "settings";
+export type OpenCodexPage = "console" | "web" | "vision" | "versions" | "logs" | "settings" | "transfer";
 
 export type OpenCodexAction =
   | "init"
@@ -14,6 +14,8 @@ export type OpenCodexAction =
   | "uninstall";
 
 export interface OpenCodexSystemSnapshot {
+  instanceId: string;
+  dataDir: string;
   desktopVersion: string;
   engineVersion?: string | null;
   engineSource: "managed" | "missing";
@@ -161,4 +163,27 @@ export interface OpenCodexVisionModelsUpdateResult {
   selectedCount: number;
   changedProviders: string[];
   message: string;
+}
+
+export type OpenCodexVisionBackend = "openai" | "anthropic" | "routed";
+
+export interface OpenCodexVisionSidecarModelOption {
+  value: string;
+  label: string;
+  backend: OpenCodexVisionBackend;
+  baseline?: boolean;
+}
+
+export interface OpenCodexVisionSidecarSettings {
+  enabled: boolean;
+  model: string;
+  backend?: OpenCodexVisionBackend | null;
+  reasoning?: string;
+  maxDescriptionsPerTurn?: number;
+  timeoutMs?: number;
+}
+
+export interface OpenCodexVisionSidecarResponse {
+  vision: OpenCodexVisionSidecarSettings;
+  visionModels: OpenCodexVisionSidecarModelOption[];
 }

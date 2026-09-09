@@ -51,6 +51,7 @@ textarea {
   flex-direction: column;
 }
 
+
 .app-shell:has(.app-sidebar.collapsed) {
   padding-left: 96px;
 }
@@ -3784,6 +3785,20 @@ textarea {
     transform 160ms ease,
     background-color 160ms ease,
     box-shadow 160ms ease;
+}
+
+.usage-activity-tooltip {
+  display: grid;
+  gap: 6px;
+  min-width: 200px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-activity-tooltip > span {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
 }
 
 .usage-activity-cell:hover {

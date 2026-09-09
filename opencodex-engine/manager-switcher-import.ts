@@ -134,7 +134,8 @@ function tokensOf(account: SwitcherAccount): SwitcherTokens {
 }
 
 function defaultSourcePath(): string {
-  return join(homedir(), ".codex_switcher", "account", "accounts.json");
+  return process.env.OPENCODEX_SWITCHER_ACCOUNTS_PATH
+    || join(homedir(), ".codex_switcher", "account", "accounts.json");
 }
 
 function readJsonObject(path: string): Record<string, unknown> {

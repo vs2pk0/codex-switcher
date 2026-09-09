@@ -1372,13 +1372,26 @@ onBeforeUnmount(() => {
                 class="usage-activity-grid"
                 :style="{ '--activity-columns': activityColumnCount, '--activity-rows': activityRowCount }"
               >
-                <i
+                <a-tooltip
                   v-for="cell in activityCells"
                   :key="cell.key"
-                  class="usage-activity-cell"
-                  :class="`level-${cell.level}`"
-                  :title="activityCellTitle(cell)"
-                />
+                  position="top"
+                  :mouse-enter-delay="100"
+                >
+                  <template #content>
+                    <div class="usage-activity-tooltip">
+                      <strong>{{ cell.label }}</strong>
+                      <span>{{ t("当日") }} Token <b>{{ formatFullNumber(cell.tokens) }}</b></span>
+                      <span>{{ t("累计") }} Token <b>{{ formatFullNumber(cell.value) }}</b></span>
+                      <span>{{ t("请求次数") }} <b>{{ formatLocalizedCount(cell.requests, "次") }}</b></span>
+                    </div>
+                  </template>
+                  <i
+                    class="usage-activity-cell"
+                    :class="`level-${cell.level}`"
+                    :aria-label="`${cell.label}: ${t('当日')} ${formatFullNumber(cell.tokens)} Tokens, ${activityCellTitle(cell)}`"
+                  />
+                </a-tooltip>
               </div>
               <div
                 class="usage-activity-months"

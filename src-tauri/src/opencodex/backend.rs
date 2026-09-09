@@ -6,6 +6,7 @@ use super::models::{
     ImportSwitcherAccountsRequest, InstallEngineVersionRequest, RunActionRequest,
     SwitcherAccountScan, SwitcherDeleteResult, SwitcherImportResult, SystemSnapshot,
     UpdateVisionModelsRequest, VisionModel, VisionModelCatalog, VisionModelsUpdateResult,
+    VisionSidecarUpdate,
 };
 use chrono::Utc;
 use once_cell::sync::Lazy;
@@ -96,12 +97,498 @@ struct ManagementModelRow {
 pub struct Backend {
     app: AppHandle,
     root: PathBuf,
+    instance_id: String,
+    home: PathBuf,
+    codex_home: PathBuf,
+    default_port: u16,
+    children: Mutex<HashMap<String, Arc<Backend>>>,
     operation_busy: AtomicBool,
     interactive: Mutex<Option<InteractiveProcess>>,
     sequence: AtomicU64,
 }
 
 impl Backend {
+    pub fn delete_instance(
+        self: &Arc<Self>,
+        id: &str,
+    ) -> Result<crate::instances::DeleteCodexInstanceResult, String> {
+        if id == "default" {
+            return Err("系统默认实例不能删除".into());
+        }
+        let instance = self.for_instance(Some(id))?;
+        instance.begin_mutation()?;
+        let result = (|| {
+            if let Ok(launcher) = instance.active_launcher() {
+                let service = instance.query_background_service_state()?;
+                if service.conflict {
+                    return Err("该实例后台服务状态存在冲突，请先修复再删除".into());
+                }
+                if let Some(port) = instance.running_open_codex_port() {
+                    instance.stop_for_account_binding(&launcher, port)?;
+                }
+                if service.installed {
+                    let output = instance
+                        .command(&launcher, &["service".into(), "uninstall".into()])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output()
+                        .map_err(|e| e.to_string())?;
+                    if !output.status.success() {
+                        return Err(format!(
+                            "移除实例后台服务失败：{}",
+                            instance.redact(String::from_utf8_lossy(&output.stderr).trim())
+                        ));
+                    }
+                    if instance.query_background_service_state()?.installed {
+                        return Err("实例后台服务尚未移除，未删除数据".into());
+                    }
+                }
+            } else if instance.home.join("service-state.json").exists()
+                || instance.read_runtime_port().is_some()
+            {
+                return Err(
+                    "该实例仍有运行记录，但 Engine 不可用；请重新激活 Engine 并停止服务后删除"
+                        .into(),
+                );
+            }
+            crate::instances::delete_codex_instance(id.to_string())
+        })();
+        // Keep this backend cached while concurrent requests wind down. Registry
+        // resolution checks the instance list first, so deleted IDs cannot revive it.
+        instance.finish_mutation();
+        result
+    }
+
+    fn data_helper(&self, action: &str, input: &Value) -> Result<Value, String> {
+        let mut command = Command::new(self.bundled_runtime_path()?);
+        command
+            .arg(self.bundled_engine_dir()?.join("manager-data-transfer.ts"))
+            .arg(action)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        self.configure_environment(&mut command);
+        hide_command_window(&mut command);
+        let mut child = command.spawn().map_err(|e| e.to_string())?;
+        let write = child.stdin.take().ok_or("数据传输入口不可用")?.write_all(
+            serde_json::to_string(input)
+                .map_err(|e| e.to_string())?
+                .as_bytes(),
+        );
+        if let Err(e) = write {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e.to_string());
+        }
+        let output = child.wait_with_output().map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(self.redact(String::from_utf8_lossy(&output.stderr).trim()));
+        }
+        serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())
+    }
+
+    pub fn transfer_data(
+        &self,
+        target: &Self,
+        mode: &str,
+        history: bool,
+        execute: bool,
+        fingerprint: Option<&str>,
+    ) -> Result<Value, String> {
+        if self.instance_id == target.instance_id {
+            return Err("请选择不同的源和目标实例".into());
+        }
+        let (first, second) = if self.instance_id < target.instance_id {
+            (self, target)
+        } else {
+            (target, self)
+        };
+        first.begin_mutation()?;
+        if let Err(e) = second.begin_mutation() {
+            first.finish_mutation();
+            return Err(e);
+        }
+        let result = (|| {
+            let source_version = self
+                .active_launcher()?
+                .version
+                .ok_or("源实例没有可复制的 Engine")?;
+            let target_version = target.active_launcher().ok().and_then(|l| l.version);
+            let align_engine =
+                transfer_engine_needs_alignment(&source_version, target_version.as_deref());
+            let input = serde_json::json!({
+                "source": self.home, "target": target.home, "manager": target.root,
+                "port": target.read_configured_port().unwrap_or(target.default_port),
+                "mode": mode, "history": history, "execute": execute,
+                "fingerprint": fingerprint,
+                "sourceEngine": source_version, "targetEngine": target_version,
+            });
+            if !execute {
+                let mut result = target.data_helper("transfer", &input)?;
+                if align_engine {
+                    result["rows"]
+                        .as_array_mut()
+                        .ok_or("传输预览格式无效")?
+                        .insert(
+                            0,
+                            serde_json::json!({
+                                "name": if target_version.is_some() {
+                                    format!("Engine v{source_version}（复制并切换）")
+                                } else {
+                                    format!("Engine v{source_version}（完整复制）")
+                                },
+                                "source": 1,
+                                "target": usize::from(target_version.is_some()),
+                                "result": 1
+                            }),
+                        );
+                }
+                return Ok(result);
+            }
+            // Validate data before stopping either runtime.
+            let mut preview = input.clone();
+            preview["execute"] = Value::Bool(false);
+            let checked = target.data_helper("transfer", &preview)?;
+            if checked.get("fingerprint").and_then(Value::as_str) != fingerprint {
+                return Err("源或目标数据/Engine 版本已变化，请重新预览后再执行".into());
+            }
+            let source_port = self.running_open_codex_port();
+            let target_port = target.running_open_codex_port();
+            let source_launcher = if source_port.is_some() {
+                Some(self.active_launcher()?)
+            } else {
+                None
+            };
+            let target_launcher = if target_port.is_some() {
+                Some(target.active_launcher()?)
+            } else {
+                None
+            };
+            let source_mode = source_launcher
+                .as_ref()
+                .map(|_| self.query_background_service_state())
+                .transpose()?;
+            let target_mode = target_launcher
+                .as_ref()
+                .map(|_| target.query_background_service_state())
+                .transpose()?;
+            let mut copied_engine_directory = None;
+            let operation = (|| {
+                if let (Some(l), Some(p)) = (&source_launcher, source_port) {
+                    self.stop_for_account_binding(l, p)?;
+                }
+                if let (Some(l), Some(p)) = (&target_launcher, target_port) {
+                    target.stop_for_account_binding(l, p)?;
+                }
+                if align_engine {
+                    let directory = target.managed_engine_root().join(&source_version);
+                    if !directory.exists() {
+                        fs::create_dir_all(target.managed_engine_root())
+                            .map_err(|e| e.to_string())?;
+                        let stage = target
+                            .managed_engine_root()
+                            .join(target.operation_id("copy-stage"));
+                        let prepare = (|| {
+                            super::isolation::copy_engine_tree(
+                                &self.managed_engine_root().join(&source_version),
+                                &stage,
+                            )?;
+                            let package = stage.join("node_modules/@bitkyc08/opencodex");
+                            super::isolation::rebind_engine(
+                                &package,
+                                &target.instance_id,
+                                &dirs::home_dir().ok_or("无法定位用户目录")?,
+                            )?;
+                            validate_managed_package(&package, &source_version)?;
+                            fs::rename(&stage, &directory).map_err(|e| e.to_string())
+                        })();
+                        if let Err(error) = prepare {
+                            if stage.exists() {
+                                let _ = fs::remove_dir_all(&stage);
+                            }
+                            return Err(error);
+                        }
+                        copied_engine_directory = Some(directory);
+                    }
+                    if let Err(error) = target.activate_engine_safely(&source_version, "transfer") {
+                        if let Some(directory) = &copied_engine_directory {
+                            let _ = fs::remove_dir_all(directory);
+                        }
+                        return Err(error);
+                    }
+                }
+                let result = target.data_helper("transfer", &input);
+                if result.is_err() && align_engine {
+                    target.write_active_engine(target_version.as_deref())?;
+                    if let Some(directory) = &copied_engine_directory {
+                        fs::remove_dir_all(directory)
+                            .map_err(|e| format!("复制失败后的 Engine 清理失败：{e}"))?;
+                    }
+                }
+                result.map(|mut value| {
+                    if align_engine {
+                        value["message"] = Value::String(if target_version.is_some() {
+                            format!("数据已复制，目标 Engine 已安全切换为 v{source_version}；端口与实例身份保持独立")
+                        } else {
+                            format!("Engine v{source_version} 和数据已复制，目标可直接启动，无需安装；端口与实例身份保持独立")
+                        });
+                    }
+                    value
+                })
+            })();
+            let restart_target_launcher =
+                if operation.is_ok() && align_engine && target_port.is_some() {
+                    Some(target.active_launcher()?)
+                } else {
+                    target_launcher.clone()
+                };
+            let mut restart_errors = Vec::new();
+            if let (Some(l), Some(p), Some(mode)) = (&source_launcher, source_port, &source_mode) {
+                if !self.open_codex_service_running() {
+                    if let Err(e) =
+                        self.restart_after_account_binding(l, p, account_binding_restart_mode(mode))
+                    {
+                        restart_errors.push(e);
+                    }
+                }
+            }
+            if let (Some(l), Some(p), Some(mode)) =
+                (&restart_target_launcher, target_port, &target_mode)
+            {
+                if !target.open_codex_service_running() {
+                    if let Err(e) = target.restart_after_account_binding(
+                        l,
+                        p,
+                        account_binding_restart_mode(mode),
+                    ) {
+                        restart_errors.push(e);
+                        if let Ok(ref transferred) = operation {
+                            if let Some(backup) =
+                                transferred.get("backupPath").and_then(Value::as_str)
+                            {
+                                let recovery = (|| -> Result<(), String> {
+                                    if target.open_codex_service_running() {
+                                        target.stop_for_account_binding(l, p)?;
+                                    }
+                                    fs::rename(
+                                        &target.home,
+                                        target.root.join(target.operation_id("failed-transfer")),
+                                    )
+                                    .map_err(|e| e.to_string())?;
+                                    fs::rename(backup, &target.home).map_err(|e| e.to_string())?;
+                                    if align_engine {
+                                        target.write_active_engine(target_version.as_deref())?;
+                                        if let Some(directory) = &copied_engine_directory {
+                                            if directory.exists() {
+                                                fs::remove_dir_all(directory).map_err(|e| {
+                                                    format!("目标回滚后的 Engine 清理失败：{e}")
+                                                })?;
+                                            }
+                                        }
+                                    }
+                                    target.restart_after_account_binding(
+                                        target_launcher.as_ref().unwrap_or(l),
+                                        p,
+                                        account_binding_restart_mode(mode),
+                                    )?;
+                                    Ok(())
+                                })();
+                                restart_errors.push(match recovery {
+                                    Ok(()) => "目标数据已回滚，原服务已恢复".into(),
+                                    Err(e) => format!("目标恢复失败：{e}；备份位于 {backup}"),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            if !restart_errors.is_empty() {
+                return Err(format!(
+                    "{}；{}",
+                    operation
+                        .as_ref()
+                        .err()
+                        .map(String::as_str)
+                        .unwrap_or("传输后的服务恢复失败"),
+                    restart_errors.join("；")
+                ));
+            }
+            operation
+        })();
+        second.finish_mutation();
+        first.finish_mutation();
+        result
+    }
+
+    /// Immutable per-instance backends: asynchronous work never follows a UI selection.
+    pub fn for_instance(self: &Arc<Self>, id: Option<&str>) -> Result<Arc<Self>, String> {
+        let instance = crate::instances::resolve_instance(id.unwrap_or("default"))?;
+        if instance.is_default {
+            return Ok(Arc::clone(self));
+        }
+        if !instance
+            .id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err("实例 ID 不安全".into());
+        }
+        let mut children = self.children.lock().map_err(|_| "实例管理锁不可用")?;
+        if let Some(child) = children.get(&instance.id) {
+            if child.codex_home.as_path() == Path::new(&instance.codex_home) {
+                return Ok(Arc::clone(child));
+            }
+            if child.operation_busy.load(Ordering::Acquire) || child.open_codex_service_running() {
+                return Err("请先停止该实例 OpenCodex，再变更实例目录".into());
+            }
+        }
+        let profile = crate::instances::default_profile_root(&instance.id);
+        super::isolation::validate_directory(&profile)?;
+        let home = profile.join(".opencodex");
+        let root = profile.join("opencodex-manager");
+        super::isolation::validate_directory(&home)?;
+        super::isolation::validate_directory(&root)?;
+        fs::create_dir_all(root.join("logs")).map_err(|e| e.to_string())?;
+        let port_path = root.join("port.json");
+        let default_port = if port_path.exists() {
+            let port: u16 =
+                serde_json::from_slice(&fs::read(&port_path).map_err(|e| e.to_string())?)
+                    .map_err(|e| format!("实例端口记录无效：{e}"))?;
+            validate_port(port)?;
+            port
+        } else {
+            let mut reserved = HashSet::from([self.read_configured_port().unwrap_or(DEFAULT_PORT)]);
+            reserved.extend(children.values().map(|child| child.default_port));
+            for other in crate::instances::list_codex_instances()? {
+                let path = crate::instances::default_profile_root(&other.id)
+                    .join("opencodex-manager/port.json");
+                if let Ok(bytes) = fs::read(path) {
+                    if let Ok(port) = serde_json::from_slice::<u16>(&bytes) {
+                        reserved.insert(port);
+                    }
+                }
+            }
+            let port = (15801..=65535)
+                .find(|p| {
+                    !reserved.contains(p) && std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok()
+                })
+                .ok_or("没有可用的实例端口")?;
+            fs::write(&port_path, port.to_string()).map_err(|e| e.to_string())?;
+            port
+        };
+        let child = Arc::new(Self {
+            app: self.app.clone(),
+            root,
+            home,
+            default_port,
+            instance_id: instance.id.clone(),
+            codex_home: PathBuf::from(instance.codex_home),
+            operation_busy: AtomicBool::new(false),
+            interactive: Mutex::new(None),
+            sequence: AtomicU64::new(1),
+            children: Mutex::new(HashMap::new()),
+        });
+        children.insert(instance.id, Arc::clone(&child));
+        Ok(child)
+    }
+
+    fn configure_environment(&self, command: &mut Command) {
+        command
+            .env("OPENCODEX_HOME", &self.home)
+            .env("CODEX_HOME", &self.codex_home)
+            .env("CODEX_SQLITE_HOME", &self.codex_home)
+            .env(
+                "OPENCODEX_SWITCHER_ACCOUNTS_PATH",
+                crate::switcher_data_dir().join("account/accounts.json"),
+            )
+            .env(
+                "OPENCODEX_SYSTEM_SERVICE_NAME",
+                if self.instance_id == "default" {
+                    "opencodex-proxy".to_string()
+                } else {
+                    format!("opencodex-proxy-{}", self.instance_id)
+                },
+            );
+        // Scope fallback caches, other client integrations and relative storage
+        // paths to the child process; never mutate the desktop's environment.
+        if self.instance_id != "default" {
+            if let Some(profile) = self.home.parent() {
+                command
+                    .env("HOME", profile)
+                    .env("USERPROFILE", profile)
+                    .env("XDG_CONFIG_HOME", profile.join(".config"))
+                    .env("XDG_DATA_HOME", profile.join(".local/share"))
+                    .env("XDG_CACHE_HOME", profile.join(".cache"));
+            }
+        }
+    }
+
+    fn read_configured_port(&self) -> Option<u16> {
+        super::isolation::read_port(&self.home.join("config.json"))
+    }
+
+    fn read_runtime_port(&self) -> Option<u16> {
+        super::isolation::read_port(&self.home.join("runtime-port.json"))
+    }
+
+    fn owned_health(&self, port: u16) -> Option<HealthBody> {
+        let health = probe_health(port)?;
+        let record: Value =
+            serde_json::from_slice(&fs::read(self.home.join("runtime-port.json")).ok()?).ok()?;
+        (record.get("port")?.as_u64()? == u64::from(port)
+            && record.get("pid")?.as_u64()? == u64::from(health.pid?))
+        .then_some(health)
+    }
+
+    fn running_open_codex_port(&self) -> Option<u16> {
+        self.read_runtime_port()
+            .filter(|p| self.owned_health(*p).is_some())
+    }
+
+    fn open_codex_service_running(&self) -> bool {
+        self.running_open_codex_port().is_some()
+    }
+
+    fn validate_instance_port(&self, port: u16) -> Result<(), String> {
+        for other in crate::instances::list_codex_instances()? {
+            if other.id == self.instance_id {
+                continue;
+            }
+            let home = if other.is_default {
+                config_dir().ok_or("无法定位主实例")?
+            } else {
+                crate::instances::default_profile_root(&other.id).join(".opencodex")
+            };
+            let allocated = if other.is_default {
+                Some(DEFAULT_PORT)
+            } else {
+                fs::read(
+                    crate::instances::default_profile_root(&other.id)
+                        .join("opencodex-manager/port.json"),
+                )
+                .ok()
+                .and_then(|b| serde_json::from_slice::<u16>(&b).ok())
+            };
+            if allocated == Some(port)
+                || super::isolation::read_port(&home.join("config.json")) == Some(port)
+                || super::isolation::read_port(&home.join("runtime-port.json")) == Some(port)
+            {
+                return Err(format!(
+                    "端口 {port} 属于实例 {}，请选择其他端口",
+                    other.name
+                ));
+            }
+        }
+        if TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), HTTP_TIMEOUT)
+            .is_ok()
+            && self.owned_health(port).is_none()
+        {
+            return Err(format!("端口 {port} 被其他进程占用，未操作该进程"));
+        }
+        Ok(())
+    }
+
     pub fn new(app: AppHandle) -> Result<Self, String> {
         let root = app
             .path()
@@ -113,6 +600,11 @@ impl Backend {
         Ok(Self {
             app,
             root,
+            instance_id: "default".into(),
+            home: config_dir().ok_or("无法定位 OpenCodex 目录")?,
+            codex_home: crate::instances::codex_home_for(None)?,
+            default_port: DEFAULT_PORT,
+            children: Mutex::new(HashMap::new()),
             operation_busy: AtomicBool::new(false),
             interactive: Mutex::new(None),
             sequence: AtomicU64::new(1),
@@ -122,8 +614,27 @@ impl Backend {
     fn begin_mutation(&self) -> Result<(), String> {
         self.operation_busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| ())
-            .map_err(|_| "已有操作正在执行，请等待完成后重试".to_string())
+            .map_err(|_| "已有操作正在执行，请等待完成后重试".to_string())?;
+        let check = (|| {
+            if self.instance_id != "default" {
+                super::isolation::validate_directory(&self.home)?;
+                super::isolation::validate_directory(&self.root)?;
+            }
+            if self.root.join("transfer-journal.json").exists() {
+                if self.open_codex_service_running() {
+                    return Err("存在未完成的数据传输，请停止服务后恢复".into());
+                }
+                self.data_helper(
+                    "recover",
+                    &serde_json::json!({"manager": self.root, "target": self.home}),
+                )?;
+            }
+            Ok(())
+        })();
+        if check.is_err() {
+            self.finish_mutation();
+        }
+        check
     }
 
     fn finish_mutation(&self) {
@@ -132,7 +643,11 @@ impl Backend {
 
     fn operation_id(&self, action: &str) -> String {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        format!("{action}-{}-{sequence}", Utc::now().timestamp_millis())
+        format!(
+            "{}:{action}-{}-{sequence}",
+            self.instance_id,
+            Utc::now().timestamp_millis()
+        )
     }
 
     fn manager_log_path(&self) -> PathBuf {
@@ -227,6 +742,14 @@ impl Backend {
         })?;
         let package_root = self.managed_package_root(&version);
         validate_managed_package(&package_root, &version)?;
+        if self.instance_id != "default"
+            && fs::read_to_string(package_root.join(".switcher-instance"))
+                .ok()
+                .as_deref()
+                != Some(&self.instance_id)
+        {
+            return Err("Engine 尚未完成实例隔离，请在版本管理中重新激活该版本".into());
+        }
         let cli = package_root.join("src").join("cli").join("index.ts");
         if !cli.is_file() {
             return Err(format!(
@@ -382,7 +905,7 @@ impl Backend {
         &self,
         launcher: &Launcher,
         args: &[String],
-        codex_home: Option<&Path>,
+        _codex_home: Option<&Path>,
     ) -> Command {
         let mut command = Command::new(&launcher.program);
         command.args(&launcher.prefix_args).args(args);
@@ -390,25 +913,15 @@ impl Backend {
             command.current_dir(working_dir);
         }
         command.env("NO_COLOR", "1").env("FORCE_COLOR", "0");
-        let effective_codex_home = codex_home
-            .map(Path::to_path_buf)
-            .or_else(|| crate::instances::codex_home_for(None).ok());
-        if let Some(path) = effective_codex_home {
-            command.env("CODEX_HOME", path);
-        } else {
-            command.env_remove("CODEX_HOME");
-        }
+        self.configure_environment(&mut command);
         hide_command_window(&mut command);
         command
     }
 
     pub fn snapshot(&self) -> SystemSnapshot {
-        let configured_port = read_configured_port().unwrap_or(DEFAULT_PORT);
-        let runtime_port = read_runtime_port();
-        let mut health = runtime_port.and_then(probe_health);
-        if health.is_none() && runtime_port != Some(configured_port) {
-            health = probe_health(configured_port);
-        }
+        let configured_port = self.read_configured_port().unwrap_or(self.default_port);
+        let runtime_port = self.read_runtime_port();
+        let health = runtime_port.and_then(|p| self.owned_health(p));
         let live_port = health
             .as_ref()
             .and_then(|body| body.port)
@@ -428,7 +941,7 @@ impl Backend {
             .map_or("missing", |item| item.source)
             .to_string();
         let installed = launcher.is_some();
-        let configuration = config_dir();
+        let configuration = Some(self.home.clone());
         let initialized = configuration.as_deref().is_some_and(config_is_initialized);
         let codex_integration_enabled = configuration
             .as_deref()
@@ -449,6 +962,8 @@ impl Backend {
         };
         let background_service = self.background_service_state();
         SystemSnapshot {
+            instance_id: self.instance_id.clone(),
+            data_dir: self.home.to_string_lossy().into_owned(),
             desktop_version: self.app.package_info().version.to_string(),
             engine_version,
             engine_source,
@@ -466,10 +981,70 @@ impl Backend {
         }
     }
 
+    pub fn vision_sidecar_settings(
+        &self,
+        update: Option<VisionSidecarUpdate>,
+    ) -> Result<Value, String> {
+        let mut update = update;
+        if let Some(settings) = update.as_mut() {
+            settings.model = settings.model.trim().to_string();
+            validate_vision_sidecar_update(settings)?;
+            self.begin_mutation()?;
+        }
+        let result = (|| {
+            let port = self
+                .running_open_codex_port()
+                .ok_or("请先启动所选实例的 OpenCodex 服务")?;
+            let token = fs::read_to_string(self.home.join("admin-api-token"))
+                .map_err(|_| "无法读取所选实例的管理凭证".to_string())?;
+            if token.trim().is_empty() {
+                return Err("所选实例的管理凭证为空".into());
+            }
+            let client = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let url = format!("http://127.0.0.1:{port}/api/sidecar-settings");
+            let request = match update.as_ref() {
+                Some(settings) => client
+                    .put(&url)
+                    .json(&serde_json::json!({ "vision": settings })),
+                None => client.get(&url),
+            };
+            let response = request
+                .bearer_auth(token.trim())
+                .send()
+                .map_err(|e| format!("图片描述设置请求失败：{e}"))?;
+            let status = response.status();
+            let body: Value = response
+                .json()
+                .map_err(|_| "图片描述设置接口返回无效数据".to_string())?;
+            if !status.is_success() {
+                let detail = body
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("当前 Engine 不支持图片描述设置接口");
+                return Err(format!(
+                    "图片描述设置失败（{status}）：{}",
+                    self.redact(detail)
+                ));
+            }
+            // Only expose vision data; other sidecars may contain unrelated credentials.
+            Ok(
+                serde_json::json!({ "vision": body.get("vision"), "visionModels": body.get("visionModels") }),
+            )
+        })();
+        if update.is_some() {
+            self.finish_mutation();
+        }
+        result
+    }
+
     pub fn get_vision_models(&self) -> Result<VisionModelCatalog, String> {
-        let port = running_open_codex_port()
+        let port = self
+            .running_open_codex_port()
             .ok_or_else(|| "请先启动 OpenCodex 服务，再读取当前模型".to_string())?;
-        let directory = config_dir().ok_or_else(|| "无法定位 OpenCodex 配置目录".to_string())?;
+        let directory = self.home.clone();
         let token = fs::read_to_string(directory.join("admin-api-token"))
             .map_err(|error| format!("无法读取 OpenCodex 管理凭证：{error}"))?;
         let token = token.trim();
@@ -541,7 +1116,7 @@ impl Backend {
         &self,
         request: UpdateVisionModelsRequest,
     ) -> Result<VisionModelsUpdateResult, String> {
-        let codex_home = crate::instances::codex_home_for(request.instance_id.as_deref())?;
+        let codex_home = self.codex_home.clone();
         let live = self.get_vision_models()?;
         let known = live
             .models
@@ -638,13 +1213,12 @@ impl Backend {
                     });
                 }
             }
-            // Provider capabilities belong to the shared service, but the
-            // catalog/routing destination is the explicitly selected instance.
+            // Provider capabilities and routing both belong to this instance.
             self.run_instance_integration_helper(
                 &CommandAction::Sync,
-                read_runtime_port()
-                    .or_else(read_configured_port)
-                    .unwrap_or(DEFAULT_PORT),
+                self.read_runtime_port()
+                    .or_else(|| self.read_configured_port())
+                    .unwrap_or(self.default_port),
                 &codex_home,
             )?;
             let count = selected.len();
@@ -710,7 +1284,7 @@ impl Backend {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        command.env("CODEX_HOME", crate::instances::codex_home_for(None)?);
+        self.configure_environment(&mut command);
         hide_command_window(&mut command);
         let output = command
             .output()
@@ -751,7 +1325,7 @@ impl Backend {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        command.env("CODEX_HOME", crate::instances::codex_home_for(None)?);
+        self.configure_environment(&mut command);
         hide_command_window(&mut command);
         let output = command
             .output()
@@ -773,6 +1347,7 @@ impl Backend {
         request: RunActionRequest,
     ) -> Result<CommandStarted, String> {
         validate_port(request.port)?;
+        self.validate_instance_port(request.port)?;
         let isolated_instance_integration =
             isolated_instance_integration_action(&request.action, request.instance_id.as_deref());
         let codex_home = if matches!(
@@ -783,7 +1358,7 @@ impl Backend {
                 request.instance_id.as_deref(),
             )?)
         } else {
-            None
+            Some(self.codex_home.clone())
         };
         self.begin_mutation()?;
         let launcher = match self.active_launcher() {
@@ -843,7 +1418,7 @@ impl Backend {
                 .map(|message| (Some(0), message))
             })
         } else if matches!(action, CommandAction::Start) {
-            if probe_health(port).is_some() {
+            if self.owned_health(port).is_some() {
                 self.emit_log(&operation_id, "system", "OpenCodex 服务已经在运行。");
                 Ok((Some(0), "服务已在运行".to_string()))
             } else {
@@ -868,19 +1443,12 @@ impl Backend {
                 action,
                 CommandAction::Uninstall | CommandAction::ServiceUninstall
             ) {
-                crate::instances::list_codex_instances().and_then(|instances| {
-                    for instance in instances {
-                        self.run_instance_integration_helper(
-                            &CommandAction::Restore,
-                            port,
-                            Path::new(&instance.codex_home),
-                        )
-                        .map_err(|error| {
-                            format!("实例 {} 恢复失败，已中止卸载：{error}", instance.name)
-                        })?;
-                    }
-                    Ok(())
-                })
+                self.run_instance_integration_helper(
+                    &CommandAction::Restore,
+                    port,
+                    &self.codex_home,
+                )
+                .map(|_| ())
             } else {
                 Ok(())
             };
@@ -997,6 +1565,7 @@ impl Backend {
         operation_id: Option<&str>,
     ) -> Result<HealthBody, String> {
         validate_port(port)?;
+        self.validate_instance_port(port)?;
         let args = vec!["start".to_string(), "--port".to_string(), port.to_string()];
         if let Some(id) = operation_id {
             self.emit_log(id, "system", &format!("后台启动：ocx start --port {port}"));
@@ -1036,7 +1605,7 @@ impl Backend {
                 let correct_version = expected_version
                     .map(|expected| health.version.as_deref() == Some(expected))
                     .unwrap_or(true);
-                if correct_version {
+                if correct_version && health.pid == Some(child.id()) {
                     thread::spawn(move || {
                         let _ = child.wait();
                     });
@@ -1091,7 +1660,10 @@ impl Backend {
         validate_port(port)?;
         let url = tauri::Url::parse(&format!("http://127.0.0.1:{port}"))
             .map_err(|error| format!("Dashboard 地址无效：{error}"))?;
-        if let Some(window) = self.app.get_webview_window("opencodex-dashboard") {
+        if let Some(window) = self
+            .app
+            .get_webview_window(&format!("opencodex-dashboard-{}", self.instance_id))
+        {
             window
                 .navigate(url)
                 .map_err(|error| format!("无法刷新 Dashboard 窗口：{error}"))?;
@@ -1103,14 +1675,18 @@ impl Backend {
                 .map_err(|error| format!("无法聚焦 Dashboard 窗口：{error}"))?;
             return Ok(());
         }
-        WebviewWindowBuilder::new(&self.app, "opencodex-dashboard", WebviewUrl::External(url))
-            .title("OpenCodex Web 管理")
-            .inner_size(1280.0, 820.0)
-            .min_inner_size(900.0, 620.0)
-            .center()
-            .build()
-            .map(|_| ())
-            .map_err(|error| format!("无法创建 Dashboard 窗口：{error}"))
+        WebviewWindowBuilder::new(
+            &self.app,
+            format!("opencodex-dashboard-{}", self.instance_id),
+            WebviewUrl::External(url),
+        )
+        .title("OpenCodex Web 管理")
+        .inner_size(1280.0, 820.0)
+        .min_inner_size(900.0, 620.0)
+        .center()
+        .build()
+        .map(|_| ())
+        .map_err(|error| format!("无法创建 Dashboard 窗口：{error}"))
     }
 
     pub fn open_dashboard_browser(&self, port: u16) -> Result<(), String> {
@@ -1129,7 +1705,7 @@ impl Backend {
         validate_switcher_import_request(&request)?;
         self.begin_mutation()?;
         let result = (|| {
-            if open_codex_service_running() {
+            if self.open_codex_service_running() {
                 return Err(
                     "导入账号前请先停止 OpenCodex 服务，避免运行中的 Engine 覆盖账号配置"
                         .to_string(),
@@ -1159,7 +1735,8 @@ impl Backend {
         validate_switcher_import_request(&request)?;
         self.begin_mutation()?;
         let result = (|| {
-            let port = running_open_codex_port()
+            let port = self
+                .running_open_codex_port()
                 .ok_or_else(|| "请先启动 OpenCodex 服务，再绑定账号".to_string())?;
             let launcher = self.active_launcher()?;
             let background_service = self.query_background_service_state()?;
@@ -1355,6 +1932,11 @@ impl Backend {
                 }
                 validate_managed_package(&package, &version)?;
             }
+            super::isolation::scope_engine(
+                &package,
+                &self.instance_id,
+                &dirs::home_dir().ok_or("无法定位用户目录")?,
+            )?;
             let restarted = self.activate_engine_safely(&version, operation_id)?;
             Ok(EngineInstallResult {
                 version: version.clone(),
@@ -1389,7 +1971,7 @@ impl Backend {
                 let package = self.managed_package_root(version);
                 validate_managed_package(&package, version)?;
                 let service = self.run_background_service_helper_for("status", &package)?;
-                if running_open_codex_port().is_some()
+                if self.running_open_codex_port().is_some()
                     || service.installed
                     || service.running
                     || service.conflict
@@ -1406,8 +1988,9 @@ impl Backend {
         if service.conflict {
             return Err("后台服务存在冲突，请先修复后台服务后再切换 Engine".to_string());
         }
-        let running_port = running_open_codex_port();
-        let port = running_port.unwrap_or_else(|| read_configured_port().unwrap_or(DEFAULT_PORT));
+        let running_port = self.running_open_codex_port();
+        let port = running_port
+            .unwrap_or_else(|| self.read_configured_port().unwrap_or(self.default_port));
         if running_port
             .and_then(probe_health)
             .is_some_and(|health| health.version != old_launcher.version)
@@ -1545,10 +2128,37 @@ impl Backend {
         let version = validate_engine_version(&request.version)?;
         self.begin_mutation()?;
         let result = (|| {
-            if self.active_managed_version().as_deref() == Some(version.as_str()) {
-                return Err("当前正在使用的 Engine 版本不能删除，请先切换到其他版本".to_string());
+            let versions = self.installed_managed_versions();
+            if !versions.contains(&version) {
+                return Err(format!("本地未安装 Engine v{version}"));
             }
-            if running_open_codex_port()
+            let active = self.active_managed_version().as_deref() == Some(version.as_str());
+            let last = versions.len() == 1;
+            let service = self.query_background_service_state()?;
+            if service.conflict {
+                return Err("后台服务存在冲突，未删除任何数据".into());
+            }
+            if (active || last) && (self.running_open_codex_port().is_some() || service.running) {
+                return Err("当前实例 OpenCodex 仍在运行，请先停止再删除".into());
+            }
+            if last {
+                if !request.remove_data {
+                    return Err(
+                        "这是最后一个版本，请刷新并确认清理全部实例 OpenCodex 数据后再删除".into(),
+                    );
+                }
+                self.remove_stopped_instance_opencodex(&version, &service)?;
+                return Ok(EngineDeleteResult { version: version.clone(), message: "已删除当前实例的最后一个 Engine 及全部 OpenCodex 数据目录、配置和备份；Codex 会话与其他实例不受影响".into() });
+            }
+            if active {
+                let remaining = versions
+                    .iter()
+                    .find(|v| **v != version)
+                    .ok_or("没有可用的剩余版本")?;
+                self.activate_engine_safely(remaining, "delete-current")?;
+            }
+            if self
+                .running_open_codex_port()
                 .and_then(probe_health)
                 .is_some_and(|health| health.version.as_deref() == Some(&version))
             {
@@ -1574,9 +2184,55 @@ impl Backend {
         })();
         self.finish_mutation();
         if let Ok(value) = &result {
-            self.persist_log("system", &value.message);
+            if self.root.exists() {
+                self.persist_log("system", &value.message);
+            }
         }
         result
+    }
+
+    fn remove_stopped_instance_opencodex(
+        &self,
+        version: &str,
+        service: &BackgroundServiceState,
+    ) -> Result<(), String> {
+        // These immutable directories are resolved by the backend, never supplied by IPC.
+        super::isolation::validate_cleanup(&self.home, &self.root, &self.codex_home)?;
+        let launcher = self.active_launcher().or_else(|_| {
+            self.write_active_engine(Some(version))?;
+            self.active_launcher()
+        })?;
+        if crate::instances::codex_home_has_opencodex_routing(&self.codex_home) {
+            self.run_instance_integration_helper(
+                &CommandAction::Restore,
+                self.default_port,
+                &self.codex_home,
+            )?;
+        }
+        if service.installed {
+            let output = self
+                .command(&launcher, &["service".into(), "uninstall".into()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() {
+                return Err(format!(
+                    "解除后台服务失败，未删除数据：{}",
+                    self.redact(String::from_utf8_lossy(&output.stderr).trim())
+                ));
+            }
+        }
+        let after = self.query_background_service_state()?;
+        if after.installed
+            || after.running
+            || after.conflict
+            || self.running_open_codex_port().is_some()
+        {
+            return Err("服务尚未完全停止或解除注册，未删除数据".into());
+        }
+        super::isolation::remove_instance_data(&self.home, &self.root, &self.codex_home)
     }
 
     fn run_engine_update_helper<T: DeserializeOwned>(
@@ -1605,6 +2261,7 @@ impl Backend {
             } else {
                 Stdio::null()
             });
+        self.configure_environment(&mut command);
         hide_command_window(&mut command);
         let mut child = command
             .spawn()
@@ -1689,7 +2346,7 @@ impl Backend {
         instance_id: &str,
     ) -> Result<crate::CodexConfigFileContent, String> {
         let home = crate::instances::codex_home_for(Some(instance_id))?;
-        let has_integration_settings = config_dir()
+        let has_integration_settings = Some(self.home.clone())
             .is_some_and(|dir| dir.join("config.json").exists())
             || home.join(".switcher-opencodex/config.json").exists();
         if has_integration_settings {
@@ -1790,13 +2447,8 @@ impl Backend {
             return Err("客户端缺少多开实例隔离组件，请重新安装完整客户端".to_string());
         }
         let mut command = Command::new(runtime);
-        let source_home = config_dir().ok_or("无法定位 OpenCodex 配置目录")?;
-        let is_default = codex_home == crate::instances::codex_home_for(None)?;
-        let integration_home = if is_default {
-            source_home.clone()
-        } else {
-            codex_home.join(".switcher-opencodex")
-        };
+        let source_home = self.home.clone();
+        let integration_home = self.home.clone();
         command
             .arg(helper)
             .arg(action_name)
@@ -1807,10 +2459,7 @@ impl Backend {
             // message. Give the process its final instance home from startup.
             .env("OPENCODEX_HOME", integration_home)
             .env("OPENCODEX_MANAGER_SOURCE_HOME", source_home)
-            .env(
-                "OPENCODEX_MANAGER_DEFAULT_INSTANCE",
-                if is_default { "1" } else { "0" },
-            )
+            .env("OPENCODEX_MANAGER_DEFAULT_INSTANCE", "1")
             .env("NO_COLOR", "1")
             .env("FORCE_COLOR", "0")
             .stdin(Stdio::null())
@@ -1821,6 +2470,7 @@ impl Backend {
         } else {
             command.env_remove("OPENCODEX_PACKAGE_ROOT");
         }
+        self.configure_environment(&mut command);
         hide_command_window(&mut command);
         let output = command
             .output()
@@ -1882,6 +2532,7 @@ impl Backend {
             } else {
                 Stdio::null()
             });
+        self.configure_environment(&mut command);
         hide_command_window(&mut command);
         let mut child = command
             .spawn()
@@ -2129,28 +2780,6 @@ fn config_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".opencodex"))
 }
 
-fn read_runtime_port() -> Option<u16> {
-    let text = fs::read_to_string(config_dir()?.join("runtime-port.json")).ok()?;
-    let value: Value = serde_json::from_str(&text).ok()?;
-    let port = value.get("port")?.as_u64()?;
-    u16::try_from(port).ok().filter(|port| *port > 0)
-}
-
-fn read_configured_port() -> Option<u16> {
-    let text = fs::read_to_string(config_dir()?.join("config.json")).ok()?;
-    let value: Value = serde_json::from_str(&text).ok()?;
-    let port = value.get("port")?.as_u64()?;
-    u16::try_from(port).ok().filter(|port| *port > 0)
-}
-
-fn running_open_codex_port() -> Option<u16> {
-    let configured = read_configured_port().unwrap_or(DEFAULT_PORT);
-    let runtime = read_runtime_port();
-    runtime
-        .filter(|port| probe_health(*port).is_some())
-        .or_else(|| probe_health(configured).map(|_| configured))
-}
-
 fn configured_sidecar_models(config: &Value) -> HashMap<String, HashSet<String>> {
     let mut result = HashMap::new();
     let Some(providers) = config.get("providers").and_then(Value::as_object) else {
@@ -2170,6 +2799,32 @@ fn configured_sidecar_models(config: &Value) -> HashMap<String, HashSet<String>>
         }
     }
     result
+}
+
+fn transfer_engine_needs_alignment(source_version: &str, target_version: Option<&str>) -> bool {
+    target_version != Some(source_version)
+}
+
+fn validate_vision_sidecar_update(settings: &VisionSidecarUpdate) -> Result<(), String> {
+    let model = settings.model.trim();
+    if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
+        return Err("图片描述模型名称无效".to_string());
+    }
+    if settings
+        .backend
+        .as_deref()
+        .is_some_and(|backend| !matches!(backend, "openai" | "anthropic" | "routed"))
+    {
+        return Err("图片描述后端只支持 openai、anthropic 或 routed".to_string());
+    }
+    let namespaced = model.contains('/');
+    if namespaced && settings.backend.as_deref() != Some("routed") {
+        return Err("带 Provider 前缀的图片模型必须使用 routed 后端".to_string());
+    }
+    if !namespaced && settings.backend.as_deref() == Some("routed") {
+        return Err("routed 后端必须选择带 Provider 前缀的图片模型".to_string());
+    }
+    Ok(())
 }
 
 fn config_is_initialized(directory: &Path) -> bool {
@@ -2243,13 +2898,6 @@ fn probe_health(port: u16) -> Option<HealthBody> {
 fn probe_ready(port: u16) -> Option<HealthBody> {
     let (status, body) = request_json(port, "/readyz")?;
     (status == 200 && body.service.as_deref() == Some("opencodex")).then_some(body)
-}
-
-fn open_codex_service_running() -> bool {
-    let configured_port = read_configured_port().unwrap_or(DEFAULT_PORT);
-    let runtime_port = read_runtime_port();
-    runtime_port.is_some_and(|port| probe_health(port).is_some())
-        || probe_health(configured_port).is_some()
 }
 
 fn validate_switcher_import_request(request: &ImportSwitcherAccountsRequest) -> Result<(), String> {
@@ -2374,11 +3022,12 @@ mod tests {
     use super::{
         account_binding_restart_mode, build_engine_update_catalog, codex_integration_is_enabled,
         config_is_initialized, configured_sidecar_models, isolated_instance_integration_action,
-        managed_versions_to_remove, read_last_log_lines, validate_engine_version,
-        validate_managed_package, validate_port, AccountBindingRestartMode, RemoteEngineCatalog,
+        managed_versions_to_remove, read_last_log_lines, transfer_engine_needs_alignment,
+        validate_engine_version, validate_managed_package, validate_port,
+        validate_vision_sidecar_update, AccountBindingRestartMode, RemoteEngineCatalog,
         DEFAULT_PORT,
     };
-    use crate::opencodex::models::{BackgroundServiceState, CommandAction};
+    use crate::opencodex::models::{BackgroundServiceState, CommandAction, VisionSidecarUpdate};
     use chrono::Utc;
     #[cfg(unix)]
     use std::process::Command;
@@ -2463,6 +3112,41 @@ mod tests {
                 .into_iter()
                 .collect()
         );
+    }
+
+    #[test]
+    fn transfer_aligns_missing_or_different_target_engines() {
+        assert!(transfer_engine_needs_alignment("2.45.0", None));
+        assert!(transfer_engine_needs_alignment("2.45.0", Some("2.48.0")));
+        assert!(!transfer_engine_needs_alignment("2.45.0", Some("2.45.0")));
+    }
+
+    #[test]
+    fn validates_coherent_vision_sidecar_model_and_backend_pairs() {
+        assert!(validate_vision_sidecar_update(&VisionSidecarUpdate {
+            model: "gpt-5.6-luna".to_string(),
+            backend: Some("openai".to_string()),
+            enabled: true,
+        })
+        .is_ok());
+        assert!(validate_vision_sidecar_update(&VisionSidecarUpdate {
+            model: "Zc/qwen3.8-max".to_string(),
+            backend: Some("routed".to_string()),
+            enabled: true,
+        })
+        .is_ok());
+        assert!(validate_vision_sidecar_update(&VisionSidecarUpdate {
+            model: "Zc/qwen3.8-max".to_string(),
+            backend: Some("openai".to_string()),
+            enabled: true,
+        })
+        .is_err());
+        assert!(validate_vision_sidecar_update(&VisionSidecarUpdate {
+            model: "gpt-5.6-luna".to_string(),
+            backend: Some("routed".to_string()),
+            enabled: false,
+        })
+        .is_err());
     }
 
     #[test]

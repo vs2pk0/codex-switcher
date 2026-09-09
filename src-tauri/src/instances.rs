@@ -229,7 +229,7 @@ fn validate_instance_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn default_profile_root(id: &str) -> PathBuf {
+pub(crate) fn default_profile_root(id: &str) -> PathBuf {
     crate::switcher_data_dir().join("instances").join(id)
 }
 
@@ -1014,7 +1014,6 @@ pub fn save_codex_instance(input: SaveCodexInstanceInput) -> Result<CodexInstanc
     Ok(public_instance(candidate))
 }
 
-#[tauri::command]
 pub fn delete_codex_instance(instance_id: String) -> Result<DeleteCodexInstanceResult, String> {
     if instance_id == DEFAULT_INSTANCE_ID {
         return Err("系统默认实例不能删除".to_string());

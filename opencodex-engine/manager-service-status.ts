@@ -29,7 +29,7 @@ export function readServiceReferences(paths: string[]) {
 export function readBackgroundServiceState() {
   const diagnostic = diagnoseService();
   const references = diagnostic.installed
-    ? readServiceReferences([join(getConfigDir(), "service-state.json"), join(homedir(), ".opencodex", "service-state.json")])
+    ? readServiceReferences([join(getConfigDir(), "service-state.json")])
     : { referencedCliPaths: [], referencesUnknown: false };
   return {
     supported: diagnostic.supported,
@@ -52,7 +52,7 @@ export function restoreDisabledAutostart(
   // Repair enables systemd units; preserve a running-but-disabled registration.
   const state = diagnose();
   if (!state.installed || state.conflict || state.backend !== "systemd") throw new Error("后台服务类型已变化，无法恢复自启设置");
-  run("systemctl", ["--user", "disable", "opencodex-proxy"]);
+  run("systemctl", ["--user", "disable", process.env.OPENCODEX_SYSTEM_SERVICE_NAME || "opencodex-proxy"]);
   if (diagnose().enabled) throw new Error("未能恢复后台服务原有的禁用自启设置");
 }
 

@@ -284,6 +284,35 @@ struct LocalImageRepairResult {
     changed_rollout_files: usize,
     changed_session_ids: HashSet<String>,
     backup_dirs: Vec<String>,
+    /// 因为是其他会话 history_base 的祖先、前缀不允许改动而被跳过的会话 ID。
+    skipped_protected_ancestors: Vec<String>,
+}
+
+/// rollout 文件重写结果：除了改动数与备份目录，还记录被前缀保护跳过的祖先会话。
+#[derive(Debug, Default)]
+struct RolloutRewriteOutcome {
+    changed: usize,
+    changed_session_ids: HashSet<String>,
+    backup_dirs: Vec<String>,
+    skipped_protected_ancestors: Vec<String>,
+}
+
+/// 被 fork 子会话 `history_base` 引用的祖先 rollout：thread_id -> 受保护的前缀字节数。
+///
+/// 子会话把祖先文件 `end_byte_offset` 之前的字节当作自己不可变的历史前缀，
+/// 一旦这段字节被改写（重排 ordinal、重写 provider、删行），所有子会话的历史都会失效。
+type ProtectedRolloutPrefixes = HashMap<String, u64>;
+
+/// 判断重写后的内容是否原样保留了受保护前缀。
+fn rollout_prefix_preserved(original: &str, rewritten: &str, protected_bytes: u64) -> bool {
+    let Ok(protected_bytes) = usize::try_from(protected_bytes) else {
+        return false;
+    };
+    let original = original.as_bytes();
+    let rewritten = rewritten.as_bytes();
+    original.len() >= protected_bytes
+        && rewritten.len() >= protected_bytes
+        && original[..protected_bytes] == rewritten[..protected_bytes]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1870,8 +1899,17 @@ impl SessionStore {
         let deep = mode
             .map(|value| value.eq_ignore_ascii_case("deep"))
             .unwrap_or(false);
-        let (mut changed_rollout_files, mut rollout_backup_dirs) =
-            self.repair_rollout_visibility(&target_provider, &repair_records, deep)?;
+        let protected_prefixes = self.protected_rollout_prefixes();
+        let rollout_outcome = self.repair_rollout_visibility_guarded(
+            &target_provider,
+            &repair_records,
+            deep,
+            &protected_prefixes,
+        )?;
+        let mut changed_rollout_files = rollout_outcome.changed;
+        let mut rollout_backup_dirs = rollout_outcome.backup_dirs;
+        let mut skipped_protected_ancestors = rollout_outcome.skipped_protected_ancestors;
+        let rewritten_session_ids = rollout_outcome.changed_session_ids;
         let (updated_rows, backup_dirs) = self.repair_sqlite_visibility(
             &target_provider,
             Some(&repair_records),
@@ -1893,21 +1931,36 @@ impl SessionStore {
         let projects = self.repair_desktop_projects(&repair_records)?;
         let mut generated_images = self.repair_generated_images(&repair_records)?;
         let local_images = if deep {
-            self.repair_local_image_attachments(&repair_records)?
+            self.repair_local_image_attachments(&repair_records, &protected_prefixes)?
         } else {
             LocalImageRepairResult::default()
         };
         changed_rollout_files += local_images.changed_rollout_files;
         rollout_backup_dirs.extend(local_images.backup_dirs);
         generated_images.add(local_images.images);
-        let (reset_history_projections, history_backup_dirs) = if deep {
-            let mut changed_session_ids = local_images.changed_session_ids.clone();
-            if selected_ids.is_some() {
-                changed_session_ids.extend(repair_records.iter().map(|session| session.id.clone()));
-            }
-            self.reset_stale_thread_history_projections(&repair_records, &changed_session_ids)?
+        skipped_protected_ancestors.extend(local_images.skipped_protected_ancestors);
+        skipped_protected_ancestors.sort();
+        skipped_protected_ancestors.dedup();
+        // 只要 rollout 文件被改写（ordinal 重排、删行、追加快照），Codex 之前记下的分页投影
+        // 游标就不再对应文件内容，必须重建；deep 模式额外校对所有目标会话的投影。
+        let mut changed_session_ids = local_images.changed_session_ids.clone();
+        changed_session_ids.extend(rewritten_session_ids);
+        if deep && selected_ids.is_some() {
+            changed_session_ids.extend(repair_records.iter().map(|session| session.id.clone()));
+        }
+        let projection_targets = if deep {
+            repair_records.clone()
         } else {
+            repair_records
+                .iter()
+                .filter(|session| changed_session_ids.contains(&session.id))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let (reset_history_projections, history_backup_dirs) = if projection_targets.is_empty() {
             (0, Vec::new())
+        } else {
+            self.reset_stale_thread_history_projections(&projection_targets, &changed_session_ids)?
         };
         let repaired = changed_rollout_files
             + updated_rows
@@ -1952,12 +2005,22 @@ impl SessionStore {
                 "verifiedGeneratedImages": generated_images.verified,
                 "invalidGeneratedImages": generated_images.invalid,
                 "resetHistoryProjections": reset_history_projections,
+                "skippedProtectedAncestors": skipped_protected_ancestors,
                 "desktopReloadRequired": !sessions.is_empty(),
                 "updatedAt": now_timestamp()
             }))
             .unwrap_or_default(),
         )
         .map_err(|error| format!("写入修复标记失败: {}", error))?;
+        let protected_ancestor_note = if skipped_protected_ancestors.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "；另有 {} 个会话是其他会话的副本来源，为保住副本历史未改写其文件（{}）",
+                skipped_protected_ancestors.len(),
+                skipped_protected_ancestors.join(", ")
+            )
+        };
         Ok(CodexSessionVisibilityRepairSummary {
             scanned: sessions.len(),
             repaired,
@@ -1996,7 +2059,7 @@ impl SessionStore {
                 running: false,
             }],
             message: format!(
-                "已修复 Codex 会话、项目目录与图片：校正 {} 个会话文件，重置 {} 条分页历史投影，更新 {} 条线程记录，同步 {} 条侧栏目录，目录校验通过 {} 条；创建 {} 个本地项目，归组 {} 条会话，项目校验通过 {} 个，恢复 {} 张图片、校验 {} 张，跳过 {} 条非侧栏或无效目录会话；需要重载 ChatGPT/Codex 才会刷新当前侧栏",
+                "已修复 Codex 会话、项目目录与图片：校正 {} 个会话文件，重置 {} 条分页历史投影，更新 {} 条线程记录，同步 {} 条侧栏目录，目录校验通过 {} 条；创建 {} 个本地项目，归组 {} 条会话，项目校验通过 {} 个，恢复 {} 张图片、校验 {} 张，跳过 {} 条非侧栏或无效目录会话{}；需要重载 ChatGPT/Codex 才会刷新当前侧栏",
                 changed_rollout_files,
                 reset_history_projections,
                 updated_rows,
@@ -2007,7 +2070,8 @@ impl SessionStore {
                 projects.verified_projects,
                 generated_images.recreated,
                 generated_images.verified,
-                projects.skipped
+                projects.skipped,
+                protected_ancestor_note
             ),
         })
     }
@@ -2483,6 +2547,7 @@ impl SessionStore {
     fn repair_local_image_attachments(
         &self,
         sessions: &[SessionRepairRecord],
+        protected: &ProtectedRolloutPrefixes,
     ) -> Result<LocalImageRepairResult, String> {
         let mut result = LocalImageRepairResult::default();
         let backup_dir = visibility_backup_dir();
@@ -2502,6 +2567,12 @@ impl SessionStore {
             let Some(rewritten) = rewritten else {
                 continue;
             };
+            if let Some(&protected_bytes) = protected.get(&session.id) {
+                if !rollout_prefix_preserved(&content, &rewritten, protected_bytes) {
+                    result.skipped_protected_ancestors.push(session.id.clone());
+                    continue;
+                }
+            }
             if !backup_created {
                 fs::create_dir_all(&backup_dir)
                     .map_err(|error| format!("创建图片恢复备份目录失败: {error}"))?;
@@ -3329,14 +3400,67 @@ impl SessionStore {
         Ok((reset_session_ids.len(), backup_dirs))
     }
 
+    /// 扫描 sessions/archived_sessions 下所有 rollout 首行，收集被 fork 子会话引用的祖先前缀。
+    fn protected_rollout_prefixes(&self) -> ProtectedRolloutPrefixes {
+        let mut protected = ProtectedRolloutPrefixes::new();
+        let mut directories = vec![
+            self.sessions_dir(),
+            self.codex_home.join("archived_sessions"),
+        ];
+        while let Some(directory) = directories.pop() {
+            let Ok(entries) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                if !kind.is_file()
+                    || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+                {
+                    continue;
+                }
+                let Some(base) = read_rollout_history_base(&path) else {
+                    continue;
+                };
+                let slot = protected.entry(base.thread_id).or_insert(0);
+                *slot = (*slot).max(base.end_byte_offset);
+            }
+        }
+        protected
+    }
+
+    #[cfg(test)]
     fn repair_rollout_visibility(
         &self,
         target_provider: &str,
         sessions: &[SessionRepairRecord],
         rewrite_all_meta: bool,
     ) -> Result<(usize, Vec<String>), String> {
+        let outcome = self.repair_rollout_visibility_guarded(
+            target_provider,
+            sessions,
+            rewrite_all_meta,
+            &self.protected_rollout_prefixes(),
+        )?;
+        Ok((outcome.changed, outcome.backup_dirs))
+    }
+
+    fn repair_rollout_visibility_guarded(
+        &self,
+        target_provider: &str,
+        sessions: &[SessionRepairRecord],
+        rewrite_all_meta: bool,
+        protected: &ProtectedRolloutPrefixes,
+    ) -> Result<RolloutRewriteOutcome, String> {
+        let mut outcome = RolloutRewriteOutcome::default();
         if sessions.is_empty() {
-            return Ok((0, Vec::new()));
+            return Ok(outcome);
         }
         let backup_dir = visibility_backup_dir();
         let mut changed = 0usize;
@@ -3387,6 +3511,13 @@ impl SessionStore {
             let Some(next) = local_compaction.or(visibility_rewrite) else {
                 continue;
             };
+            if let Some(&protected_bytes) = protected.get(&session.id) {
+                if !rollout_prefix_preserved(&content, &next, protected_bytes) {
+                    // 这个会话是其他会话的 fork 来源，前缀一旦改动子会话历史就会失效，宁可跳过。
+                    outcome.skipped_protected_ancestors.push(session.id.clone());
+                    continue;
+                }
+            }
             if !backup_created {
                 fs::create_dir_all(&backup_dir)
                     .map_err(|error| format!("创建会话文件备份目录失败: {}", error))?;
@@ -3411,13 +3542,15 @@ impl SessionStore {
                 .arg(&session.path)
                 .output();
             changed += 1;
+            outcome.changed_session_ids.insert(session.id.clone());
         }
-        let backup_dirs = if backup_created {
-            vec![backup_dir.to_string_lossy().to_string()]
-        } else {
-            Vec::new()
-        };
-        Ok((changed, backup_dirs))
+        outcome.changed = changed;
+        if backup_created {
+            outcome
+                .backup_dirs
+                .push(backup_dir.to_string_lossy().to_string());
+        }
+        Ok(outcome)
     }
 
     fn sqlite_candidate_paths(&self) -> Vec<PathBuf> {
@@ -7468,6 +7601,54 @@ fn align_rollout_line_ordinal(line: &str, ordinal: Option<u64>) -> Result<String
     serde_json::to_string(&value).map_err(|error| format!("重写会话分页序号失败: {}", error))
 }
 
+/// 分页 rollout 首行 `session_meta.payload.history_base`：fork 出的会话用它指向父会话的不可变前缀。
+///
+/// Codex 读取这类会话时，把父会话 `end_ordinal_exclusive` 之前的记录当作自己的历史，
+/// 因此子会话文件自身的 ordinal 必须从 `end_ordinal_exclusive` 开始接着编号（首行 session_meta
+/// 就是 `end_ordinal_exclusive`），而不是从 0 开始；否则投影器会报
+/// `expected ordinal N, got 0` 并永久停止，界面上只剩部分历史。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RolloutHistoryBase {
+    thread_id: String,
+    end_byte_offset: u64,
+    end_ordinal_exclusive: u64,
+}
+
+fn rollout_history_base(session_meta: &Value) -> Option<RolloutHistoryBase> {
+    if session_meta.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = session_meta.get("payload")?;
+    let base = payload
+        .get("history_base")
+        .or_else(|| session_meta.get("history_base"))?
+        .as_object()?;
+    let thread_id = base
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(RolloutHistoryBase {
+        thread_id: thread_id.to_string(),
+        end_byte_offset: base.get("end_byte_offset").and_then(Value::as_u64)?,
+        end_ordinal_exclusive: base.get("end_ordinal_exclusive").and_then(Value::as_u64)?,
+    })
+}
+
+/// 读取 rollout 首条记录里的 history_base；非分页会话或没有 fork 来源时返回 None。
+fn read_rollout_history_base(path: &Path) -> Option<RolloutHistoryBase> {
+    let file = fs::File::open(path).ok()?;
+    for line in BufReader::new(file).lines() {
+        let line = line.ok()?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(&line).ok()?;
+        return rollout_history_base(&value);
+    }
+    None
+}
+
 fn normalize_paginated_rollout_ordinals(content: &str) -> Result<Option<String>, String> {
     let Some(first_record) = content.lines().find(|line| !line.trim().is_empty()) else {
         return Ok(None);
@@ -7482,8 +7663,12 @@ fn normalize_paginated_rollout_ordinals(content: &str) -> Result<Option<String>,
     }
 
     let mut output = String::with_capacity(content.len());
-    let mut expected_ordinal = 0u64;
+    // fork 出的会话从父会话的 end_ordinal_exclusive 接着编号，其余会话从 0 开始。
+    let mut expected_ordinal = rollout_history_base(&first_value)
+        .map(|base| base.end_ordinal_exclusive)
+        .unwrap_or(0);
     let mut changed = false;
+    let mut saw_session_meta = false;
     for segment in content.split_inclusive('\n') {
         let (body, ending) = if let Some(body) = segment.strip_suffix("\r\n") {
             (body, "\r\n")
@@ -7505,6 +7690,15 @@ fn normalize_paginated_rollout_ordinals(content: &str) -> Result<Option<String>,
         let object = value
             .as_object_mut()
             .ok_or_else(|| format!("分页会话第 {} 条记录不是 JSON 对象", expected_ordinal))?;
+        if object.get("type").and_then(Value::as_str) == Some("session_meta") {
+            if saw_session_meta {
+                // Codex 只认首条 session_meta；后续重复的 meta 是恢复会话时误写入的
+                // （通常还带着 ordinal 0），会让分页投影回退并停滞，这里直接丢弃。
+                changed = true;
+                continue;
+            }
+            saw_session_meta = true;
+        }
         if object.get("ordinal").and_then(Value::as_u64) == Some(expected_ordinal) {
             output.push_str(segment);
         } else {
@@ -8468,7 +8662,7 @@ mod tests {
         LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES,
     };
     use serde_json::{json, Value};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::io::Write;
     use std::path::Path;
@@ -11663,7 +11857,7 @@ mod tests {
         let store = SessionStore::new(codex.path().to_path_buf());
 
         let result = store
-            .repair_local_image_attachments(&records)
+            .repair_local_image_attachments(&records, &HashMap::new())
             .expect("repair local images");
 
         assert_eq!(result.changed_rollout_files, 1);
@@ -11701,7 +11895,7 @@ mod tests {
         );
 
         let second = store
-            .repair_local_image_attachments(&records)
+            .repair_local_image_attachments(&records, &HashMap::new())
             .expect("verify repaired local images");
         assert_eq!(second.changed_rollout_files, 0);
         assert_eq!(second.images.recreated, 0);
@@ -11770,7 +11964,7 @@ mod tests {
         let store = SessionStore::new(codex.path().to_path_buf());
 
         let result = store
-            .repair_local_image_attachments(&records)
+            .repair_local_image_attachments(&records, &HashMap::new())
             .expect("repair legacy local images");
 
         assert_eq!(result.changed_rollout_files, 1);
@@ -11807,7 +12001,7 @@ mod tests {
         );
 
         let second = store
-            .repair_local_image_attachments(&records)
+            .repair_local_image_attachments(&records, &HashMap::new())
             .expect("verify repaired legacy local images");
         assert_eq!(second.changed_rollout_files, 0);
         assert_eq!(second.images.recreated, 0);
@@ -11876,7 +12070,7 @@ mod tests {
         let store = SessionStore::new(codex.path().to_path_buf());
 
         let result = store
-            .repair_local_image_attachments(&records)
+            .repair_local_image_attachments(&records, &HashMap::new())
             .expect("finish partial local image migration");
 
         assert_eq!(result.changed_rollout_files, 1);
@@ -11975,6 +12169,268 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(ordinals, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn repair_visibility_normalizes_rewound_and_repeated_paginated_ordinals() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-rewound.jsonl");
+        fs::write(
+            &session_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"rewound"},"ordinal":0}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_started"},"ordinal":1}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_complete"},"ordinal":2}"#,
+                "\n",
+                r#"{"type":"session_meta","payload":{"id":"rewound"},"ordinal":2}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_complete"},"ordinal":10}"#,
+                "\n"
+            ),
+        )
+        .expect("write rewound session");
+        let records = vec![SessionRepairRecord {
+            id: "rewound".to_string(),
+            title: "Rewound".to_string(),
+            path: session_path.clone(),
+            updated_at: 10,
+        }];
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let (changed, _) = store
+            .repair_rollout_visibility("openai", &records, false)
+            .expect("repair rewound rollout");
+
+        assert_eq!(changed, 1);
+        let repaired = fs::read_to_string(session_path).expect("read repaired rollout");
+        let records = repaired
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid repaired record"))
+            .collect::<Vec<_>>();
+        // Codex 只认首条 session_meta；恢复会话时误写入的重复 meta 会被丢弃，其余记录连续编号。
+        assert_eq!(
+            records
+                .iter()
+                .filter(|value| value["type"] == "session_meta")
+                .count(),
+            1
+        );
+        let ordinals = records
+            .iter()
+            .map(|value| value["ordinal"].as_u64().expect("repaired record ordinal"))
+            .collect::<Vec<_>>();
+        assert_eq!(ordinals, vec![0, 1, 2, 3]);
+    }
+
+    /// fork 出的会话：Codex 从父会话 `end_ordinal_exclusive` 之后接着编号，
+    /// 修复不得把它重排回 0，否则投影器报 `expected ordinal N, got 0` 并永久停滞。
+    #[test]
+    fn repair_visibility_keeps_forked_rollout_ordinals_anchored_to_history_base() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-fork.jsonl");
+        fs::write(
+            &session_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"fork","history_mode":"paginated","history_base":{"thread_id":"parent","end_byte_offset":4096,"end_ordinal_exclusive":15129}},"ordinal":0}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"},"ordinal":1}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]},"ordinal":2}"#,
+                "\n",
+                r#"{"type":"session_meta","payload":{"id":"fork","history_mode":"paginated","history_base":{"thread_id":"parent","end_byte_offset":4096,"end_ordinal_exclusive":15129}},"ordinal":0}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"},"ordinal":3}"#,
+                "\n"
+            ),
+        )
+        .expect("write forked session");
+        let records = vec![SessionRepairRecord {
+            id: "fork".to_string(),
+            title: "Fork".to_string(),
+            path: session_path.clone(),
+            updated_at: 10,
+        }];
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let (changed, _) = store
+            .repair_rollout_visibility("openai", &records, false)
+            .expect("repair forked rollout");
+
+        assert_eq!(changed, 1);
+        let repaired = fs::read_to_string(&session_path).expect("read repaired rollout");
+        let values = repaired
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid repaired record"))
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 4);
+        assert_eq!(values[0]["type"], "session_meta");
+        assert_eq!(
+            values[0]["payload"]["history_base"]["end_ordinal_exclusive"],
+            15129
+        );
+        let ordinals = values
+            .iter()
+            .map(|value| value["ordinal"].as_u64().expect("ordinal"))
+            .collect::<Vec<_>>();
+        assert_eq!(ordinals, vec![15129, 15130, 15131, 15132]);
+
+        // 已经正确编号的文件不应再次被改写。
+        let (second_changed, _) = store
+            .repair_rollout_visibility("openai", &records, false)
+            .expect("repeat forked repair");
+        assert_eq!(second_changed, 0);
+
+        // 投影重建目标与 Codex 的期望保持一致：下一条 ordinal 接着最后一行。
+        let target = super::paginated_rollout_projection_target(&session_path)
+            .expect("projection target")
+            .expect("paginated target");
+        assert_eq!(target.next_ordinal, 15133);
+        assert_eq!(target.turn_count, 1);
+        assert_eq!(
+            target.next_byte_offset,
+            i64::try_from(fs::metadata(&session_path).expect("metadata").len()).expect("len")
+        );
+    }
+
+    #[test]
+    fn deep_repair_appends_local_compaction_after_forked_ordinals() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let session_path = sessions_dir.join("session-fork-oversized.jsonl");
+        let oversized = "x".repeat(LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES + 1024);
+        fs::write(
+            &session_path,
+            format!(
+                concat!(
+                    r#"{{"type":"session_meta","payload":{{"id":"fork","model_provider":"openai","history_mode":"paginated","history_base":{{"thread_id":"parent","end_byte_offset":4096,"end_ordinal_exclusive":40}}}},"ordinal":40}}"#,
+                    "\n",
+                    r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"问题"}}]}},"ordinal":41}}"#,
+                    "\n",
+                    r#"{{"type":"response_item","payload":{{"type":"custom_tool_call_output","call_id":"big","output":"{}"}},"ordinal":42}}"#,
+                    "\n"
+                ),
+                oversized
+            ),
+        )
+        .expect("write forked session");
+        let records = vec![SessionRepairRecord {
+            id: "fork".to_string(),
+            title: "Fork".to_string(),
+            path: session_path.clone(),
+            updated_at: 10,
+        }];
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let (changed, _) = store
+            .repair_rollout_visibility("openai", &records, true)
+            .expect("deep repair forked rollout");
+
+        assert_eq!(changed, 1);
+        let repaired = fs::read_to_string(&session_path).expect("read repaired rollout");
+        let last = repaired
+            .lines()
+            .rfind(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid record"))
+            .expect("last record");
+        assert_eq!(last["type"], "compacted");
+        assert_eq!(last["ordinal"], 43);
+    }
+
+    /// 作为其他会话 fork 来源的祖先，其 `end_byte_offset` 之前的字节被子会话当作不可变历史，
+    /// 任何会改动这段前缀的重写都必须跳过，否则子会话的历史会整体失效。
+    #[test]
+    fn repair_visibility_skips_rewrites_that_would_break_a_fork_ancestor_prefix() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        let archived_dir = codex.path().join("archived_sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        fs::create_dir_all(&archived_dir).expect("archived dir");
+        let parent_path = archived_dir.join("rollout-parent.jsonl");
+        let parent_content = concat!(
+            r#"{"type":"session_meta","payload":{"id":"parent","model_provider":"old-provider"},"ordinal":0}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"},"ordinal":1}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"},"ordinal":2}"#,
+            "\n"
+        );
+        fs::write(&parent_path, parent_content).expect("write parent");
+        let child_path = sessions_dir.join("rollout-child.jsonl");
+        fs::write(
+            &child_path,
+            format!(
+                concat!(
+                    r#"{{"type":"session_meta","payload":{{"id":"child","model_provider":"old-provider","history_mode":"paginated","history_base":{{"thread_id":"parent","end_byte_offset":{},"end_ordinal_exclusive":3}}}},"ordinal":3}}"#,
+                    "\n",
+                    r#"{{"type":"event_msg","payload":{{"type":"task_started","turn_id":"turn-2"}},"ordinal":4}}"#,
+                    "\n"
+                ),
+                parent_content.len()
+            ),
+        )
+        .expect("write child");
+        let store = SessionStore::new(codex.path().to_path_buf());
+        let protected = store.protected_rollout_prefixes();
+        assert_eq!(
+            protected.get("parent").copied(),
+            Some(parent_content.len() as u64)
+        );
+
+        let records = vec![
+            SessionRepairRecord {
+                id: "parent".to_string(),
+                title: "Parent".to_string(),
+                path: parent_path.clone(),
+                updated_at: 10,
+            },
+            SessionRepairRecord {
+                id: "child".to_string(),
+                title: "Child".to_string(),
+                path: child_path.clone(),
+                updated_at: 10,
+            },
+        ];
+        let outcome = store
+            .repair_rollout_visibility_guarded("new-provider", &records, false, &protected)
+            .expect("guarded repair");
+
+        // 子会话可以改写（首行 provider），祖先因为前缀会变动而被跳过并保持原样。
+        assert_eq!(outcome.changed, 1);
+        assert_eq!(
+            outcome.skipped_protected_ancestors,
+            vec!["parent".to_string()]
+        );
+        assert_eq!(
+            fs::read_to_string(&parent_path).expect("parent unchanged"),
+            parent_content
+        );
+        assert!(fs::read_to_string(&child_path)
+            .expect("child rewritten")
+            .contains(r#""model_provider":"new-provider""#));
+
+        // 只在受保护前缀之后追加/改动是允许的：祖先尾部被 Codex 误写入的重复 meta 可以清理。
+        let mut appended = parent_content.to_string();
+        appended.push_str(
+            r#"{"type":"session_meta","payload":{"id":"parent","model_provider":"old-provider"},"ordinal":0}"#,
+        );
+        appended.push('\n');
+        fs::write(&parent_path, &appended).expect("append duplicate meta");
+        let outcome = store
+            .repair_rollout_visibility_guarded("old-provider", &records[..1], false, &protected)
+            .expect("guarded tail repair");
+        assert_eq!(outcome.changed, 1);
+        assert!(outcome.skipped_protected_ancestors.is_empty());
+        assert_eq!(
+            fs::read_to_string(&parent_path).expect("parent tail repaired"),
+            parent_content
+        );
     }
 
     #[test]

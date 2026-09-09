@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OpenCodex layout fixture</title>
+<div id="app"></div>
+<script type="module">
+  // Visual regression fixture: all IPC is mocked; never reads or changes real instances.
+  import { createApp, h } from 'vue';
+  import ArcoVue from '@arco-design/web-vue';
+  import ArcoVueIcon from '@arco-design/web-vue/es/icon';
+  import '@arco-design/web-vue/dist/arco.css';
+  import '../../src/styles.css';
+  import OpenCodexPanel from '../../src/opencodex/OpenCodexPanel.vue';
+  const empty = new URLSearchParams(location.search).has('empty');
+  const stopped = new URLSearchParams(location.search).has('stopped');
+  let callback = 0;
+  const latest = { version: '2.48.0', newerThanCurrent: true, prerelease: false };
+  window.fixtureCalls = [];
+  window.__TAURI_INTERNALS__ = {
+    transformCallback: () => ++callback,
+    invoke: async (command, args) => {
+      window.fixtureCalls.push({ command, args });
+      if (command.startsWith('plugin:event|')) return 1;
+      if (command === 'opencodex_get_system_snapshot') return {
+        instanceId: args.instanceId, dataDir: args.instanceId === 'default' ? '/Users/demo/.opencodex' : '/Users/demo/.codex_switcher/instances/work/.opencodex',
+        desktopVersion: '0.1.34', engineVersion: empty ? null : '2.45.0', engineSource: empty ? 'missing' : 'managed', platform: 'darwin-aarch64',
+        installed: !empty, initialized: !empty, running: !empty && !stopped, ready: !empty && !stopped, pid: 12345, port: args.instanceId === 'default' ? 15800 : 15801,
+        integrationStatus: '连接正常', backgroundService: { supported: true, running: !empty, installed: !empty, viable: !empty, summary: '独立服务' },
+      };
+      if (command === 'opencodex_read_manager_logs') return [];
+      if (command === 'opencodex_get_engine_update_catalog') return { latestStable: latest, currentVersion: empty ? null : '2.45.0', installedVersions: empty ? [] : stopped ? ['2.45.0'] : ['2.45.0', '2.42.0', '2.40.0'], releases: [latest] };
+      if (command === 'opencodex_get_vision_models') return { sidecarModel: 'Zc/qwen3.8-max', sidecarBackend: 'routed', models: [
+        { provider: 'Zc', id: 'qwen3.8-max', namespaced: 'Zc/qwen3.8-max', disabled: false, nativeVision: true, sidecarEnabled: false },
+        { provider: 'Zc', id: 'deepseek-v4-pro', namespaced: 'Zc/deepseek-v4-pro', disabled: false, nativeVision: false, sidecarEnabled: true },
+      ] };
+      if (command === 'opencodex_get_vision_sidecar_settings') return {
+        vision: { enabled: true, model: 'Zc/qwen3.8-max', backend: 'routed', reasoning: 'medium', maxDescriptionsPerTurn: 8, timeoutMs: 45000 },
+        visionModels: [
+          { value: 'gpt-5.6-luna', label: 'gpt-5.6-luna', backend: 'openai', baseline: true },
+          { value: 'Zc/qwen3.8-max', label: 'Zc/qwen3.8-max', backend: 'routed' },
+        ],
+      };
+      if (command === 'opencodex_transfer_data' && !args.execute) return { fingerprint: 'fixture', rows: [
+        { name: '账号', source: 12, target: 8, result: args.mode === 'merge' ? 20 : 12 },
+        { name: '渠道', source: 6, target: 4, result: args.mode === 'merge' ? 10 : 6 },
+        { name: '模型', source: 28, target: 24, result: args.mode === 'merge' ? 52 : 28 },
+      ] };
+      throw new Error('Fixture blocked unexpected IPC: ' + command);
+    },
+  };
+  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
+  const instances = ['default', 'work'].map(id => ({ id, name: id, isDefault: id === 'default', openCodexConnected: true, codexHome: '', electronData: '', appPath: '', createdAt: 0, running: false }));
+  createApp({ render: () => h(OpenCodexPanel, { active: true, instances }) }).use(ArcoVue).use(ArcoVueIcon).mount('#app');
+</script>
+<style>body { padding: 28px; } #app { max-width: 1400px; margin: auto; }</style>
+</html>
