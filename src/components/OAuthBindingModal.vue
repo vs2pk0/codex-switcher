@@ -4,19 +4,32 @@ import { hasAnyQuotaWindow, hasQuotaWindow } from "../quota";
 import type { CodexAccount } from "../types/codex";
 import PlanBadge from "./PlanBadge.vue";
 
-defineProps<{
-  visible: boolean;
-  bindingForm: { boundOauthAccountId: string };
-  saving: boolean;
-  oauthAccounts: CodexAccount[];
-  displayName: (account: CodexAccount) => string;
-  isFreePlanAccount: (account: CodexAccount) => boolean;
-  quotaColor: (percentage: number) => string;
-  quotaWindowLabel: (minutes?: number, fallback?: string) => string;
-  quotaResetLabel: (timestamp?: number) => string;
-  planLabel: (account: CodexAccount) => string;
-  planClass: (account: CodexAccount) => string;
-}>();
+withDefaults(
+  defineProps<{
+    visible: boolean;
+    bindingForm: { boundOauthAccountId: string };
+    saving: boolean;
+    oauthAccounts: CodexAccount[];
+    /** 弹窗标题 / 说明 / 「不绑定」选项文案，服务绑定场景可覆盖默认的 API Key 文案。 */
+    title?: string;
+    description?: string;
+    unlinkTitle?: string;
+    unlinkHint?: string;
+    displayName: (account: CodexAccount) => string;
+    isFreePlanAccount: (account: CodexAccount) => boolean;
+    quotaColor: (percentage: number) => string;
+    quotaWindowLabel: (minutes?: number, fallback?: string) => string;
+    quotaResetLabel: (timestamp?: number) => string;
+    planLabel: (account: CodexAccount) => string;
+    planClass: (account: CodexAccount) => string;
+  }>(),
+  {
+    title: "绑定 OAuth 账号",
+    description: "API Key 账号绑定 OAuth 后，切换时会同时写入 OAuth Token 与 API Key 配置，便于修复会话身份。",
+    unlinkTitle: "不绑定 OAuth",
+    unlinkHint: "切换时仅写入 API Key 配置",
+  },
+);
 
 defineEmits<{
   (event: "update:visible", value: boolean): void;
@@ -27,14 +40,14 @@ defineEmits<{
 <template>
   <a-modal
     :visible="visible"
-    :title="t('绑定 OAuth 账号')"
+    :title="t(title)"
     :footer="false"
     width="840px"
     @update:visible="$emit('update:visible', $event)"
   >
     <div class="modal-form">
       <a-typography-paragraph>
-        {{ t("API Key 账号绑定 OAuth 后，切换时会同时写入 OAuth Token 与 API Key 配置，便于修复会话身份。") }}
+        {{ t(description) }}
       </a-typography-paragraph>
       <div class="oauth-bind-list">
         <button
@@ -47,8 +60,8 @@ defineEmits<{
             <icon-check v-if="!bindingForm.boundOauthAccountId" />
           </span>
           <div class="oauth-bind-option-title">
-            <strong>{{ t("不绑定 OAuth") }}</strong>
-            <span>{{ t("切换时仅写入 API Key 配置") }}</span>
+            <strong>{{ t(unlinkTitle) }}</strong>
+            <span>{{ t(unlinkHint) }}</span>
           </div>
         </button>
 

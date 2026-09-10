@@ -3458,3 +3458,184 @@ fn restart_command_targets_codex_app_on_current_platform() {
         assert_eq!(start_program, "codex");
     }
 }
+
+#[test]
+fn oauth_login_only_writes_auth_json_without_touching_config() {
+    let (_storage, codex, store) = test_store();
+    let config_path = codex.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "# Auto-injected by opencodex\nopenai_base_url = \"http://127.0.0.1:15800/v1\"\n",
+    )
+    .unwrap();
+    let oauth = store
+        .import_from_json(
+            &json!({
+                "email":"login-only@example.com",
+                "tokens":{"id_token":"id","access_token":"access","refresh_token":"refresh"}
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .remove(0);
+
+    let bound = store.apply_oauth_login_only(Some(&oauth.id)).unwrap();
+    assert_eq!(bound.map(|account| account.id), Some(oauth.id.clone()));
+    let auth: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(codex.path().join("auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["tokens"]["access_token"], "access");
+    // config.toml 保持 OpenCodex 注入原样
+    assert!(fs::read_to_string(&config_path)
+        .unwrap()
+        .contains("openai_base_url"));
+    assert_eq!(
+        store.current_account().unwrap().map(|account| account.id),
+        Some(oauth.id.clone())
+    );
+
+    // 取消绑定：清空登录态并清除当前账号记录
+    assert!(store.apply_oauth_login_only(None).unwrap().is_none());
+    let auth: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(codex.path().join("auth.json")).unwrap()).unwrap();
+    assert!(auth.get("tokens").is_none());
+    assert!(store.current_account().unwrap().is_none());
+
+    // API Key 账号不能作为登录态
+    let api = store
+        .add_api_key_account("sk-login-only".to_string(), None, None, None, None)
+        .unwrap();
+    assert!(store.apply_oauth_login_only(Some(&api.id)).is_err());
+}
+
+#[test]
+fn local_gateway_binding_keeps_chatgpt_login_and_passes_key_via_header() {
+    let (_storage, codex, store) = test_store();
+    let oauth = store
+        .import_from_json(
+            &json!({
+                "email":"gateway@example.com",
+                "tokens":{"id_token":"id","access_token":"access","refresh_token":"refresh"}
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .remove(0);
+    let api = store
+        .add_api_key_account_with_binding(ApiKeyAccountBindingInput {
+            api_key: "sk-cpa-gateway".to_string(),
+            api_base_url: Some("http://127.0.0.1:17877/v1".to_string()),
+            api_provider_name: Some("CLIProxyAPI".to_string()),
+            api_official_url: None,
+            account_name: Some("本地 API 服务".to_string()),
+            bound_oauth_account_id: None,
+            bound_oauth_use_local_gateway: false,
+        })
+        .unwrap();
+
+    // 本地网关模式：ChatGPT 登录态 + X-Api-Key
+    store
+        .update_api_key_bound_oauth_account(&api.id, Some(oauth.id.clone()), true)
+        .unwrap();
+    store.switch_account(&api.id).unwrap();
+    let config = fs::read_to_string(codex.path().join("config.toml")).unwrap();
+    let document: toml_edit::Document = config.parse().unwrap();
+    let provider = &document["model_providers"]["cliproxyapi"];
+    assert_eq!(provider["requires_openai_auth"].as_bool(), Some(true));
+    assert_eq!(
+        provider["http_headers"]["X-Api-Key"].as_str(),
+        Some("sk-cpa-gateway")
+    );
+    assert!(provider.get("experimental_bearer_token").is_none());
+    let auth: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(codex.path().join("auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["tokens"]["access_token"], "access");
+    // 从 config.toml 仍能识别出当前账号
+    assert_eq!(
+        store
+            .detect_current_account_from_codex_config()
+            .unwrap()
+            .map(|account| account.id),
+        Some(api.id.clone())
+    );
+
+    // 普通绑定（不走本地网关）：恢复 Bearer Token 写法并清理网关头
+    store
+        .update_api_key_bound_oauth_account(&api.id, Some(oauth.id.clone()), false)
+        .unwrap();
+    store.switch_account(&api.id).unwrap();
+    let config = fs::read_to_string(codex.path().join("config.toml")).unwrap();
+    let document: toml_edit::Document = config.parse().unwrap();
+    let provider = &document["model_providers"]["cliproxyapi"];
+    assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
+    assert_eq!(
+        provider["experimental_bearer_token"].as_str(),
+        Some("sk-cpa-gateway")
+    );
+    assert!(provider.get("http_headers").is_none());
+}
+
+#[test]
+fn oauth_login_only_switches_injected_proxy_provider_to_chatgpt_login_mode() {
+    let (_storage, codex, store) = test_store();
+    let config_path = codex.path().join("config.toml");
+    fs::write(
+        &config_path,
+        concat!(
+            "model_provider = \"opencodex\"\n",
+            "model = \"gpt-5\"\n\n",
+            "# Auto-injected by opencodex\n",
+            "[model_providers.opencodex]\n",
+            "name = \"OpenCodex Proxy\"\n",
+            "base_url = \"http://127.0.0.1:15800/v1\"\n",
+            "wire_api = \"responses\"\n",
+            "requires_openai_auth = false\n",
+        ),
+    )
+    .unwrap();
+    let oauth = store
+        .import_from_json(
+            &json!({
+                "email":"proxy-login@example.com",
+                "tokens":{"id_token":"id","access_token":"access","refresh_token":"refresh"}
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .remove(0);
+
+    store.apply_oauth_login_only(Some(&oauth.id)).unwrap();
+    let document: toml_edit::Document = fs::read_to_string(&config_path).unwrap().parse().unwrap();
+    // 路由保持不变，仅切换为 ChatGPT 登录模式，Codex 才会显示账号
+    assert_eq!(document["model_provider"].as_str(), Some("opencodex"));
+    assert_eq!(
+        document["model_providers"]["opencodex"]["base_url"].as_str(),
+        Some("http://127.0.0.1:15800/v1")
+    );
+    assert_eq!(
+        document["model_providers"]["opencodex"]["requires_openai_auth"].as_bool(),
+        Some(true)
+    );
+    assert!(store.auth_json_matches_account(&oauth));
+
+    // 取消绑定后切回无登录模式
+    store.apply_oauth_login_only(None).unwrap();
+    let document: toml_edit::Document = fs::read_to_string(&config_path).unwrap().parse().unwrap();
+    assert_eq!(
+        document["model_providers"]["opencodex"]["requires_openai_auth"].as_bool(),
+        Some(false)
+    );
+    assert!(!store.auth_json_matches_account(&oauth));
+
+    // 需要客户端密钥的第三方 Provider 不受影响
+    fs::write(
+        &config_path,
+        "model_provider = \"relay\"\n[model_providers.relay]\nbase_url = \"https://relay.example/v1\"\nexperimental_bearer_token = \"sk-relay\"\nrequires_openai_auth = false\n",
+    )
+    .unwrap();
+    assert!(!super::set_active_provider_login_mode(codex.path(), true).unwrap());
+    let document: toml_edit::Document = fs::read_to_string(&config_path).unwrap().parse().unwrap();
+    assert_eq!(
+        document["model_providers"]["relay"]["requires_openai_auth"].as_bool(),
+        Some(false)
+    );
+}

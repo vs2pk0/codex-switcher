@@ -3764,9 +3764,388 @@ struct RuntimeInfoInternal {
     binary_path: PathBuf,
 }
 
+// ---------------------------------------------------------------------------
+// API 服务 ↔ Codex 实例接入（参考 OpenCodex 的「同步配置 / 恢复 Codex」）
+// ---------------------------------------------------------------------------
+
+/// 写入账号总览时使用的 Provider 显示名（config.toml 中的 provider id 由它规范化而来）。
+pub(crate) const API_SERVICE_PROVIDER_NAME: &str = "CLIProxyAPI";
+/// 账号总览中代表本地 API 服务的账号名。
+pub(crate) const API_SERVICE_ACCOUNT_NAME: &str = "本地 API 服务";
+/// API 服务接入 Codex 的进度事件名；payload 为 [`ApiServiceCodexSyncProgress`]。
+pub(crate) const CODEX_SYNC_PROGRESS_EVENT: &str = "codex-switcher-api-service-codex-sync-progress";
+
+/// 进度阶段：0 启动 API 服务，1 关闭实例并同步配置，2 修复切号会话，3 恢复全部完整历史，4 重新打开实例。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApiServiceCodexSyncProgress {
+    pub step: u8,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiServiceCodexSyncSummary {
+    pub instance_id: String,
+    pub instance_name: String,
+    pub account_id: String,
+    /// 自动绑定到 API 服务账号上的 OAuth 账号（没有可用账号时为空）。
+    pub bound_oauth_account_id: Option<String>,
+    pub base_url: String,
+    /// 本次流程是否顺带启动了 API 服务。
+    pub service_started: bool,
+    pub session_count: usize,
+    pub repair_message: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiServiceCodexRestoreSummary {
+    pub instance_id: String,
+    pub instance_name: String,
+    pub synchronized_session_provider_count: usize,
+    pub message: String,
+}
+
+pub(crate) fn api_service_base_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/v1")
+}
+
+/// 读取当前 API 服务配置的端口（不需要 Tauri State）。
+pub(crate) fn configured_port() -> Option<u16> {
+    let dirs = ApiServiceDirs::new().ok()?;
+    read_settings(&dirs).ok().map(|settings| settings.port)
+}
+
+/// 服务未运行时启动它（用于启动已接入 API 服务的 Codex 实例前）。返回本次是否真正启动了服务。
+pub(crate) fn ensure_service_started(app: &AppHandle) -> Result<bool, String> {
+    let process = app.state::<ApiServiceProcessState>();
+    let download = app.state::<ApiServiceDownloadState>();
+    let operation = app.state::<ApiServiceOperationState>();
+    let _guard = lock_operation(&operation)?;
+    ensure_not_shutting_down(&operation)?;
+    if service_pid_for_state(&process)?.is_some() {
+        return Ok(false);
+    }
+    start_service_impl(app, &process, &download, &operation)?;
+    Ok(true)
+}
+
+/// 判断某个 Codex Home 是否已路由到本地 API 服务：
+/// `model_provider = X` 且 `model_providers.X.base_url` 指向 127.0.0.1/localhost 上的服务端口。
+pub(crate) fn codex_home_has_api_service_routing(codex_home: &Path) -> bool {
+    let Some(port) = configured_port() else {
+        return false;
+    };
+    codex_config_routes_to_local_port(&codex_home.join("config.toml"), port)
+}
+
+fn codex_config_routes_to_local_port(config_path: &Path, port: u16) -> bool {
+    let Ok(config) = fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(document) = config.parse::<toml_edit::Document>() else {
+        return false;
+    };
+    let Some(provider_id) = document
+        .get("model_provider")
+        .and_then(toml_edit::Item::as_str)
+    else {
+        return false;
+    };
+    let Some(base_url) = document
+        .get("model_providers")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|providers| providers.get(provider_id))
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(toml_edit::Item::as_str)
+    else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let local_host = matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"));
+    local_host && url.port_or_known_default() == Some(port)
+}
+
+fn normalize_instance_id(instance_id: Option<&str>) -> String {
+    instance_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "__default__")
+        .unwrap_or(crate::instances::DEFAULT_INSTANCE_ID)
+        .to_string()
+}
+
+/// 在账号列表中找出代表本地 API 服务（当前配置端口）的 API Key 账号。
+pub(crate) fn find_api_service_account(
+    accounts: &[crate::account::CodexAccount],
+) -> Option<&crate::account::CodexAccount> {
+    let base_url = api_service_base_url(configured_port().unwrap_or(DEFAULT_PORT));
+    find_api_service_account_by_base_url(accounts, &base_url)
+}
+
+fn find_api_service_account_by_base_url<'a>(
+    accounts: &'a [crate::account::CodexAccount],
+    base_url: &str,
+) -> Option<&'a crate::account::CodexAccount> {
+    let same_base_url = |candidate: Option<&str>| {
+        candidate
+            .map(|value| value.trim().trim_end_matches('/'))
+            .is_some_and(|value| value == base_url.trim_end_matches('/'))
+    };
+    accounts.iter().find(|account| {
+        account.auth_mode.as_deref() == Some("apikey")
+            && same_base_url(account.api_base_url.as_deref())
+            && account
+                .api_provider_name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(API_SERVICE_PROVIDER_NAME))
+    })
+}
+
+/// 读取当前 API 服务设置（端口 + 第一个密钥）并确保账号总览中存在对应的 API Key 账号，返回其 ID。
+pub(crate) fn ensure_api_service_account_from_settings() -> Result<String, String> {
+    let dirs = ApiServiceDirs::new()?;
+    let settings = read_effective_settings(&dirs)?;
+    let api_key = first_api_key(&settings)?;
+    ensure_api_service_account(&api_key, &api_service_base_url(settings.port))
+}
+
+fn first_api_key(settings: &ApiServiceSettings) -> Result<String, String> {
+    settings
+        .api_keys
+        .iter()
+        .map(|key| key.trim())
+        .find(|key| !key.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "请先在 API 服务中添加一个 API 密钥".to_string())
+}
+
+/// 在账号总览中找到（或创建/更新）代表本地 API 服务的 API Key 账号，返回其 ID。
+fn ensure_api_service_account(api_key: &str, base_url: &str) -> Result<String, String> {
+    let store = AccountStore::default();
+    let accounts = store.list_accounts()?;
+    let existing = find_api_service_account_by_base_url(&accounts, base_url);
+    if let Some(account) = existing {
+        if account.openai_api_key.as_deref() != Some(api_key) {
+            store.update_api_key_credentials(crate::account::ApiKeyAccountUpdateInput {
+                account_id: account.id.clone(),
+                api_key: api_key.to_string(),
+                api_base_url: Some(base_url.to_string()),
+                api_provider_name: Some(API_SERVICE_PROVIDER_NAME.to_string()),
+                api_official_url: account.api_official_url.clone(),
+                account_name: account
+                    .account_name
+                    .clone()
+                    .or_else(|| Some(API_SERVICE_ACCOUNT_NAME.to_string())),
+                tags: None,
+                is_hidden: None,
+            })?;
+        }
+        return Ok(account.id.clone());
+    }
+    let port = configured_port().unwrap_or(DEFAULT_PORT);
+    let account =
+        store.add_api_key_account_with_binding(crate::account::ApiKeyAccountBindingInput {
+            api_key: api_key.to_string(),
+            api_base_url: Some(base_url.to_string()),
+            api_provider_name: Some(API_SERVICE_PROVIDER_NAME.to_string()),
+            api_official_url: Some(format!("http://127.0.0.1:{port}/management.html")),
+            account_name: Some(API_SERVICE_ACCOUNT_NAME.to_string()),
+            bound_oauth_account_id: None,
+            bound_oauth_use_local_gateway: false,
+        })?;
+    Ok(account.id)
+}
+
+/// 同步配置：确保 API 服务运行 → 停止目标实例 → 重置基础配置 → 写入 API 服务 Provider 路由
+/// → 一键修复会话（切号修复 + 恢复全部完整会话）→ 重新打开实例。
+#[tauri::command]
+pub async fn api_service_sync_codex_instance(
+    app: AppHandle,
+    instance_id: Option<String>,
+) -> Result<ApiServiceCodexSyncSummary, String> {
+    let task_app = app.clone();
+    let instance_id = normalize_instance_id(instance_id.as_deref());
+    // 先在异步上下文中挑选默认 OAuth 账号并完成 Token 续期：优先实例当前账号，其次账号列表第一个可用账号。
+    let oauth_account_id =
+        crate::service_binding::prepare_default_oauth_account(&instance_id).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let emit = |step: u8| {
+            let _ = task_app.emit(CODEX_SYNC_PROGRESS_EVENT, ApiServiceCodexSyncProgress { step });
+        };
+
+        // 第一步：读取服务设置并确保服务运行（持有服务操作锁）。
+        emit(0);
+        let (api_key, base_url, service_started) = {
+            let process = task_app.state::<ApiServiceProcessState>();
+            let download = task_app.state::<ApiServiceDownloadState>();
+            let operation = task_app.state::<ApiServiceOperationState>();
+            let _guard = lock_operation(&operation)?;
+            ensure_not_shutting_down(&operation)?;
+            let dirs = ApiServiceDirs::new()?;
+            if list_runtimes(&dirs)?.is_empty() {
+                return Err("尚未安装 API 服务，请先下载并开启 API 服务".to_string());
+            }
+            let settings = read_effective_settings(&dirs)?;
+            let api_key = first_api_key(&settings)?;
+            let already_running = service_pid_for_state(&process)?.is_some();
+            if !already_running {
+                start_service_impl(&task_app, &process, &download, &operation)?;
+            }
+            (
+                api_key,
+                api_service_base_url(settings.port),
+                !already_running,
+            )
+        };
+
+        let account_id = ensure_api_service_account(&api_key, &base_url)?;
+
+        // 第二步：停止实例、重置并写入路由、绑定 OAuth 登录态、修复会话，成功后打开实例。
+        emit(1);
+        let ((instance_name, outcome, binding_message), _) = (
+            crate::instances::run_with_instance_opened_on_success(&instance_id, |instance| {
+                let codex_home = PathBuf::from(&instance.codex_home);
+                crate::reset_codex_config_for_instance(&instance.id)?;
+                let account_store = AccountStore::new_for_instance(
+                    crate::switcher_account_dir(),
+                    codex_home.clone(),
+                    &instance.id,
+                );
+                // 参考 API Key 账号「绑定 OAuth」：把 OAuth 账号绑到 API 服务账号上，切换时同时写入登录态。
+                let binding_message = crate::service_binding::auto_bind_default_oauth(
+                    crate::service_binding::ServiceKind::ApiService,
+                    &account_store,
+                    oauth_account_id.as_deref(),
+                )?;
+                let session_store = crate::session::SessionStore::new(codex_home);
+                let switched = crate::switch_account_and_sync_session_provider(
+                    &account_store,
+                    &session_store,
+                    &account_id,
+                )?;
+                // 切换时的会话 provider 同步告警无需中断：随后的一键修复会再次全量同步。
+                let _ = switched.warning;
+                let mut report = |step: u8| emit(step + 1);
+                let outcome = crate::one_click_repair_session_store(&session_store, &mut report)
+                    .map_err(|error| format!("配置已同步，但一键修复会话失败：{error}"))?;
+                emit(4);
+                Ok((instance.name.clone(), outcome, binding_message))
+            })?,
+            (),
+        );
+        let repair_message = crate::one_click_repair_message(&outcome);
+        let message = format!(
+            "实例“{instance_name}”已接入本地 API 服务（{base_url}）{}；{binding_message}；一键修复完成：{repair_message}；实例已重新打开",
+            if service_started { "，并已顺带启动 API 服务" } else { "" }
+        );
+        Ok(ApiServiceCodexSyncSummary {
+            instance_id,
+            instance_name,
+            account_id,
+            bound_oauth_account_id: oauth_account_id,
+            base_url,
+            service_started,
+            session_count: outcome.session_count,
+            repair_message,
+            message,
+        })
+    })
+    .await
+    .map_err(|error| format!("API 服务同步配置任务失败: {error}"))?
+}
+
+/// 恢复配置：停止目标实例 → 重置为基础配置（model_provider = openai，移除 API 服务路由）
+/// → 把旧会话的 provider 同步回 openai → 重新打开实例。
+#[tauri::command]
+pub async fn api_service_restore_codex_instance(
+    app: AppHandle,
+    instance_id: Option<String>,
+) -> Result<ApiServiceCodexRestoreSummary, String> {
+    let task_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let emit = |step: u8| {
+            let _ = task_app.emit(CODEX_SYNC_PROGRESS_EVENT, ApiServiceCodexSyncProgress { step });
+        };
+        let instance_id = normalize_instance_id(instance_id.as_deref());
+        emit(1);
+        let (instance_name, synchronized) =
+            crate::instances::run_with_instance_opened_on_success(&instance_id, |instance| {
+                let codex_home = PathBuf::from(&instance.codex_home);
+                crate::reset_codex_config_for_instance(&instance.id)?;
+                let session_store = crate::session::SessionStore::new(codex_home);
+                let provider = session_store.read_target_provider()?;
+                let synchronized = session_store
+                    .synchronize_model_provider(&provider)
+                    .map_err(|error| format!("配置已恢复，但同步旧会话 provider 失败：{error}"))?;
+                emit(4);
+                Ok((instance.name.clone(), synchronized))
+            })?;
+        Ok(ApiServiceCodexRestoreSummary {
+            instance_id,
+            instance_name: instance_name.clone(),
+            synchronized_session_provider_count: synchronized,
+            message: format!(
+                "实例“{instance_name}”已恢复基础配置并重新打开，{synchronized} 条会话的 provider 已同步；如需回到 ChatGPT 账号，请在账号总览中切换"
+            ),
+        })
+    })
+    .await
+    .map_err(|error| format!("API 服务恢复配置任务失败: {error}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_codex_config_routed_to_local_api_service_port() {
+        let home = tempfile::tempdir().expect("codex home");
+        let config_path = home.path().join("config.toml");
+
+        // 指向本地 API 服务端口：视为已接入
+        fs::write(
+            &config_path,
+            concat!(
+                "model_provider = \"cliproxyapi\"\n",
+                "[model_providers.cliproxyapi]\n",
+                "name = \"CLIProxyAPI\"\n",
+                "base_url = \"http://127.0.0.1:17877/v1\"\n",
+            ),
+        )
+        .expect("write routed config");
+        assert!(codex_config_routes_to_local_port(&config_path, 17877));
+        // 端口不同或 host 非本机：不算接入
+        assert!(!codex_config_routes_to_local_port(&config_path, 17878));
+        fs::write(
+            &config_path,
+            concat!(
+                "model_provider = \"relay\"\n",
+                "[model_providers.relay]\n",
+                "base_url = \"https://gateway.example:17877/v1\"\n",
+            ),
+        )
+        .expect("write remote config");
+        assert!(!codex_config_routes_to_local_port(&config_path, 17877));
+        // 官方 provider / 缺少 provider 表：不算接入
+        fs::write(&config_path, "model_provider = \"openai\"\n").expect("write official config");
+        assert!(!codex_config_routes_to_local_port(&config_path, 17877));
+        assert!(!codex_config_routes_to_local_port(
+            &home.path().join("missing.toml"),
+            17877
+        ));
+    }
+
+    #[test]
+    fn normalizes_instance_id_aliases_to_default() {
+        assert_eq!(normalize_instance_id(None), "default");
+        assert_eq!(normalize_instance_id(Some("")), "default");
+        assert_eq!(normalize_instance_id(Some("__default__")), "default");
+        assert_eq!(normalize_instance_id(Some("  work  ")), "work");
+    }
 
     #[test]
     fn cpa_switcher_account_id_metadata_is_strictly_validated() {

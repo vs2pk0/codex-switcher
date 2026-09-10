@@ -15,6 +15,8 @@ export interface CodexInstance {
   running: boolean;
   pid?: number | null;
   openCodexConnected: boolean;
+  /** config.toml 的 model_provider 是否指向本地 API 服务（CLIProxyAPI）。 */
+  apiServiceConnected: boolean;
 }
 
 export interface CodexInstanceCapabilities {
@@ -53,8 +55,15 @@ export function deleteCodexInstance(instanceId: string): Promise<DeleteCodexInst
   return invoke("delete_codex_instance", { instanceId });
 }
 
-export function launchCodexInstance(instanceId: string): Promise<CodexInstance> {
-  return invoke("launch_codex_instance", { instanceId });
+export interface CodexInstanceLaunchResult {
+  instance: CodexInstance;
+  /** 本次为实例顺带拉起的依赖服务（OpenCodex / API 服务）。 */
+  startedServices: string[];
+}
+
+/** 启动实例；若实例已接入 OpenCodex 或 API 服务而服务未运行，会先启动服务再启动 Codex。 */
+export function launchCodexInstance(instanceId: string): Promise<CodexInstanceLaunchResult> {
+  return invoke("launch_codex_instance_with_services", { instanceId });
 }
 
 export function stopCodexInstance(instanceId: string): Promise<void> {

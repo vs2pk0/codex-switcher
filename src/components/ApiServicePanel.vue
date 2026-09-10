@@ -4,12 +4,21 @@ import { Message, Modal } from "@arco-design/web-vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { isSubscriptionExpired } from "../accountStatus";
-import { addCodexAccountWithApiKey, openExternalUrl, type CodexSwitcherSettings } from "../services/codex";
+import {
+  addCodexAccountWithApiKey,
+  openExternalUrl,
+  type CodexSwitcherSettings,
+  type ServiceOauthBindingRequest,
+} from "../services/codex";
 import { t } from "../i18n";
 import { hasAnyQuotaWindow, hasQuotaWindow } from "../quota";
 import type { CodexAccount } from "../types/codex";
+import { instanceDisplayName, type CodexInstance } from "../services/instances";
+import AppBusyOverlay from "./AppBusyOverlay.vue";
+import InstancePickerModal from "./InstancePickerModal.vue";
 import PlanBadge from "./PlanBadge.vue";
 import {
+  API_SERVICE_CODEX_SYNC_PROGRESS_EVENT,
   API_SERVICE_DOWNLOAD_PROGRESS_EVENT,
   activateApiServiceRuntime,
   bindApiServiceAccounts,
@@ -23,10 +32,13 @@ import {
   isCurrentApiServiceAccount,
   listApiServiceBoundAccounts,
   resetApiService,
+  restoreApiServiceCodexInstance,
   startApiService,
   stopApiService,
+  syncApiServiceCodexInstance,
   updateApiServiceSettings,
   type ApiServiceAutoUpdateEvent,
+  type ApiServiceCodexSyncProgress,
   type ApiServiceBoundAccount,
   type ApiServiceDownloadProgress,
   type ApiServiceState,
@@ -38,11 +50,16 @@ const props = defineProps<{
   settings: CodexSwitcherSettings;
   active: boolean;
   autoUpdateEvent?: ApiServiceAutoUpdateEvent | null;
+  instances: CodexInstance[];
 }>();
 
 const emit = defineEmits<{
   (event: "account-added", account: CodexAccount): void;
   (event: "bound-accounts-changed"): void;
+  /** 同步/恢复配置改变了实例的接入状态或运行状态。 */
+  (event: "instances-changed"): void;
+  /** 请求为某个已接入实例绑定 / 更换 / 取消 OAuth 账号（由 App 复用 OAuth 绑定弹窗处理）。 */
+  (event: "bind-oauth", request: ServiceOauthBindingRequest): void;
 }>();
 
 const state = ref<ApiServiceState | null>(null);
@@ -69,6 +86,102 @@ const bindSearchKeyword = ref("");
 const boundAccounts = ref<ApiServiceBoundAccount[]>([]);
 const progress = ref<ApiServiceDownloadProgress | null>(null);
 let unlistenProgress: UnlistenFn | null = null;
+let unlistenCodexSyncProgress: UnlistenFn | null = null;
+
+/** 「同步配置 / 恢复配置」的实例选择与全屏遮罩状态。 */
+type CodexIntegrationMode = "sync" | "restore" | "bind-oauth";
+const codexIntegrationMode = ref<CodexIntegrationMode>("sync");
+const instancePickerVisible = ref(false);
+const codexIntegrationBusy = ref<{ title: string; message: string; steps: string[]; activeStep: number } | null>(null);
+
+/** 后端进度 step（0..4）→ 遮罩步骤索引；恢复流程只有两个阶段。 */
+/** 同步流程的后端 step（0..4）映射到 6 个展示步骤：绑定 OAuth 发生在「同步配置」阶段内，随切号修复一起推进。 */
+function codexIntegrationStepIndex(mode: CodexIntegrationMode, step: number): number {
+  if (mode === "sync") return step >= 2 ? step + 1 : step;
+  return step >= 4 ? 1 : 0;
+}
+
+function codexIntegrationSteps(mode: CodexIntegrationMode): string[] {
+  return mode === "sync"
+    ? [t("启动 API 服务"), t("关闭实例并同步配置"), t("绑定 OAuth 登录态"), t("修复切号会话"), t("恢复全部会话的完整历史"), t("重新打开 Codex 实例")]
+    : [t("关闭实例并恢复基础配置"), t("重新打开 Codex 实例")];
+}
+
+function instancePickerTitle(mode: CodexIntegrationMode): string {
+  if (mode === "sync") return t("选择要接入 API 服务的 Codex 实例");
+  if (mode === "restore") return t("选择要恢复配置的 Codex 实例");
+  return t("选择要绑定 OAuth 账号的 Codex 实例");
+}
+
+function instancePickerDescription(mode: CodexIntegrationMode): string {
+  if (mode === "sync") return t("所选实例的 config.toml 会指向本地 API 服务，同步时会自动绑定 OAuth 登录态并执行一键修复。");
+  if (mode === "restore") return t("所选实例将恢复为基础配置并重新打开。");
+  return t("为该实例上的“本地 API 服务”账号更换或取消绑定的 OAuth 账号。");
+}
+
+function openCodexIntegration(mode: CodexIntegrationMode): void {
+  if (codexIntegrationBusy.value) return;
+  if (mode === "sync") {
+    if (!serviceReady.value) {
+      Message.warning(t("请先下载并开启 API 服务"));
+      return;
+    }
+    if (!firstApiKey.value) {
+      Message.error(t("请先添加一个 API 密钥"));
+      return;
+    }
+  }
+  codexIntegrationMode.value = mode;
+  instancePickerVisible.value = true;
+}
+
+function confirmCodexIntegration(instanceId: string): void {
+  instancePickerVisible.value = false;
+  const mode = codexIntegrationMode.value;
+  const instance = props.instances.find((item) => item.id === instanceId);
+  const instanceName = instance ? instanceDisplayName(instance) : instanceId;
+  if (mode === "bind-oauth") {
+    emit("bind-oauth", { kind: "api-service", instanceId, instanceName });
+    return;
+  }
+  Modal.warning({
+    title: t(mode === "sync" ? "同步配置到 Codex 实例" : "恢复 Codex 实例配置"),
+    content: mode === "sync"
+      ? `${instanceName}：${t("将先确保 API 服务运行，然后关闭该实例、重置基础配置并把 model_provider 指向本地 API 服务（自动写入/更新账号总览中的“本地 API 服务”账号，并绑定实例当前账号或列表中第一个可用的 OAuth 账号作为登录态），接着执行一键修复（切号修复 + 恢复全部完整会话），全部完成后再重新打开 Codex。修复前会自动备份，期间请勿关闭应用。")}`
+      : `${instanceName}：${t("将关闭该实例，恢复为基础配置（model_provider = openai，移除本地 API 服务路由），同步旧会话的 provider 后重新打开 Codex。如需回到 ChatGPT 账号，完成后请在账号总览中切换。")}`,
+    okText: t("确认执行"),
+    cancelText: t("取消"),
+    hideCancel: false,
+    onOk: () => {
+      void runCodexIntegration(mode, instanceId, instanceName);
+    },
+  });
+}
+
+async function runCodexIntegration(mode: CodexIntegrationMode, instanceId: string, instanceName: string): Promise<void> {
+  codexIntegrationBusy.value = {
+    title: `${t(mode === "sync" ? "正在同步配置并一键修复" : "正在恢复配置")}「${instanceName}」`,
+    message: t(mode === "sync"
+      ? "同步配置后会先对该实例执行一键修复（切号修复 + 恢复全部完整会话），修复完成后再重新打开 Codex。请勿关闭应用。"
+      : "恢复期间 Codex 实例会先关闭，完成后自动重新打开。请勿关闭应用。"),
+    steps: codexIntegrationSteps(mode),
+    activeStep: 0,
+  };
+  try {
+    const summary = mode === "sync"
+      ? await syncApiServiceCodexInstance(instanceId)
+      : await restoreApiServiceCodexInstance(instanceId);
+    codexIntegrationBusy.value = null;
+    await refreshState(true, false);
+    emit("instances-changed");
+    emit("bound-accounts-changed");
+    Message.success(`${t(mode === "sync" ? "同步配置完成" : "恢复配置完成")}：${summary.message}`);
+  } catch (error) {
+    codexIntegrationBusy.value = null;
+    emit("instances-changed");
+    Message.error(`${t(mode === "sync" ? "同步配置失败" : "恢复配置失败")}：${errorText(error)}`);
+  }
+}
 let countdownTimer: number | undefined;
 let progressClearTimer: number | undefined;
 let panelMounted = false;
@@ -291,6 +404,8 @@ async function start(): Promise<void> {
     state.value = next;
     syncForm(next);
     progress.value = null;
+    // 服务开启后刷新实例列表，让实例卡片 / 实例选择弹窗的「API 服务」标识与最新端口配置保持同步。
+    emit("instances-changed");
     Message.success(t("API 服务已开启"));
   } catch (error) {
     Message.error(`开启失败：${errorText(error)}`);
@@ -306,6 +421,7 @@ async function stop(): Promise<void> {
     const next = await stopApiService();
     state.value = next;
     syncForm(next);
+    emit("instances-changed");
     Message.success(t("API 服务已停止"));
   } catch (error) {
     Message.error(`停止失败：${errorText(error)}`);
@@ -964,6 +1080,16 @@ onMounted(async () => {
       }
     },
   );
+  unlistenCodexSyncProgress = await listen<ApiServiceCodexSyncProgress>(
+    API_SERVICE_CODEX_SYNC_PROGRESS_EVENT,
+    (event) => {
+      if (!codexIntegrationBusy.value) return;
+      const index = codexIntegrationStepIndex(codexIntegrationMode.value, event.payload.step);
+      if (index >= codexIntegrationBusy.value.activeStep) {
+        codexIntegrationBusy.value = { ...codexIntegrationBusy.value, activeStep: index };
+      }
+    },
+  );
   countdownTimer = window.setInterval(() => {
     countdownNow.value = Date.now();
   }, 1000);
@@ -982,6 +1108,7 @@ watch(
 onUnmounted(() => {
   panelMounted = false;
   unlistenProgress?.();
+  unlistenCodexSyncProgress?.();
   if (countdownTimer) window.clearInterval(countdownTimer);
   if (progressClearTimer) window.clearTimeout(progressClearTimer);
 });
@@ -1093,6 +1220,30 @@ onUnmounted(() => {
               >
                 <template #icon><icon-delete /></template>
                 {{ t("重置服务") }}
+              </a-button>
+              <a-button
+                type="primary"
+                status="success"
+                :disabled="!serviceReady || !firstApiKey || downloading || starting || stopping || Boolean(codexIntegrationBusy)"
+                @click="openCodexIntegration('sync')"
+              >
+                <template #icon><icon-sync /></template>
+                {{ t("同步配置") }}
+              </a-button>
+              <a-button
+                status="warning"
+                :disabled="downloading || starting || stopping || Boolean(codexIntegrationBusy)"
+                @click="openCodexIntegration('restore')"
+              >
+                <template #icon><icon-undo /></template>
+                {{ t("恢复配置") }}
+              </a-button>
+              <a-button
+                :disabled="!serviceReady || Boolean(codexIntegrationBusy)"
+                @click="openCodexIntegration('bind-oauth')"
+              >
+                <template #icon><icon-user /></template>
+                {{ t("绑定 OAuth") }}
               </a-button>
               <a-button :disabled="!serviceReady" @click="openBindAccounts">
                 <template #icon><icon-link /></template>
@@ -1491,5 +1642,21 @@ onUnmounted(() => {
         </div>
       </div>
     </a-modal>
+
+    <InstancePickerModal
+      v-model:visible="instancePickerVisible"
+      :instances="instances"
+      :title="instancePickerTitle(codexIntegrationMode)"
+      :description="instancePickerDescription(codexIntegrationMode)"
+      :confirm-text="t('下一步')"
+      @confirm="confirmCodexIntegration"
+    />
+    <AppBusyOverlay
+      :visible="codexIntegrationBusy !== null"
+      :title="codexIntegrationBusy?.title ?? ''"
+      :message="codexIntegrationBusy?.message"
+      :steps="codexIntegrationBusy?.steps"
+      :active-step="codexIntegrationBusy?.activeStep"
+    />
   </section>
 </template>

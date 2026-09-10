@@ -550,6 +550,20 @@ impl Backend {
         self.running_open_codex_port().is_some()
     }
 
+    /// 服务未运行时后台拉起 OpenCodex（用于启动已接入 OpenCodex 的 Codex 实例前）。
+    /// 返回本次是否真正启动了服务。
+    pub fn ensure_service_running(&self) -> Result<bool, String> {
+        if self.open_codex_service_running() {
+            return Ok(false);
+        }
+        let launcher = self.active_launcher()?;
+        let port = self.read_configured_port().unwrap_or(self.default_port);
+        self.begin_mutation()?;
+        let started = self.start_background(&launcher, port, launcher.version.as_deref(), None);
+        self.finish_mutation();
+        started.map(|_| true)
+    }
+
     fn validate_instance_port(&self, port: u16) -> Result<(), String> {
         for other in crate::instances::list_codex_instances()? {
             if other.id == self.instance_id {
@@ -1408,9 +1422,62 @@ impl Backend {
                         .into_iter()
                         .find(|instance| Path::new(&instance.codex_home) == home)
                         .ok_or_else(|| "目标实例不存在，请刷新后重试".to_string())?;
+                    // 同步流程：停止实例 → 重置基础配置 → 注入 OpenCodex 路由 → 一键修复会话
+                    // （切号修复 + 全部会话完整历史）→ 最后才重新打开实例。修复期间实例保持关闭。
                     crate::instances::run_with_instance_opened_on_success(&instance.id, |_| {
+                        self.emit_log(&operation_id, "system", "已停止实例，开始重置并同步配置…");
                         self.reset_instance_config_inner(&instance.id)?;
-                        self.run_instance_integration_helper(&action, port, home)
+                        let sync_message =
+                            self.run_instance_integration_helper(&action, port, home)?;
+                        // 绑定 OAuth 登录态：优先实例当前账号，否则取账号列表第一个可用账号（与 API Key 绑定 OAuth 一致）。
+                        self.emit_log(
+                            &operation_id,
+                            "system",
+                            "配置已同步，正在绑定 OAuth 账号登录态…",
+                        );
+                        let oauth_account_id =
+                            crate::service_binding::prepare_default_oauth_account_blocking(
+                                &instance.id,
+                            )?;
+                        let account_store = crate::account::AccountStore::new_for_instance(
+                            crate::switcher_account_dir(),
+                            home.to_path_buf(),
+                            &instance.id,
+                        );
+                        let binding_message = crate::service_binding::auto_bind_default_oauth(
+                            crate::service_binding::ServiceKind::OpenCodex,
+                            &account_store,
+                            oauth_account_id.as_deref(),
+                        )?;
+                        self.emit_log(&operation_id, "system", &binding_message);
+                        self.emit_log(
+                            &operation_id,
+                            "system",
+                            "开始一键修复会话（切号修复 + 恢复全部完整会话），实例暂不启动…",
+                        );
+                        let session_store = crate::session::SessionStore::new(home.to_path_buf());
+                        let mut report = |step: u8| {
+                            let text = match step {
+                                1 => "修复切号会话：Provider 模型前缀、线程模型与加密引用…",
+                                2 => "恢复全部会话的完整历史：分页历史、消息序号与本地索引…",
+                                _ => return,
+                            };
+                            self.emit_log(&operation_id, "system", text);
+                        };
+                        let outcome =
+                            crate::one_click_repair_session_store(&session_store, &mut report)
+                                .map_err(|error| {
+                                    format!("配置已同步，但一键修复会话失败：{error}")
+                                })?;
+                        let repair_message = crate::one_click_repair_message(&outcome);
+                        self.emit_log(
+                            &operation_id,
+                            "system",
+                            &format!("一键修复完成：{repair_message}，正在重新打开实例…"),
+                        );
+                        Ok(format!(
+                            "{sync_message}；{binding_message}；一键修复完成（{repair_message}）"
+                        ))
                     })
                 } else {
                     self.run_instance_integration_helper(&action, port, home)

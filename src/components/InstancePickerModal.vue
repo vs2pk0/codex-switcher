@@ -69,6 +69,10 @@ function confirm(): void {
                 <template #icon><icon-link /></template>
                 OpenCodex
               </a-tag>
+              <a-tag v-if="instance.apiServiceConnected" color="green" size="small">
+                <template #icon><icon-link /></template>
+                {{ t("API 服务") }}
+              </a-tag>
             </div>
             <span class="instance-picker-path" :title="instance.codexHome">{{ instance.codexHome }}</span>
           </div>

@@ -6,6 +6,7 @@ mod oauth;
 mod opencodex;
 mod push;
 mod reset;
+mod service_binding;
 mod session;
 mod subscription;
 mod token_keeper;
@@ -364,10 +365,10 @@ struct CodexSessionRestoreResult {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CodexAccountSwitchResult {
-    account: CodexAccount,
-    synchronized_session_provider_count: usize,
-    warning: Option<String>,
+pub(crate) struct CodexAccountSwitchResult {
+    pub(crate) account: CodexAccount,
+    pub(crate) synchronized_session_provider_count: usize,
+    pub(crate) warning: Option<String>,
 }
 
 #[tauri::command]
@@ -1671,6 +1672,11 @@ async fn switch_codex_account(
     }
     instances::run_with_instance_restarted(&instance_id, |instance| {
         let codex_home = PathBuf::from(&instance.codex_home);
+        // 实例若已接入 API 服务 / OpenCodex / 第三方 API Key Provider，先重置 config.toml 再导入账号数据，
+        // 避免旧的代理路由残留在新账号配置里。
+        if codex_home_needs_config_reset_before_switch(&codex_home) {
+            reset_codex_config_for_instance(&instance.id)?;
+        }
         let account_store = AccountStore::new_for_instance(
             switcher_account_dir(),
             codex_home.clone(),
@@ -1681,7 +1687,31 @@ async fn switch_codex_account(
     })
 }
 
-fn switch_account_and_sync_session_provider(
+/// 切换账号前是否需要先重置 config.toml：已接入 OpenCodex、本地 API 服务，或 `model_provider` 指向非官方 Provider（API Key）。
+pub(crate) fn codex_home_needs_config_reset_before_switch(codex_home: &Path) -> bool {
+    if instances::codex_home_has_opencodex_routing(codex_home)
+        || api_service::codex_home_has_api_service_routing(codex_home)
+    {
+        return true;
+    }
+    codex_config_uses_custom_model_provider(&codex_home.join("config.toml"))
+}
+
+fn codex_config_uses_custom_model_provider(config_path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(document) = content.parse::<toml_edit::Document>() else {
+        return false;
+    };
+    document
+        .get("model_provider")
+        .and_then(toml_edit::Item::as_str)
+        .map(str::trim)
+        .is_some_and(|provider| !provider.is_empty() && provider != "openai")
+}
+
+pub(crate) fn switch_account_and_sync_session_provider(
     account_store: &AccountStore,
     session_store: &SessionStore,
     account_id: &str,
@@ -1706,6 +1736,54 @@ fn switch_account_and_sync_session_provider(
     })
 }
 
+/// 启动实例的结果：附带本次为它顺带拉起的依赖服务名称。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexInstanceLaunchResult {
+    pub instance: instances::CodexInstance,
+    pub started_services: Vec<String>,
+}
+
+/// 启动 Codex 实例前，先确保它依赖的本地服务在运行：
+/// 已接入 OpenCodex 的实例先拉起 OpenCodex Engine；已接入 API 服务的实例先拉起 CLIProxyAPI。
+#[tauri::command]
+async fn launch_codex_instance_with_services(
+    app: AppHandle,
+    backend: tauri::State<'_, Arc<opencodex::OpenCodexBackend>>,
+    instance_id: String,
+) -> Result<CodexInstanceLaunchResult, String> {
+    let backend = Arc::clone(backend.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let instance = instances::resolve_instance(&instance_id)?;
+        let mut started_services = Vec::new();
+        if instance.open_codex_connected {
+            let instance_backend = backend.for_instance(Some(&instance.id))?;
+            if instance_backend
+                .ensure_service_running()
+                .map_err(|error| format!("启动 OpenCodex 服务失败：{error}"))?
+            {
+                started_services.push("OpenCodex".to_string());
+            }
+            // OpenCodex 重新注入配置时会把 Provider 写回 requires_openai_auth = false；
+            // 若实例已绑定 OAuth 登录态，启动前把登录模式补回去，保证 Codex 显示账号。
+            service_binding::ensure_opencodex_login_mode(&instance.id)?;
+        }
+        if instance.api_service_connected
+            && api_service::ensure_service_started(&app)
+                .map_err(|error| format!("启动 API 服务失败：{error}"))?
+        {
+            started_services.push("API 服务".to_string());
+        }
+        let launched = instances::launch_codex_instance(instance.id.clone())?;
+        Ok(CodexInstanceLaunchResult {
+            instance: launched,
+            started_services,
+        })
+    })
+    .await
+    .map_err(|error| format!("启动实例任务失败：{error}"))?
+}
+
 #[tauri::command]
 fn restart_codex_app(instance_id: Option<String>) -> Result<String, String> {
     let instance_id = instance_id.unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
@@ -1722,6 +1800,138 @@ fn repair_codex_session_model_compatibility(
         let session_store = SessionStore::new(PathBuf::from(&instance.codex_home));
         let target_provider = session_store.read_target_provider()?;
         session_store.repair_model_compatibility(&target_provider)
+    })
+}
+
+/// 「一键修复」结果：切号会话修复 + 当前实例全部会话的完整历史修复。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionOneClickRepairSummary {
+    pub instance_id: String,
+    pub instance_name: String,
+    /// 修复前实例是否在运行；修复后实例保持关闭，由前端询问是否重启。
+    pub instance_was_running: bool,
+    pub session_count: usize,
+    pub model_compatibility: CodexSessionModelCompatibilityRepairSummary,
+    pub visibility: CodexSessionVisibilityRepairSummary,
+    pub message: String,
+}
+
+/// 一键修复：先做切号会话修复（Provider 前缀 / 模型 / 加密引用），再对当前实例下所有会话执行
+/// 「恢复完整会话」（deep 可见性修复）。全程只停止一次 Codex，且不自动重启。
+///
+/// 耗时可能很长，必须放到阻塞线程池执行，否则会卡住主线程（前端表现为系统忙碌光标、无法操作）。
+#[tauri::command]
+async fn codex_one_click_repair_sessions(
+    app_handle: AppHandle,
+    instance_id: Option<String>,
+) -> Result<CodexSessionOneClickRepairSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        one_click_repair_sessions_blocking(instance_id.as_deref(), |step| {
+            let _ = app_handle.emit(
+                ONE_CLICK_REPAIR_PROGRESS_EVENT,
+                OneClickRepairProgress { step },
+            );
+        })
+    })
+    .await
+    .map_err(|error| format!("一键修复任务失败：{error}"))?
+}
+
+/// 一键修复的进度事件名；payload 为 [`OneClickRepairProgress`]。
+pub(crate) const ONE_CLICK_REPAIR_PROGRESS_EVENT: &str = "codex-one-click-repair-progress";
+
+/// 一键修复的阶段：0 停止 Codex，1 切号会话修复，2 全部会话完整历史修复。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OneClickRepairProgress {
+    pub step: u8,
+}
+
+/// 一键修复的核心（不涉及实例锁）：切号会话修复 + 全部会话 deep 修复。
+/// 调用方必须保证对应 Codex 实例已停止。
+pub(crate) struct OneClickStoreRepairOutcome {
+    pub session_count: usize,
+    pub model_compatibility: CodexSessionModelCompatibilityRepairSummary,
+    pub visibility: CodexSessionVisibilityRepairSummary,
+}
+
+pub(crate) fn one_click_repair_session_store(
+    session_store: &SessionStore,
+    report_progress: &mut impl FnMut(u8),
+) -> Result<OneClickStoreRepairOutcome, String> {
+    let target_provider = session_store.read_target_provider()?;
+    report_progress(1);
+    let model_compatibility = session_store.repair_model_compatibility(&target_provider)?;
+    let session_ids = session_store
+        .list_sessions(None, None)?
+        .into_iter()
+        .map(|session| session.id)
+        .collect::<Vec<_>>();
+    let session_count = session_ids.len();
+    report_progress(2);
+    let visibility = session_store.repair_visibility_with_options(
+        Some("deep"),
+        Some(target_provider),
+        None,
+        None,
+        Some(session_ids),
+    )?;
+    Ok(OneClickStoreRepairOutcome {
+        session_count,
+        model_compatibility,
+        visibility,
+    })
+}
+
+/// 把一键修复结果压成一行人类可读的摘要。
+pub(crate) fn one_click_repair_message(outcome: &OneClickStoreRepairOutcome) -> String {
+    format!(
+        "切号修复 {} 条会话、{} 个会话文件，清理加密引用 {} 个；完整历史修复扫描 {} 条会话，校正 {} 个会话文件，重置 {} 条分页历史投影",
+        outcome.model_compatibility.repaired_thread_count,
+        outcome.model_compatibility.repaired_rollout_file_count,
+        outcome.model_compatibility.removed_encrypted_reasoning_item_count
+            + outcome.model_compatibility.removed_encrypted_compaction_item_count,
+        outcome.visibility.scanned,
+        outcome.visibility.changed_rollout_file_count,
+        outcome.visibility.reset_history_projection_count
+    )
+}
+
+pub(crate) fn one_click_repair_sessions_blocking(
+    instance_id: Option<&str>,
+    mut report_progress: impl FnMut(u8),
+) -> Result<CodexSessionOneClickRepairSummary, String> {
+    let instance_id = instance_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value != "__default__")
+        .unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
+    report_progress(0);
+    let ((instance_name, outcome), was_running) =
+        instances::run_with_instance_stopped(&instance_id, |instance| {
+            let session_store = SessionStore::new(PathBuf::from(&instance.codex_home));
+            let outcome = one_click_repair_session_store(&session_store, &mut report_progress)?;
+            Ok((instance.name.clone(), outcome))
+        })?;
+    let message = format!("已完成一键修复：{}", one_click_repair_message(&outcome));
+    let OneClickStoreRepairOutcome {
+        session_count,
+        model_compatibility,
+        mut visibility,
+    } = outcome;
+    if let Some(item) = visibility.items.first_mut() {
+        item.instance_id = instance_id.clone();
+        item.instance_name = instance_name.clone();
+        item.running = was_running;
+    }
+    Ok(CodexSessionOneClickRepairSummary {
+        instance_id,
+        instance_name,
+        instance_was_running: was_running,
+        session_count,
+        model_compatibility,
+        visibility,
+        message,
     })
 }
 
@@ -2124,7 +2334,9 @@ async fn delete_codex_instance(
         .map_err(|e| format!("删除实例任务失败：{e}"))?
 }
 
-fn reset_codex_config_for_instance(instance_id: &str) -> Result<CodexConfigFileContent, String> {
+pub(crate) fn reset_codex_config_for_instance(
+    instance_id: &str,
+) -> Result<CodexConfigFileContent, String> {
     let codex_home = instances::codex_home_for(Some(instance_id))?;
     let path = codex_home.join("config.toml");
     let snapshot = read_file_snapshot(&path)?;
@@ -3084,7 +3296,7 @@ fn test_switcher_data_dir() -> PathBuf {
         .join(format!("{}-{}", std::process::id(), thread_id))
 }
 
-fn switcher_account_dir() -> PathBuf {
+pub(crate) fn switcher_account_dir() -> PathBuf {
     switcher_data_dir().join("account")
 }
 
@@ -4363,11 +4575,11 @@ fn compact_http_body(body: &str) -> String {
 mod tests {
     use super::{
         add_directory_to_backup_zip, backup_entry_restore_target, backup_file_info,
-        codex_config_backup_path, codex_session_trash_dir, default_backup_excluded_paths,
-        default_codex_home, delete_codex_config_toml_from, enrich_session_backup_file_info,
-        format_codex_config_content, parse_codex_api_key_models, parse_codex_quota,
-        prepare_backup_archive_files_with, read_codex_config_file_from, reset_codex_config_toml_in,
-        rollback_file_on_error, run_with_codex_desktop_restart,
+        codex_config_backup_path, codex_config_uses_custom_model_provider, codex_session_trash_dir,
+        default_backup_excluded_paths, default_codex_home, delete_codex_config_toml_from,
+        enrich_session_backup_file_info, format_codex_config_content, parse_codex_api_key_models,
+        parse_codex_quota, prepare_backup_archive_files_with, read_codex_config_file_from,
+        reset_codex_config_toml_in, rollback_file_on_error, run_with_codex_desktop_restart,
         switch_account_and_sync_session_provider, switcher_account_dir, switcher_data_dir,
         validate_prepared_switcher_backup, write_codex_config_file_to, AccountStore,
         CodexApiKeyModel, CodexConfigFileKind, SessionStore,
@@ -4378,6 +4590,25 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn custom_model_provider_requires_config_reset_before_switch() {
+        let home = tempdir().expect("codex home");
+        let config = home.path().join("config.toml");
+        // 不存在 / 官方 Provider：不需要重置
+        assert!(!codex_config_uses_custom_model_provider(&config));
+        std::fs::write(&config, "model = \"gpt-5\"\n").unwrap();
+        assert!(!codex_config_uses_custom_model_provider(&config));
+        std::fs::write(&config, "model_provider = \"openai\"\n").unwrap();
+        assert!(!codex_config_uses_custom_model_provider(&config));
+        // API Key / 代理 Provider：需要先重置再导入账号
+        std::fs::write(
+            &config,
+            "model_provider = \"cliproxyapi\"\n[model_providers.cliproxyapi]\nbase_url = \"http://127.0.0.1:17877/v1\"\n",
+        )
+        .unwrap();
+        assert!(codex_config_uses_custom_model_provider(&config));
+    }
 
     #[test]
     fn tcp_listener_retry_succeeds_after_previous_listener_releases_port() {
@@ -5455,6 +5686,10 @@ pub fn run() {
             api_service::api_service_list_bound_accounts,
             api_service::api_service_delete_bound_accounts,
             api_service::api_service_delete_account_binding,
+            api_service::api_service_sync_codex_instance,
+            api_service::api_service_restore_codex_instance,
+            service_binding::codex_get_service_oauth_binding,
+            service_binding::codex_update_service_oauth_binding,
             app_update::app_update_check,
             app_update::app_update_download,
             app_update::app_update_cancel_download,
@@ -5496,11 +5731,13 @@ pub fn run() {
             instances::save_codex_instance,
             delete_codex_instance,
             instances::launch_codex_instance,
+            launch_codex_instance_with_services,
             instances::stop_codex_instance,
             instances::restart_codex_instance,
             switch_codex_account,
             restart_codex_app,
             repair_codex_session_model_compatibility,
+            codex_one_click_repair_sessions,
             get_codex_switcher_settings,
             update_codex_switcher_settings,
             get_codex_reset_state,

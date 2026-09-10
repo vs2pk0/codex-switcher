@@ -20,6 +20,7 @@ import AddAccountModal from "./components/AddAccountModal.vue";
 import ApiKeyModelModal from "./components/ApiKeyModelModal.vue";
 import AppUpdateModal from "./components/AppUpdateModal.vue";
 import AppHeader from "./components/AppHeader.vue";
+import AppBusyOverlay from "./components/AppBusyOverlay.vue";
 import BackupProgressModal from "./components/BackupProgressModal.vue";
 import BadgeStyleModal from "./components/BadgeStyleModal.vue";
 import CodexConfigEditorModal from "./components/CodexConfigEditorModal.vue";
@@ -79,6 +80,8 @@ import {
   importCodexFromJson,
   importCodexFromLocal,
   readCodexConfigFile,
+  oneClickRepairCodexSessions,
+  type CodexSessionOneClickRepairSummary,
   repairCodexSessionModelCompatibility,
   reloadCodexAfterSessionVisibilityRepair,
   listCodexSwitcherBackups,
@@ -103,6 +106,9 @@ import {
   updateCodexAccountProfile,
   updateCodexApiKeyBoundOAuthAccount,
   updateCodexApiKeyCredentials,
+  getServiceOauthBinding,
+  updateServiceOauthBinding,
+  type ServiceOauthBindingRequest,
   type CodexExportFormat,
   type CodexApiKeyBalanceState,
   type CodexApiKeyModel,
@@ -180,6 +186,7 @@ import type { ActiveView, SessionGroup } from "./types/ui";
 import {
   getCodexInstanceCapabilities,
   instanceDisplayName,
+  launchCodexInstance,
   listCodexInstances,
   type CodexInstance,
 } from "./services/instances";
@@ -273,6 +280,10 @@ const configEditorLoading = ref(false);
 const configEditorSaving = ref(false);
 const configEditorFormatting = ref(false);
 const sessionModelRepairing = ref(false);
+const sessionOneClickRepairing = ref(false);
+/** 全局忙碌遮罩状态：非空时覆盖整个窗口并拦截所有交互（一键修复等长耗时流程）。 */
+const appBusy = ref<{ title: string; message?: string; steps?: string[]; activeStep?: number } | null>(null);
+let oneClickRepairProgressUnlisten: UnlistenFn | null = null;
 const appPaths = ref<CodexSwitcherPaths | null>(null);
 const backupFiles = ref<CodexSwitcherBackupFile[]>([]);
 const backupLoading = ref(false);
@@ -397,6 +408,22 @@ const bindingVisible = ref(false);
 const bindingAccount = ref<CodexAccount | null>(null);
 const bindingForm = reactive({ boundOauthAccountId: "" });
 const savingBinding = ref(false);
+/** 服务（OpenCodex / API 服务）绑定 OAuth 的目标；为 null 时弹窗用于 API Key 账号绑定。 */
+const serviceBindingTarget = ref<ServiceOauthBindingRequest | null>(null);
+const serviceBindingModalText = computed(() => {
+  const target = serviceBindingTarget.value;
+  if (!target) return null;
+  const serviceLabel = target.kind === "opencodex" ? "OpenCodex" : t("API 服务");
+  return {
+    title: formatTranslatedText(t("绑定 OAuth 账号到 {service}"), { service: serviceLabel }),
+    description: formatTranslatedText(
+      t("{service}接入后 Codex 仍需要 ChatGPT 登录态，绑定的 OAuth 账号会写入实例「{instance}」的 auth.json；实例运行中时会自动重启生效。"),
+      { service: serviceLabel, instance: target.instanceName },
+    ),
+    unlinkTitle: t("取消绑定"),
+    unlinkHint: t("清除登录态，Codex 将回到未登录状态"),
+  };
+});
 const apiModelVisible = ref(false);
 const apiModelAccount = ref<CodexAccount | null>(null);
 const apiModels = ref<CodexApiKeyModel[]>([]);
@@ -2334,6 +2361,11 @@ async function handleApiServiceAccountAdded(account: CodexAccount): Promise<void
   warnQuotaRefreshFailures(quotaFailures);
 }
 
+/** API 服务同步/恢复配置后：实例接入状态与当前账号都可能变化，刷新实例与账号列表。 */
+async function handleApiServiceInstancesChanged(): Promise<void> {
+  await Promise.all([loadCodexInstances(), loadAccounts()]);
+}
+
 async function refreshApiServiceAccountIds(showError = false): Promise<void> {
   try {
     const bound = await listApiServiceBoundAccounts();
@@ -2630,7 +2662,7 @@ async function handleSettingsInstanceChange(instanceId: string): Promise<void> {
 
 async function handleSessionInstanceChange(instanceId: string): Promise<void> {
   if (instanceId === sessionInstanceId.value) return;
-  if (backupWorking.value || sessionRepairing.value || sessionModelRepairing.value) {
+  if (backupWorking.value || sessionRepairing.value || sessionModelRepairing.value || sessionOneClickRepairing.value) {
     Message.warning(t("当前会话操作完成后再切换实例"));
     return;
   }
@@ -3514,9 +3546,47 @@ async function handlePhoneSave(): Promise<void> {
 }
 
 function openBinding(account: CodexAccount): void {
+  serviceBindingTarget.value = null;
   bindingAccount.value = account;
   bindingForm.boundOauthAccountId = account.bound_oauth_account_id ?? "";
   bindingVisible.value = true;
+}
+
+/** OpenCodex / API 服务面板请求「绑定 OAuth」：先读取当前绑定，再复用 OAuth 绑定弹窗选择账号。 */
+async function openServiceOauthBinding(request: ServiceOauthBindingRequest): Promise<void> {
+  try {
+    const binding = await getServiceOauthBinding(request.kind, request.instanceId);
+    bindingAccount.value = null;
+    serviceBindingTarget.value = request;
+    bindingForm.boundOauthAccountId = binding.boundAccountId ?? "";
+    bindingVisible.value = true;
+  } catch (error) {
+    Message.error(`${t("读取绑定信息失败")}：${errorText(error)}`);
+  }
+}
+
+async function handleServiceBindingSave(target: ServiceOauthBindingRequest): Promise<void> {
+  savingBinding.value = true;
+  try {
+    const binding = await updateServiceOauthBinding({
+      kind: target.kind,
+      instanceId: target.instanceId,
+      oauthAccountId: bindingForm.boundOauthAccountId || null,
+    });
+    bindingVisible.value = false;
+    serviceBindingTarget.value = null;
+    await Promise.all([loadAccounts(), loadCodexInstances()]);
+    target.onUpdated?.(binding);
+    Message.success(
+      binding.boundAccountId
+        ? formatTranslatedText(t("已绑定 OAuth 账号「{account}」"), { account: binding.boundAccountLabel ?? binding.boundAccountId })
+        : t("已取消绑定 OAuth 账号"),
+    );
+  } catch (error) {
+    Message.error(`${t("绑定失败")}：${errorText(error)}`);
+  } finally {
+    savingBinding.value = false;
+  }
 }
 
 function openApiModels(account: CodexAccount): void {
@@ -3635,6 +3705,10 @@ async function handleSaveApiModel(): Promise<void> {
 }
 
 async function handleBindingSave(): Promise<void> {
+  if (serviceBindingTarget.value) {
+    await handleServiceBindingSave(serviceBindingTarget.value);
+    return;
+  }
   if (!bindingAccount.value) return;
   savingBinding.value = true;
   try {
@@ -3922,7 +3996,7 @@ async function runRepairSessions(): Promise<void> {
 }
 
 function confirmRepairSingleSessionHistory(session: CodexSessionRecord): void {
-  if (repairingSessionId.value || sessionRepairing.value || sessionModelRepairing.value) return;
+  if (repairingSessionId.value || sessionRepairing.value || sessionModelRepairing.value || sessionOneClickRepairing.value) return;
   Modal.warning({
     title: t("恢复完整会话"),
     content: t(
@@ -4044,7 +4118,7 @@ function confirmResetConfig(): void {
 }
 
 function confirmRepairSessionModels(): void {
-  if (sessionModelRepairing.value) return;
+  if (sessionModelRepairing.value || sessionOneClickRepairing.value) return;
   Modal.warning({
     title: t("一键修复切号会话"),
     content: t(
@@ -4077,6 +4151,94 @@ function confirmRepairSessionModels(): void {
         sessionModelRepairing.value = false;
       }
     },
+  });
+}
+
+/** 一键修复：切号会话修复 + 当前实例所有会话「恢复完整会话」，全部完成后再询问是否重启 Codex。 */
+function confirmOneClickRepairSessions(): void {
+  if (
+    sessionOneClickRepairing.value ||
+    sessionModelRepairing.value ||
+    sessionRepairing.value ||
+    repairingSessionId.value
+  ) {
+    return;
+  }
+  const instanceId = sessionInstanceId.value || "default";
+  const instanceName =
+    codexInstances.value.find((instance) => instance.id === instanceId)?.name || t("默认实例");
+  Modal.warning({
+    title: t("一键修复"),
+    content: t(
+      "将依次执行「一键修复切号会话」，并对当前实例下的所有会话执行「恢复完整会话」：修复 Provider 模型前缀、线程模型、消息序号、分页历史与本地索引，清理无法跨账号复用的加密记录。会话较多时耗时较长，期间请勿关闭应用。修复前会自动备份；修复期间对应 Codex 实例会先关闭，全部处理完后再询问是否重启。",
+    ),
+    okText: t("开始修复"),
+    cancelText: t("取消"),
+    hideCancel: false,
+    onOk: () => {
+      void runOneClickRepairSessions(instanceId, instanceName);
+    },
+  });
+}
+
+/** 一键修复的阶段文案，顺序与 Rust 侧进度事件的 step 一致。 */
+function oneClickRepairSteps(): string[] {
+  return [t("关闭 Codex 实例"), t("修复切号会话"), t("恢复全部会话的完整历史")];
+}
+
+async function runOneClickRepairSessions(instanceId: string, instanceName: string): Promise<void> {
+  sessionOneClickRepairing.value = true;
+  appBusy.value = {
+    title: `${t("正在一键修复")}「${instanceName}」`,
+    message: t("会话较多时耗时较长，请勿关闭应用；完成后会询问是否重启 Codex。"),
+    steps: oneClickRepairSteps(),
+    activeStep: 0,
+  };
+  try {
+    const summary = await oneClickRepairCodexSessions(instanceId);
+    appBusy.value = null;
+    await Promise.all([loadSessions({ silent: true }), loadCodexInstances()]);
+    Message.success(`${t("一键修复完成")}：${summary.message}`);
+    await askRestartCodexAfterRepair(instanceId, instanceName, summary);
+  } catch (error) {
+    appBusy.value = null;
+    Message.error(`${t("一键修复失败")}：${errorText(error)}`);
+    await loadCodexInstances().catch(() => undefined);
+  } finally {
+    sessionOneClickRepairing.value = false;
+  }
+}
+
+/** 一键修复完成后的二次确认：是否重启 Codex。返回用户是否选择了重启并成功启动。 */
+function askRestartCodexAfterRepair(
+  instanceId: string,
+  instanceName: string,
+  summary: CodexSessionOneClickRepairSummary,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    Modal.confirm({
+      title: t("是否重启 Codex？"),
+      content: `${t("已处理")} ${summary.sessionCount} ${t("条会话")}。${summary.instanceWasRunning
+        ? t("Codex 实例在修复期间已关闭，重启后修复结果才会在会话列表中生效。")
+        : t("Codex 实例当前未运行，启动后即可看到修复结果。")} ${t("是否现在重启 Codex？")}`,
+      okText: t("立即重启"),
+      cancelText: t("稍后手动打开"),
+      onOk: async () => {
+        appBusy.value = { title: `${t("正在重启 Codex")}「${instanceName}」` };
+        try {
+          await launchCodexInstance(instanceId);
+          await loadCodexInstances();
+          Message.success(`${t("已重启 Codex 实例")}「${instanceName}」`);
+          resolve(true);
+        } catch (error) {
+          Message.error(`${t("重启 Codex 失败")}：${errorText(error)}`);
+          resolve(false);
+        } finally {
+          appBusy.value = null;
+        }
+      },
+      onCancel: () => resolve(false),
+    });
   });
 }
 
@@ -4573,6 +4735,13 @@ onMounted(() => {
   }).then((unlisten) => {
     accountStateUnlisten = unlisten;
   });
+  void listen<{ step: number }>("codex-one-click-repair-progress", (event) => {
+    if (appBusy.value?.steps) {
+      appBusy.value = { ...appBusy.value, activeStep: event.payload.step };
+    }
+  }).then((unlisten) => {
+    oneClickRepairProgressUnlisten = unlisten;
+  });
 });
 
 onUnmounted(() => {
@@ -4580,6 +4749,7 @@ onUnmounted(() => {
   appUpdateUnlisten?.();
   apiServiceAutoUpdateUnlisten?.();
   accountStateUnlisten?.();
+  oneClickRepairProgressUnlisten?.();
   window.removeEventListener("resize", handleWindowResize);
   if (windowResizeFrame) window.cancelAnimationFrame(windowResizeFrame);
   if (viewLoadTimer) window.clearTimeout(viewLoadTimer);
@@ -4774,6 +4944,7 @@ onUnmounted(() => {
       :session-repairing="sessionRepairing"
       :repairing-session-id="repairingSessionId"
       :session-model-repairing="sessionModelRepairing"
+      :session-one-click-repairing="sessionOneClickRepairing"
       :active-session-ids="activeSessionIds"
       :all-sessions-selected="allSessionsSelected"
       :selected-session-ids="selectedSessionIds"
@@ -4793,6 +4964,7 @@ onUnmounted(() => {
       @repair-sessions="handleRepairSessions"
       @repair-session-history="confirmRepairSingleSessionHistory"
       @repair-session-models="confirmRepairSessionModels"
+      @one-click-repair="confirmOneClickRepairSessions"
       @trash-sessions="handleTrashSessions"
       @restore-sessions="handleRestoreSessions"
       @toggle-session-group-expanded="toggleSessionGroupExpanded"
@@ -4851,8 +5023,11 @@ onUnmounted(() => {
       :accounts="apiServiceAccounts"
       :settings="settings"
       :auto-update-event="apiServiceAutoUpdateEvent"
+      :instances="codexInstances"
       @account-added="handleApiServiceAccountAdded"
       @bound-accounts-changed="refreshApiServiceAccountIds"
+      @instances-changed="handleApiServiceInstancesChanged"
+      @bind-oauth="openServiceOauthBinding"
     />
 
     <OpenCodexPanel
@@ -4862,6 +5037,7 @@ onUnmounted(() => {
       :instances="codexInstances"
       @accounts-refreshed="refreshOpenCodexAccountIds"
       @instances-refreshed="loadCodexInstances"
+      @bind-oauth="openServiceOauthBinding"
     />
 
     <CodexInstancesPanel
@@ -5064,6 +5240,10 @@ onUnmounted(() => {
       :binding-form="bindingForm"
       :saving="savingBinding"
       :oauth-accounts="oauthAccounts"
+      :title="serviceBindingModalText?.title"
+      :description="serviceBindingModalText?.description"
+      :unlink-title="serviceBindingModalText?.unlinkTitle"
+      :unlink-hint="serviceBindingModalText?.unlinkHint"
       :display-name="displayNameForUi"
       :is-free-plan-account="isFreePlanAccount"
       :quota-color="quotaColor"
@@ -5130,6 +5310,13 @@ onUnmounted(() => {
       :repair-result="repairResult"
       :session-repairing="sessionRepairing"
       @run="runRepairSessions"
+    />
+    <AppBusyOverlay
+      :visible="appBusy !== null"
+      :title="appBusy?.title ?? ''"
+      :message="appBusy?.message"
+      :steps="appBusy?.steps"
+      :active-step="appBusy?.activeStep"
     />
   </main>
 </template>

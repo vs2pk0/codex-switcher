@@ -1,10 +1,16 @@
 <script setup lang="ts">
 import InstanceTransfer from "./InstanceTransfer.vue";
+import AppBusyOverlay from "../components/AppBusyOverlay.vue";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { instanceDisplayName } from "../services/instances";
 import type { CodexInstance } from "../services/instances";
+import {
+  getServiceOauthBinding,
+  type ServiceOauthBinding,
+  type ServiceOauthBindingRequest,
+} from "../services/codex";
 import { currentLanguage, formatTranslatedText, t } from "../i18n";
 import { filterMigrationAccounts, toggleVisibleAccounts } from "./accounts";
 import {
@@ -51,12 +57,35 @@ const props = defineProps<{ active: boolean; instances: CodexInstance[] }>();
 const emit = defineEmits<{
   (event: "accounts-refreshed"): void;
   (event: "instances-refreshed"): void;
+  /** 请求为所选实例绑定 / 更换 / 取消 OAuth 登录态（由 App 复用 OAuth 绑定弹窗处理）。 */
+  (event: "bind-oauth", request: ServiceOauthBindingRequest): void;
 }>();
 
 const page = ref<OpenCodexPage>("console");
 const snapshot = ref<OpenCodexSystemSnapshot | null>(null);
 const logs = ref<OpenCodexCommandLogEvent[]>([]);
 const busy = ref(false);
+/** 同步配置期间的全屏遮罩：同步 → 一键修复 → 重新打开实例，全程禁止操作其他页面。 */
+const syncOverlay = ref<{ title: string; message: string; steps: string[]; activeStep: number } | null>(null);
+const SYNC_OVERLAY_STEP_MARKERS: Array<{ marker: string; step: number }> = [
+  { marker: "已停止实例", step: 0 },
+  { marker: "正在绑定 OAuth 账号登录态", step: 1 },
+  { marker: "修复切号会话", step: 2 },
+  { marker: "恢复全部会话的完整历史", step: 3 },
+  { marker: "正在重新打开实例", step: 4 },
+];
+
+function syncOverlaySteps(): string[] {
+  return [t("重置并同步配置"), t("绑定 OAuth 登录态"), t("修复切号会话"), t("恢复全部会话的完整历史"), t("重新打开 Codex 实例")];
+}
+
+/** 根据后端日志行推进遮罩步骤。 */
+function advanceSyncOverlay(line: string): void {
+  if (!syncOverlay.value) return;
+  const matched = SYNC_OVERLAY_STEP_MARKERS.find((item) => line.includes(item.marker));
+  if (!matched || matched.step < syncOverlay.value.activeStep) return;
+  syncOverlay.value = { ...syncOverlay.value, activeStep: matched.step };
+}
 const loading = ref(false);
 const interactiveOperationId = ref("");
 const commandInput = ref("");
@@ -209,6 +238,7 @@ function errorText(error: unknown): string {
 function appendLog(event: OpenCodexCommandLogEvent): void {
   if (event.operationId !== "history" && !event.operationId.startsWith(`${selectedInstanceId.value}:`)) return;
   logs.value = [...logs.value.slice(-999), event];
+  if (event.operationId !== "history" && event.stream === "system") advanceSyncOverlay(event.line);
   if (isOpenCodexPortPrompt(event.line) && !answeredPortPrompts.has(event.operationId)) {
     answeredPortPrompts.add(event.operationId);
     const selectedPort = settings.value.port || DEFAULT_OPEN_CODEX_PORT;
@@ -234,11 +264,38 @@ async function refreshSnapshot(showError = true, quiet = false): Promise<void> {
     snapshot.value = result;
     if (!quiet) emit("instances-refreshed");
     if (snapshot.value.port) settings.value.port = snapshot.value.port;
+    void refreshOauthBinding();
   } catch (error) {
     if (showError) Message.error(formatTranslatedText("读取 OpenCodex 状态失败：{error}", { error: errorText(error) }));
   } finally {
     if (!quiet) loading.value = false;
   }
+}
+
+/** 所选实例当前绑定的 OAuth 登录态（auth.json 推断），用于快捷操作卡片展示。 */
+const oauthBinding = ref<ServiceOauthBinding | null>(null);
+async function refreshOauthBinding(): Promise<void> {
+  const instanceId = selectedInstanceId.value;
+  try {
+    const binding = await getServiceOauthBinding("opencodex", instanceId);
+    if (instanceId !== selectedInstanceId.value) return;
+    oauthBinding.value = binding;
+  } catch {
+    if (instanceId === selectedInstanceId.value) oauthBinding.value = null;
+  }
+}
+
+function requestOauthBinding(): void {
+  const instanceId = selectedInstanceId.value;
+  emit("bind-oauth", {
+    kind: "opencodex",
+    instanceId,
+    instanceName: selectedInstance.value ? instanceDisplayName(selectedInstance.value) : instanceId,
+    onUpdated: (binding) => {
+      if (binding.instanceId === selectedInstanceId.value) oauthBinding.value = binding;
+      void refreshSnapshot(false, true);
+    },
+  });
 }
 
 async function executeAction(action: OpenCodexAction, instanceId = selectedInstanceId.value): Promise<void> {
@@ -283,12 +340,21 @@ async function executeAction(action: OpenCodexAction, instanceId = selectedInsta
     if (!confirmed) return;
   }
   busy.value = true;
+  if (action === "sync") {
+    syncOverlay.value = {
+      title: `${t("正在同步配置并一键修复")}「${selectedInstance.value ? instanceDisplayName(selectedInstance.value) : t("系统默认实例（原版）")}」`,
+      message: t("同步配置后会先对该实例执行一键修复（切号修复 + 恢复全部完整会话），修复完成后再重新打开 Codex。请勿关闭应用。"),
+      steps: syncOverlaySteps(),
+      activeStep: 0,
+    };
+  }
   try {
     const started = await runOpenCodexAction(action, settings.value.port, instanceId);
     interactiveOperationId.value = started.interactive ? started.operationId : "";
     if (started.interactive) page.value = "console";
   } catch (error) {
     busy.value = false;
+    syncOverlay.value = null;
     Message.error(formatTranslatedText("OpenCodex 操作启动失败：{error}", { error: errorText(error) }));
   }
 }
@@ -701,6 +767,7 @@ onMounted(async () => {
       (event) => {
         if (!event.operationId.startsWith(`${selectedInstanceId.value}:`)) return;
         if (!installingVersion.value) busy.value = false;
+        if (event.action === "sync") syncOverlay.value = null;
         if (interactiveOperationId.value === event.operationId) interactiveOperationId.value = "";
         appendLog({
           operationId: event.operationId,
@@ -728,6 +795,13 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
 
 <template>
   <section class="opencodex-page">
+    <AppBusyOverlay
+      :visible="syncOverlay !== null"
+      :title="syncOverlay?.title ?? ''"
+      :message="syncOverlay?.message"
+      :steps="syncOverlay?.steps"
+      :active-step="syncOverlay?.activeStep"
+    />
     <header class="opencodex-hero">
       <div>
         <div class="opencodex-title-row">
@@ -849,7 +923,15 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
           <div class="section-heading"><div><h2>{{ t("快捷操作") }}</h2><p>{{ t("所有命令均经过 Rust 白名单和参数校验") }}</p></div></div>
           <div class="quick-grid">
             <button :disabled="busy || !snapshot?.initialized" @click="run('doctor')"><span><icon-bug /></span><div><strong>{{ t("环境诊断") }}</strong><small>{{ t("检查运行环境与配置") }}</small></div><icon-right /></button>
-            <button :disabled="busy || !snapshot?.initialized" @click="run('sync')"><span><icon-sync /></span><div><strong>{{ t("同步配置") }}</strong><small>{{ t("恢复基础配置，同步后自动打开实例") }}</small></div><icon-right /></button>
+            <button :disabled="busy || !snapshot?.initialized" @click="run('sync')"><span><icon-sync /></span><div><strong>{{ t("同步配置") }}</strong><small>{{ t("恢复基础配置，绑定 OAuth 并一键修复后打开实例") }}</small></div><icon-right /></button>
+            <button :disabled="busy || selectionLocked" @click="requestOauthBinding">
+              <span><icon-user /></span>
+              <div>
+                <strong>{{ t("绑定 OAuth") }}</strong>
+                <small>{{ oauthBinding?.boundAccountId ? formatTranslatedText(t("当前：{account}，点击更换或取消绑定"), { account: oauthBinding.boundAccountLabel ?? oauthBinding.boundAccountId }) : t("为所选实例写入 ChatGPT 登录态") }}</small>
+              </div>
+              <icon-right />
+            </button>
             <button
               :class="{ 'toggle-enabled': snapshot?.backgroundService?.installed }"
               :disabled="busy || !snapshot?.initialized || snapshot?.backgroundService?.supported === false"

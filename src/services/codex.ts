@@ -337,6 +337,59 @@ export function repairCodexSessionModelCompatibility(
   return invoke("repair_codex_session_model_compatibility", { instanceId });
 }
 
+/** 「一键修复」结果：切号会话修复 + 当前实例全部会话的完整历史修复；实例修复后保持关闭。 */
+export interface CodexSessionOneClickRepairSummary {
+  instanceId: string;
+  instanceName: string;
+  instanceWasRunning: boolean;
+  sessionCount: number;
+  modelCompatibility: CodexSessionModelCompatibilityRepairSummary;
+  visibility: CodexSessionVisibilityRepairSummary;
+  message: string;
+}
+
+export function oneClickRepairCodexSessions(
+  instanceId = "default",
+): Promise<CodexSessionOneClickRepairSummary> {
+  return invoke("codex_one_click_repair_sessions", { instanceId });
+}
+
+/** 接入 Codex 实例的本地服务类型（与 Rust `ServiceKind` 的 kebab-case 序列化一致）。 */
+export type ServiceOauthBindingKind = "opencodex" | "api-service";
+
+/** 某个实例上服务当前绑定的 OAuth 账号。 */
+export interface ServiceOauthBinding {
+  kind: ServiceOauthBindingKind;
+  instanceId: string;
+  boundAccountId: string | null;
+  boundAccountLabel: string | null;
+}
+
+/** 面板向 App 发起「绑定 OAuth」的请求参数。 */
+export interface ServiceOauthBindingRequest {
+  kind: ServiceOauthBindingKind;
+  instanceId: string;
+  instanceName: string;
+  /** 绑定更新成功后的回调，供面板刷新自身显示。 */
+  onUpdated?: (binding: ServiceOauthBinding) => void;
+}
+
+export function getServiceOauthBinding(
+  kind: ServiceOauthBindingKind,
+  instanceId = "default",
+): Promise<ServiceOauthBinding> {
+  return invoke("codex_get_service_oauth_binding", { kind, instanceId });
+}
+
+/** 更换 / 取消服务绑定的 OAuth 账号；实例运行中时会自动重启以使登录态生效。 */
+export function updateServiceOauthBinding(input: {
+  kind: ServiceOauthBindingKind;
+  instanceId: string;
+  oauthAccountId: string | null;
+}): Promise<ServiceOauthBinding> {
+  return invoke("codex_update_service_oauth_binding", input);
+}
+
 export function getCodexSwitcherSettings(): Promise<CodexSwitcherSettings> {
   return invoke("get_codex_switcher_settings");
 }

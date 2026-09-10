@@ -416,6 +416,11 @@ impl AccountStore {
         Ok(self.read_database()?.accounts)
     }
 
+    /// 该 store 对应的 Codex Home 目录。
+    pub fn codex_home(&self) -> &Path {
+        &self.codex_home
+    }
+
     pub fn current_account(&self) -> Result<Option<CodexAccount>, String> {
         let database = self.read_database()?;
         let Some(current_id) = self.current_account_id(&database).map(str::to_string) else {
@@ -1035,7 +1040,8 @@ impl AccountStore {
             }
         }
 
-        let is_current = database.current_account_id.as_deref() == Some(account_id);
+        // 按当前 store 的实例作用域判断，避免多开实例误写默认实例的 auth.json。
+        let is_current = self.current_account_id(&database) == Some(account_id);
         let account = database
             .accounts
             .iter_mut()
@@ -1714,10 +1720,19 @@ impl AccountStore {
                     .get("base_url")
                     .and_then(|value| value.as_str())
                     .and_then(|value| normalize_optional(Some(value)));
+                // 本地网关模式下 API Key 放在 http_headers.X-Api-Key（Authorization 留给 ChatGPT 登录态）。
                 config.provider_api_key = provider
                     .get("experimental_bearer_token")
                     .and_then(|value| value.as_str())
-                    .and_then(|value| normalize_optional(Some(value)));
+                    .and_then(|value| normalize_optional(Some(value)))
+                    .or_else(|| {
+                        provider
+                            .get("http_headers")
+                            .and_then(Item::as_table_like)
+                            .and_then(|headers| headers.get(LOCAL_GATEWAY_API_KEY_HEADER))
+                            .and_then(|value| value.as_str())
+                            .and_then(|value| normalize_optional(Some(value)))
+                    });
             }
         }
         Ok(config)
@@ -2963,16 +2978,7 @@ fn write_codex_auth_projection(
             if oauth_account.tokens.access_token.trim().is_empty() {
                 return Err("绑定的 OAuth 账号缺少 access_token".to_string());
             }
-            serde_json::json!({
-                "OPENAI_API_KEY": Value::Null,
-                "tokens": {
-                    "id_token": oauth_account.tokens.id_token,
-                    "access_token": oauth_account.tokens.access_token,
-                    "account_id": chatgpt_account_id(oauth_account).unwrap_or_default(),
-                    "refresh_token": oauth_account.tokens.refresh_token.clone().unwrap_or_default()
-                },
-                "last_refresh": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
-            })
+            oauth_auth_json_value(oauth_account)
         } else {
             serde_json::json!({
                 "auth_mode": "apikey",
@@ -2983,22 +2989,9 @@ fn write_codex_auth_projection(
         if account.tokens.access_token.trim().is_empty() {
             return Err("OAuth 账号缺少 access_token，无法写入 auth.json".to_string());
         }
-        serde_json::json!({
-            "OPENAI_API_KEY": Value::Null,
-            "tokens": {
-                "id_token": account.tokens.id_token,
-                "access_token": account.tokens.access_token,
-                "account_id": chatgpt_account_id(account).unwrap_or_default(),
-                "refresh_token": account.tokens.refresh_token.clone().unwrap_or_default()
-            },
-            "last_refresh": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
-        })
+        oauth_auth_json_value(account)
     };
-    write_string_atomic(
-        &codex_home.join("auth.json"),
-        &serde_json::to_string_pretty(&auth_value)
-            .map_err(|error| format!("序列化 auth.json 失败: {}", error))?,
-    )?;
+    write_auth_json(codex_home, &auth_value)?;
 
     if account.auth_mode.as_deref() == Some("apikey") {
         write_api_key_provider_config(codex_home, account, model_transition)?;
@@ -3006,6 +2999,148 @@ fn write_codex_auth_projection(
         write_official_provider_config(codex_home, model_transition)?;
     }
     Ok(())
+}
+
+/// 生成 OAuth 账号对应的 auth.json 内容（ChatGPT 登录态）。
+fn oauth_auth_json_value(account: &CodexAccount) -> Value {
+    serde_json::json!({
+        "OPENAI_API_KEY": Value::Null,
+        "tokens": {
+            "id_token": account.tokens.id_token,
+            "access_token": account.tokens.access_token,
+            "account_id": chatgpt_account_id(account).unwrap_or_default(),
+            "refresh_token": account.tokens.refresh_token.clone().unwrap_or_default()
+        },
+        "last_refresh": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+    })
+}
+
+fn write_auth_json(codex_home: &Path, auth_value: &Value) -> Result<(), String> {
+    fs::create_dir_all(codex_home).map_err(|error| format!("创建 Codex 目录失败: {}", error))?;
+    write_string_atomic(
+        &codex_home.join("auth.json"),
+        &serde_json::to_string_pretty(auth_value)
+            .map_err(|error| format!("序列化 auth.json 失败: {}", error))?,
+    )
+}
+
+/// 本地网关模式下向网关传递 API Key 的请求头（CLIProxyAPI 支持 Authorization / X-Api-Key / X-Goog-Api-Key 任一命中）。
+pub(crate) const LOCAL_GATEWAY_API_KEY_HEADER: &str = "X-Api-Key";
+
+/// API Key 账号是否以「本地网关 + ChatGPT 登录态」模式写入 config.toml：
+/// 绑定了 OAuth 且勾选了 `bound_oauth_use_local_gateway`。
+fn uses_local_gateway_login(account: &CodexAccount) -> bool {
+    account.bound_oauth_use_local_gateway
+        && account
+            .bound_oauth_account_id
+            .as_deref()
+            .and_then(|value| normalize_optional(Some(value)))
+            .is_some()
+}
+
+/// OAuth 账号的 Token 是否齐备（access_token / refresh_token 都有），可直接写入 auth.json。
+pub(crate) fn oauth_tokens_complete(account: &CodexAccount) -> bool {
+    account.auth_mode.as_deref() != Some("apikey")
+        && !account.tokens.access_token.trim().is_empty()
+        && account
+            .tokens
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+}
+
+/// 判断 OAuth 账号是否适合作为默认候选：Token 齐备且未隐藏。
+pub(crate) fn is_usable_oauth_account(account: &CodexAccount) -> bool {
+    !account.is_hidden && oauth_tokens_complete(account)
+}
+
+/// 让 config.toml 里当前激活的自定义 Provider（OpenCodex 等本地代理）改用 / 不用 ChatGPT 登录态。
+///
+/// 代理注入的 Provider 默认 `requires_openai_auth = false`，Codex 会按 API Key 模式运行并忽略 auth.json，
+/// 账号菜单只显示 Provider 名字。绑定 OAuth 后把它改为 `true`，Codex 才会带上 OAuth Token 并显示账号；
+/// 只处理不需要客户端密钥（无 `env_key` / `experimental_bearer_token`）的 Provider，内置 `openai` 无需处理。
+pub(crate) fn set_active_provider_login_mode(
+    codex_home: &Path,
+    requires_openai_auth: bool,
+) -> Result<bool, String> {
+    let config_path = codex_home.join("config.toml");
+    if !config_path.exists() {
+        return Ok(false);
+    }
+    let mut document = read_toml_document(&config_path)?;
+    let Some(provider_id) = document
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && *id != "openai")
+        .map(str::to_string)
+    else {
+        return Ok(false);
+    };
+    let Some(provider) = document
+        .get_mut("model_providers")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|providers| providers.get_mut(&provider_id))
+        .and_then(Item::as_table_like_mut)
+    else {
+        return Ok(false);
+    };
+    if provider.get("env_key").is_some() || provider.get("experimental_bearer_token").is_some() {
+        return Ok(false);
+    }
+    if provider.get("requires_openai_auth").and_then(Item::as_bool) == Some(requires_openai_auth) {
+        return Ok(false);
+    }
+    provider.insert("requires_openai_auth", value(requires_openai_auth));
+    write_string_atomic(&config_path, &document.to_string())?;
+    Ok(true)
+}
+
+impl AccountStore {
+    /// auth.json 中的登录态是否属于指定 OAuth 账号（邮箱或 access_token 一致）。
+    pub fn auth_json_matches_account(&self, account: &CodexAccount) -> bool {
+        self.read_current_codex_config()
+            .map(|config| oauth_identity_matches(account, &config))
+            .unwrap_or(false)
+    }
+
+    /// 只把 OAuth 账号的登录态写入 auth.json，不改动 config.toml 的路由（供 OpenCodex 等已自行注入路由的场景使用），
+    /// 并把当前激活的代理 Provider 切到 ChatGPT 登录态模式。传入 `None` 时清空登录态并切回无登录模式。
+    pub fn apply_oauth_login_only(
+        &self,
+        account_id: Option<&str>,
+    ) -> Result<Option<CodexAccount>, String> {
+        let _database_guard = lock_account_database_mutation()?;
+        let mut database = self.read_database()?;
+        let Some(account_id) = normalize_optional(account_id) else {
+            write_auth_json(
+                &self.codex_home,
+                &serde_json::json!({ "OPENAI_API_KEY": Value::Null }),
+            )?;
+            set_active_provider_login_mode(&self.codex_home, false)?;
+            self.set_current_account_id(&mut database, None);
+            self.write_database(&database)?;
+            return Ok(None);
+        };
+        let account = database
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| "账号不存在".to_string())?;
+        if account.auth_mode.as_deref() == Some("apikey") {
+            return Err("只能绑定 OAuth 账号".to_string());
+        }
+        if account.tokens.access_token.trim().is_empty() {
+            return Err("OAuth 账号缺少 access_token，无法写入 auth.json".to_string());
+        }
+        account.last_used = now_timestamp();
+        let updated = account.clone();
+        write_auth_json(&self.codex_home, &oauth_auth_json_value(&updated))?;
+        set_active_provider_login_mode(&self.codex_home, true)?;
+        self.set_current_account_id(&mut database, Some(updated.id.clone()));
+        self.write_database(&database)?;
+        Ok(Some(updated))
+    }
 }
 
 fn write_api_key_provider_config(
@@ -3062,8 +3197,30 @@ fn write_api_key_provider_config(
     provider["name"] = value(provider_name);
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
-    provider["requires_openai_auth"] = value(false);
-    provider["experimental_bearer_token"] = value(api_key);
+    if uses_local_gateway_login(account) {
+        // 本地网关模式：Codex 继续使用 ChatGPT 登录态（Authorization 携带 OAuth Token，界面显示账号），
+        // 网关自身的 API Key 改由 X-Api-Key 头携带（CLIProxyAPI 会依次校验 Authorization / X-Api-Key）。
+        provider["requires_openai_auth"] = value(true);
+        provider["http_headers"][LOCAL_GATEWAY_API_KEY_HEADER] = value(api_key);
+        if let Some(table) = provider.as_table_like_mut() {
+            table.remove("experimental_bearer_token");
+        }
+    } else {
+        provider["requires_openai_auth"] = value(false);
+        provider["experimental_bearer_token"] = value(api_key);
+        if let Some(table) = provider.as_table_like_mut() {
+            let headers_empty = table
+                .get_mut("http_headers")
+                .and_then(Item::as_table_like_mut)
+                .map(|headers| {
+                    headers.remove(LOCAL_GATEWAY_API_KEY_HEADER);
+                    headers.is_empty()
+                });
+            if headers_empty == Some(true) {
+                table.remove("http_headers");
+            }
+        }
+    }
     if let Some(table) = provider.as_table_like_mut() {
         table.remove("env_key");
         if uses_gpt_5_6 {

@@ -10262,3 +10262,110 @@ textarea {
     min-width: 0;
   }
 }
+
+/* 全局忙碌遮罩（一键修复等长耗时流程） */
+.app-busy-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 3000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(16, 24, 39, 0.42);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  cursor: progress;
+}
+
+.app-busy-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  width: min(440px, calc(100vw - 48px));
+  padding: 32px 28px 26px;
+  border-radius: 20px;
+  background: var(--surface-strong);
+  border: 1px solid var(--line);
+  box-shadow: 0 24px 64px rgba(16, 24, 39, 0.28);
+  text-align: center;
+}
+
+.app-busy-title {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.app-busy-message {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-soft);
+}
+
+.app-busy-steps {
+  width: 100%;
+  margin: 6px 0 0;
+  padding: 12px 16px;
+  list-style: none;
+  border-radius: 12px;
+  background: rgba(37, 99, 235, 0.06);
+  text-align: left;
+}
+
+.app-busy-steps li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 0;
+  font-size: 13px;
+  color: var(--text-soft);
+}
+
+.app-busy-steps li.active {
+  color: var(--text-main);
+  font-weight: 600;
+}
+
+.app-busy-steps li.done {
+  color: var(--green);
+}
+
+.app-busy-step-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--line-strong);
+}
+
+.app-busy-steps li.active .app-busy-step-dot {
+  background: var(--blue);
+  box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.18);
+  animation: app-busy-pulse 1.2s ease-in-out infinite;
+}
+
+.app-busy-steps li.done .app-busy-step-dot {
+  background: var(--green);
+}
+
+@keyframes app-busy-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(37, 99, 235, 0.24);
+  }
+}
+
+.app-busy-fade-enter-active,
+.app-busy-fade-leave-active {
+  transition: opacity 0.18s ease;
+}
+
+.app-busy-fade-enter-from,
+.app-busy-fade-leave-to {
+  opacity: 0;
+}

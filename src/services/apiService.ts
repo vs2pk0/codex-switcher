@@ -193,3 +193,41 @@ export function deleteApiServiceBoundAccounts(boundIds: string[]): Promise<ApiSe
 export function deleteApiServiceAccountBinding(accountId: string): Promise<ApiServiceAccountSyncSummary> {
   return invoke("api_service_delete_account_binding", { accountId });
 }
+
+/** API 服务接入 Codex 实例（同步 / 恢复）的进度事件；payload 为 { step }。 */
+export const API_SERVICE_CODEX_SYNC_PROGRESS_EVENT = "codex-switcher-api-service-codex-sync-progress";
+
+export interface ApiServiceCodexSyncProgress {
+  /** 0 启动 API 服务，1 关闭实例并同步配置，2 修复切号会话，3 恢复全部完整历史，4 重新打开实例 */
+  step: number;
+}
+
+export interface ApiServiceCodexSyncSummary {
+  instanceId: string;
+  instanceName: string;
+  accountId: string;
+  /** 自动绑定到 API 服务账号上的 OAuth 账号 ID（没有可用账号时为 null）。 */
+  boundOauthAccountId: string | null;
+  baseUrl: string;
+  serviceStarted: boolean;
+  sessionCount: number;
+  repairMessage: string;
+  message: string;
+}
+
+export interface ApiServiceCodexRestoreSummary {
+  instanceId: string;
+  instanceName: string;
+  synchronizedSessionProviderCount: number;
+  message: string;
+}
+
+/** 同步配置：确保服务运行 → 停止实例 → 重置基础配置并写入 API 服务路由 → 一键修复会话 → 重新打开实例。 */
+export function syncApiServiceCodexInstance(instanceId: string): Promise<ApiServiceCodexSyncSummary> {
+  return invoke("api_service_sync_codex_instance", { instanceId });
+}
+
+/** 恢复配置：停止实例 → 重置为基础配置（移除 API 服务路由）→ 同步旧会话 provider → 重新打开实例。 */
+export function restoreApiServiceCodexInstance(instanceId: string): Promise<ApiServiceCodexRestoreSummary> {
+  return invoke("api_service_restore_codex_instance", { instanceId });
+}

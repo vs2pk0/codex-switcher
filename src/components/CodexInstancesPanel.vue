@@ -107,14 +107,23 @@ async function runAction(instance: CodexInstance, action: "launch" | "stop" | "r
   if (workingId.value) return;
   workingId.value = instance.id;
   try {
-    if (action === "launch") await launchCodexInstance(instance.id);
+    let startedServices: string[] = [];
+    if (action === "launch") {
+      // 已接入 OpenCodex / API 服务的实例：后端会先确保对应服务运行，再启动 Codex
+      startedServices = (await launchCodexInstance(instance.id)).startedServices;
+    }
     if (action === "stop") await stopCodexInstance(instance.id);
     if (action === "restart") await restartCodexInstance(instance.id);
     await refresh();
-    Message.success(formatTranslatedText("{name} 已{action}", {
+    const summary = formatTranslatedText("{name} 已{action}", {
       name: t(instanceDisplayName(instance)),
       action: t(action === "launch" ? "启动" : action === "stop" ? "停止" : "重启"),
-    }));
+    });
+    Message.success(
+      startedServices.length
+        ? `${summary}（${formatTranslatedText("已先启动 {services}", { services: startedServices.map((name) => t(name)).join("、") })}）`
+        : summary,
+    );
   } catch (error) {
     Message.error(formatTranslatedText("实例操作失败：{error}", { error: errorText(error) }));
   } finally {
@@ -193,6 +202,10 @@ onMounted(refresh);
               <a-tag v-if="instance.openCodexConnected" color="purple">
                 <template #icon><icon-link /></template>
                 OpenCodex
+              </a-tag>
+              <a-tag v-if="instance.apiServiceConnected" color="green">
+                <template #icon><icon-link /></template>
+                {{ t("API 服务") }}
               </a-tag>
               <a-tag v-if="instance.isDefault" color="blue">{{ t("默认") }}</a-tag>
             </div>

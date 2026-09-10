@@ -17,6 +17,7 @@ const props = defineProps<{
   sessionRepairing: boolean;
   repairingSessionId: string;
   sessionModelRepairing: boolean;
+  sessionOneClickRepairing: boolean;
   activeSessionIds: string[];
   allSessionsSelected: boolean;
   selectedSessionIds: Set<string>;
@@ -40,6 +41,7 @@ const emit = defineEmits<{
   (event: "repair-sessions"): void;
   (event: "repair-session-history", session: CodexSessionRecord): void;
   (event: "repair-session-models"): void;
+  (event: "one-click-repair"): void;
   (event: "trash-sessions"): void;
   (event: "restore-sessions"): void;
   (event: "toggle-session-group-expanded", key: string): void;
@@ -103,7 +105,7 @@ function switchMode(trashMode: boolean): void {
       </div>
       <a-select
         :model-value="selectedInstanceId"
-        :disabled="sessionLoading || backupWorking || sessionRepairing || sessionModelRepairing"
+        :disabled="sessionLoading || backupWorking || sessionRepairing || sessionModelRepairing || sessionOneClickRepairing"
         popup-container="body"
         class="session-instance-select"
         @change="emit('select-instance', String($event))"
@@ -153,8 +155,15 @@ function switchMode(trashMode: boolean): void {
         <a-button :loading="sessionLoading" @click="emit('load-sessions')"><template #icon><icon-refresh /></template>{{ t("刷新") }}</a-button>
         <a-button :loading="backupWorking" @click="emit('export-session-backup')"><template #icon><icon-download /></template>{{ backupButtonText }}</a-button>
         <a-button :loading="sessionBackupLoading" :disabled="backupWorking" @click="emit('open-session-restore-modal')"><template #icon><icon-import /></template>{{ t("恢复会话") }}</a-button>
-        <a-button :loading="sessionRepairing" type="primary" @click="emit('repair-sessions')"><template #icon><icon-tool /></template>{{ t("修复可见性") }}</a-button>
-        <a-button :loading="sessionModelRepairing" status="success" @click="emit('repair-session-models')"><template #icon><icon-sync /></template>{{ t("一键修复切号会话") }}</a-button>
+        <!-- 「修复可见性」已并入「一键修复」，按钮隐藏（v-if="false"），保留事件链路便于后续恢复 -->
+        <a-button v-if="false" :loading="sessionRepairing" type="primary" @click="emit('repair-sessions')"><template #icon><icon-tool /></template>{{ t("修复可见性") }}</a-button>
+        <a-button
+          :loading="sessionOneClickRepairing"
+          :disabled="sessionRepairing || sessionModelRepairing || Boolean(repairingSessionId)"
+          type="primary"
+          @click="emit('one-click-repair')"
+        ><template #icon><icon-tool /></template>{{ sessionOneClickRepairing ? t("正在一键修复…") : t("一键修复") }}</a-button>
+        <a-button :loading="sessionModelRepairing" :disabled="sessionOneClickRepairing" status="success" @click="emit('repair-session-models')"><template #icon><icon-sync /></template>{{ t("一键修复切号会话") }}</a-button>
         <a-button v-if="!sessionTrashMode" status="danger" :disabled="!selectedSessionIdList.length" @click="emit('trash-sessions')"><template #icon><icon-delete /></template>{{ t("移入回收站") }}</a-button>
         <template v-else>
           <a-button :disabled="!activeSessionIds.length" @click="emit('toggle-all-sessions')"><template #icon><icon-check /></template>{{ t(allSessionsSelected ? "取消全选" : "全选回收站") }}</a-button>
@@ -197,7 +206,7 @@ function switchMode(trashMode: boolean): void {
                     type="text"
                     status="success"
                     :loading="repairingSessionId === session.id"
-                    :disabled="Boolean(repairingSessionId && repairingSessionId !== session.id) || sessionRepairing || sessionModelRepairing"
+                    :disabled="Boolean(repairingSessionId && repairingSessionId !== session.id) || sessionRepairing || sessionModelRepairing || sessionOneClickRepairing"
                     @click="emit('repair-session-history', session)"
                   >
                     <template #icon><icon-tool /></template>
@@ -224,8 +233,8 @@ function switchMode(trashMode: boolean): void {
         </section>
         <div v-if="!sessions.length" class="session-empty-state">
           <div class="session-empty-icon"><icon-message /></div>
-          <div class="session-empty-copy"><strong>{{ sessionSearch.titleQuery || sessionSearch.contentQuery ? t("没有匹配的会话") : t("还没有可显示的会话") }}</strong><span>{{ sessionSearch.titleQuery || sessionSearch.contentQuery ? t("换个关键词试试，或清空搜索后重新刷新。") : t("可以先刷新本机会话；如果是切号后看不到旧会话，使用修复可见性重新挂回列表。") }}</span></div>
-          <div class="session-empty-actions"><a-button type="primary" :loading="sessionLoading" @click="emit('load-sessions')"><template #icon><icon-refresh /></template>{{ t("刷新会话") }}</a-button><a-button :loading="sessionBackupLoading" :disabled="backupWorking" @click="emit('open-session-restore-modal')"><template #icon><icon-import /></template>{{ t("从备份恢复") }}</a-button><a-button :loading="sessionRepairing" @click="emit('repair-sessions')"><template #icon><icon-tool /></template>{{ t("修复可见性") }}</a-button></div>
+          <div class="session-empty-copy"><strong>{{ sessionSearch.titleQuery || sessionSearch.contentQuery ? t("没有匹配的会话") : t("还没有可显示的会话") }}</strong><span>{{ sessionSearch.titleQuery || sessionSearch.contentQuery ? t("换个关键词试试，或清空搜索后重新刷新。") : t("可以先刷新本机会话；如果是切号后看不到旧会话，使用一键修复重新挂回列表。") }}</span></div>
+          <div class="session-empty-actions"><a-button type="primary" :loading="sessionLoading" @click="emit('load-sessions')"><template #icon><icon-refresh /></template>{{ t("刷新会话") }}</a-button><a-button :loading="sessionBackupLoading" :disabled="backupWorking" @click="emit('open-session-restore-modal')"><template #icon><icon-import /></template>{{ t("从备份恢复") }}</a-button><a-button :loading="sessionOneClickRepairing" :disabled="sessionRepairing || sessionModelRepairing" @click="emit('one-click-repair')"><template #icon><icon-tool /></template>{{ t("一键修复") }}</a-button></div>
         </div>
         <footer v-if="sessions.length" class="session-table-footer"><span><icon-check-circle /> {{ t("已选择") }} {{ selectedSessionIdList.length }} {{ t("项") }}</span><div><span>{{ t("共") }} {{ sessions.length }} {{ t("条会话") }}</span><span>{{ t("总 Tokens") }} {{ formatTokens(totalTokens) }}</span><span>{{ t("总占用") }} {{ formatFileSize(totalSize) }}</span></div></footer>
       </div>

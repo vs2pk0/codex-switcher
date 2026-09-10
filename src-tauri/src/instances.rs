@@ -49,6 +49,8 @@ pub struct CodexInstance {
     pub running: bool,
     pub pid: Option<u32>,
     pub open_codex_connected: bool,
+    /// config.toml 的 model_provider 是否指向本地 API 服务（CLIProxyAPI）。
+    pub api_service_connected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -826,6 +828,8 @@ fn live_pid(instance: &StoredCodexInstance) -> Option<u32> {
 fn public_instance(instance: StoredCodexInstance) -> CodexInstance {
     let pid = live_pid(&instance);
     let open_codex_connected = codex_home_has_opencodex_routing(Path::new(&instance.codex_home));
+    let api_service_connected =
+        crate::api_service::codex_home_has_api_service_routing(Path::new(&instance.codex_home));
     CodexInstance {
         id: instance.id.clone(),
         name: instance.name,
@@ -838,6 +842,7 @@ fn public_instance(instance: StoredCodexInstance) -> CodexInstance {
         running: pid.is_some(),
         pid,
         open_codex_connected,
+        api_service_connected,
     }
 }
 
@@ -1276,6 +1281,54 @@ pub fn run_with_instance_restarted<T>(
     if public.running {
         stop_stored(&stored)?;
     }
+    let action_result = action(&public);
+    let start_result = launch_stored(&stored).map(|_| ());
+    match (action_result, start_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(action_error), Err(start_error)) => Err(format!(
+            "{action_error}；同时未能重新启动实例“{}”：{start_error}",
+            stored.name
+        )),
+    }
+}
+
+/// 停止实例后执行操作，但不自动重新拉起；返回操作结果与实例原本是否在运行。
+///
+/// 用于耗时较长的批量修复：修复期间 Codex 必须处于关闭状态（它持有 rollout 与 sqlite 的写句柄），
+/// 修完后由前端询问用户是否重启。
+pub fn run_with_instance_stopped<T>(
+    instance_id: &str,
+    action: impl FnOnce(&CodexInstance) -> Result<T, String>,
+) -> Result<(T, bool), String> {
+    let _guard = INSTANCE_OPERATION_LOCK
+        .lock()
+        .map_err(|_| "Codex 实例操作锁已损坏".to_string())?;
+    let stored = stored_instance(instance_id)?;
+    let public = public_instance(stored.clone());
+    let was_running = public.running;
+    if was_running {
+        stop_stored(&stored)?;
+    }
+    let value = action(&public)?;
+    Ok((value, was_running))
+}
+
+/// 停止实例后执行操作；只有实例原本在运行时才重新拉起（原本关闭的实例保持关闭）。
+pub fn run_with_instance_restarted_if_running<T>(
+    instance_id: &str,
+    action: impl FnOnce(&CodexInstance) -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = INSTANCE_OPERATION_LOCK
+        .lock()
+        .map_err(|_| "Codex 实例操作锁已损坏".to_string())?;
+    let stored = stored_instance(instance_id)?;
+    let public = public_instance(stored.clone());
+    if !public.running {
+        return action(&public);
+    }
+    stop_stored(&stored)?;
     let action_result = action(&public);
     let start_result = launch_stored(&stored).map(|_| ());
     match (action_result, start_result) {
