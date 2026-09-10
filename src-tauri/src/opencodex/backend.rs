@@ -3,10 +3,11 @@ use super::models::{
     BackgroundServiceState, CommandAction, CommandFinishedEvent, CommandLogEvent, CommandStarted,
     DeleteEngineVersionRequest, DeleteSwitcherAccountRequest, EngineDeleteResult,
     EngineInstallResult, EngineProgress, EngineRelease, EngineUpdateCatalog, HealthBody,
-    ImportSwitcherAccountsRequest, InstallEngineVersionRequest, RunActionRequest,
-    SwitcherAccountScan, SwitcherDeleteResult, SwitcherImportResult, SystemSnapshot,
-    UpdateVisionModelsRequest, VisionModel, VisionModelCatalog, VisionModelsUpdateResult,
-    VisionSidecarUpdate,
+    ImageGenerationProviderOption, ImageGenerationRecentRequest, ImageGenerationSettings,
+    ImageGenerationUpdate, ImageGenerationUpdateResult, ImportSwitcherAccountsRequest,
+    InstallEngineVersionRequest, RunActionRequest, SwitcherAccountScan, SwitcherDeleteResult,
+    SwitcherImportResult, SystemSnapshot, UpdateVisionModelsRequest, VisionModel,
+    VisionModelCatalog, VisionModelsUpdateResult, VisionSidecarUpdate,
 };
 use chrono::Utc;
 use once_cell::sync::Lazy;
@@ -32,6 +33,79 @@ const START_TIMEOUT: Duration = Duration::from_secs(35);
 const HTTP_TIMEOUT: Duration = Duration::from_millis(750);
 const MANAGED_ENGINE_HISTORY_LIMIT: usize = 3;
 const MANAGER_LOG_TAIL_MAX_BYTES: u64 = 2 * 1024 * 1024;
+/// 图片生成镜像提供方的名称后缀：源提供方不是 openai-responses 时，用同一 baseUrl/apiKey 创建镜像承接 /v1/images。
+const IMAGE_MIRROR_SUFFIX: &str = "-images";
+/// Engine 对 images.timeoutMs 的上限（对应 MAX_IMAGE_TIMEOUT_MS）。
+const IMAGE_TIMEOUT_MAX_MS: u64 = 300_000;
+const IMAGE_TIMEOUT_MIN_MS: u64 = 5_000;
+/// 图片生成可复用的提供方适配器：openai-responses 可直连，openai-chat 需镜像。
+const IMAGE_DIRECT_ADAPTER: &str = "openai-responses";
+const IMAGE_MIRRORABLE_ADAPTERS: &[&str] = &[IMAGE_DIRECT_ADAPTER, "openai-chat"];
+/// Engine 内置注册表中的提供方 id，不能作为 images.provider（Engine 会返回 400）。
+const ENGINE_BUILTIN_PROVIDER_IDS: &[&str] = &[
+    "openai",
+    "openai-apikey",
+    "cursor",
+    "xai",
+    "command-code",
+    "commandcode",
+    "anthropic",
+    "anthropic-apikey",
+    "kimi",
+    "kimi-code",
+    "kiro",
+    "nous",
+    "meta-model",
+    "meta-muse",
+    "umans",
+    "opencode-go",
+    "opencode-zen",
+    "opencode-free",
+    "neuralwatt",
+    "openrouter",
+    "cline-pass",
+    "cline",
+    "orcarouter",
+    "bizrouter",
+    "google",
+    "deepseek",
+    "chutes",
+    "deepinfra",
+    "hyperbolic",
+    "nscale",
+    "vultr",
+    "baseten",
+    "sambanova",
+    "nebius",
+    "digitalocean",
+    "scaleway",
+    "featherless",
+    "novita",
+    "firepass",
+    "moonshot",
+    "nvidia",
+    "zai",
+    "zhipu-bigmodel",
+    "zhipu-bigmodel-coding",
+    "siliconflow",
+    "qwen-cloud",
+    "tencent-coding-plan",
+    "volcengine",
+    "volcengine-coding-plan",
+    "volcengine-agent-plan",
+    "alibaba-token-plan",
+    "alibaba-token-plan-intl",
+    "zenmux",
+    "litellm",
+    "ollama-cloud",
+    "minimax",
+    "minimax-cn",
+    "xiaomi-mimo",
+    "mimo-free",
+    "mimo",
+    "cloudflare-workers-ai",
+    "github-copilot",
+];
 
 static SECRET_FIELD: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password)(\s*[:=]\s*)([^\s,;]+)")
@@ -1244,6 +1318,241 @@ impl Backend {
                 } else {
                     format!("已为 {count} 个模型开启图片输入并同步 Codex")
                 },
+            })
+        })();
+        self.finish_mutation();
+        if let Ok(value) = &result {
+            self.persist_log("system", &value.message);
+        }
+        result
+    }
+
+    fn read_open_codex_config(&self) -> Result<Value, String> {
+        let config_text = fs::read_to_string(self.home.join("config.json"))
+            .map_err(|error| format!("无法读取 OpenCodex 配置：{error}"))?;
+        serde_json::from_str(&config_text)
+            .map_err(|error| format!("OpenCodex 配置格式无效：{error}"))
+    }
+
+    /// 执行 `ocx config set/unset`，失败时返回脱敏后的错误。
+    fn run_config_mutation(
+        &self,
+        launcher: &Launcher,
+        args: &[String],
+        failure: &str,
+    ) -> Result<(), String> {
+        let output = self
+            .command(launcher, args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| format!("{failure}：{error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let detail = self.redact(String::from_utf8_lossy(&output.stderr).trim());
+        Err(if detail.is_empty() {
+            failure.to_string()
+        } else {
+            format!("{failure}：{detail}")
+        })
+    }
+
+    /// 读取 Codex「Image Gen」在 OpenCodex 中的图片生成上游设置（只读 config.json，不要求服务运行）。
+    pub fn image_generation_settings(&self) -> Result<ImageGenerationSettings, String> {
+        let config = self.read_open_codex_config()?;
+        let mut settings = resolve_image_generation_settings(&config);
+        if let Some(provider) = settings.configured_provider.clone() {
+            settings.recent_requests =
+                read_recent_image_requests(&self.home.join("usage.jsonl"), &provider);
+        }
+        Ok(settings)
+    }
+
+    /// 保存图片生成上游：写入 images.provider / images.timeoutMs，必要时创建或清理镜像提供方，并重启运行中的服务。
+    pub fn update_image_generation_settings(
+        &self,
+        request: ImageGenerationUpdate,
+    ) -> Result<ImageGenerationUpdateResult, String> {
+        let provider_name = request
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        if let Some(timeout) = request.timeout_ms {
+            if !(IMAGE_TIMEOUT_MIN_MS..=IMAGE_TIMEOUT_MAX_MS).contains(&timeout) {
+                return Err(format!(
+                    "图片生成超时需在 {} 到 {} 秒之间",
+                    IMAGE_TIMEOUT_MIN_MS / 1000,
+                    IMAGE_TIMEOUT_MAX_MS / 1000
+                ));
+            }
+        }
+        let config = self.read_open_codex_config()?;
+        let providers = config
+            .get("providers")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let options = image_generation_options(&config);
+
+        // 计算目标 images.provider 与需要创建的镜像提供方。
+        let mut mirror_to_create: Option<(String, Value)> = None;
+        let target_provider = match provider_name.as_deref() {
+            None => None,
+            Some(name) => {
+                let option = options
+                    .iter()
+                    .find(|option| option.name == name)
+                    .ok_or_else(|| {
+                        format!("提供方 {name} 不存在或不能用于图片生成，请刷新后重试")
+                    })?;
+                if option.builtin {
+                    return Err(format!(
+                        "{name} 是 OpenCodex 内置提供方，不能作为图片生成上游"
+                    ));
+                }
+                if !option.has_api_key {
+                    return Err(format!("提供方 {name} 没有可用的 API Key"));
+                }
+                if option.direct {
+                    Some(name.to_string())
+                } else {
+                    let source = providers
+                        .get(name)
+                        .ok_or_else(|| format!("提供方 {name} 不存在"))?;
+                    let mirror_name = format!("{name}{IMAGE_MIRROR_SUFFIX}");
+                    if let Some(existing) = providers.get(&mirror_name) {
+                        if !is_image_mirror_provider(&mirror_name, existing, &providers) {
+                            return Err(format!(
+                                "提供方 {mirror_name} 已存在且不是图片生成镜像，请先在 OpenCodex 中重命名或删除它"
+                            ));
+                        }
+                    }
+                    mirror_to_create =
+                        Some((mirror_name.clone(), build_image_mirror_provider(source)));
+                    Some(mirror_name)
+                }
+            }
+        };
+
+        // 合并 images 段：保留 bridge 等其他字段，只改 provider 与 timeoutMs。
+        let mut images = config
+            .get("images")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        match target_provider.as_deref() {
+            Some(name) => {
+                images.insert("provider".into(), Value::String(name.to_string()));
+            }
+            None => {
+                images.remove("provider");
+            }
+        }
+        match request.timeout_ms {
+            Some(timeout) => {
+                images.insert("timeoutMs".into(), Value::from(timeout));
+            }
+            None => {
+                images.remove("timeoutMs");
+            }
+        }
+
+        // 不再被引用的旧镜像提供方一并清理。
+        let stale_mirrors = providers
+            .iter()
+            .filter(|(name, provider)| is_image_mirror_provider(name, provider, &providers))
+            .map(|(name, _)| name.clone())
+            .filter(|name| {
+                mirror_to_create
+                    .as_ref()
+                    .is_none_or(|(created, _)| created != name)
+            })
+            .collect::<Vec<_>>();
+
+        self.begin_mutation()?;
+        let result = (|| {
+            let launcher = self.active_launcher()?;
+            if let Some((mirror_name, mirror)) = &mirror_to_create {
+                let json = serde_json::to_string(mirror)
+                    .map_err(|error| format!("无法生成镜像提供方配置：{error}"))?;
+                self.run_config_mutation(
+                    &launcher,
+                    &[
+                        "config".into(),
+                        "set".into(),
+                        format!("providers.{mirror_name}"),
+                        json,
+                        "--json".into(),
+                    ],
+                    &format!("无法创建图片生成镜像提供方 {mirror_name}"),
+                )?;
+            }
+            if images.is_empty() {
+                if config.get("images").is_some() {
+                    self.run_config_mutation(
+                        &launcher,
+                        &[
+                            "config".into(),
+                            "unset".into(),
+                            "images".into(),
+                            "--json".into(),
+                        ],
+                        "无法清除图片生成设置",
+                    )?;
+                }
+            } else {
+                let json = serde_json::to_string(&Value::Object(images.clone()))
+                    .map_err(|error| format!("无法生成图片生成配置：{error}"))?;
+                self.run_config_mutation(
+                    &launcher,
+                    &[
+                        "config".into(),
+                        "set".into(),
+                        "images".into(),
+                        json,
+                        "--json".into(),
+                    ],
+                    "无法保存图片生成设置",
+                )?;
+            }
+            for stale in &stale_mirrors {
+                self.run_config_mutation(
+                    &launcher,
+                    &[
+                        "config".into(),
+                        "unset".into(),
+                        format!("providers.{stale}"),
+                        "--json".into(),
+                    ],
+                    &format!("无法清理旧的图片生成镜像提供方 {stale}"),
+                )?;
+            }
+            let restarted = if self.open_codex_service_running() {
+                self.run_config_mutation(
+                    &launcher,
+                    &["restart".into()],
+                    "配置已保存，但重启 OpenCodex 失败",
+                )?;
+                true
+            } else {
+                false
+            };
+            let settings = self.image_generation_settings()?;
+            let message = match (&provider_name, &mirror_to_create) {
+                (None, _) => "已恢复 OpenCodex 默认图片生成路径".to_string(),
+                (Some(name), Some((mirror, _))) => {
+                    format!("图片生成已切换到 {name}（通过镜像提供方 {mirror} 转发）")
+                }
+                (Some(name), None) => format!("图片生成已切换到 {name}"),
+            };
+            Ok(ImageGenerationUpdateResult {
+                settings,
+                restarted,
+                message,
             })
         })();
         self.finish_mutation();
@@ -2872,6 +3181,210 @@ fn transfer_engine_needs_alignment(source_version: &str, target_version: Option<
     target_version != Some(source_version)
 }
 
+fn provider_str<'a>(provider: &'a Value, key: &str) -> Option<&'a str> {
+    provider.get(key).and_then(Value::as_str)
+}
+
+fn provider_disabled(provider: &Value) -> bool {
+    provider
+        .get("disabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn provider_has_api_key(provider: &Value) -> bool {
+    provider_str(provider, "apiKey").is_some_and(|key| !key.trim().is_empty())
+}
+
+/// 镜像提供方的来源名：名称以 `-images` 结尾且去掉后缀后存在对应源提供方。
+fn image_mirror_source<'a>(
+    name: &'a str,
+    providers: &serde_json::Map<String, Value>,
+) -> Option<&'a str> {
+    let source = name.strip_suffix(IMAGE_MIRROR_SUFFIX)?;
+    (!source.is_empty() && providers.contains_key(source)).then_some(source)
+}
+
+/// 判断是否为 Switcher 创建的图片生成镜像提供方：名称带后缀、源存在，且形状为「openai-responses + 关闭在线模型 + 空模型列表」。
+fn is_image_mirror_provider(
+    name: &str,
+    provider: &Value,
+    providers: &serde_json::Map<String, Value>,
+) -> bool {
+    if image_mirror_source(name, providers).is_none() {
+        return false;
+    }
+    provider_str(provider, "adapter") == Some(IMAGE_DIRECT_ADAPTER)
+        && provider.get("liveModels").and_then(Value::as_bool) == Some(false)
+        && provider
+            .get("models")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+}
+
+/// 由源提供方派生镜像提供方：复用地址、凭证与网络设置，但不暴露任何聊天模型。
+fn build_image_mirror_provider(source: &Value) -> Value {
+    let mut mirror = serde_json::Map::new();
+    mirror.insert("adapter".into(), Value::String(IMAGE_DIRECT_ADAPTER.into()));
+    mirror.insert("authMode".into(), Value::String("key".into()));
+    for key in [
+        "baseUrl",
+        "apiKey",
+        "apiKeyTransport",
+        "headers",
+        "allowPrivateNetwork",
+        "upstreamHttpVersion",
+    ] {
+        if let Some(value) = source.get(key) {
+            mirror.insert(key.into(), value.clone());
+        }
+    }
+    mirror.insert("models".into(), Value::Array(Vec::new()));
+    mirror.insert("liveModels".into(), Value::Bool(false));
+    mirror.insert("newModelPolicy".into(), Value::String("off".into()));
+    mirror.insert("disabled".into(), Value::Bool(false));
+    Value::Object(mirror)
+}
+
+/// 列出可作为图片生成上游的提供方：启用中、API Key 鉴权、适配器为 openai-responses/openai-chat，排除镜像自身。
+fn image_generation_options(config: &Value) -> Vec<ImageGenerationProviderOption> {
+    let Some(providers) = config.get("providers").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut options = providers
+        .iter()
+        .filter(|(name, provider)| {
+            !provider_disabled(provider) && !is_image_mirror_provider(name, provider, providers)
+        })
+        .filter(|(_, provider)| {
+            provider_str(provider, "adapter")
+                .is_some_and(|adapter| IMAGE_MIRRORABLE_ADAPTERS.contains(&adapter))
+        })
+        .filter(|(_, provider)| provider_str(provider, "authMode").is_none_or(|mode| mode == "key"))
+        .map(|(name, provider)| {
+            let adapter = provider_str(provider, "adapter").unwrap_or_default();
+            ImageGenerationProviderOption {
+                name: name.clone(),
+                adapter: adapter.to_string(),
+                base_url: provider_str(provider, "baseUrl")
+                    .unwrap_or_default()
+                    .to_string(),
+                direct: adapter == IMAGE_DIRECT_ADAPTER,
+                has_api_key: provider_has_api_key(provider),
+                builtin: ENGINE_BUILTIN_PROVIDER_IDS.contains(&name.as_str()),
+            }
+        })
+        .collect::<Vec<_>>();
+    options.sort_by(|left, right| left.name.cmp(&right.name));
+    options
+}
+
+/// 是否存在 OpenCodex 内置的 OpenAI 图片上游（ChatGPT 转发或 api.openai.com 的 API Key 提供方）。
+fn openai_image_upstream_available(config: &Value) -> bool {
+    config
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get("openai"))
+        .is_some_and(|provider| {
+            !provider_disabled(provider)
+                && provider_str(provider, "adapter") == Some(IMAGE_DIRECT_ADAPTER)
+        })
+}
+
+fn resolve_image_generation_settings(config: &Value) -> ImageGenerationSettings {
+    let providers = config
+        .get("providers")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let configured_provider = config
+        .pointer("/images/provider")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    // 若 images.provider 指向镜像提供方，则把选择映射回源提供方展示。
+    let (provider, mirror_provider) = match configured_provider.as_deref() {
+        Some(name)
+            if providers
+                .get(name)
+                .is_some_and(|value| is_image_mirror_provider(name, value, &providers)) =>
+        {
+            (
+                image_mirror_source(name, &providers).map(str::to_string),
+                Some(name.to_string()),
+            )
+        }
+        Some(name) => (Some(name.to_string()), None),
+        None => (None, None),
+    };
+    ImageGenerationSettings {
+        recent_requests: Vec::new(),
+        provider,
+        configured_provider,
+        mirror_provider,
+        timeout_ms: config.pointer("/images/timeoutMs").and_then(Value::as_u64),
+        openai_upstream_available: openai_image_upstream_available(config),
+        options: image_generation_options(config),
+    }
+}
+
+const IMAGE_REQUEST_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+const IMAGE_REQUEST_LIMIT: usize = 5;
+
+/// 从 usage.jsonl 尾部读取发往指定图片生成上游的最近请求（新到旧）。文件很大时只读最后 2MB。
+fn read_recent_image_requests(path: &Path, provider: &str) -> Vec<ImageGenerationRecentRequest> {
+    let Ok(mut file) = File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(length) = file.metadata().map(|meta| meta.len()) else {
+        return Vec::new();
+    };
+    let start = length.saturating_sub(IMAGE_REQUEST_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut text = String::new();
+    if file.read_to_string(&mut text).is_err() {
+        return Vec::new();
+    }
+    let mut lines = text.lines();
+    if start > 0 {
+        // 从中间开始读，第一行大概率是被截断的半条记录。
+        lines.next();
+    }
+    parse_recent_image_requests(lines, provider)
+}
+
+fn parse_recent_image_requests<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    provider: &str,
+) -> Vec<ImageGenerationRecentRequest> {
+    let mut requests = lines
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|row| row.get("provider").and_then(Value::as_str) == Some(provider))
+        .filter_map(|row| {
+            Some(ImageGenerationRecentRequest {
+                timestamp: row.get("timestamp").and_then(Value::as_i64)?,
+                model: row
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                status: u16::try_from(row.get("status").and_then(Value::as_u64)?).ok()?,
+                error_code: row
+                    .get("errorCode")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                duration_ms: row.get("durationMs").and_then(Value::as_u64),
+            })
+        })
+        .collect::<Vec<_>>();
+    requests.sort_by_key(|request| std::cmp::Reverse(request.timestamp));
+    requests.truncate(IMAGE_REQUEST_LIMIT);
+    requests
+}
+
 fn validate_vision_sidecar_update(settings: &VisionSidecarUpdate) -> Result<(), String> {
     let model = settings.model.trim();
     if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
@@ -3044,6 +3557,100 @@ fn parse_engine_progress(line: &str) -> Option<EngineProgress> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{json, Value};
+
+    fn image_config() -> Value {
+        json!({
+            "providers": {
+                "openai": { "adapter": "openai-responses", "baseUrl": "https://chatgpt.com/backend-api/codex", "authMode": "forward", "disabled": true },
+                "Zc": { "adapter": "openai-chat", "baseUrl": "https://relay.example/v1", "authMode": "key", "apiKey": "sk-secret", "allowPrivateNetwork": true, "noVisionModels": ["a"] },
+                "Direct": { "adapter": "openai-responses", "baseUrl": "https://direct.example/v1", "apiKey": "sk-direct" },
+                "Claude": { "adapter": "anthropic-messages", "baseUrl": "https://api.anthropic.com", "apiKey": "sk-ant" },
+                "xai": { "adapter": "openai-responses", "baseUrl": "https://api.x.ai/v1", "authMode": "key", "apiKey": "xai-key" },
+                "Zc-images": { "adapter": "openai-responses", "authMode": "key", "baseUrl": "https://relay.example/v1", "apiKey": "sk-secret", "models": [], "liveModels": false }
+            },
+            "images": { "provider": "Zc-images", "timeoutMs": 120000, "bridgeEnabled": false }
+        })
+    }
+
+    #[test]
+    fn image_generation_options_keep_keyed_openai_style_providers_and_hide_mirrors() {
+        let options = super::image_generation_options(&image_config());
+        let names = options
+            .iter()
+            .map(|option| option.name.as_str())
+            .collect::<Vec<_>>();
+        // 已禁用的 openai、anthropic 适配器和镜像自身都不出现；内置 xai 保留但标记 builtin。
+        assert_eq!(names, vec!["Direct", "Zc", "xai"]);
+        let zc = options.iter().find(|option| option.name == "Zc").unwrap();
+        assert!(!zc.direct && zc.has_api_key && !zc.builtin);
+        let direct = options
+            .iter()
+            .find(|option| option.name == "Direct")
+            .unwrap();
+        assert!(direct.direct);
+        assert!(
+            options
+                .iter()
+                .find(|option| option.name == "xai")
+                .unwrap()
+                .builtin
+        );
+    }
+
+    #[test]
+    fn image_generation_settings_map_mirror_back_to_source_provider() {
+        let settings = super::resolve_image_generation_settings(&image_config());
+        assert_eq!(settings.provider.as_deref(), Some("Zc"));
+        assert_eq!(settings.configured_provider.as_deref(), Some("Zc-images"));
+        assert_eq!(settings.mirror_provider.as_deref(), Some("Zc-images"));
+        assert_eq!(settings.timeout_ms, Some(120_000));
+        // ChatGPT 转发提供方已禁用，因此没有内置 OpenAI 图片上游。
+        assert!(!settings.openai_upstream_available);
+    }
+
+    #[test]
+    fn recent_image_requests_keep_only_the_configured_provider_newest_first() {
+        let lines = [
+            r#"{"provider":"Zc","model":"gpt-5.4","status":200,"timestamp":10}"#,
+            r#"{"provider":"Zc-images","model":"gpt-image-2","status":502,"timestamp":20,"durationMs":11098,"errorCode":"upstream_server_error"}"#,
+            "not json",
+            r#"{"provider":"Zc-images","model":"gpt-image-2","status":200,"timestamp":30,"durationMs":9000}"#,
+        ];
+        let requests = super::parse_recent_image_requests(lines.into_iter(), "Zc-images");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].timestamp, 30);
+        assert_eq!(requests[0].status, 200);
+        assert_eq!(
+            requests[1].error_code.as_deref(),
+            Some("upstream_server_error")
+        );
+        assert_eq!(requests[1].duration_ms, Some(11098));
+    }
+
+    #[test]
+    fn image_mirror_provider_copies_credentials_but_exposes_no_models() {
+        let config = image_config();
+        let source = &config["providers"]["Zc"];
+        let mirror = super::build_image_mirror_provider(source);
+        assert_eq!(mirror["adapter"], "openai-responses");
+        assert_eq!(mirror["authMode"], "key");
+        assert_eq!(mirror["apiKey"], "sk-secret");
+        assert_eq!(mirror["baseUrl"], "https://relay.example/v1");
+        assert_eq!(mirror["allowPrivateNetwork"], true);
+        assert_eq!(mirror["liveModels"], false);
+        assert_eq!(mirror["models"], json!([]));
+        // 源提供方的图片描述配置不应被带到镜像里。
+        assert!(mirror.get("noVisionModels").is_none());
+        let providers = config["providers"].as_object().unwrap();
+        assert!(super::is_image_mirror_provider(
+            "Zc-images",
+            &mirror,
+            providers
+        ));
+        assert!(!super::is_image_mirror_provider("Zc", source, providers));
+    }
+
     #[test]
     fn engine_progress_accepts_only_helper_download_stages() {
         let progress = super::parse_engine_progress(

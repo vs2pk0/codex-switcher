@@ -5811,9 +5811,13 @@ pub fn run() {
             opencodex::opencodex_update_vision_models,
             opencodex::opencodex_get_vision_sidecar_settings,
             opencodex::opencodex_update_vision_sidecar_settings,
+            opencodex::opencodex_get_image_generation_settings,
+            opencodex::opencodex_update_image_generation_settings,
         ])
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::Destroyed) {
+            // 只有主窗口销毁才代表应用退出；OpenCodex Web 管理等子窗口关闭时不能停掉 API 服务，
+            // 否则 shutting_down 标志会一直置位，后续所有 API 服务操作都会报"应用正在退出"。
+            if matches!(event, tauri::WindowEvent::Destroyed) && window.label() == "main" {
                 let process = window.state::<api_service::ApiServiceProcessState>();
                 let download = window.state::<api_service::ApiServiceDownloadState>();
                 let operation = window.state::<api_service::ApiServiceOperationState>();

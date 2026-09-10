@@ -187,3 +187,41 @@ export interface OpenCodexVisionSidecarResponse {
   vision: OpenCodexVisionSidecarSettings;
   visionModels: OpenCodexVisionSidecarModelOption[];
 }
+
+/** Codex「Image Gen」可选的图片生成上游（OpenCodex 中带 API Key 的自定义提供方）。 */
+export interface OpenCodexImageGenerationProviderOption {
+  name: string;
+  adapter: string;
+  baseUrl: string;
+  /** openai-responses 适配器可直接作为 images.provider；否则保存时会自动创建镜像提供方。 */
+  direct: boolean;
+  hasApiKey: boolean;
+  /** Engine 内置提供方不能作为图片生成上游。 */
+  builtin: boolean;
+}
+
+export interface OpenCodexImageGenerationRecentRequest {
+  timestamp: number;
+  model: string;
+  status: number;
+  errorCode: string | null;
+  durationMs: number | null;
+}
+
+export interface OpenCodexImageGenerationSettings {
+  /** 最近发往当前图片生成上游的请求（新到旧），用于判断上游是否真正可用。 */
+  recentRequests: OpenCodexImageGenerationRecentRequest[];
+  /** 用户选择的源提供方；null 表示交给 OpenCodex 默认顺序（ChatGPT 转发 / OpenAI API Key）。 */
+  provider: string | null;
+  configuredProvider: string | null;
+  mirrorProvider: string | null;
+  timeoutMs: number | null;
+  openaiUpstreamAvailable: boolean;
+  options: OpenCodexImageGenerationProviderOption[];
+}
+
+export interface OpenCodexImageGenerationUpdateResult {
+  settings: OpenCodexImageGenerationSettings;
+  restarted: boolean;
+  message: string;
+}

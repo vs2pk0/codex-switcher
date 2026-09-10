@@ -17,6 +17,7 @@ import {
   deleteOpenCodexSwitcherAccount,
   deleteOpenCodexEngine,
   getOpenCodexEngineCatalog,
+  getOpenCodexImageGenerationSettings,
   getOpenCodexSnapshot,
   getOpenCodexVisionSidecarSettings,
   getOpenCodexVisionModels,
@@ -28,6 +29,7 @@ import {
   scanOpenCodexSwitcherAccounts,
   subscribeOpenCodexEvents,
   subscribeOpenCodexEngineProgress,
+  updateOpenCodexImageGenerationSettings,
   updateOpenCodexVisionSidecarSettings,
   updateOpenCodexVisionModels,
   writeOpenCodexInput,
@@ -44,6 +46,7 @@ import type {
   OpenCodexEngineCatalog,
   OpenCodexEngineRelease,
   OpenCodexEngineProgress,
+  OpenCodexImageGenerationSettings,
   OpenCodexPage,
   OpenCodexSettings,
   OpenCodexSwitcherAccountScan,
@@ -112,6 +115,14 @@ const visionSaving = ref(false);
 const visionSidecarSaving = ref(false);
 const visionSearch = ref("");
 const selectedVisionModels = ref<string[]>([]);
+// Codex「Image Gen」图片生成上游：空字符串表示交给 OpenCodex 默认顺序（ChatGPT 转发 / OpenAI API Key）。
+const IMAGE_GEN_DEFAULT_PROVIDER = "";
+const IMAGE_GEN_DEFAULT_TIMEOUT_SECONDS = 120;
+const imageGen = ref<OpenCodexImageGenerationSettings | null>(null);
+const imageGenDraft = ref<{ provider: string; timeoutSeconds: number }>({ provider: IMAGE_GEN_DEFAULT_PROVIDER, timeoutSeconds: IMAGE_GEN_DEFAULT_TIMEOUT_SECONDS });
+const imageGenLoading = ref(false);
+const imageGenSaving = ref(false);
+const imageGenError = ref("");
 const selectedInstanceId = ref("default");
 const selectedInstance = computed(() => props.instances.find((instance) => instance.id === selectedInstanceId.value));
 watch(() => props.instances, (instances) => {
@@ -120,12 +131,14 @@ watch(() => props.instances, (instances) => {
 
 const transferring = ref(false);
 const selectionLocked = computed(() => busy.value || importingAccounts.value || Boolean(deletingAccountId.value)
-  || visionSaving.value || visionSidecarSaving.value || loading.value || catalogLoading.value || accountScanLoading.value || visionLoading.value || transferring.value);
+  || visionSaving.value || visionSidecarSaving.value || imageGenSaving.value || loading.value || catalogLoading.value || accountScanLoading.value || visionLoading.value || transferring.value);
 watch(selectedInstanceId, async () => {
   snapshot.value = null; catalog.value = null; accountScan.value = null; visionCatalog.value = null; visionSidecar.value = null;
   selectedAccountIds.value = []; selectedVisionModels.value = []; logs.value = [];
   visionSidecarDraft.value = { enabled: true, model: "", backend: "openai" };
   visionSidecarError.value = "";
+  imageGen.value = null; imageGenError.value = "";
+  imageGenDraft.value = { provider: IMAGE_GEN_DEFAULT_PROVIDER, timeoutSeconds: IMAGE_GEN_DEFAULT_TIMEOUT_SECONDS };
   selectedVersion.value = ""; engineProgress.value = null; engineError.value = "";
   interactiveOperationId.value = ""; answeredPortPrompts.clear();
   settings.value = loadSettings();
@@ -221,6 +234,78 @@ function applyVisionSidecarResponse(response: OpenCodexVisionSidecarResponse): v
       sidecarModel: response.vision.model,
       sidecarBackend: visionSidecarDraft.value.backend,
     };
+  }
+}
+
+const imageGenOptions = computed(() => imageGen.value?.options ?? []);
+const selectedImageGenOption = computed(() =>
+  imageGenOptions.value.find((option) => option.name === imageGenDraft.value.provider),
+);
+/** 当前选择对应的说明：默认路径是否可用、是否会创建镜像提供方。 */
+const imageGenHint = computed(() => {
+  const option = selectedImageGenOption.value;
+  if (!option) {
+    return imageGen.value?.openaiUpstreamAvailable
+      ? t("默认由 OpenCodex 内置的 ChatGPT 转发或 OpenAI API Key 上游处理")
+      : t("当前没有 ChatGPT 转发或 OpenAI API Key 上游，Codex 生图会直接报错，请选择一个提供方");
+  }
+  return option.direct
+    ? formatTranslatedText("生图请求会直接转发到 {name} 的 /v1/images 接口", { name: option.name })
+    : formatTranslatedText("保存时会创建镜像提供方 {mirror} 承接 /v1/images，不会增加聊天模型", { mirror: `${option.name}-images` });
+});
+const imageGenHintWarning = computed(() => !selectedImageGenOption.value && !imageGen.value?.openaiUpstreamAvailable);
+const imageGenRecentRequests = computed(() => imageGen.value?.recentRequests ?? []);
+const imageGenLatestFailed = computed(() => (imageGenRecentRequests.value[0]?.status ?? 0) >= 400);
+
+function formatImageGenTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleString(undefined, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function applyImageGenerationSettings(settings: OpenCodexImageGenerationSettings): void {
+  imageGen.value = settings;
+  imageGenDraft.value = {
+    provider: settings.provider ?? IMAGE_GEN_DEFAULT_PROVIDER,
+    timeoutSeconds: settings.timeoutMs ? Math.round(settings.timeoutMs / 1000) : IMAGE_GEN_DEFAULT_TIMEOUT_SECONDS,
+  };
+}
+
+async function loadImageGenerationSettings(): Promise<void> {
+  imageGenLoading.value = true;
+  imageGenError.value = "";
+  try {
+    const instanceId = selectedInstanceId.value;
+    const settings = await getOpenCodexImageGenerationSettings(instanceId);
+    if (instanceId !== selectedInstanceId.value) return;
+    applyImageGenerationSettings(settings);
+  } catch (error) {
+    imageGen.value = null;
+    imageGenError.value = errorText(error);
+  } finally {
+    imageGenLoading.value = false;
+  }
+}
+
+async function saveImageGenerationSettings(): Promise<void> {
+  const provider = imageGenDraft.value.provider || null;
+  const timeoutSeconds = Math.round(Number(imageGenDraft.value.timeoutSeconds));
+  if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 5 || timeoutSeconds > 300) {
+    Message.warning(t("图片生成超时需在 5 到 300 秒之间"));
+    return;
+  }
+  imageGenSaving.value = true;
+  imageGenError.value = "";
+  try {
+    const result = await updateOpenCodexImageGenerationSettings(
+      { provider, timeoutMs: timeoutSeconds * 1000 },
+      selectedInstanceId.value,
+    );
+    applyImageGenerationSettings(result.settings);
+    Message.success(result.restarted ? t("图片生成设置已保存，OpenCodex 已重启") : t("图片生成设置已保存，将在下次启动时生效"));
+  } catch (error) {
+    imageGenError.value = errorText(error);
+    Message.error(formatTranslatedText("保存图片生成设置失败：{error}", { error: imageGenError.value }));
+  } finally {
+    imageGenSaving.value = false;
   }
 }
 
@@ -520,6 +605,8 @@ async function loadVisionModels(): Promise<void> {
   }
   visionLoading.value = true;
   visionSidecarError.value = "";
+  // 图片生成上游只读 config.json，与模型目录并行读取即可。
+  void loadImageGenerationSettings();
   try {
     const instanceId = selectedInstanceId.value;
     const result = await getOpenCodexVisionModels(instanceId);
@@ -1042,6 +1129,50 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
               <h2>{{ t("图片输入兼容") }}</h2>
               <p>{{ t("为本身不识图的模型开启图片粘贴。OpenCodex 会先用图片模型生成描述，再交给所选模型处理。") }}</p>
             </div>
+          </div>
+          <!-- 两张设置卡并排：左侧 Codex Image Gen 的转发上游，右侧图片描述器。 -->
+          <div class="vision-editor-grid">
+            <div class="vision-sidecar-editor image-gen-editor">
+              <div class="vision-sidecar-editor-title">
+                <div><small>{{ t("图片生成上游") }}</small><strong>{{ t("Codex Image Gen 转发目标") }}</strong></div>
+                <a-button size="mini" :loading="imageGenLoading" :disabled="imageGenSaving" @click="loadImageGenerationSettings"><template #icon><icon-refresh /></template></a-button>
+              </div>
+              <label class="vision-sidecar-field" @click.prevent>
+                <span>{{ t("提供方") }}</span>
+                <a-select v-model="imageGenDraft.provider" :loading="imageGenLoading" :disabled="!imageGen || imageGenSaving" :placeholder="t('选择图片生成提供方')">
+                  <a-option :value="IMAGE_GEN_DEFAULT_PROVIDER" :label="t('默认（OpenAI 上游）')">
+                    <span class="image-gen-option"><span>{{ t("默认（OpenAI 上游）") }}</span><small>{{ t("ChatGPT 转发 / OpenAI API Key") }}</small></span>
+                  </a-option>
+                  <a-option
+                    v-for="option in imageGenOptions"
+                    :key="option.name"
+                    :value="option.name"
+                    :label="option.name"
+                    :disabled="option.builtin || !option.hasApiKey"
+                  >
+                    <span class="image-gen-option"><span>{{ option.name }}</span><small>{{ option.builtin ? t("内置提供方") : !option.hasApiKey ? t("缺少 API Key") : option.adapter }}</small></span>
+                  </a-option>
+                </a-select>
+              </label>
+              <label class="vision-sidecar-field" @click.prevent>
+                <span>{{ t("超时（秒）") }}</span>
+                <a-input-number v-model="imageGenDraft.timeoutSeconds" :min="5" :max="300" :step="10" :disabled="!imageGen || imageGenSaving" />
+              </label>
+              <p :class="['vision-sidecar-hint', { warning: imageGenHintWarning }]"><icon-info-circle />{{ imageGenHint }}</p>
+              <p class="vision-sidecar-hint"><icon-info-circle />{{ t("生图模型由 Codex 客户端决定（gpt-image 系列），所选提供方需提供对应模型。") }}</p>
+              <div v-if="imageGenRecentRequests.length" class="image-gen-recent">
+                <small>{{ t("最近生图请求") }}</small>
+                <div v-for="request in imageGenRecentRequests" :key="`${request.timestamp}:${request.model}`" :class="['image-gen-recent-row', request.status >= 400 ? 'failed' : 'ok']">
+                  <span class="image-gen-recent-status">{{ request.status }}</span>
+                  <span class="image-gen-recent-model">{{ request.model }}</span>
+                  <span class="image-gen-recent-meta">{{ request.errorCode ? request.errorCode : request.durationMs ? `${(request.durationMs / 1000).toFixed(1)}s` : '' }}</span>
+                  <span class="image-gen-recent-time">{{ formatImageGenTime(request.timestamp) }}</span>
+                </div>
+                <p v-if="imageGenLatestFailed" class="vision-sidecar-hint warning"><icon-info-circle />{{ t("最近一次生图被上游拒绝：请求已正确转发到所选提供方，请确认该提供方的 /v1/images 接口与模型可用。") }}</p>
+              </div>
+              <p v-if="imageGenError" class="vision-sidecar-error">{{ imageGenError }}</p>
+              <a-button type="primary" :loading="imageGenSaving" :disabled="!imageGen || imageGenLoading || busy" @click="saveImageGenerationSettings"><template #icon><icon-save /></template>{{ t("保存生图设置") }}</a-button>
+            </div>
             <div class="vision-sidecar-editor">
               <div class="vision-sidecar-editor-title">
                 <div><small>{{ t("图片描述模型") }}</small><strong>{{ t("直接修改 OpenCodex 描述器") }}</strong></div>
@@ -1513,7 +1644,28 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
 .opencodex-page .health-indicator.healthy { color: #0f9f6e; }
 .opencodex-page .console-output { background: #111c2e; color: #cfe9c0; }
 .opencodex-page .console-line time { color: #6b7d99; }
-.opencodex-page .vision-manager-header { grid-template-columns: minmax(0, 1fr) minmax(340px, 430px); background: linear-gradient(120deg, #f2f7ff, #f7fbff 60%, #eef9f7); }
+/* 头部只放标题与说明；两张设置卡（生图上游 / 描述器）在下方等宽并排。 */
+.opencodex-page .vision-manager-header { grid-template-columns: 1fr; padding-bottom: 18px; border-bottom: 0; background: linear-gradient(120deg, #f2f7ff, #f7fbff 60%, #eef9f7); }
+.vision-editor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding: 0 24px 20px; border-bottom: 1px solid rgba(85, 113, 156, .13); background: linear-gradient(120deg, #f2f7ff, #f7fbff 60%, #eef9f7); }
+.vision-editor-grid > .vision-sidecar-editor { align-content: start; }
+@media (max-width: 1100px) { .vision-editor-grid { grid-template-columns: 1fr; } }
+.image-gen-editor { grid-template-columns: minmax(0, 1fr) minmax(110px, 140px); }
+.image-gen-editor :deep(.arco-input-number) { border: 1px solid var(--oc-line, #d9dee8); border-radius: 6px; background: #fff; }
+.image-gen-option { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; min-width: 0; }
+.image-gen-option > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.image-gen-option > small { flex: 0 0 auto; color: var(--oc-muted, #6d788a); font-size: 11px; }
+.image-gen-recent { display: grid; grid-column: 1 / -1; gap: 4px; padding: 10px 12px; border: 1px dashed var(--oc-line, #d9dee8); border-radius: 8px; background: rgba(247, 249, 252, .9); }
+.image-gen-recent > small { color: var(--oc-muted, #6d788a); font-size: 11px; }
+.image-gen-recent-row { display: grid; grid-template-columns: 40px minmax(0, 1fr) auto auto; align-items: center; gap: 10px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.image-gen-recent-status { display: inline-block; padding: 1px 0; border-radius: 4px; font-weight: 700; text-align: center; }
+.image-gen-recent-row.ok .image-gen-recent-status { color: #0f766e; background: rgba(15, 118, 110, .1); }
+.image-gen-recent-row.failed .image-gen-recent-status { color: #b42318; background: rgba(180, 35, 24, .1); }
+.image-gen-recent-model { overflow: hidden; color: var(--oc-ink, #172235); text-overflow: ellipsis; white-space: nowrap; }
+.image-gen-recent-meta { color: #b45309; font-size: 11px; }
+.image-gen-recent-row.ok .image-gen-recent-meta { color: var(--oc-muted, #6d788a); }
+.image-gen-recent-time { color: var(--oc-muted, #6d788a); font-size: 11px; }
+.image-gen-recent > .vision-sidecar-hint { margin-top: 4px; }
+.vision-sidecar-hint.warning { color: #b45309; }
 .opencodex-page .vision-kicker { color: var(--oc-accent); }
 .opencodex-page .vision-offline-icon, .opencodex-page .web-orb { color: var(--oc-accent); background: var(--oc-accent-soft); }
 .opencodex-page .vision-model-row:hover:not(.disabled):not(.native), .opencodex-page .vision-model-row.selected { background: #f0f6ff; }

@@ -19,6 +19,8 @@ import type {
   OpenCodexSwitcherDeleteResult,
   OpenCodexSwitcherImportResult,
   OpenCodexSystemSnapshot,
+  OpenCodexImageGenerationSettings,
+  OpenCodexImageGenerationUpdateResult,
   OpenCodexVisionModelCatalog,
   OpenCodexVisionModelsUpdateResult,
   OpenCodexVisionSidecarResponse,
@@ -126,6 +128,19 @@ export function updateOpenCodexVisionSidecarSettings(
   instanceId?: string,
 ): Promise<OpenCodexVisionSidecarResponse> {
   return invoke("opencodex_update_vision_sidecar_settings", { instanceId, request });
+}
+
+export function getOpenCodexImageGenerationSettings(
+  instanceId?: string,
+): Promise<OpenCodexImageGenerationSettings> {
+  return invoke("opencodex_get_image_generation_settings", { instanceId });
+}
+
+export function updateOpenCodexImageGenerationSettings(
+  request: { provider: string | null; timeoutMs: number | null },
+  instanceId?: string,
+): Promise<OpenCodexImageGenerationUpdateResult> {
+  return invoke("opencodex_update_image_generation_settings", { instanceId, request });
 }
 
 export async function subscribeOpenCodexEvents(

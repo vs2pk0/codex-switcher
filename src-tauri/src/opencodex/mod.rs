@@ -7,10 +7,11 @@ mod models;
 use backend::Backend;
 use models::{
     CommandStarted, DeleteEngineVersionRequest, DeleteSwitcherAccountRequest, EngineDeleteResult,
-    EngineInstallResult, EngineUpdateCatalog, ImportSwitcherAccountsRequest,
-    InstallEngineVersionRequest, RunActionRequest, SwitcherAccountScan, SwitcherDeleteResult,
-    SwitcherImportResult, SystemSnapshot, UpdateVisionModelsRequest, VisionModelCatalog,
-    VisionModelsUpdateResult, VisionSidecarUpdate,
+    EngineInstallResult, EngineUpdateCatalog, ImageGenerationSettings, ImageGenerationUpdate,
+    ImageGenerationUpdateResult, ImportSwitcherAccountsRequest, InstallEngineVersionRequest,
+    RunActionRequest, SwitcherAccountScan, SwitcherDeleteResult, SwitcherImportResult,
+    SystemSnapshot, UpdateVisionModelsRequest, VisionModelCatalog, VisionModelsUpdateResult,
+    VisionSidecarUpdate,
 };
 use std::sync::Arc;
 use tauri::State;
@@ -222,6 +223,29 @@ pub async fn opencodex_get_vision_sidecar_settings(
     tauri::async_runtime::spawn_blocking(move || backend.vision_sidecar_settings(None))
         .await
         .map_err(|error| format!("读取图片描述设置任务失败：{error}"))?
+}
+
+#[tauri::command]
+pub async fn opencodex_get_image_generation_settings(
+    backend: State<'_, Arc<OpenCodexBackend>>,
+    instance_id: Option<String>,
+) -> Result<ImageGenerationSettings, String> {
+    let backend = backend.inner().for_instance(instance_id.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || backend.image_generation_settings())
+        .await
+        .map_err(|error| format!("读取图片生成设置任务失败：{error}"))?
+}
+
+#[tauri::command]
+pub async fn opencodex_update_image_generation_settings(
+    backend: State<'_, Arc<OpenCodexBackend>>,
+    instance_id: Option<String>,
+    request: ImageGenerationUpdate,
+) -> Result<ImageGenerationUpdateResult, String> {
+    let backend = backend.inner().for_instance(instance_id.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || backend.update_image_generation_settings(request))
+        .await
+        .map_err(|error| format!("保存图片生成设置任务失败：{error}"))?
 }
 
 #[tauri::command]

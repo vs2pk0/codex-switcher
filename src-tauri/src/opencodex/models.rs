@@ -333,6 +333,63 @@ pub struct VisionSidecarUpdate {
     pub enabled: bool,
 }
 
+/// Codex「Image Gen」可选的图片生成上游（OpenCodex 中带 API Key 的自定义提供方）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageGenerationProviderOption {
+    pub name: String,
+    pub adapter: String,
+    pub base_url: String,
+    /// openai-responses 适配器可直接作为 images.provider；其他适配器需要创建镜像提供方。
+    pub direct: bool,
+    pub has_api_key: bool,
+    /// Engine 内置注册表中的提供方不能作为 images.provider。
+    pub builtin: bool,
+}
+
+/// usage.jsonl 中最近一次经 /v1/images 转发到图片生成上游的请求结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageGenerationRecentRequest {
+    pub timestamp: i64,
+    pub model: String,
+    pub status: u16,
+    pub error_code: Option<String>,
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageGenerationSettings {
+    /// 最近几次发往当前图片生成上游的请求（新到旧），用于判断上游是否真正可用。
+    pub recent_requests: Vec<ImageGenerationRecentRequest>,
+    /// 用户选择的源提供方（镜像提供方已映射回源名）；None 表示交给 OpenCodex 内置顺序。
+    pub provider: Option<String>,
+    /// config.json 中 images.provider 的原始值。
+    pub configured_provider: Option<String>,
+    /// 实际承接 /v1/images 转发的镜像提供方名（仅当源提供方不是 openai-responses 时存在）。
+    pub mirror_provider: Option<String>,
+    pub timeout_ms: Option<u64>,
+    /// 是否存在可用的 ChatGPT 转发或 OpenAI API Key 上游（未选择自定义提供方时的默认路径）。
+    pub openai_upstream_available: bool,
+    pub options: Vec<ImageGenerationProviderOption>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageGenerationUpdate {
+    pub provider: Option<String>,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageGenerationUpdateResult {
+    pub settings: ImageGenerationSettings,
+    pub restarted: bool,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VisionModelsUpdateResult {
