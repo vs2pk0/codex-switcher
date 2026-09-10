@@ -55,6 +55,11 @@ import { additionalQuotaWindows, hasQuotaWindow, quotaWindowForMinutes } from ".
 import { resolveResetScheduleEntry } from "./services/resetScheduleEntry";
 import { shouldCleanupHiddenAccount } from "./services/accountVisibility";
 import {
+  ADAPTIVE_COLUMNS,
+  ADAPTIVE_REFERENCE_WINDOW_WIDTH,
+  normalizeMaxColumns,
+} from "./services/accountLayout";
+import {
   beginPendingItem,
   finishPendingItem,
   hasAvailableResetCredit,
@@ -300,6 +305,8 @@ const backupButtonText = computed(() =>
 );
 const sessionRestoreVisible = ref(false);
 const expandedLayout = ref(false);
+// 当前窗口宽度，用于「每行账号数」自适应计算。
+const viewportWidth = ref(ADAPTIVE_REFERENCE_WINDOW_WIDTH);
 let windowResizeFrame: number | undefined;
 let viewLoadTimer: number | undefined;
 const EXPANDED_LAYOUT_MIN_WIDTH = 1260;
@@ -321,7 +328,7 @@ const settings = reactive<CodexSwitcherSettings>({
   showAdditionalQuotaWindows: true,
   badgeStyle: "classic",
   badgeStyles: defaultBadgeStyles(),
-  maxColumns: 5,
+  maxColumns: ADAPTIVE_COLUMNS,
   language: "zh-CN",
 });
 
@@ -759,7 +766,7 @@ function scheduleCountdownSettingsPersist(): void {
         : 0,
       showQuotaCountdowns: settings.showQuotaCountdowns ?? true,
       showAdditionalQuotaWindows: settings.showAdditionalQuotaWindows ?? true,
-      maxColumns: [3, 4, 5].includes(settings.maxColumns) ? settings.maxColumns : 5,
+      maxColumns: normalizeMaxColumns(settings.maxColumns),
       language: settings.language || "zh-CN",
     }).catch(() => {
       // 倒计时缓存失败不影响主流程，下一次正常保存设置会带上最新时间。
@@ -2061,7 +2068,7 @@ async function loadSettings(options: { includeStorage?: boolean } = {}): Promise
       currentAccountNextRefreshAt: Number(nextSettings.currentAccountNextRefreshAt || 0),
       showQuotaCountdowns: nextSettings.showQuotaCountdowns ?? true,
       showAdditionalQuotaWindows: nextSettings.showAdditionalQuotaWindows ?? true,
-      maxColumns: [3, 4, 5].includes(nextSettings.maxColumns) ? nextSettings.maxColumns : 5,
+      maxColumns: normalizeMaxColumns(nextSettings.maxColumns),
       language: nextSettings.language || "zh-CN",
     });
     setLanguage(settings.language);
@@ -2122,7 +2129,7 @@ async function saveSettings(): Promise<void> {
         : 0,
       showQuotaCountdowns: settings.showQuotaCountdowns ?? true,
       showAdditionalQuotaWindows: settings.showAdditionalQuotaWindows ?? true,
-      maxColumns: [3, 4, 5].includes(settings.maxColumns) ? settings.maxColumns : 5,
+      maxColumns: normalizeMaxColumns(settings.maxColumns),
       language: settings.language || "zh-CN",
     });
     Object.assign(settings, saved);
@@ -4617,6 +4624,7 @@ async function refreshOpenCodexAccountIds(): Promise<void> {
 
 function syncExpandedLayout(): void {
   expandedLayout.value = window.innerWidth >= EXPANDED_LAYOUT_MIN_WIDTH;
+  viewportWidth.value = window.innerWidth;
 }
 
 function handleWindowResize(): void {
@@ -4823,6 +4831,7 @@ onUnmounted(() => {
         :selected-account-ids="selectedAccountIds"
         :settings="settings"
         :expanded-layout="expandedLayout"
+        :viewport-width="viewportWidth"
         :loading="loading"
         :switching-id="switchingId"
         :deleting-id="deletingId"
@@ -5067,6 +5076,7 @@ onUnmounted(() => {
       @restore-backup="handleRestoreBackup"
       @delete-backup="handleDeleteBackup"
       @open-push-settings="switchView('pushSettings')"
+      @open-reset-records="switchView('resets')"
       @select-instance="handleSettingsInstanceChange"
     />
 

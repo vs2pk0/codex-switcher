@@ -146,7 +146,7 @@ pub struct CodexUsagePricingConfig {
     pub pricing_model_source: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CumulativeTokens {
     input: u64,
     cached_input: u64,
@@ -249,11 +249,16 @@ struct FileParseState {
     is_fork: bool,
     has_external_history_base: bool,
     is_canonical_root: bool,
+    /// session_meta 标注为子代理线程（Codex 多代理会为子代理单独落盘 rollout）。
+    is_subagent_thread: bool,
     session_started_at: Option<i64>,
     last_valid_event_at: Option<i64>,
     owned_task_started: bool,
     has_usage_event_at_or_after_session_start: bool,
+    has_usage_event_before_session_start: bool,
     has_usage_event_without_comparable_timestamp: bool,
+    /// 首条 token_count 的累计用量等于本次用量，说明计数器从零开始、没有继承父线程累计。
+    first_usage_starts_fresh_counter: Option<bool>,
     current_model: String,
     prev_total: Option<CumulativeTokens>,
     event_index: u32,
@@ -267,6 +272,9 @@ struct ParsedUsageFile {
     events: Vec<ParsedUsageEvent>,
     is_fork: bool,
     confirmed_replay_only: bool,
+    is_subagent_thread: bool,
+    /// fork 自带独立计数器且全部用量事件都发生在本会话创建之后：没有回放父用量。
+    owns_all_events_without_replay: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -297,7 +305,7 @@ struct UsageEventIdentity {
 }
 
 const PROVENANCE_USAGE_CACHE_VERSION: u32 = 4;
-const USAGE_CACHE_VERSION: u32 = 7;
+const USAGE_CACHE_VERSION: u32 = 8;
 const PRICING_DEFAULTS_VERSION: u32 = 1;
 const GPT_56_DEFAULT_MODEL_IDS: [&str; 3] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 static USAGE_DATA_LOCK: Mutex<()> = Mutex::new(());
@@ -475,11 +483,14 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
         is_fork: false,
         has_external_history_base: false,
         is_canonical_root: false,
+        is_subagent_thread: false,
         session_started_at: None,
         last_valid_event_at: None,
         owned_task_started: false,
         has_usage_event_at_or_after_session_start: false,
+        has_usage_event_before_session_start: false,
         has_usage_event_without_comparable_timestamp: false,
+        first_usage_starts_fresh_counter: None,
         current_model: "unknown".to_string(),
         prev_total: None,
         event_index: 0,
@@ -535,6 +546,7 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
                     .map(ToString::to_string);
                 state.has_external_history_base =
                     has_external_history_base(&value, state.parent_rollout_id.as_deref());
+                state.is_subagent_thread = payload.is_some_and(is_subagent_thread_meta);
                 let has_fork_parent = state.parent_rollout_id.is_some();
                 let has_distinct_rollout_id = match (&raw_session_id, &state.rollout_id) {
                     (Some(session_id), Some(rollout_id)) => session_id != rollout_id,
@@ -615,6 +627,12 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
                     state.last_valid_event_at = Some(timestamp);
                 }
                 let fingerprint = token_usage_fingerprint(total.as_ref(), last.as_ref());
+                if state.first_usage_starts_fresh_counter.is_none() {
+                    state.first_usage_starts_fresh_counter = Some(matches!(
+                        (total.as_ref(), last.as_ref()),
+                        (Some(total), Some(last)) if total == last
+                    ));
+                }
                 let delta = if let Some(total) = total {
                     // Fork/replay rollouts start with the parent's cumulative total.  Only
                     // those rollouts use last_token_usage for their first event; a canonical
@@ -644,7 +662,7 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
                     (Some(event_at), Some(session_at)) if event_at >= session_at => {
                         state.has_usage_event_at_or_after_session_start = true;
                     }
-                    (Some(_), Some(_)) => {}
+                    (Some(_), Some(_)) => state.has_usage_event_before_session_start = true,
                     _ => state.has_usage_event_without_comparable_timestamp = true,
                 }
                 state.event_index += 1;
@@ -699,6 +717,14 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
         && !state.owned_task_started
         && !state.has_usage_event_at_or_after_session_start
         && !state.has_usage_event_without_comparable_timestamp;
+    // 子代理线程会复制父线程的历史，但 token_count 计数器从零开始且全部在本会话创建后产生；
+    // 这类文件与父 rollout 没有公共回放前缀，却完整拥有自己的用量。
+    let owns_all_events_without_replay = state.is_fork
+        && !events.is_empty()
+        && state.first_usage_starts_fresh_counter == Some(true)
+        && state.has_usage_event_at_or_after_session_start
+        && !state.has_usage_event_before_session_start
+        && !state.has_usage_event_without_comparable_timestamp;
     Ok(ParsedUsageFile {
         source_path: path.to_string_lossy().to_string(),
         rollout_id,
@@ -706,6 +732,8 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
         events,
         is_fork: state.is_fork,
         confirmed_replay_only,
+        is_subagent_thread: state.is_subagent_thread,
+        owns_all_events_without_replay,
     })
 }
 
@@ -943,6 +971,10 @@ fn parse_codex_usage_files(
             let lcp = common_event_prefix_len(&parent.events, &file.events);
             if lcp > 0 {
                 Some(lcp)
+            } else if file.owns_all_events_without_replay {
+                // 与父无公共前缀，且自身计数器从零开始、事件全部晚于会话创建：
+                // 这是子代理/独立计数的 fork，没有回放父用量，全部事件归自己。
+                Some(0)
             } else {
                 errors.push(format!(
                     "{}: fork 与父 rollout 无公共回放前缀且缺少可信自有事件边界，已保留上次可信缓存",
@@ -954,6 +986,10 @@ fn parse_codex_usage_files(
             // Every usage event predates this fork's own session timestamp, so the file is
             // a replay-only snapshot. It owns no usage and can safely replace stale cache rows.
             Some(file.events.len())
+        } else if file.is_subagent_thread && file.owns_all_events_without_replay {
+            // 父线程文件已不存在，但 session_meta 明确标注为子代理线程，且计数器从零开始、
+            // 事件全部晚于会话创建，可以安全地把全部事件归为自有。
+            Some(0)
         } else {
             // If the parent JSONL has rotated away, only an explicit task_started whose
             // started_at belongs to this rollout is a safe ownership boundary. Otherwise
@@ -3205,6 +3241,23 @@ fn has_external_history_base(meta: &Value, parent_rollout_id: Option<&str>) -> b
         })
 }
 
+/// 判断 session_meta payload 是否标注为 Codex 多代理的子代理线程。
+fn is_subagent_thread_meta(payload: &Value) -> bool {
+    if payload.get("thread_source").and_then(Value::as_str) == Some("subagent") {
+        return true;
+    }
+    if payload
+        .get("source")
+        .and_then(Value::as_object)
+        .is_some_and(|source| source.contains_key("subagent"))
+    {
+        return true;
+    }
+    payload
+        .get("subagent_history_start_ordinal")
+        .is_some_and(|value| value.is_number())
+}
+
 fn token_usage_fingerprint(
     total: Option<&CumulativeTokens>,
     last: Option<&CumulativeTokens>,
@@ -3733,7 +3786,10 @@ mod tests {
             UsageLogSourceKind::CanonicalRoot,
             75,
         );
-        for (version, refresh) in [(USAGE_CACHE_VERSION, true), (6, false)] {
+        for (version, refresh) in [
+            (USAGE_CACHE_VERSION, true),
+            (USAGE_CACHE_VERSION - 1, false),
+        ] {
             let mut conn = open_usage_db_at(&target.database_path).unwrap();
             write_usage_cache_db(
                 &mut conn,
@@ -4305,6 +4361,147 @@ mod tests {
             &replace_ids,
         );
         assert!(merged.contains(&previous));
+    }
+
+    fn subagent_meta(timestamp: &str, rollout_id: &str, parent: &str) -> String {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "session_meta",
+            "payload": {
+                "session_id": parent,
+                "id": rollout_id,
+                "forked_from_id": parent,
+                "parent_thread_id": parent,
+                "thread_source": "subagent",
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": parent, "depth": 1}}},
+                "subagent_history_start_ordinal": 824,
+                "history_mode": "paginated",
+            },
+        })
+        .to_string()
+    }
+
+    fn task_started_copied_from_parent(timestamp: &str) -> String {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {"type": "task_started", "started_at": 1_700_000_000_i64},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn subagent_thread_with_fresh_counter_owns_all_usage_when_lcp_is_zero() {
+        // Codex 多代理的子代理线程会复制父线程历史（含旧的 task_started），
+        // 但自己的 token_count 计数器从零开始，与父 rollout 没有公共回放前缀。
+        let temp = tempfile::tempdir().expect("tempdir");
+        let parent = temp.path().join("parent.jsonl");
+        let child = temp.path().join("child.jsonl");
+        fs::write(
+            &parent,
+            [
+                usage_meta("2026-09-09T09:00:00Z", "parent", "parent", None),
+                token_event(Some("2026-09-09T09:01:00Z"), (100, 20, 5), (100, 20, 5)),
+                token_event(Some("2026-09-09T09:02:00Z"), (260, 120, 15), (160, 100, 10)),
+            ]
+            .join("\n"),
+        )
+        .expect("write parent");
+        fs::write(
+            &child,
+            [
+                subagent_meta("2026-09-09T09:25:51Z", "child", "parent"),
+                task_started_copied_from_parent("2026-09-09T09:25:51Z"),
+                token_event(
+                    Some("2026-09-09T09:26:04Z"),
+                    (52_591, 0, 354),
+                    (52_591, 0, 354),
+                ),
+                token_event(
+                    Some("2026-09-09T09:26:20Z"),
+                    (106_201, 51_712, 1_111),
+                    (53_610, 51_712, 757),
+                ),
+            ]
+            .join("\n"),
+        )
+        .expect("write child");
+
+        let (current, replace_ids, errors) = parse_codex_usage_files(&[parent, child]);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(replace_ids.contains("child"));
+        let child_logs = current
+            .iter()
+            .filter(|log| log.rollout_id == "child")
+            .collect::<Vec<_>>();
+        assert_eq!(child_logs.len(), 2);
+        assert_eq!(child_logs[0].input_tokens, 52_591);
+        assert_eq!(child_logs[0].output_tokens, 354);
+        assert_eq!(child_logs[1].input_tokens, 106_201 - 52_591);
+        assert_eq!(child_logs[1].cache_read_tokens, 51_712);
+        assert_eq!(child_logs[1].output_tokens, 1_111 - 354);
+        // 父线程自己的用量保持不变
+        assert_eq!(
+            current
+                .iter()
+                .filter(|log| log.rollout_id == "parent")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn subagent_thread_without_parent_file_still_owns_fresh_counter_usage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let child = temp.path().join("child.jsonl");
+        fs::write(
+            &child,
+            [
+                subagent_meta("2026-09-09T09:25:51Z", "child", "missing-parent"),
+                token_event(Some("2026-09-09T09:26:04Z"), (500, 0, 40), (500, 0, 40)),
+            ]
+            .join("\n"),
+        )
+        .expect("write child");
+
+        let (current, replace_ids, errors) = parse_codex_usage_files(&[child]);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(replace_ids.contains("child"));
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].input_tokens, 500);
+    }
+
+    #[test]
+    fn fresh_counter_is_not_trusted_when_usage_predates_session_or_parent_is_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // 事件早于会话创建：仍属于回放，不能凭 total == last 归为自有
+        let replayed = temp.path().join("replayed.jsonl");
+        fs::write(
+            &replayed,
+            [
+                usage_meta("2026-09-09T09:25:51Z", "parent", "replayed", Some("parent")),
+                token_event(Some("2026-09-09T08:00:00Z"), (500, 0, 40), (500, 0, 40)),
+                token_event(Some("2026-09-09T09:30:00Z"), (900, 0, 80), (400, 0, 40)),
+            ]
+            .join("\n"),
+        )
+        .expect("write replayed");
+        // 普通 fork 缺少父文件、没有子代理标记：保持保守，不归为自有
+        let plain = temp.path().join("plain.jsonl");
+        fs::write(
+            &plain,
+            [
+                usage_meta("2026-09-09T09:25:51Z", "parent", "plain", Some("parent")),
+                token_event(Some("2026-09-09T09:26:04Z"), (500, 0, 40), (500, 0, 40)),
+            ]
+            .join("\n"),
+        )
+        .expect("write plain");
+
+        let (current, replace_ids, errors) = parse_codex_usage_files(&[replayed, plain]);
+        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert!(replace_ids.is_empty());
+        assert!(current.is_empty());
     }
 
     #[test]

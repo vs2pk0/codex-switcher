@@ -502,12 +502,13 @@ async function loadUsage(
       pricingConfigs.value = nextDashboard.pricingConfigs;
       originalPricingConfigs.value = nextDashboard.pricingConfigs.map((item) => ({ ...item }));
     }
+    if (nextDashboard.errors.length) {
+      // 无法自动归属的会话文件只记录到控制台供排查，不再在页面上打扰用户；
+      // 后端刷新时会尽量自动处理（子代理线程、独立计数的 fork 等）。
+      console.warn("[usage] 未能自动归属的会话统计项：", nextDashboard.errors);
+    }
     if (refresh && notify && !silent) {
-      if (nextDashboard.errors.length) {
-        Message.warning(t("消耗数据已刷新，仍有统计项无法自动修复，请查看异常详情"));
-      } else {
-        Message.success(t("消耗数据已刷新"));
-      }
+      Message.success(t("消耗数据已刷新"));
     }
   } catch (error) {
     if (serial !== loadSerial) return;
@@ -1215,21 +1216,6 @@ onBeforeUnmount(() => {
         </a-button>
       </div>
     </div>
-
-    <a-alert
-      v-if="dashboard?.errors.length"
-      type="warning"
-      show-icon
-      class="usage-session-warning"
-    >
-      {{ t(`有 ${dashboard.errors.length} 个会话统计项需要注意，已保留可确认的可信数据。`) }}
-      <details class="usage-warning-details">
-        <summary>{{ t("异常详情") }}</summary>
-        <ul>
-          <li v-for="(error, index) in dashboard.errors" :key="index">{{ error }}</li>
-        </ul>
-      </details>
-    </a-alert>
 
     <a-spin :loading="loading" dot>
       <div class="usage-dashboard-grid">

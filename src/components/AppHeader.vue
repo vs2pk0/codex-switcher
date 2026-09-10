@@ -59,14 +59,14 @@ const sidebarCollapsed = ref(true);
           <span class="sidebar-label">{{ t("会话管理") }}</span>
         </button>
       </a-tooltip>
-      <a-tooltip :content="t('重置记录')" position="right" :disabled="!sidebarCollapsed">
+      <a-tooltip :content="t('推送')" position="right" :disabled="!sidebarCollapsed">
         <button
           type="button"
-          :class="{ active: activeView === 'resets' }"
-          @click="$emit('switch-view', 'resets')"
+          :class="{ active: activeView === 'pushSettings' }"
+          @click="$emit('switch-view', 'pushSettings')"
         >
-          <icon-thunderbolt />
-          <span class="sidebar-label">{{ t("重置记录") }}</span>
+          <icon-notification />
+          <span class="sidebar-label">{{ t("推送") }}</span>
         </button>
       </a-tooltip>
       <a-tooltip :content="t('使用统计')" position="right" :disabled="!sidebarCollapsed">
@@ -117,7 +117,7 @@ const sidebarCollapsed = ref(true);
       <a-tooltip :content="t('设置')" position="right" :disabled="!sidebarCollapsed">
         <button
           type="button"
-          :class="{ active: activeView === 'settings' || activeView === 'pushSettings' }"
+          :class="{ active: activeView === 'settings' || activeView === 'resets' }"
           @click="$emit('switch-view', 'settings')"
         >
           <icon-settings />
@@ -145,11 +145,9 @@ const sidebarCollapsed = ref(true);
     </button>
   </aside>
 
-  <header v-if="activeView !== 'openCodex' && activeView !== 'instances'" class="topbar">
+  <header v-if="activeView === 'accounts'" class="topbar">
     <div class="brand">
-      <h1>Codex Switcher</h1>
-      <p>{{ t("管理 OAuth 与 API Key 登录态，并写回本机 Codex 配置。") }}</p>
-      <section v-if="activeView === 'accounts'" class="status-line">
+      <section class="status-line">
         <a-tag color="arcoblue">{{ t("全部") }} {{ accountsCount }}</a-tag>
         <a-tag color="green">OAuth {{ oauthCount }}</a-tag>
         <a-tag color="orange">API Key {{ apiKeyCount }}</a-tag>
@@ -160,7 +158,7 @@ const sidebarCollapsed = ref(true);
         <a-tag v-if="abnormalCount" color="red">{{ t("异常账号") }} {{ abnormalCount }}</a-tag>
       </section>
     </div>
-    <div v-if="activeView === 'accounts'" class="command-actions">
+    <div class="command-actions">
       <a-button
         class="command-button command-quota"
         :loading="refreshingAllQuotas"
@@ -214,9 +212,9 @@ const sidebarCollapsed = ref(true);
         <template #icon><icon-folder /></template>
         {{ t("会话管理") }}
       </a-button>
-      <a-button :type="activeView === 'resets' ? 'primary' : 'text'" @click="$emit('switch-view', 'resets')">
-        <template #icon><icon-thunderbolt /></template>
-        {{ t("重置记录") }}
+      <a-button :type="activeView === 'pushSettings' ? 'primary' : 'text'" @click="$emit('switch-view', 'pushSettings')">
+        <template #icon><icon-notification /></template>
+        {{ t("推送") }}
       </a-button>
       <a-button :type="activeView === 'usage' ? 'primary' : 'text'" @click="$emit('switch-view', 'usage')">
         <template #icon><icon-bar-chart /></template>

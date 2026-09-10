@@ -33,6 +33,7 @@ const emit = defineEmits<{
   (event: "restore-backup", backup: CodexSwitcherBackupFile): void;
   (event: "delete-backup", backup: CodexSwitcherBackupFile): void;
   (event: "open-push-settings"): void;
+  (event: "open-reset-records"): void;
   (event: "select-instance", instanceId: string): void;
 }>();
 
@@ -205,8 +206,12 @@ function changeLanguage(value: unknown): void {
             <a-form-item :label="t('侧边栏')">
               <a-switch v-model="settings.sidebarEnabled" @change="emit('save')" />
             </a-form-item>
-            <a-form-item :label="t('每行固定账号数')">
+            <a-form-item
+              :label="t('每行账号数')"
+              :extra="t('自适应时以 1800px 宽度显示 5 个为基准，按窗口宽度自动计算每行个数。')"
+            >
               <a-radio-group v-model="settings.maxColumns" type="button" @change="emit('save')">
+                <a-radio :value="0">{{ t("自适应") }}</a-radio>
                 <a-radio :value="3">{{ t("3 个") }}</a-radio>
                 <a-radio :value="4">{{ t("4 个") }}</a-radio>
                 <a-radio :value="5">{{ t("5 个") }}</a-radio>
@@ -249,11 +254,15 @@ function changeLanguage(value: unknown): void {
             </a-button>
           </div>
         </a-card>
-        <a-card :title="t('推送')" :bordered="false" class="settings-card settings-push">
+        <a-card :title="t('推送与重置')" :bordered="false" class="settings-card settings-push">
           <div class="settings-config-actions">
             <a-button type="primary" @click="emit('open-push-settings')">
               <template #icon><icon-notification /></template>
               {{ t("推送设置") }}
+            </a-button>
+            <a-button @click="emit('open-reset-records')">
+              <template #icon><icon-thunderbolt /></template>
+              {{ t("重置记录") }}
             </a-button>
           </div>
         </a-card>

@@ -1,3 +1,4 @@
+import type { AccountColumnsSetting } from "./accountLayout";
 import { invoke } from "@tauri-apps/api/core";
 import type { CodexAccount } from "../types/codex";
 import type { CodexSessionVisibilityRepairSummary } from "./session";
@@ -36,7 +37,7 @@ export interface CodexSwitcherSettings {
   showAdditionalQuotaWindows: boolean;
   badgeStyle: string;
   badgeStyles: Record<string, string>;
-  maxColumns: 3 | 4 | 5;
+  maxColumns: AccountColumnsSetting;
   language: string;
 }
 

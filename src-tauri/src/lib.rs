@@ -255,7 +255,8 @@ fn default_badge_styles() -> HashMap<String, String> {
 }
 
 fn default_max_columns() -> u64 {
-    5
+    // 0 表示前端按窗口宽度自适应计算每行账号数。
+    0
 }
 
 fn default_language() -> String {

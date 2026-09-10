@@ -2,6 +2,7 @@
 import { Message } from "@arco-design/web-vue";
 import { computed, ref } from "vue";
 import { isSubscriptionExpired } from "../accountStatus";
+import { ADAPTIVE_COLUMNS, normalizeMaxColumns, resolveAccountColumns } from "../services/accountLayout";
 import type { CodexApiKeyBalanceState, CodexSwitcherSettings } from "../services/codex";
 import type { CodexAccount, CodexResetCredit } from "../types/codex";
 import { currentLocale, formatLocalizedDuration, t } from "../i18n";
@@ -20,6 +21,7 @@ const props = defineProps<{
   selectedAccountIds: Set<string>;
   settings: CodexSwitcherSettings;
   expandedLayout: boolean;
+  viewportWidth: number;
   loading: boolean;
   switchingId: string;
   deletingId: string;
@@ -56,10 +58,20 @@ const emit = defineEmits<{
 
 const dragOverAccountId = ref("");
 
+const isAdaptiveColumns = computed(
+  () => normalizeMaxColumns(props.settings.maxColumns) === ADAPTIVE_COLUMNS,
+);
+
+const accountColumns = computed(() =>
+  resolveAccountColumns(props.settings.maxColumns, props.viewportWidth),
+);
+
 const gridClass = computed(() => {
-  const columns = [3, 4, 5].includes(props.settings.maxColumns) ? props.settings.maxColumns : 5;
+  // 超过 5 列时复用 5 列的紧凑样式，实际列数由内联 grid-template-columns 控制。
+  const styleColumns = Math.min(5, accountColumns.value);
   return {
-    [`columns-${columns}`]: true,
+    [`columns-${styleColumns}`]: true,
+    adaptive: isAdaptiveColumns.value,
     expanded: props.expandedLayout,
   };
 });
@@ -83,7 +95,12 @@ const accountGridStyle = computed<Record<string, string>>(() => {
     0,
   );
   const extraRows = Math.max(0, maxQuotaRows - 2);
-  return { "--additional-quota-height": `${extraRows * 70}px` };
+  const style: Record<string, string> = { "--additional-quota-height": `${extraRows * 70}px` };
+  if (isAdaptiveColumns.value) {
+    // 自适应模式下按窗口宽度直接写列数，覆盖固定列数的样式规则。
+    style.gridTemplateColumns = `repeat(${accountColumns.value}, minmax(0, 1fr))`;
+  }
+  return style;
 });
 
 function isPinned(account: CodexAccount): boolean {

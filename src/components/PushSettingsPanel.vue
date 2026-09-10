@@ -802,7 +802,7 @@ function triggerLabel(value: string): string {
                 </div>
 
                 <div class="push-rule-advanced">
-                  <label><span>{{ t("结果排序") }}</span><a-select v-model="rule.sortBy" popup-container="body"><a-option value="accountOrder">{{ t("账号列表顺序") }}</a-option><a-option value="quotaAsc">{{ t("剩余额度升序") }}</a-option><a-option value="subscriptionExpiryAsc">{{ t("订阅到期升序") }}</a-option><a-option value="tokenExpiryAsc">{{ t("Token 到期升序") }}</a-option></a-select></label>
+                  <div class="push-field"><span>{{ t("结果排序") }}</span><a-select v-model="rule.sortBy" popup-container="body"><a-option value="accountOrder">{{ t("账号列表顺序") }}</a-option><a-option value="quotaAsc">{{ t("剩余额度升序") }}</a-option><a-option value="subscriptionExpiryAsc">{{ t("订阅到期升序") }}</a-option><a-option value="tokenExpiryAsc">{{ t("Token 到期升序") }}</a-option></a-select></div>
                   <label><span>{{ t("重复提醒间隔") }}</span><a-input-number v-model="rule.cooldownMinutes" :min="1" :max="10080"><template #suffix>{{ t("分钟") }}</template></a-input-number></label>
                   <label class="push-inline-switch"><div><span>{{ t("推送前主动刷新") }}</span><small>{{ t("关闭时直接读取定时任务保存的账号状态") }}</small></div><a-switch v-model="rule.activeRefresh" size="small" /></label>
                 </div>

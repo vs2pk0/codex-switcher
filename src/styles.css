@@ -92,8 +92,9 @@ textarea {
   min-height: 44px;
   padding: 0 10px 28px;
   color: #101827;
-  font-size: 16px;
-  font-weight: 860;
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
 }
 
 .sidebar-brand img {
@@ -121,10 +122,9 @@ textarea {
   width: 40px;
   height: 40px;
   align-items: center;
-  align-self: flex-start;
+  align-self: center;
   justify-content: center;
   margin-top: auto;
-  margin-left: 10px;
   border: 1px solid rgba(85, 113, 156, 0.16);
   border-radius: 8px;
   color: #64748b;
@@ -154,6 +154,8 @@ textarea {
 
 .app-sidebar.collapsed .sidebar-brand {
   justify-content: center;
+  /* 收起时去掉与标题之间的间距，否则隐藏的标题仍会占用 gap 导致图标偏左 */
+  gap: 0;
   padding: 0 0 30px;
 }
 
@@ -163,10 +165,6 @@ textarea {
   transform: translateX(-6px);
 }
 
-.app-sidebar.collapsed .sidebar-toggle {
-  align-self: center;
-  margin-left: 0;
-}
 
 .sidebar-nav {
   display: grid;
@@ -253,6 +251,7 @@ textarea {
 .app-sidebar.collapsed .sidebar-nav button {
   width: 44px;
   justify-content: center;
+  gap: 0;
   padding: 0;
 }
 
@@ -552,7 +551,7 @@ textarea {
   gap: 10px;
   min-height: 28px;
   width: 100%;
-  margin: 22px 0 0;
+  margin: 0;
   color: var(--text-soft);
 }
 
@@ -3321,26 +3320,6 @@ textarea {
   align-items: center;
   justify-content: flex-end;
   gap: 10px;
-}
-
-.usage-session-warning {
-  margin-bottom: 16px;
-}
-
-.usage-warning-details {
-  margin-top: 6px;
-  overflow-wrap: anywhere;
-}
-
-.usage-warning-details summary {
-  cursor: pointer;
-}
-
-.usage-warning-details ul {
-  max-height: 180px;
-  overflow-y: auto;
-  margin: 8px 0 0;
-  padding-left: 20px;
 }
 
 .usage-range-picker {
@@ -7425,14 +7404,16 @@ textarea {
 }
 
 .push-rule-form-grid > label,
-.push-rule-advanced > label {
+.push-rule-advanced > label,
+.push-rule-advanced > .push-field {
   display: grid;
   min-width: 0;
   gap: 7px;
 }
 
 .push-rule-form-grid label > span,
-.push-rule-advanced label > span {
+.push-rule-advanced label > span,
+.push-rule-advanced .push-field > span {
   display: flex;
   align-items: center;
   justify-content: space-between;

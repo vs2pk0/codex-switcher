@@ -2,6 +2,7 @@
 import { computed, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import { instanceDisplayName, type CodexInstance } from "../services/instances";
+import { formatTranslatedText, t } from "../i18n";
 import { transferOpenCodexData } from "./service";
 const props = defineProps<{ instances: CodexInstance[]; targetId: string; disabled: boolean }>();
 const emit = defineEmits<{ (event: "busy", value: boolean): void; (event: "complete"): void }>();
@@ -14,7 +15,7 @@ const previewError = ref("");
 const backup = ref("");
 const targetName = computed(() => {
   const instance = props.instances.find(i => i.id === props.targetId);
-  return instance ? instanceDisplayName(instance) : "默认实例";
+  return instance ? instanceDisplayName(instance) : t("默认实例");
 });
 watch([source,mode,history], () => { preview.value = null; previewError.value = ""; if (mode.value === "merge") history.value = false; });
 async function showPreview(): Promise<void> {
@@ -29,8 +30,11 @@ function transfer(): void {
   const plan = { source: source.value, target: props.targetId, mode: mode.value, history: history.value, fingerprint: preview.value.fingerprint };
   emit("busy",true);
   Modal.warning({
-    title: plan.mode === "overwrite" ? "确认覆盖目标数据" : "确认复制数据",
-    content: `目标：${targetName.value}。执行时会暂停源和目标 OpenCodex，备份目标后传输配置和账号${plan.history ? "及用量历史" : ""}，完成后恢复原运行状态。`,
+    title: t(plan.mode === "overwrite" ? "确认覆盖目标数据" : "确认复制数据"),
+    content: formatTranslatedText(
+      "目标：{target}。执行时会暂停源和目标 OpenCodex，备份目标后传输配置和账号{history}，完成后恢复原运行状态。",
+      { target: targetName.value, history: plan.history ? t("及用量历史") : "" },
+    ),
     hideCancel: false,
     onCancel: () => emit("busy",false),
     onClose: () => { if (!loading.value) emit("busy",false); },
@@ -48,25 +52,25 @@ function transfer(): void {
 </script>
 <template>
   <section class="transfer-card">
-    <header class="transfer-heading"><div><h2>选择源与目标实例</h2><p>复制账号与配置；目标未安装时，一并复制并激活源实例的 Engine，无需额外下载。</p></div><span class="isolation-badge">独立存储</span></header>
+    <header class="transfer-heading"><div><h2>{{ t("选择源与目标实例") }}</h2><p>{{ t("复制账号与配置；目标未安装时，一并复制并激活源实例的 Engine，无需额外下载。") }}</p></div><span class="isolation-badge">{{ t("独立存储") }}</span></header>
     <div class="transfer-fields">
-      <div class="transfer-field"><span class="transfer-field-icon"><icon-storage /></span><label for="transfer-source">源实例 <span>从此处复制数据</span></label><a-select id="transfer-source" v-model="source" :disabled="disabled || loading" placeholder="请选择源实例"><a-option v-for="instance in instances.filter(i => i.id !== targetId)" :key="instance.id" :value="instance.id">{{ instanceDisplayName(instance) }}</a-option></a-select></div>
+      <div class="transfer-field"><span class="transfer-field-icon"><icon-storage /></span><label for="transfer-source">{{ t("源实例") }} <span>{{ t("从此处复制数据") }}</span></label><a-select id="transfer-source" v-model="source" :disabled="disabled || loading" :placeholder="t('请选择源实例')"><a-option v-for="instance in instances.filter(i => i.id !== targetId)" :key="instance.id" :value="instance.id">{{ instanceDisplayName(instance) }}</a-option></a-select></div>
       <span class="transfer-direction" aria-hidden="true">→</span>
-      <div class="transfer-field"><span class="transfer-field-icon"><icon-storage /></span><label for="transfer-target">目标实例 <span>传输到此实例</span></label><a-input id="transfer-target" :model-value="targetName" readonly /></div>
+      <div class="transfer-field"><span class="transfer-field-icon"><icon-storage /></span><label for="transfer-target">{{ t("目标实例") }} <span>{{ t("传输到此实例") }}</span></label><a-input id="transfer-target" :model-value="targetName" readonly /></div>
     </div>
-    <fieldset class="transfer-modes" :disabled="disabled || loading"><legend>传输方式</legend><div class="mode-grid">
-      <label class="mode-option" :class="{ selected: mode === 'merge' }"><input v-model="mode" type="radio" value="merge" name="transfer-mode" /><span><strong>复制合并</strong><small>补充源数据，冲突时保留目标实例的数据。</small></span></label>
-      <label class="mode-option" :class="{ selected: mode === 'overwrite' }"><input v-model="mode" type="radio" value="overwrite" name="transfer-mode" /><span><strong>覆盖配置和账号</strong><small>以源实例为准，替换目标的配置与账号。</small></span></label>
+    <fieldset class="transfer-modes" :disabled="disabled || loading"><legend>{{ t("传输方式") }}</legend><div class="mode-grid">
+      <label class="mode-option" :class="{ selected: mode === 'merge' }"><input v-model="mode" type="radio" value="merge" name="transfer-mode" /><span><strong>{{ t("复制合并") }}</strong><small>{{ t("补充源数据，冲突时保留目标实例的数据。") }}</small></span></label>
+      <label class="mode-option" :class="{ selected: mode === 'overwrite' }"><input v-model="mode" type="radio" value="overwrite" name="transfer-mode" /><span><strong>{{ t("覆盖配置和账号") }}</strong><small>{{ t("以源实例为准，替换目标的配置与账号。") }}</small></span></label>
     </div></fieldset>
-    <div class="transfer-history"><a-checkbox v-model="history" :disabled="disabled || loading || mode !== 'overwrite'">同时覆盖用量历史</a-checkbox><span>{{ mode === 'overwrite' ? '替换目标的 usage.jsonl，不合并历史记录' : '仅覆盖模式可选，合并时保留目标用量历史' }}</span></div>
-    <aside class="transfer-note"><strong>传输前自动备份</strong><p>目标未安装或版本不同时，会复制源 Engine 并安全切换到同一版本。目录、端口、管理凭证和集成记录保持独立。执行时暂停双方服务，完成后恢复原运行状态；新实例保持停止，可直接启动。相同 OAuth 账号仍对应同一上游身份。</p></aside>
-    <section class="transfer-preview" aria-live="polite"><h3>传输预览</h3>
-      <div v-if="preview" class="preview-table-scroll"><table><thead><tr><th>数据类型</th><th>源实例</th><th>目标实例</th><th>传输后</th></tr></thead><tbody><tr v-for="row in preview.rows" :key="row.name"><td>{{ row.name }}</td><td>{{ row.source }}</td><td>{{ row.target }}</td><td>{{ row.result }}</td></tr></tbody></table></div>
+    <div class="transfer-history"><a-checkbox v-model="history" :disabled="disabled || loading || mode !== 'overwrite'">{{ t("同时覆盖用量历史") }}</a-checkbox><span>{{ t(mode === 'overwrite' ? '替换目标的 usage.jsonl，不合并历史记录' : '仅覆盖模式可选，合并时保留目标用量历史') }}</span></div>
+    <aside class="transfer-note"><strong>{{ t("传输前自动备份") }}</strong><p>{{ t("目标未安装或版本不同时，会复制源 Engine 并安全切换到同一版本。目录、端口、管理凭证和集成记录保持独立。执行时暂停双方服务，完成后恢复原运行状态；新实例保持停止，可直接启动。相同 OAuth 账号仍对应同一上游身份。") }}</p></aside>
+    <section class="transfer-preview" aria-live="polite"><h3>{{ t("传输预览") }}</h3>
+      <div v-if="preview" class="preview-table-scroll"><table><thead><tr><th>{{ t("数据类型") }}</th><th>{{ t("源实例") }}</th><th>{{ t("目标实例") }}</th><th>{{ t("传输后") }}</th></tr></thead><tbody><tr v-for="row in preview.rows" :key="row.name"><td>{{ t(row.name) }}</td><td>{{ row.source }}</td><td>{{ row.target }}</td><td>{{ row.result }}</td></tr></tbody></table></div>
       <p v-else-if="previewError" class="preview-error">{{ previewError }}</p>
-      <p v-else class="preview-empty">{{ source ? '点击「预览传输」查看变更内容；目标未安装或版本不同，会随源复制并切换 Engine。' : '暂无可用的源实例，请先创建另一个实例。' }}</p>
+      <p v-else class="preview-empty">{{ t(source ? '点击「预览传输」查看变更内容；目标未安装或版本不同，会随源复制并切换 Engine。' : '暂无可用的源实例，请先创建另一个实例。') }}</p>
     </section>
-    <footer><span>{{ preview ? '预览已生成，可以执行传输' : '先预览校验数据，再执行传输' }}</span><div><a-button :type="preview ? 'secondary' : 'primary'" :loading="loading" :disabled="disabled || loading || !source" @click="showPreview">预览传输</a-button><a-button type="primary" :disabled="disabled || loading || !preview" @click="transfer">执行传输</a-button></div></footer>
-    <p v-if="backup" class="backup">目标备份：{{ backup }}</p>
+    <footer><span>{{ t(preview ? '预览已生成，可以执行传输' : '先预览校验数据，再执行传输') }}</span><div><a-button :type="preview ? 'secondary' : 'primary'" :loading="loading" :disabled="disabled || loading || !source" @click="showPreview">{{ t("预览传输") }}</a-button><a-button type="primary" :disabled="disabled || loading || !preview" @click="transfer">{{ t("执行传输") }}</a-button></div></footer>
+    <p v-if="backup" class="backup">{{ t("目标备份：") }}{{ backup }}</p>
   </section>
 </template>
 <style scoped>
