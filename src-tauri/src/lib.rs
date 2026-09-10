@@ -3081,6 +3081,15 @@ fn codex_restore_sessions_from_trash_across_instances(
     })
 }
 
+/// 永久删除回收站中的会话。这些会话已从 Codex 索引移除，无需重启实例。
+#[tauri::command]
+fn codex_purge_sessions_from_trash_across_instances(
+    session_ids: Vec<String>,
+    instance_id: Option<String>,
+) -> Result<CodexSessionTrashSummary, String> {
+    session_store_for_instance(instance_id.as_deref())?.purge_from_trash(&session_ids)
+}
+
 #[tauri::command]
 fn codex_copy_session_history_across_instances(
     source_session_id: String,
@@ -5729,6 +5738,8 @@ pub fn run() {
             delete_codex_account,
             instances::get_codex_instance_capabilities,
             instances::list_codex_instances,
+            instances::list_session_edit_backups,
+            instances::delete_session_edit_backups,
             instances::save_codex_instance,
             delete_codex_instance,
             instances::launch_codex_instance,
@@ -5787,6 +5798,7 @@ pub fn run() {
             codex_move_sessions_to_trash_across_instances,
             codex_list_trashed_sessions_across_instances,
             codex_restore_sessions_from_trash_across_instances,
+            codex_purge_sessions_from_trash_across_instances,
             codex_copy_session_history_across_instances,
             codex_rename_session_across_instances,
             codex_update_session_working_directory_across_instances,

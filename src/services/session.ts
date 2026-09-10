@@ -30,6 +30,8 @@ export interface CodexSessionTokenStats {
 export interface CodexSessionTrashSummary {
   moved: number;
   restored: number;
+  /** 从回收站永久删除的会话数量。 */
+  purged: number;
   failed: string[];
 }
 
@@ -233,6 +235,13 @@ export function restoreSessionsFromTrashAcrossInstances(
   return invoke("codex_restore_sessions_from_trash_across_instances", { sessionIds, instanceId });
 }
 
+export function purgeSessionsFromTrashAcrossInstances(
+  sessionIds: string[],
+  instanceId = "default",
+): Promise<CodexSessionTrashSummary> {
+  return invoke("codex_purge_sessions_from_trash_across_instances", { sessionIds, instanceId });
+}
+
 export function copySessionHistoryAcrossInstances(
   sourceSessionId: string,
   copySuffix: string,
@@ -335,4 +344,47 @@ export function listSessionVisibilityRepairProviders(): Promise<CodexSessionVisi
 
 export function openPathInFileManager(path: string): Promise<void> {
   return invoke("open_path_in_file_manager", { path });
+}
+
+/** 会话编辑备份：删除轮次 / 删除消息 / 修改工作目录 / 切号修复等操作前保留的原文件副本。 */
+export interface SessionEditBackupEntry {
+  fileName: string;
+  operation: string;
+  createdAt: string | null;
+  sizeBytes: number;
+}
+
+export interface SessionEditBackupSummary {
+  directory: string;
+  /** 归属当前实例的备份。 */
+  entries: SessionEditBackupEntry[];
+  instanceCount: number;
+  instanceBytes: number;
+  otherInstanceCount: number;
+  otherInstanceBytes: number;
+  /** 无法归属任何实例（原会话已彻底删除）。 */
+  orphanCount: number;
+  orphanBytes: number;
+  totalCount: number;
+  totalBytes: number;
+}
+
+export type SessionEditBackupDeleteScope = "selected" | "instance" | "orphan" | "all";
+
+export interface SessionEditBackupDeleteResult {
+  deletedCount: number;
+  deletedBytes: number;
+  summary: SessionEditBackupSummary;
+}
+
+export function listSessionEditBackups(instanceId = "default"): Promise<SessionEditBackupSummary> {
+  return invoke("list_session_edit_backups", { instanceId });
+}
+
+export function deleteSessionEditBackups(
+  instanceId: string,
+  scope: SessionEditBackupDeleteScope,
+  fileNames: string[] = [],
+): Promise<SessionEditBackupDeleteResult> {
+  return invoke("delete_session_edit_backups", { input: { instanceId, scope, fileNames } });
 }

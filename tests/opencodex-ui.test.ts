@@ -34,6 +34,34 @@ test('图片模型页提供 Codex Image Gen 上游设置，并通过 ocx config 
   assert.match(lib, /opencodex::opencodex_update_image_generation_settings/);
 });
 
+test('会话页提供按实例查看与清理会话编辑备份的入口', () => {
+  const panel = readFileSync(new URL('../src/components/SessionPanel.vue', import.meta.url), 'utf8');
+  assert.match(panel, /<SessionEditBackupCard\s/);
+  const card = readFileSync(new URL('../src/components/SessionEditBackupCard.vue', import.meta.url), 'utf8');
+  // 四种清理范围都要经过确认弹窗。
+  for (const scope of ['selected', 'instance', 'orphan', 'all']) {
+    assert.match(card, new RegExp(`confirmDelete\\('${scope}'\\)`));
+  }
+  const service = readFileSync(new URL('../src/services/session.ts', import.meta.url), 'utf8');
+  assert.match(service, /invoke\("list_session_edit_backups"/);
+  assert.match(service, /invoke\("delete_session_edit_backups"/);
+  const lib = readFileSync(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8');
+  assert.match(lib, /instances::list_session_edit_backups,/);
+  assert.match(lib, /instances::delete_session_edit_backups,/);
+});
+
+test('回收站提供经确认后永久删除会话的入口', () => {
+  const panel = readFileSync(new URL('../src/components/SessionPanel.vue', import.meta.url), 'utf8');
+  assert.match(panel, /emit\('purge-sessions'\)/);
+  const app = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8');
+  assert.match(app, /@purge-sessions="handlePurgeSessions"/);
+  assert.match(app, /function handlePurgeSessions[\s\S]*?Modal\.confirm\([\s\S]*?purgeSessionsFromTrashAcrossInstances/);
+  const service = readFileSync(new URL('../src/services/session.ts', import.meta.url), 'utf8');
+  assert.match(service, /invoke\("codex_purge_sessions_from_trash_across_instances"/);
+  const lib = readFileSync(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8');
+  assert.match(lib, /codex_purge_sessions_from_trash_across_instances,/);
+});
+
 test('只有主窗口销毁才触发 API 服务等后台组件的退出逻辑', () => {
   const lib = readFileSync(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8');
   // OpenCodex Web 管理子窗口关闭时不能把 API 服务标记为"应用正在退出"。

@@ -63,6 +63,9 @@ pub struct CodexSessionTokenStats {
 pub struct CodexSessionTrashSummary {
     pub moved: usize,
     pub restored: usize,
+    /// 从回收站永久删除的会话数量。
+    #[serde(default)]
+    pub purged: usize,
     pub failed: Vec<String>,
 }
 
@@ -1749,6 +1752,7 @@ impl SessionStore {
         Ok(CodexSessionTrashSummary {
             moved: moved_sessions.len(),
             restored: 0,
+            purged: 0,
             failed,
         })
     }
@@ -1830,6 +1834,50 @@ impl SessionStore {
         Ok(CodexSessionTrashSummary {
             moved: 0,
             restored: restored_ids.len(),
+            purged: 0,
+            failed,
+        })
+    }
+
+    /// 从回收站永久删除会话：同时移除会话文件与元数据，删除后不可恢复。
+    pub fn purge_from_trash(
+        &self,
+        session_ids: &[String],
+    ) -> Result<CodexSessionTrashSummary, String> {
+        let trashed = self.list_trashed()?;
+        let mut purged = 0;
+        let mut failed = Vec::new();
+        for session_id in session_ids {
+            let Some(record) = trashed.iter().find(|item| &item.id == session_id) else {
+                failed.push(format!("回收站中不存在: {}", session_id));
+                continue;
+            };
+            let trash_path = PathBuf::from(&record.trash_path);
+            // 只允许删除回收站目录内的文件，避免元数据被篡改后误删其他路径。
+            if !self
+                .trash_dirs()
+                .iter()
+                .any(|dir| trash_path.starts_with(dir))
+            {
+                failed.push(format!("回收站记录路径异常，已跳过: {}", session_id));
+                continue;
+            }
+            match fs::remove_file(&trash_path) {
+                Ok(()) => {
+                    let _ = fs::remove_file(trash_path.with_extension("json"));
+                    purged += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let _ = fs::remove_file(trash_path.with_extension("json"));
+                    purged += 1;
+                }
+                Err(error) => failed.push(format!("删除失败 {}: {}", session_id, error)),
+            }
+        }
+        Ok(CodexSessionTrashSummary {
+            moved: 0,
+            restored: 0,
+            purged,
             failed,
         })
     }
@@ -10968,6 +11016,57 @@ mod tests {
             .expect("restore legacy trash");
         assert_eq!(restored.restored, 1);
         assert!(session_path.exists());
+    }
+
+    #[test]
+    fn purges_trashed_sessions_permanently_and_rejects_paths_outside_trash() {
+        let codex = tempdir().expect("codex tempdir");
+        let legacy_trash = codex.path().join(".codex-switcher").join("session-trash");
+        fs::create_dir_all(&legacy_trash).expect("legacy trash dir");
+        let write_record = |id: &str, trash_path: &Path| {
+            fs::write(trash_path, "{}").expect("write trash file");
+            fs::write(
+                legacy_trash.join(format!("{id}.json")),
+                serde_json::json!({
+                    "id": id,
+                    "title": id,
+                    "originalPath": codex.path().join("sessions").join(format!("{id}.jsonl")).to_string_lossy(),
+                    "trashPath": trash_path.to_string_lossy(),
+                    "deletedAt": 1
+                })
+                .to_string(),
+            )
+            .expect("write metadata");
+        };
+        let inside = legacy_trash.join("inside.jsonl");
+        write_record("inside", &inside);
+        // 元数据指向回收站之外的文件：必须拒绝删除。
+        let outside_dir = tempdir().expect("outside dir");
+        let outside = outside_dir.path().join("outside.jsonl");
+        write_record("outside", &outside);
+        let store = SessionStore::new(codex.path().to_path_buf());
+        assert_eq!(store.list_trashed().expect("list").len(), 2);
+
+        let summary = store
+            .purge_from_trash(&[
+                "inside".to_string(),
+                "outside".to_string(),
+                "missing".to_string(),
+            ])
+            .expect("purge");
+
+        assert_eq!(summary.purged, 1);
+        assert_eq!(summary.failed.len(), 2);
+        assert!(!inside.exists());
+        // list_trashed 会把旧目录迁移到主回收站目录，元数据以主目录为准。
+        assert!(!store.trash_dir().join("inside.jsonl").exists());
+        assert!(!store.trash_dir().join("inside.json").exists());
+        assert!(!legacy_trash.join("inside.json").exists());
+        assert!(outside.exists());
+        assert!(store.trash_dir().join("outside.json").exists());
+        let remaining = store.list_trashed().expect("list after purge");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "outside");
     }
 
     #[test]

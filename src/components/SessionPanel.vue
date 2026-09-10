@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import SessionEditBackupCard from "./SessionEditBackupCard.vue";
 import type { CodexSessionRecord, CodexTrashedSessionRecord } from "../services/session";
 import { instanceDisplayName, type CodexInstance } from "../services/instances";
 import type { SessionGroup } from "../types/ui";
@@ -44,6 +45,7 @@ const emit = defineEmits<{
   (event: "one-click-repair"): void;
   (event: "trash-sessions"): void;
   (event: "restore-sessions"): void;
+  (event: "purge-sessions"): void;
   (event: "toggle-session-group-expanded", key: string): void;
   (event: "toggle-session-group-selection", group: SessionGroup): void;
   (event: "toggle-session", id: string): void;
@@ -136,6 +138,11 @@ function switchMode(trashMode: boolean): void {
         <span class="session-overview-icon orange"><icon-computer /></span>
         <div><small>{{ t("磁盘占用") }}</small><strong>{{ formatFileSize(totalSize) }}</strong></div>
       </article>
+      <SessionEditBackupCard
+        :instance-id="selectedInstanceId"
+        :session-loading="sessionLoading"
+        :disabled="backupWorking || sessionRepairing || sessionModelRepairing || sessionOneClickRepairing"
+      />
     </section>
 
     <div class="session-toolbar session-command-bar">
@@ -168,6 +175,7 @@ function switchMode(trashMode: boolean): void {
         <template v-else>
           <a-button :disabled="!activeSessionIds.length" @click="emit('toggle-all-sessions')"><template #icon><icon-check /></template>{{ t(allSessionsSelected ? "取消全选" : "全选回收站") }}</a-button>
           <a-button type="primary" :disabled="!selectedSessionIdList.length" @click="emit('restore-sessions')"><template #icon><icon-undo /></template>{{ t("恢复") }}</a-button>
+          <a-button status="danger" :disabled="!selectedSessionIdList.length" @click="emit('purge-sessions')"><template #icon><icon-delete /></template>{{ t("永久删除") }}</a-button>
         </template>
       </div>
     </div>

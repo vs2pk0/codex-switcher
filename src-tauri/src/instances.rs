@@ -1362,10 +1362,322 @@ pub(crate) fn run_with_instance_opened_on_success<T>(
     Ok(value)
 }
 
+/// 会话编辑备份（删除轮次 / 删除消息 / 修改工作目录 / 切号修复等操作前的原文件副本）。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEditBackupEntry {
+    pub file_name: String,
+    /// 文件名中的操作类型，如 turn-delete、message-delete、before-restore、cwd、model-compatibility。
+    pub operation: String,
+    /// 备份创建时间（UTC，RFC 3339），无法从文件名解析时为 None。
+    pub created_at: Option<String>,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEditBackupSummary {
+    pub directory: String,
+    /// 归属当前实例的备份（会话仍存在于该实例，或在其回收站中）。
+    pub entries: Vec<SessionEditBackupEntry>,
+    pub instance_count: usize,
+    pub instance_bytes: u64,
+    /// 归属其他实例的备份。
+    pub other_instance_count: usize,
+    pub other_instance_bytes: u64,
+    /// 无法归属任何实例的备份（原会话已被彻底删除）。
+    pub orphan_count: usize,
+    pub orphan_bytes: u64,
+    pub total_count: usize,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteSessionEditBackupsInput {
+    pub instance_id: Option<String>,
+    /// selected：仅删除 file_names；instance：当前实例全部；orphan：无法归属的备份；all：目录内全部。
+    pub scope: String,
+    #[serde(default)]
+    pub file_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteSessionEditBackupsResult {
+    pub deleted_count: usize,
+    pub deleted_bytes: u64,
+    pub summary: SessionEditBackupSummary,
+}
+
+fn session_edit_backup_dir() -> PathBuf {
+    crate::switcher_data_dir().join("session-edit-backups")
+}
+
+/// 解析备份文件名 `{YYYYmmdd-HHMMSS-ffffff}-{operation}-{hash}.jsonl`。
+fn parse_session_edit_backup_name(file_name: &str) -> Option<(String, Option<String>, String)> {
+    let stem = file_name.strip_suffix(".jsonl")?;
+    let (rest, hash) = stem.rsplit_once('-')?;
+    // short_path_hash 取 SHA-256 前 12 字节，十六进制后为 24 个字符。
+    if hash.len() != 24 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    // 时间戳固定 22 个字符：8 位日期 + '-' + 6 位时间 + '-' + 6 位微秒。
+    let (timestamp, operation) = if rest.len() > 23 && rest.as_bytes()[22] == b'-' {
+        (&rest[..22], &rest[23..])
+    } else {
+        ("", rest)
+    };
+    if operation.is_empty() {
+        return None;
+    }
+    let created_at = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y%m%d-%H%M%S-%6f")
+        .ok()
+        .map(|value| value.and_utc().to_rfc3339());
+    Some((operation.to_string(), created_at, hash.to_string()))
+}
+
+struct ScannedSessionEditBackup {
+    entry: SessionEditBackupEntry,
+    session_hash: String,
+    path: PathBuf,
+}
+
+fn scan_session_edit_backups() -> Result<Vec<ScannedSessionEditBackup>, String> {
+    let backup_dir = session_edit_backup_dir();
+    let entries = match fs::read_dir(&backup_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("读取会话编辑备份目录失败：{error}")),
+    };
+    let mut backups = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("读取会话编辑备份失败：{error}"))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("读取会话编辑备份信息失败：{error}"))?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        // 非 .jsonl（如 .DS_Store）不计入；无法解析的 .jsonl 仍计入合计并按无法归属处理，避免漏统计。
+        let (operation, created_at, session_hash) = match parse_session_edit_backup_name(&file_name)
+        {
+            Some(parsed) => parsed,
+            None if file_name.ends_with(".jsonl") => (
+                file_name.trim_end_matches(".jsonl").to_string(),
+                None,
+                String::new(),
+            ),
+            None => continue,
+        };
+        backups.push(ScannedSessionEditBackup {
+            entry: SessionEditBackupEntry {
+                file_name,
+                operation,
+                created_at,
+                size_bytes: metadata.len(),
+            },
+            session_hash,
+            path: entry.path(),
+        });
+    }
+    Ok(backups)
+}
+
+/// 当前实例与其他所有实例的会话路径 hash 集合，用于把备份归属到实例。
+fn session_edit_backup_hash_sets(
+    instance_id: &str,
+) -> Result<(HashSet<String>, HashSet<String>), String> {
+    let current_home = codex_home_for(Some(instance_id))?;
+    let current = collect_session_path_hashes(&current_home)?;
+    let mut others = HashSet::new();
+    let mut homes = vec![PathBuf::from(default_instance().codex_home)];
+    if managed_instances_supported() {
+        homes.extend(
+            read_stored_instances()?
+                .into_iter()
+                .map(|instance| PathBuf::from(instance.codex_home)),
+        );
+    }
+    for home in homes {
+        if home == current_home {
+            continue;
+        }
+        // 其他实例目录读取失败不应阻断当前实例的查看，按无归属处理。
+        if let Ok(hashes) = collect_session_path_hashes(&home) {
+            others.extend(hashes);
+        }
+    }
+    Ok((current, others))
+}
+
+fn summarize_session_edit_backups(
+    backups: &[ScannedSessionEditBackup],
+    current: &HashSet<String>,
+    others: &HashSet<String>,
+) -> SessionEditBackupSummary {
+    let mut summary = SessionEditBackupSummary {
+        directory: session_edit_backup_dir().to_string_lossy().into_owned(),
+        ..SessionEditBackupSummary::default()
+    };
+    for backup in backups {
+        summary.total_count += 1;
+        summary.total_bytes += backup.entry.size_bytes;
+        if current.contains(&backup.session_hash) {
+            summary.instance_count += 1;
+            summary.instance_bytes += backup.entry.size_bytes;
+            summary.entries.push(backup.entry.clone());
+        } else if others.contains(&backup.session_hash) {
+            summary.other_instance_count += 1;
+            summary.other_instance_bytes += backup.entry.size_bytes;
+        } else {
+            summary.orphan_count += 1;
+            summary.orphan_bytes += backup.entry.size_bytes;
+        }
+    }
+    // 新的排在前面。
+    summary
+        .entries
+        .sort_by(|left, right| right.file_name.cmp(&left.file_name));
+    summary
+}
+
+#[tauri::command]
+pub fn list_session_edit_backups(
+    instance_id: Option<String>,
+) -> Result<SessionEditBackupSummary, String> {
+    let instance_id = instance_id.unwrap_or_else(|| DEFAULT_INSTANCE_ID.to_string());
+    let (current, others) = session_edit_backup_hash_sets(&instance_id)?;
+    let backups = scan_session_edit_backups()?;
+    Ok(summarize_session_edit_backups(&backups, &current, &others))
+}
+
+#[tauri::command]
+pub fn delete_session_edit_backups(
+    input: DeleteSessionEditBackupsInput,
+) -> Result<DeleteSessionEditBackupsResult, String> {
+    let instance_id = input
+        .instance_id
+        .clone()
+        .unwrap_or_else(|| DEFAULT_INSTANCE_ID.to_string());
+    let (current, others) = session_edit_backup_hash_sets(&instance_id)?;
+    let backups = scan_session_edit_backups()?;
+    let selected = input
+        .file_names
+        .iter()
+        .map(|name| name.trim().to_string())
+        .collect::<HashSet<_>>();
+    let targets = backups
+        .iter()
+        .filter(|backup| match input.scope.as_str() {
+            "selected" => {
+                selected.contains(&backup.entry.file_name) && current.contains(&backup.session_hash)
+            }
+            "instance" => current.contains(&backup.session_hash),
+            "orphan" => {
+                !current.contains(&backup.session_hash) && !others.contains(&backup.session_hash)
+            }
+            "all" => true,
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    if !matches!(
+        input.scope.as_str(),
+        "selected" | "instance" | "orphan" | "all"
+    ) {
+        return Err("未知的备份清理范围".to_string());
+    }
+    let mut deleted_count = 0;
+    let mut deleted_bytes = 0;
+    for backup in targets {
+        match fs::remove_file(&backup.path) {
+            Ok(()) => {
+                deleted_count += 1;
+                deleted_bytes += backup.entry.size_bytes;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "删除会话编辑备份失败（{}）：{error}",
+                    backup.entry.file_name
+                ))
+            }
+        }
+    }
+    let remaining = scan_session_edit_backups()?;
+    Ok(DeleteSessionEditBackupsResult {
+        deleted_count,
+        deleted_bytes,
+        summary: summarize_session_edit_backups(&remaining, &current, &others),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn parses_session_edit_backup_names_with_dashed_operations() {
+        let (operation, created_at, hash) = parse_session_edit_backup_name(
+            "20260825-101530-123456-message-delete-0123456789ab0123456789ab.jsonl",
+        )
+        .expect("valid name");
+        assert_eq!(operation, "message-delete");
+        assert_eq!(hash, "0123456789ab0123456789ab");
+        assert_eq!(
+            created_at.as_deref(),
+            Some("2026-08-25T10:15:30.123456+00:00")
+        );
+        // 测试夹具里没有时间戳前缀的名字也要能归属。
+        let (operation, created_at, hash) =
+            parse_session_edit_backup_name("20260825-turn-delete-abcdefabcdefabcdefabcdef.jsonl")
+                .unwrap();
+        assert_eq!(operation, "20260825-turn-delete");
+        assert!(created_at.is_none());
+        assert_eq!(hash, "abcdefabcdefabcdefabcdef");
+        assert!(parse_session_edit_backup_name(".DS_Store").is_none());
+        assert!(parse_session_edit_backup_name("notes-xyz.jsonl").is_none());
+        assert!(
+            parse_session_edit_backup_name("20260825-turn-delete-abcdefabcdef.jsonl").is_none()
+        );
+    }
+
+    #[test]
+    fn summarizes_session_edit_backups_by_instance_attribution() {
+        let scanned = |name: &str, hash: &str, size: u64| ScannedSessionEditBackup {
+            entry: SessionEditBackupEntry {
+                file_name: name.to_string(),
+                operation: "turn-delete".to_string(),
+                created_at: None,
+                size_bytes: size,
+            },
+            session_hash: hash.to_string(),
+            path: PathBuf::from(name),
+        };
+        let backups = vec![
+            scanned("a.jsonl", "aaaaaaaaaaaa", 10),
+            scanned("b.jsonl", "aaaaaaaaaaaa", 20),
+            scanned("c.jsonl", "bbbbbbbbbbbb", 40),
+            scanned("d.jsonl", "cccccccccccc", 80),
+        ];
+        let current = HashSet::from(["aaaaaaaaaaaa".to_string()]);
+        let others = HashSet::from(["bbbbbbbbbbbb".to_string()]);
+        let summary = summarize_session_edit_backups(&backups, &current, &others);
+        assert_eq!(summary.instance_count, 2);
+        assert_eq!(summary.instance_bytes, 30);
+        assert_eq!(summary.other_instance_count, 1);
+        assert_eq!(summary.other_instance_bytes, 40);
+        assert_eq!(summary.orphan_count, 1);
+        assert_eq!(summary.orphan_bytes, 80);
+        assert_eq!(summary.total_count, 4);
+        assert_eq!(summary.total_bytes, 150);
+        // 当前实例条目按文件名倒序（新的在前）。
+        assert_eq!(summary.entries[0].file_name, "b.jsonl");
+    }
 
     #[test]
     fn default_instance_uses_reserved_id() {

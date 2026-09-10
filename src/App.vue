@@ -162,6 +162,7 @@ import {
   repairSessionVisibilityAcrossInstances,
   renameSessionAcrossInstances,
   restoreSessionsFromTrashAcrossInstances,
+  purgeSessionsFromTrashAcrossInstances,
   updateSessionWorkingDirectoryAcrossInstances,
   type CodexSessionRecord,
   type CodexSessionTokenStats,
@@ -4316,6 +4317,33 @@ async function handleRestoreSessions(): Promise<void> {
   await loadSessions();
 }
 
+function handlePurgeSessions(): void {
+  const ids = selectedSessionIdList.value;
+  if (!ids.length) {
+    Message.warning(t("请先选择回收站会话"));
+    return;
+  }
+  Modal.confirm({
+    title: t("永久删除会话"),
+    content: formatTranslatedText("将从回收站永久删除 {count} 个会话文件，删除后无法恢复。", { count: String(ids.length) }),
+    okText: t("永久删除"),
+    cancelText: t("取消"),
+    okButtonProps: { status: "danger" },
+    onOk: async () => {
+      try {
+        const summary = await purgeSessionsFromTrashAcrossInstances(ids, sessionInstanceId.value);
+        Message.success(formatTranslatedText("已永久删除 {count} 个会话", { count: String(summary.purged) }));
+        if (summary.failed.length) {
+          Message.warning(formatTranslatedText("部分会话删除失败：{errors}", { errors: summary.failed.join("；") }));
+        }
+        await loadSessions();
+      } catch (error) {
+        Message.error(formatTranslatedText("永久删除会话失败：{error}", { error: error instanceof Error ? error.message : String(error) }));
+      }
+    },
+  });
+}
+
 function createBackupTaskId(): string {
   return `backup-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
@@ -4976,6 +5004,7 @@ onUnmounted(() => {
       @one-click-repair="confirmOneClickRepairSessions"
       @trash-sessions="handleTrashSessions"
       @restore-sessions="handleRestoreSessions"
+      @purge-sessions="handlePurgeSessions"
       @toggle-session-group-expanded="toggleSessionGroupExpanded"
       @toggle-session-group-selection="toggleSessionGroupSelection"
       @toggle-session="toggleSession"
