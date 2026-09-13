@@ -64,8 +64,8 @@ export function getOpenCodexEngineCatalog(instanceId?: string): Promise<OpenCode
   return invoke("opencodex_get_engine_update_catalog", { instanceId });
 }
 
-export function installOpenCodexEngine(version: string, operationId: string, instanceId?: string): Promise<OpenCodexEngineInstallResult> {
-  return invoke("opencodex_install_engine_version", { instanceId, request: { version, operationId } });
+export function installOpenCodexEngine(version: string, operationId: string, instanceId?: string, archivePath?: string): Promise<OpenCodexEngineInstallResult> {
+  return invoke("opencodex_install_engine_version", { instanceId, request: { version, operationId, archivePath } });
 }
 
 export function subscribeOpenCodexEngineProgress(

@@ -63,6 +63,20 @@ test("verified local tarballs install without lifecycle scripts and invalid pack
         const installed = join(root, version, "node_modules", "@bitkyc08", "opencodex");
         expect(JSON.parse(readFileSync(join(installed, "package.json"), "utf8")).version).toBe(version);
         expect(existsSync(join(installed, "src", "cli", "index.ts"))).toBe(true);
+        const importRoot = mkdtempSync(join(tmpdir(), "opencodex-local-import-"));
+        try {
+          const archivePath = join(importRoot, "opencodex-1.0.0.tgz");
+          await Bun.write(archivePath, bytes);
+          const onlineFetch = globalThis.fetch;
+          globalThis.fetch = (async (input: string | URL | Request) => {
+            if (String(input) === tarball) throw new Error("archive download must not run");
+            return onlineFetch(input);
+          }) as typeof fetch;
+          expect((await installVersion({ version, engineRoot: join(importRoot, "engines"), archivePath })).version).toBe(version);
+          await Bun.write(archivePath, "tampered");
+          await expect(installVersion({ version, engineRoot: join(importRoot, "invalid"), archivePath })).rejects.toThrow("完整性校验失败");
+          expect(existsSync(join(importRoot, "invalid", version))).toBe(false);
+        } finally { rmSync(importRoot, { recursive: true, force: true }); }
       } else {
         await expect(installVersion({ version, engineRoot: root })).rejects.toThrow("缺少 CLI 入口");
         expect(existsSync(join(root, version))).toBe(false);

@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,6 +10,8 @@ import {
   disableInstance,
   resolveOpenCodexPackageRoot,
   syncInstance,
+  preflightInstance,
+  withHistoryDatabase,
   seedEmptyCatalogFromEngine,
   repairNativeAuthAccountId,
   withIsolatedOpenCodexConfig,
@@ -19,6 +22,33 @@ const originalOpenCodexHome = process.env.OPENCODEX_HOME;
 const originalCodexHome = process.env.CODEX_HOME;
 const originalOpenCodexPackageRoot = process.env.OPENCODEX_PACKAGE_ROOT;
 const originalDefaultInstance = process.env.OPENCODEX_MANAGER_DEFAULT_INSTANCE;
+
+test("关闭实例的 WAL 数据库可以预检且不修改会话", async () => {
+  const root = mkdtempSync(join(tmpdir(), "opencodex-wal-preflight-"));
+  temporaryRoots.push(root);
+  const path = join(root, "state_5.sqlite");
+  const db = new Database(join(root, "source.sqlite"));
+  db.exec("PRAGMA journal_mode=WAL; CREATE TABLE threads(id TEXT, history_mode TEXT); INSERT INTO threads VALUES ('kept', 'paginated');");
+  db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  db.close();
+  writeFileSync(path, readFileSync(join(root, "source.sqlite")));
+  const before = readFileSync(path);
+  expect(existsSync(path + "-shm")).toBe(false);
+  await withHistoryDatabase(path, async () => {
+    const reader = new Database(path, { readonly: true });
+    try { expect(reader.query("SELECT * FROM threads").all()).toEqual([{id:"kept",history_mode:"paginated"}]); }
+    finally { reader.close(); }
+  });
+  expect(readFileSync(path)).toEqual(before);
+  const missing = join(root, "missing.sqlite");
+  await withHistoryDatabase(missing, async () => {});
+  expect(existsSync(missing)).toBe(false);
+  const invalid = join(root, "invalid.sqlite");
+  writeFileSync(invalid, "invalid database");
+  let called = false;
+  await expect(withHistoryDatabase(invalid, async () => { called = true; })).rejects.toThrow();
+  expect(called).toBe(false);
+});
 
 test("已下载 Engine 在隔离实例中同步非空目录并可恢复", async () => {
   const realEngine = resolveOpenCodexPackageRoot(originalOpenCodexPackageRoot);
@@ -252,12 +282,66 @@ test("Engine 未提交更新时不把旧目录当成功，冲突可有界重试�
   }
 });
 
+test("只读预检拒绝分页迁移时保留配置、账号和接入状态", async () => {
+  const source = mkdtempSync(join(tmpdir(), "opencodex-preflight-"));
+  const pkg = mkdtempSync(join(tmpdir(), "opencodex-preflight-package-"));
+  temporaryRoots.push(source, pkg);
+  writeActiveEnginePackage(pkg);
+  writeFileSync(join(source, "config.json"), '{"clientIntegrations":{"codex":false}}');
+  writeFileSync(join(source, "auth.json"), "unchanged");
+  writeFileSync(join(pkg, "src/codex/inject.ts"),
+    'export async function injectCodexConfig(port, config, options) { if(config.syncResumeHistory !== false || !options.validateOnly) throw new Error("unsafe preflight"); return {success:false,message:"history_paginated_requires_native_writer"}; }');
+  process.env.OPENCODEX_HOME = source;
+  process.env.CODEX_HOME = source;
+  process.env.OPENCODEX_PACKAGE_ROOT = pkg;
+  process.env.OPENCODEX_MANAGER_DEFAULT_INSTANCE = "1";
+  expect((await preflightInstance(15800)).message).toContain("分页历史");
+  expect((await syncInstance(15800)).success).toBe(false);
+  expect(readFileSync(join(source, "config.json"), "utf8")).toBe('{"clientIntegrations":{"codex":false}}');
+  expect(readFileSync(join(source, "auth.json"), "utf8")).toBe("unchanged");
+  expect(existsSync(join(source, "active-engine-marker"))).toBe(false);
+});
+
+test("旧 Engine 无独立历史预检接口时仍能恢复", async () => {
+  const home = mkdtempSync(join(tmpdir(), "opencodex-old-restore-"));
+  const pkg = mkdtempSync(join(tmpdir(), "opencodex-old-package-"));
+  temporaryRoots.push(home, pkg);
+  writeActiveEnginePackage(pkg);
+  writeFileSync(join(pkg, "src/codex/history-provider.ts"), "export {};");
+  process.env.CODEX_HOME = home;
+  process.env.OPENCODEX_HOME = home;
+  process.env.OPENCODEX_PACKAGE_ROOT = pkg;
+  process.env.OPENCODEX_MANAGER_DEFAULT_INSTANCE = "1";
+  expect((await restoreInstance()).success).toBe(true);
+});
+
+test("恢复被分页保护拒绝时不关闭接入或删除配置", async () => {
+  const home = mkdtempSync(join(tmpdir(), "opencodex-restore-refusal-"));
+  const pkg = mkdtempSync(join(tmpdir(), "opencodex-restore-package-"));
+  temporaryRoots.push(home, pkg);
+  writeActiveEnginePackage(pkg);
+  writeFileSync(join(pkg, "src/codex/history-provider.ts"), 'export function preflightCodexHistoryInjection(){return "history_paginated_requires_native_writer";}');
+  writeFileSync(join(pkg, "src/codex/desired-state.ts"), 'export function setCodexIntegrationEnabled(){throw new Error("must not change intent");}');
+  writeFileSync(join(home, "config.json"), '{"clientIntegrations":{"codex":true}}');
+  process.env.CODEX_HOME = home;
+  process.env.OPENCODEX_HOME = home;
+  process.env.OPENCODEX_PACKAGE_ROOT = pkg;
+  process.env.OPENCODEX_MANAGER_DEFAULT_INSTANCE = "1";
+  const result = await restoreInstance();
+  expect(result.success).toBe(false);
+  expect(result.message).toContain("未删除 Engine");
+  expect(readFileSync(join(home, "config.json"), "utf8")).toBe('{"clientIntegrations":{"codex":true}}');
+});
+
 function writeActiveEnginePackage(root: string): void {
   const codexDir = join(root, "src", "codex");
   mkdirSync(codexDir, { recursive: true });
+  writeFileSync(join(codexDir, "history-provider.ts"), 'export function preflightCodexHistoryInjection(){return null;}');
+  writeFileSync(join(codexDir, "paths.ts"), 'import {join} from "node:path"; export function resolveCodexStateDbPath(){return join(process.env.CODEX_HOME!, "state_5.sqlite");}');
   writeFileSync(join(root, "src", "config.ts"), [
     "export function loadConfig() { return {}; }",
     "export function applyProxyEnv() {}",
+    "export function saveConfig() {}",
     "",
   ].join("\n"));
   writeFileSync(join(codexDir, "inject.ts"), [

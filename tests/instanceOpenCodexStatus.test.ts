@@ -28,17 +28,15 @@ test("OpenCodex 常驻实例下拉为同步、恢复和图片模型传递相同�
   assert.doesNotMatch(openCodexBackendSource, /run_instance_integration_process\("isolate-default"/);
 });
 
-test("同步先重置基础配置再写入，再一键修复会话，成功后才打开实例；重置先停用集成", () => {
+test("同步先预检再停止实例，不重置配置或修复历史；显式重置先停用集成", () => {
   assert.match(openCodexBackendSource, /run_with_instance_opened_on_success/);
   assert.match(
     openCodexBackendSource,
-    /reset_instance_config_inner\(&instance.id\)\?;\s*let sync_message =\s*self.run_instance_integration_helper/,
+    /run_instance_integration_process\("preflight", port, home\)\?;\s*crate::instances::run_with_instance_opened_on_success/,
   );
-  // 同步成功后、实例重新打开前，对该实例执行一键修复（切号修复 + 恢复全部完整会话）
-  assert.match(
-    openCodexBackendSource,
-    /run_instance_integration_helper\(&action, port, home\)\?;[\s\S]*?crate::one_click_repair_session_store\(&session_store, &mut report\)/,
-  );
+  const actionWorker = openCodexBackendSource.slice(openCodexBackendSource.indexOf("fn action_worker("), openCodexBackendSource.indexOf("fn run_instance_integration_helper("));
+  assert.doesNotMatch(actionWorker, /one_click_repair_session_store/);
+  assert.doesNotMatch(actionWorker, /reset_instance_config_inner\(&instance.id\)/);
   assert.match(openCodexPanelSource, /syncOverlay\.value = \{[\s\S]*?steps: syncOverlaySteps\(\)/);
   assert.match(openCodexPanelSource, /if \(event\.action === "sync"\) syncOverlay\.value = null;/);
   assert.match(openCodexBackendSource, /run_instance_integration_process\("disable"[\s\S]*?reset_codex_config_for_instance/);
@@ -104,18 +102,18 @@ test("切换账号前对已接入服务或第三方 Provider 的实例先重置 
   assert.match(libSource, /codex_home_has_opencodex_routing\(codex_home\)\s*\|\|\s*api_service::codex_home_has_api_service_routing\(codex_home\)/);
 });
 
-test("OpenCodex 与 API 服务同步配置时自动绑定 OAuth 登录态，并提供绑定 OAuth 入口", () => {
-  // OpenCodex：注入路由之后、一键修复之前绑定 OAuth
+test("OpenCodex 同步保留账号，API 服务仍自动绑定 OAuth，两个面板保留手动绑定入口", () => {
   const syncStart = openCodexBackendSource.indexOf("run_with_instance_opened_on_success(&instance.id");
   const syncBlock = openCodexBackendSource.slice(
     syncStart,
-    openCodexBackendSource.indexOf("one_click_repair_message(&outcome)", syncStart),
+    openCodexBackendSource.indexOf("} else if matches!(action, CommandAction::Start)", syncStart),
   );
   const helperIndex = syncBlock.indexOf("run_instance_integration_helper(&action, port, home)");
   const bindIndex = syncBlock.indexOf("prepare_default_oauth_account_blocking(");
   const repairIndex = syncBlock.indexOf("one_click_repair_session_store(&session_store");
-  assert.ok(helperIndex >= 0 && bindIndex > helperIndex && repairIndex > bindIndex);
-  assert.match(syncBlock, /ServiceKind::OpenCodex/);
+  assert.ok(helperIndex >= 0);
+  assert.equal(bindIndex, -1);
+  assert.equal(repairIndex, -1);
 
   // API 服务：先挑选并续期 OAuth 账号，再在同步闭包里绑定到「本地 API 服务」账号
   const apiSync = apiServiceBackendSource.slice(

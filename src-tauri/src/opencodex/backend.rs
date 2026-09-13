@@ -1673,16 +1673,7 @@ impl Backend {
         self.validate_instance_port(request.port)?;
         let isolated_instance_integration =
             isolated_instance_integration_action(&request.action, request.instance_id.as_deref());
-        let codex_home = if matches!(
-            &request.action,
-            CommandAction::Sync | CommandAction::Restore
-        ) {
-            Some(crate::instances::codex_home_for(
-                request.instance_id.as_deref(),
-            )?)
-        } else {
-            Some(self.codex_home.clone())
-        };
+        let codex_home = Some(self.codex_home.clone());
         self.begin_mutation()?;
         let launcher = match self.active_launcher() {
             Ok(value) => value,
@@ -1731,61 +1722,21 @@ impl Backend {
                         .into_iter()
                         .find(|instance| Path::new(&instance.codex_home) == home)
                         .ok_or_else(|| "目标实例不存在，请刷新后重试".to_string())?;
-                    // 同步流程：停止实例 → 重置基础配置 → 注入 OpenCodex 路由 → 一键修复会话
-                    // （切号修复 + 全部会话完整历史）→ 最后才重新打开实例。修复期间实例保持关闭。
+                    self.emit_log(
+                        &operation_id,
+                        "system",
+                        "正在预检目标实例，尚未停止实例或重置配置…",
+                    );
+                    self.run_instance_integration_process("preflight", port, home)?;
                     crate::instances::run_with_instance_opened_on_success(&instance.id, |_| {
-                        self.emit_log(&operation_id, "system", "已停止实例，开始重置并同步配置…");
-                        self.reset_instance_config_inner(&instance.id)?;
-                        let sync_message =
-                            self.run_instance_integration_helper(&action, port, home)?;
-                        // 绑定 OAuth 登录态：优先实例当前账号，否则取账号列表第一个可用账号（与 API Key 绑定 OAuth 一致）。
                         self.emit_log(
                             &operation_id,
                             "system",
-                            "配置已同步，正在绑定 OAuth 账号登录态…",
+                            "预检通过，已停止实例，仅同步接口和模型配置…",
                         );
-                        let oauth_account_id =
-                            crate::service_binding::prepare_default_oauth_account_blocking(
-                                &instance.id,
-                            )?;
-                        let account_store = crate::account::AccountStore::new_for_instance(
-                            crate::switcher_account_dir(),
-                            home.to_path_buf(),
-                            &instance.id,
-                        );
-                        let binding_message = crate::service_binding::auto_bind_default_oauth(
-                            crate::service_binding::ServiceKind::OpenCodex,
-                            &account_store,
-                            oauth_account_id.as_deref(),
-                        )?;
-                        self.emit_log(&operation_id, "system", &binding_message);
-                        self.emit_log(
-                            &operation_id,
-                            "system",
-                            "开始一键修复会话（切号修复 + 恢复全部完整会话），实例暂不启动…",
-                        );
-                        let session_store = crate::session::SessionStore::new(home.to_path_buf());
-                        let mut report = |step: u8| {
-                            let text = match step {
-                                1 => "修复切号会话：Provider 模型前缀、线程模型与加密引用…",
-                                2 => "恢复全部会话的完整历史：分页历史、消息序号与本地索引…",
-                                _ => return,
-                            };
-                            self.emit_log(&operation_id, "system", text);
-                        };
-                        let outcome =
-                            crate::one_click_repair_session_store(&session_store, &mut report)
-                                .map_err(|error| {
-                                    format!("配置已同步，但一键修复会话失败：{error}")
-                                })?;
-                        let repair_message = crate::one_click_repair_message(&outcome);
-                        self.emit_log(
-                            &operation_id,
-                            "system",
-                            &format!("一键修复完成：{repair_message}，正在重新打开实例…"),
-                        );
+                        let message = self.run_instance_integration_helper(&action, port, home)?;
                         Ok(format!(
-                            "{sync_message}；{binding_message}；一键修复完成（{repair_message}）"
+                            "{message}；已有账号与会话历史未迁移，正在重新打开实例"
                         ))
                     })
                 } else {
@@ -2296,6 +2247,7 @@ impl Backend {
                 let input = serde_json::to_vec(&serde_json::json!({
                     "version": version,
                     "engineRoot": self.managed_engine_root(),
+                    "archivePath": request.archive_path,
                 }))
                 .map_err(|error| format!("无法生成 Engine 安装请求：{error}"))?;
                 let installed: EngineHelperInstallResult = self.run_engine_update_helper(
@@ -2786,10 +2738,9 @@ impl Backend {
                 "目标实例没有接入 OpenCodex，未将此次操作标记为同步成功：{message}"
             ));
         }
-        if matches!(action, CommandAction::Sync) {
-            crate::session::SessionStore::new(codex_home.to_path_buf())
-                .repair_missing_opencodex_provider()?;
-        } else if crate::instances::codex_home_has_opencodex_routing(codex_home) {
+        if matches!(action, CommandAction::Restore)
+            && crate::instances::codex_home_has_opencodex_routing(codex_home)
+        {
             return Err(
                 "目标实例仍有 OpenCodex 路由，恢复未完成；为避免配置丢失，不会继续卸载".to_string(),
             );
@@ -2803,6 +2754,9 @@ impl Backend {
         port: u16,
         codex_home: &Path,
     ) -> Result<String, String> {
+        if codex_home != self.codex_home {
+            return Err("目标实例与 OpenCodex 后端不一致，已拒绝跨实例操作".into());
+        }
         let engine = self.bundled_engine_dir()?;
         let runtime = self.bundled_runtime_path()?;
         // Reset must remain available after migration away from the bundled

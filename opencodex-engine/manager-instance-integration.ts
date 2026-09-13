@@ -12,6 +12,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -22,6 +23,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
+import { Database } from "bun:sqlite";
 import { resolveOpenCodexPackageRoot } from "./manager-engine-package.ts";
 export { resolveOpenCodexPackageRoot } from "./manager-engine-package.ts";
 
@@ -35,7 +37,7 @@ const OVERLAY_FILES = [
   "codex-runtime.json",
 ] as const;
 
-type InstanceIntegrationAction = "sync" | "restore" | "disable";
+type InstanceIntegrationAction = "sync" | "restore" | "disable" | "preflight";
 
 interface InstanceIntegrationResult {
   action: InstanceIntegrationAction;
@@ -135,21 +137,95 @@ async function withInstanceConfig<T>(enabled: boolean, operation: () => Promise<
     join(resolve(home), ".switcher-opencodex"));
 }
 
+export function describeSyncRefusal(message: string): string {
+  if (message.includes("history_paginated_requires_native_writer")) {
+    return "目标实例存在需要原生写入协调的分页历史；未强制迁移，请勿运行旧版历史修复或反复重试。" + message;
+  }
+  if (message.includes("history_injection_preflight_unavailable")) {
+    return "目标实例历史预检不可用，可能涉及数据库读取或历史清单校验；未绕过保护。" + message;
+  }
+  return message;
+}
+
+export async function withHistoryDatabase<T>(path: string, operation: () => Promise<T>): Promise<T> {
+  if (!existsSync(path)) return operation();
+  let connection: Database | undefined;
+  try {
+    try {
+      connection = new Database(path, { readonly: true });
+      connection.query("PRAGMA schema_version").get();
+    } catch (error) {
+      connection?.close();
+      connection = undefined;
+      // A stopped WAL database may have no shared-memory file. Let SQLite
+      // initialize its own sidecars, keeping this connection alive for injection.
+      const header = Buffer.alloc(20);
+      const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try { readSync(fd, header, 0, header.length, 0); } finally { closeSync(fd); }
+      if ((error as { errno?: number }).errno !== 14
+        || header.toString("ascii", 0, 16) !== "SQLite format 3\0"
+        || header[18] !== 2 || header[19] !== 2
+        || existsSync(`${path}-shm`)) throw error;
+      for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
+        try {
+          const stat = lstatSync(candidate);
+          if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("历史数据库及辅助文件必须是普通文件");
+        } catch (cause) {
+          if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
+        }
+      }
+      connection = new Database(path, { readwrite: true, create: false });
+      connection.exec("PRAGMA query_only = ON");
+      connection.query("PRAGMA schema_version").get();
+    }
+    return await operation();
+  } finally { connection?.close(); }
+}
+
+async function withInstanceHistory<T>(operation: () => Promise<T>): Promise<T> {
+  const root = resolveOpenCodexPackageRoot();
+  const modulePath = ["src", "codex", "paths.ts"];
+  const { resolveCodexStateDbPath } = await importOpenCodexModule(root, modulePath);
+  return withHistoryDatabase(resolveCodexStateDbPath(), operation);
+}
+
+export async function preflightInstance(port: number): Promise<InstanceIntegrationResult> {
+  return withInstanceHistory(() => preflightInstanceInner(port));
+}
+
+async function preflightInstanceInner(port: number): Promise<InstanceIntegrationResult> {
+  const packageRoot = resolveOpenCodexPackageRoot();
+  const { loadConfig } = await importOpenCodexModule(packageRoot, ["src", "config.ts"]);
+  const { injectCodexConfig } = await importOpenCodexModule(packageRoot, ["src", "codex", "inject.ts"]);
+  const result = await injectCodexConfig(port, { ...loadConfig(), syncResumeHistory: false }, { validateOnly: true });
+  return { action: "preflight", success: result.success, message: describeSyncRefusal(result.message) };
+}
+
 export async function syncInstance(port: number): Promise<InstanceIntegrationResult> {
+  return withInstanceHistory(() => syncInstanceInner(port));
+}
+
+async function syncInstanceInner(port: number): Promise<InstanceIntegrationResult> {
+  if (process.env.OPENCODEX_MANAGER_DEFAULT_INSTANCE === "1") {
+    const checked = await preflightInstance(port);
+    if (!checked.success) return { ...checked, action: "sync" };
+  }
   return withInstanceConfig(true, async () => {
     const packageRoot = resolveOpenCodexPackageRoot();
     const home = process.env.CODEX_HOME?.trim();
     if (!home) throw new Error("实例操作必须指定 CODEX_HOME");
     await repairNativeAuthAccountId(home, packageRoot);
-    const [{ applyProxyEnv, loadConfig }, { injectCodexConfig }, { refreshCodexModelCatalog }] =
+    const [{ applyProxyEnv, loadConfig, saveConfig }, { injectCodexConfig }, { refreshCodexModelCatalog }] =
       await Promise.all([
         importOpenCodexModule(packageRoot, ["src", "config.ts"]),
         importOpenCodexModule(packageRoot, ["src", "codex", "inject.ts"]),
         importOpenCodexModule(packageRoot, ["src", "codex", "refresh.ts"]),
       ]);
-    let config = loadConfig();
+    let config = { ...loadConfig(), syncResumeHistory: false };
     const preflight = await injectCodexConfig(port, config, { validateOnly: true });
-    if (!preflight.success) return { action: "sync", success: false, message: preflight.message };
+    if (!preflight.success) return { action: "sync", success: false, message: describeSyncRefusal(preflight.message) };
+    // Workers and subsequent convergence must also leave existing history untouched.
+    saveConfig(config);
 
     applyProxyEnv(config);
     let catalogPath: string | null = null;
@@ -175,7 +251,7 @@ export async function syncInstance(port: number): Promise<InstanceIntegrationRes
             return { action: "sync", success: false, message: "Engine 连续 3 次未提交模型目录更新（可能存在配置变更或写入冲突）；未使用旧目录冒充同步成功。请查看运行日志后重试。" };
           }
           await new Promise(resolve => setTimeout(resolve, 150 * (attempt + 1)));
-          config = loadConfig();
+          config = { ...loadConfig(), syncResumeHistory: false };
           applyProxyEnv(config);
           continue;
         }
@@ -189,7 +265,7 @@ export async function syncInstance(port: number): Promise<InstanceIntegrationRes
       return { action: "sync", success: false, message: `模型目录刷新失败：${error instanceof Error ? error.message : String(error)}` };
     }
     const injected = await injectCodexConfig(port, config, { catalogPath });
-    return { action: "sync", success: injected.success, message: injected.message };
+    return { action: "sync", success: injected.success, message: describeSyncRefusal(injected.message) };
   });
 }
 
@@ -337,6 +413,23 @@ export async function disableInstance(): Promise<InstanceIntegrationResult> {
 }
 
 export async function restoreInstance(): Promise<InstanceIntegrationResult> {
+  // Refusal must not turn off desired integration before any restoration occurs.
+  const refusal = await withInstanceHistory(async () => {
+    const { preflightCodexHistoryInjection } = await importOpenCodexModule(
+      resolveOpenCodexPackageRoot(), ["src", "codex", "history-provider.ts"],
+    );
+    // Older Engines own their restore checks and do not export this preflight.
+    return typeof preflightCodexHistoryInjection === "function"
+      ? preflightCodexHistoryInjection(false, false) : null;
+  });
+  if (refusal) return {
+    action: "restore", success: false,
+    message: "未解除 Codex 接入，未删除 Engine 或实例数据。" + describeSyncRefusal(refusal),
+  };
+  return withInstanceHistory(() => restoreInstanceInner());
+}
+
+async function restoreInstanceInner(): Promise<InstanceIntegrationResult> {
   return withInstanceConfig(false, async () => {
     const { restoreNativeCodexAsync } = await importOpenCodexModule(
       resolveOpenCodexPackageRoot(),
@@ -348,7 +441,7 @@ export async function restoreInstance(): Promise<InstanceIntegrationResult> {
 }
 
 function parseAction(value: string | undefined): InstanceIntegrationAction {
-  if (value === "sync" || value === "restore" || value === "disable") return value;
+  if (value === "sync" || value === "restore" || value === "disable" || value === "preflight") return value;
   throw new Error("实例集成操作只支持 sync 或 restore");
 }
 
@@ -362,7 +455,7 @@ function parsePort(value: string | undefined): number {
 
 async function main(): Promise<void> {
   const action = parseAction(process.argv[2]);
-  const result = action === "disable" ? await disableInstance() : action === "sync"
+  const result = action === "preflight" ? await preflightInstance(parsePort(process.argv[3])) : action === "disable" ? await disableInstance() : action === "sync"
       ? await syncInstance(parsePort(process.argv[3]))
       : await restoreInstance();
   process.stdout.write(JSON.stringify(result));

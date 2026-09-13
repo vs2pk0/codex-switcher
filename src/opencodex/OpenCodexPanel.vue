@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import InstanceTransfer from "./InstanceTransfer.vue";
+import { open } from "@tauri-apps/plugin-dialog";
+import { openExternalUrl } from "../services/codex";
 import AppBusyOverlay from "../components/AppBusyOverlay.vue";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
@@ -508,7 +510,31 @@ async function switchInstalledVersion(version: string): Promise<void> {
   await maintainEngine(version);
 }
 
-async function maintainEngine(version: string): Promise<void> {
+async function downloadEngineInBrowser(): Promise<void> {
+  const version = selectedVersion.value || catalog.value?.latestStable?.version;
+  const url = version && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)
+    ? `https://registry.npmjs.org/@bitkyc08/opencodex/-/opencodex-${version}.tgz`
+    : "https://www.npmjs.com/package/@bitkyc08/opencodex";
+  try { await openExternalUrl(url); }
+  catch (error) { Message.error(errorText(error)); }
+}
+
+async function importEngineArchive(): Promise<void> {
+  if (accountMutationBusy.value) return;
+  const instanceId = selectedInstanceId.value;
+  try {
+    const path = await open({ multiple: false, directory: false, filters: [{ name: "OpenCodex Engine", extensions: ["tgz"] }] });
+    if (typeof path !== "string" || selectedInstanceId.value !== instanceId || accountMutationBusy.value) return;
+    const version = path.split(/[\/\\]/).pop()?.match(/^opencodex-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\.tgz$/)?.[1];
+    if (!version) {
+      Message.error(t("请选择保留官方文件名的 opencodex-版本号.tgz 安装包"));
+      return;
+    }
+    await maintainEngine(version, path);
+  } catch (error) { Message.error(errorText(error)); }
+}
+
+async function maintainEngine(version: string, archivePath?: string): Promise<void> {
   if (accountMutationBusy.value || !version) return;
   const operationId = crypto.randomUUID();
   busy.value = true;
@@ -518,7 +544,7 @@ async function maintainEngine(version: string): Promise<void> {
   try {
     unlistenEngine = await subscribeOpenCodexEngineProgress(operationId, (progress) => { engineProgress.value = progress; });
     if (disposed) return;
-    const result = await installOpenCodexEngine(version, operationId, selectedInstanceId.value);
+    const result = await installOpenCodexEngine(version, operationId, selectedInstanceId.value, archivePath);
     engineProgress.value = { operationId, version: result.version, stage: "complete" };
     Message.success(result.message);
   } catch (error) {
@@ -558,6 +584,8 @@ function confirmDeleteInstalledVersion(version: string): void {
         emit("instances-refreshed");
       } catch (error) {
         Message.error(formatTranslatedText("删除 Engine 失败：{error}", { error: errorText(error) }));
+        await Promise.all([checkVersions(), refreshSnapshot(false, true)]);
+        return false;
       } finally {
         busy.value = false;
       }
@@ -1111,6 +1139,10 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
             </a-select>
             <a-button :loading="Boolean(selectedRelease && installingVersion === selectedRelease.version)" :disabled="accountMutationBusy || !selectedRelease || selectedRelease.active" @click="selectedRelease && applyRelease(selectedRelease)">{{ t(selectedRelease?.installed ? "切换版本" : "下载并使用") }}</a-button>
           </div>
+          <div class="engine-package-actions">
+            <a-button type="text" size="small" :disabled="accountMutationBusy" @click="downloadEngineInBrowser"><template #icon><icon-launch /></template>{{ t("浏览器下载") }}</a-button>
+            <a-button type="outline" size="small" :disabled="accountMutationBusy" @click="importEngineArchive"><template #icon><icon-upload /></template>{{ t("手动导入 .tgz") }}</a-button>
+          </div>
           </div>
         </section>
       </template>
@@ -1440,6 +1472,8 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
 .latest-release h3 { margin: 4px 0; font-size: 17px; }
 .local-version-section, .github-version-section { margin-top: 24px; padding-top: 0; border-top: 0; }
 .github-version-section { padding-top: 20px; border-top: 1px solid #eef0f3; }
+.engine-package-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.engine-package-actions :deep(.arco-btn) { border-radius: 6px; }
 .local-version-heading h3 { font-size: 14px; }
 .version-count { flex-shrink: 0; color: #667085; font-size: 12px; }
 .local-version-list { gap: 0; overflow: hidden; border: 1px solid #e4e7ec; border-radius: 8px; }

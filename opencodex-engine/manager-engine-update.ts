@@ -72,6 +72,7 @@ interface GitHubRelease {
 interface InstallRequest {
   version?: unknown;
   engineRoot?: unknown;
+  archivePath?: unknown;
 }
 
 function requiredText(value: unknown, label: string): string {
@@ -170,7 +171,16 @@ export async function installVersion(request: InstallRequest): Promise<{ version
   mkdirSync(tempDir, { recursive: true });
   try {
     const archive = join(tempDir, "engine.tgz");
-    const response = await fetch(tarball, { signal: AbortSignal.timeout(5 * 60_000), redirect: "error" });
+    let response: Response;
+    if (request.archivePath != null) {
+      const path = requiredText(request.archivePath, "本地安装包路径");
+      const file = Bun.file(path);
+      if (!path.toLowerCase().endsWith(".tgz")) throw new Error("请选择官方 .tgz 安装包");
+      if (file.size > MAX_PACKAGE_BYTES) throw new Error("Engine 包超过大小限制");
+      response = new Response(file.stream(), { headers: { "content-length": String(file.size) } });
+    } else {
+      response = await fetch(tarball, { signal: AbortSignal.timeout(5 * 60_000), redirect: "error" });
+    }
     writeFileSync(archive, await readVerifiedPackage(response, integrity, reportProgress));
     writeFileSync(join(tempDir, "package.json"), JSON.stringify({
       name: "opencodex-manager-managed-engine",

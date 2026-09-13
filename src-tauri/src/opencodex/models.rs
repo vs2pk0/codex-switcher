@@ -250,6 +250,7 @@ pub struct EngineUpdateCatalog {
 pub struct InstallEngineVersionRequest {
     pub version: String,
     pub operation_id: String,
+    pub archive_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

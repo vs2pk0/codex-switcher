@@ -114,13 +114,6 @@ pub(crate) async fn prepare_default_oauth_account(
     Ok(None)
 }
 
-/// 在普通线程里同步等待 [`prepare_default_oauth_account`]。
-pub(crate) fn prepare_default_oauth_account_blocking(
-    instance_id: &str,
-) -> Result<Option<String>, String> {
-    tauri::async_runtime::block_on(prepare_default_oauth_account(instance_id))
-}
-
 /// 读取实例上某个服务当前绑定的 OAuth 账号。
 pub(crate) fn read_service_oauth_binding(
     kind: ServiceKind,
