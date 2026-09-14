@@ -57,6 +57,9 @@ interface SwitcherAccount {
   is_hidden?: unknown;
   auth_mode?: unknown;
   openai_api_key?: unknown;
+  api_base_url?: unknown;
+  api_provider_name?: unknown;
+  default_model?: unknown;
   plan_type?: unknown;
   access_token_expires_at?: unknown;
   tokens?: unknown;
@@ -68,6 +71,8 @@ interface SwitcherStore {
 }
 
 interface ExistingState {
+  providers: Record<string, unknown>;
+  providerSources: Record<string, unknown>;
   accountIds: Set<string>;
   accountIdentityByTargetId: Map<string, { email?: string; chatgptAccountId?: string }>;
   switcherSourceByTargetId: Map<string, string>;
@@ -80,7 +85,8 @@ interface ImportMaterial {
   targetAccountId: string;
   email: string;
   plan?: string;
-  credential: CodexAccountCredentials;
+  credential?: CodexAccountCredentials;
+  provider?: Record<string, unknown>;
 }
 
 export interface SwitcherAccountSummary {
@@ -125,6 +131,18 @@ function text(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   return trimmed || undefined;
+}
+
+function providerFingerprint(provider: unknown): string {
+  // Canonicalize object keys so Engine serialization does not change provenance.
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === "object") return Object.fromEntries(
+      Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, canonical(item)]),
+    );
+    return value;
+  };
+  return createHash("sha256").update(JSON.stringify(canonical(provider))).digest("hex");
 }
 
 function tokensOf(account: SwitcherAccount): SwitcherTokens {
@@ -206,6 +224,8 @@ function existingStateFromRaw(configDir: string): ExistingState {
   const legacySwitcherMigrationEnabled = accountIds.size > 0
     && [...accountIds].filter(id => id.startsWith("switcher-")).length >= 2;
   return {
+    providers: (config.providers ?? {}) as Record<string, unknown>,
+    providerSources: (config.codexSwitcherProviderSources ?? {}) as Record<string, unknown>,
     accountIds,
     accountIdentityByTargetId,
     switcherSourceByTargetId,
@@ -239,6 +259,8 @@ function existingStateFromConfig(config: OcxConfig): ExistingState {
     && [...new Set([...configuredAccountIds, ...Object.keys(credentials)])]
       .filter(id => id.startsWith("switcher-")).length >= 2;
   return {
+    providers: (config.providers ?? {}) as Record<string, unknown>,
+    providerSources: (config.codexSwitcherProviderSources ?? {}) as Record<string, unknown>,
     accountIds: new Set([
       ...configuredAccountIds,
       ...Object.keys(credentials),
@@ -323,6 +345,31 @@ function inspectAccount(
   });
 
   if (!sourceId || !targetId) return reject("invalid", "账号 ID 无效");
+  if (text(account.openai_api_key)) {
+    const name = `switcher-api-${createHash("sha256").update(sourceId).digest("hex").slice(0, 24)}`;
+    base.targetAccountId = name;
+    base.email = text(account.account_name) ?? text(account.api_provider_name) ?? base.email;
+    base.plan = "API Key";
+    if (Object.hasOwn(existing.providers, name)) {
+      const provenance = existing.providerSources[name] as { sourceId?: string; fingerprint?: string } | undefined;
+      const owned = provenance?.sourceId === sourceId
+        && provenance.fingerprint === providerFingerprint(existing.providers[name]);
+      return { summary: { ...base, eligible: false, deletable: owned, status: "already_imported", reason: owned ? "API Key 提供方已存在" : "提供方已修改或来源不匹配，请在 OpenCodex 中管理" } };
+    }
+    if (account.is_hidden === true) return reject("unsupported", "账号已启用隐身模式，不能导入 OpenCodex");
+    let url: URL;
+    try { url = new URL(text(account.api_base_url) ?? "https://api.openai.com/v1"); }
+    catch { return reject("invalid", "API Key 服务地址无效"); }
+    if (!["https:", "http:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) return reject("invalid", "API Key 服务地址无效");
+    return {
+      summary: { ...base, eligible: true, status: "ready", reason: "API Key 将绑定到独立提供方" },
+      material: { sourceId, targetAccountId: name, email: base.email, plan: "API Key", provider: {
+        baseUrl: url.toString().replace(/\/$/, ""), apiKey: text(account.openai_api_key),
+        adapter: "openai-responses",
+        models: text(account.default_model) ? [text(account.default_model)] : [],
+      } },
+    };
+  }
   if (existing.accountIds.has(targetId)) {
     const identity = existing.accountIdentityByTargetId.get(targetId);
     const mappedSourceId = existing.switcherSourceByTargetId.get(targetId);
@@ -444,6 +491,14 @@ export function importSwitcherAccounts(
     const importedSummaries: SwitcherAccountSummary[] = [];
     const importedIds: string[] = [];
     for (const material of materials) {
+      if (material.provider) {
+        const providers = (config.providers ??= {});
+        providers[material.targetAccountId] = material.provider;
+        const sources = (config.codexSwitcherProviderSources ??= {});
+        sources[material.targetAccountId] = { sourceId: material.sourceId, fingerprint: providerFingerprint(material.provider) };
+        importedSummaries.push({ sourceId: material.sourceId, targetAccountId: material.targetAccountId, email: material.email, plan: "API Key", current: false, eligible: false, deletable: true, status: "already_imported", reason: "API Key 已绑定到提供方" });
+        continue;
+      }
       const account = withCodexAccountLogLabel({
         id: material.targetAccountId,
         email: material.email,
@@ -475,7 +530,7 @@ export function importSwitcherAccounts(
     saveConfigPreservingClaudeCode(config);
     try {
       for (const material of materials) {
-        saveCodexAccountCredential(material.targetAccountId, material.credential);
+        if (material.credential) saveCodexAccountCredential(material.targetAccountId, material.credential);
       }
     } catch (error) {
       for (const accountId of importedIds) {
@@ -542,6 +597,22 @@ export async function deleteSwitcherAccountForCurrentRuntime(
   const sourceId = sourceIdInput;
   const store = readSwitcherStore(sourcePath);
   const sourceAccount = store.accounts.find(account => text(account.id) === sourceId);
+  if (sourceAccount && text(sourceAccount.openai_api_key)) {
+    if (await (deps.findLiveProxy ?? findLiveProxy)()) throw new Error("删除提供方前请先停止 OpenCodex 服务");
+    return withConfigMutationLockSync(() => {
+      const config = loadConfig();
+      const { summary } = inspectAccount(sourceAccount, undefined, existingStateFromConfig(config), new Set());
+      if (!summary.deletable) throw new Error("提供方来源不匹配，已阻止删除");
+      const id = summary.targetAccountId;
+      // Referenced providers must be detached explicitly in OpenCodex first.
+      const rest = structuredClone(config);
+      delete rest.providers?.[id];
+      delete rest.codexSwitcherProviderSources?.[id];
+      if (JSON.stringify(rest).includes(id)) throw new Error("提供方仍被配置引用，请先在 OpenCodex 中解除引用");
+      saveConfigPreservingClaudeCode(rest);
+      return { sourceId, targetAccountId: id, deleted: true, message: "已删除提供方，Switcher 原账号仍保留" };
+    });
+  }
   const targetId = targetAccountId(sourceId);
   const targetExists = exactSwitcherMigrationExistsInRawState(sourceAccount, sourceId);
   const config = loadConfig();
@@ -579,8 +650,30 @@ async function readStdin(): Promise<string> {
   return await new Response(Bun.stdin.stream()).text();
 }
 
+export async function cleanupExpiredPoolAccounts(): Promise<{ removedCount: number }> {
+  if (await findLiveProxy()) throw new Error("清理失效账号前必须停止目标 Engine");
+  return withConfigMutationLockSync(() => {
+    const config = loadConfig();
+    const records = readJsonObject(join(getConfigDir(), "codex-accounts.json"));
+    let removedCount = 0;
+    for (const account of [...(config.codexAccounts ?? [])]) {
+      if (account.isMain || account.id === "__main__") continue;
+      const record = records[account.id] as Record<string, unknown> | undefined;
+      // Token expiry alone is renewable; only Engine-confirmed dead grants qualify.
+      if (record?.lastCodexValidationStatus !== "failed" || record.lastCodexValidationTerminal !== true || record.deletedAt != null) continue;
+      deleteCodexAccount(config, account.id);
+      removedCount++;
+    }
+    return { removedCount };
+  });
+}
+
 async function main() {
   const command = process.argv[2];
+  if (command === "cleanup-expired") {
+    console.log(JSON.stringify(await cleanupExpiredPoolAccounts()));
+    return;
+  }
   if (command === "scan") {
     console.log(JSON.stringify(scanSwitcherAccounts()));
     return;

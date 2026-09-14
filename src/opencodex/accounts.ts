@@ -1,5 +1,13 @@
 import type { OpenCodexSwitcherAccount } from "./types";
 
+export function orderMigrationAccounts<T extends { sourceId: string }>(accounts: T[], order: string[]): T[] {
+  const positions = new Map(order.map((id, index) => [id, index]));
+  return [...accounts].sort((a, b) =>
+    (positions.get(a.sourceId) ?? Number.MAX_SAFE_INTEGER)
+    - (positions.get(b.sourceId) ?? Number.MAX_SAFE_INTEGER),
+  );
+}
+
 export function filterMigrationAccounts(
   accounts: OpenCodexSwitcherAccount[], query: string, status: string, plan: string,
 ): OpenCodexSwitcherAccount[] {

@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  cleanupExpiredPoolAccounts,
   deleteSwitcherAccount,
   deleteSwitcherAccountForCurrentRuntime,
   importSwitcherAccounts,
@@ -29,6 +30,72 @@ afterEach(() => {
 });
 
 describe("Codex Switcher account import", () => {
+  test("startup cleanup removes only terminal pool accounts in the target home", async () => {
+    const root = temporaryRoot();
+    process.env.OPENCODEX_HOME = root;
+    const accounts = ["dead", "renewable", "transient", "__main__"];
+    writeFileSync(join(root, "config.json"), JSON.stringify({
+      providers: { api: { adapter: "openai", baseUrl: "https://example.com/v1", apiKey: "fixture" } },
+      codexAccounts: accounts.map(id => ({ id, email: `${id}@example.com`, isMain: id === "__main__" })),
+    }));
+    writeFileSync(join(root, "codex-accounts.json"), JSON.stringify({
+      dead: { lastCodexValidationStatus: "failed", lastCodexValidationTerminal: true },
+      renewable: { expiresAt: 1 },
+      transient: { lastCodexValidationStatus: "failed", lastCodexValidationTerminal: false },
+      __main__: { lastCodexValidationStatus: "failed", lastCodexValidationTerminal: true },
+    }));
+    const source = join(root, "accounts.json");
+    writeFileSync(source, "source fixture");
+    const other = join(root, "other");
+    mkdirSync(other);
+    writeFileSync(join(other, "config.json"), "other fixture");
+    expect(await cleanupExpiredPoolAccounts()).toEqual({ removedCount: 1 });
+    const config = JSON.parse(readFileSync(join(root, "config.json"), "utf8"));
+    expect(config.codexAccounts.map((account: { id: string }) => account.id)).toEqual(accounts.slice(1));
+    expect(config.providers.api.apiKey).toBe("fixture");
+    expect(readFileSync(source, "utf8")).toBe("source fixture");
+    expect(readFileSync(join(other, "config.json"), "utf8")).toBe("other fixture");
+    writeFileSync(join(root, "codex-accounts.json"), "invalid json");
+    const before = readFileSync(join(root, "config.json"), "utf8");
+    await expect(cleanupExpiredPoolAccounts()).rejects.toThrow();
+    expect(readFileSync(join(root, "config.json"), "utf8")).toBe(before);
+  });
+  test("binds API keys to isolated providers and deletes only the copy", async () => {
+    const root = temporaryRoot();
+    const target = join(root, "target");
+    mkdirSync(target);
+    process.env.OPENCODEX_HOME = target;
+    const source = join(root, "accounts.json");
+    writeFileSync(source, JSON.stringify({ accounts: [{ id: "api-one", account_name: "Test API", openai_api_key: "secret-fixture", api_base_url: "https://example.com/v1", default_model: "test-model" }] }));
+    writeFileSync(join(target, "config.json"), JSON.stringify({ defaultProvider: "ollama", providers: { ollama: { adapter: "openai", baseUrl: "http://localhost:11434/v1", authMode: "local" } } }));
+    const result = importSwitcherAccounts(["api-one"], source);
+    expect(result.importedCount).toBe(1);
+    expect(JSON.stringify(result)).not.toContain("secret-fixture");
+    const id = result.imported[0]!.targetAccountId;
+    const saved = JSON.parse(readFileSync(join(target, "config.json"), "utf8"));
+    expect(saved.providers[id].apiKey).toBe("secret-fixture");
+    expect(saved.providers[id].models).toEqual(["test-model"]);
+    expect(saved.defaultProvider).toBe("ollama");
+    expect(scanSwitcherAccounts(source, target).accounts[0]!.deletable).toBe(true);
+    expect(scanSwitcherAccounts(source, join(root, "other")).eligibleCount).toBe(1);
+    expect(importSwitcherAccounts(["api-one"], source).importedCount).toBe(0);
+    const configPath = join(target, "config.json");
+    const original = readFileSync(configPath, "utf8");
+    const modified = JSON.parse(original);
+    modified.providers[id].apiKey = "replacement-secret";
+    writeFileSync(configPath, JSON.stringify(modified));
+    expect(scanSwitcherAccounts(source, target).accounts[0]!.deletable).toBe(false);
+    await expect(deleteSwitcherAccountForCurrentRuntime("api-one", source, { findLiveProxy: async () => null })).rejects.toThrow("来源不匹配");
+    writeFileSync(configPath, original);
+    const referenced = JSON.parse(original);
+    referenced.defaultProvider = id;
+    writeFileSync(configPath, JSON.stringify(referenced));
+    await expect(deleteSwitcherAccountForCurrentRuntime("api-one", source, { findLiveProxy: async () => null })).rejects.toThrow("仍被配置引用");
+    writeFileSync(configPath, original);
+    await deleteSwitcherAccountForCurrentRuntime("api-one", source, { findLiveProxy: async () => null });
+    expect(scanSwitcherAccounts(source, target).eligibleCount).toBe(1);
+    expect(JSON.parse(readFileSync(source, "utf8")).accounts).toHaveLength(1);
+  });
   test("does not offer hidden accounts for import", () => {
     const root = temporaryRoot();
     const sourcePath = join(root, "accounts.json");
@@ -126,7 +193,7 @@ describe("Codex Switcher account import", () => {
 
     const scan = scanSwitcherAccounts(sourcePath, targetDir);
     expect(scan.totalCount).toBe(2);
-    expect(scan.eligibleCount).toBe(1);
+    expect(scan.eligibleCount).toBe(2);
     expect(scan.accounts[0]?.email).toBe("m***r@example.com");
     expect(JSON.stringify(scan)).not.toContain(accessToken);
     expect(JSON.stringify(scan)).not.toContain("refresh-secret-one");
@@ -158,7 +225,7 @@ describe("Codex Switcher account import", () => {
     }));
 
     const rescanned = scanSwitcherAccounts(sourcePath, targetDir);
-    expect(rescanned.eligibleCount).toBe(0);
+    expect(rescanned.eligibleCount).toBe(1);
     expect(rescanned.accounts[0]?.status).toBe("already_imported");
     expect(rescanned.accounts[0]?.deletable).toBe(true);
 

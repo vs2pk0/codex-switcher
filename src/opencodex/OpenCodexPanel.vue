@@ -3,6 +3,8 @@ import InstanceTransfer from "./InstanceTransfer.vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openExternalUrl } from "../services/codex";
 import AppBusyOverlay from "../components/AppBusyOverlay.vue";
+import PlanBadge from "../components/PlanBadge.vue";
+import { BADGE_ACCOUNT_TYPES } from "../constants/badgeStyles";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -14,7 +16,7 @@ import {
   type ServiceOauthBindingRequest,
 } from "../services/codex";
 import { currentLanguage, formatTranslatedText, t } from "../i18n";
-import { filterMigrationAccounts, toggleVisibleAccounts } from "./accounts";
+import { filterMigrationAccounts, orderMigrationAccounts, toggleVisibleAccounts } from "./accounts";
 import {
   deleteOpenCodexSwitcherAccount,
   deleteOpenCodexEngine,
@@ -24,6 +26,7 @@ import {
   getOpenCodexVisionSidecarSettings,
   getOpenCodexVisionModels,
   importOpenCodexSwitcherAccounts,
+  bindOpenCodexSwitcherAccounts,
   installOpenCodexEngine,
   openOpenCodexDashboard,
   readOpenCodexLogs,
@@ -58,7 +61,13 @@ import type {
   OpenCodexVisionSidecarResponse,
 } from "./types";
 
-const props = defineProps<{ active: boolean; instances: CodexInstance[] }>();
+const props = defineProps<{ active: boolean; instances: CodexInstance[]; badgeStyle?: string; badgeStyles?: Record<string, string>; accountOrder?: string[] }>();
+function migrationBadge(plan?: string | null) {
+  const normalized = (plan || '').toLowerCase();
+  const key = normalized === 'api key' ? 'api' : normalized === 'prolite' ? 'proLite' : normalized === 'pro' ? 'proMax' : normalized;
+  const type = BADGE_ACCOUNT_TYPES.find(item => item.key === key);
+  return { label: type?.label || (plan || t('未知套餐')).toUpperCase(), className: `${type?.planClass || 'unknown'} badge-${props.badgeStyles?.[key] || props.badgeStyle || 'classic'}` };
+}
 const emit = defineEmits<{
   (event: "accounts-refreshed"): void;
   (event: "instances-refreshed"): void;
@@ -145,6 +154,7 @@ watch(selectedInstanceId, async () => {
   interactiveOperationId.value = ""; answeredPortPrompts.clear();
   settings.value = loadSettings();
   const id = selectedInstanceId.value;
+  void scanAccounts();
   await refreshSnapshot();
   const persisted = await readOpenCodexLogs(300,id).catch(() => []);
   if (id !== selectedInstanceId.value) return;
@@ -174,7 +184,7 @@ const selectedRelease = computed(
 );
 const accountMutationBusy = computed(() => busy.value || importingAccounts.value || Boolean(deletingAccountId.value));
 const filteredAccounts = computed(() => filterMigrationAccounts(
-  accountScan.value?.accounts ?? [], accountSearch.value, accountStatus.value, accountPlan.value,
+  orderMigrationAccounts(accountScan.value?.accounts ?? [], props.accountOrder ?? []), accountSearch.value, accountStatus.value, accountPlan.value,
 ));
 const accountPlans = computed(() => [...new Set((accountScan.value?.accounts ?? []).map((account) => account.plan || "__unknown__"))].sort());
 const visibleSelectable = computed(() => filteredAccounts.value.filter((account) => account.eligible || account.deletable));
@@ -605,22 +615,22 @@ function saveSettings(): void {
   Message.success(t("OpenCodex 设置已保存，下一次启动服务时生效"));
 }
 
+let accountScanRequest = 0;
 async function scanAccounts(): Promise<void> {
-  if (accountScanLoading.value) return;
+  const instanceId = selectedInstanceId.value;
+  const request = ++accountScanRequest;
   accountScanLoading.value = true;
   try {
-    const initial = !accountScan.value;
-    const instanceId = selectedInstanceId.value;
     const result = await scanOpenCodexSwitcherAccounts(instanceId);
-    if (instanceId !== selectedInstanceId.value) return;
+    if (instanceId !== selectedInstanceId.value || request !== accountScanRequest || disposed) return;
     accountScan.value = result;
     selectedAccountIds.value = accountScan.value.accounts
-      .filter((account) => initial ? account.eligible : (account.eligible || account.deletable) && selectedAccountIds.value.includes(account.sourceId))
+      .filter((account) => (account.eligible || account.deletable) && selectedAccountIds.value.includes(account.sourceId))
       .map((account) => account.sourceId);
   } catch (error) {
-    Message.error(formatTranslatedText("扫描 Switcher 账号失败：{error}", { error: errorText(error) }));
+    if (request === accountScanRequest && !disposed) Message.error(formatTranslatedText("刷新 Switcher 账号失败：{error}", { error: errorText(error) }));
   } finally {
-    accountScanLoading.value = false;
+    if (request === accountScanRequest) accountScanLoading.value = false;
   }
 }
 
@@ -722,20 +732,22 @@ async function saveVisionModels(): Promise<void> {
 }
 
 async function importAccounts(): Promise<void> {
-  if (accountMutationBusy.value || accountScanLoading.value || snapshot.value?.running) return;
+  if (accountMutationBusy.value || accountScanLoading.value) return;
   if (!selectedImportAccountIds.value.length) {
     Message.warning(t("请至少选择一个可导入账号"));
     return;
   }
   importingAccounts.value = true;
   try {
-    const result = await importOpenCodexSwitcherAccounts(selectedImportAccountIds.value, selectedInstanceId.value);
+    const bind = snapshot.value?.running ? bindOpenCodexSwitcherAccounts : importOpenCodexSwitcherAccounts;
+    const result = await bind(selectedImportAccountIds.value, selectedInstanceId.value);
     Message.success(formatTranslatedText("已导入 {importedCount} 个账号，跳过 {skippedCount} 个", {
       importedCount: result.importedCount,
       skippedCount: result.skippedCount,
     }));
     emit("accounts-refreshed");
     await scanAccounts();
+    await refreshSnapshot(false);
   } catch (error) {
     Message.error(formatTranslatedText("导入 OpenCodex 账号失败：{error}", { error: errorText(error) }));
   } finally {
@@ -857,6 +869,7 @@ watch(
   () => props.active,
   (active) => {
     if (active) {
+      void scanAccounts();
       void refreshSnapshot(false, Boolean(installingVersion.value));
       return;
     }
@@ -864,11 +877,13 @@ watch(
 );
 
 watch(page, (nextPage) => {
+  if (nextPage === "settings") void scanAccounts();
   if (nextPage === "versions" && !catalog.value) void checkVersions();
   if (nextPage === "vision") void loadVisionModels();
 });
 
 onMounted(async () => {
+  void scanAccounts();
   try {
     const persisted = await readOpenCodexLogs(300, selectedInstanceId.value);
     logs.value = persisted.map((line, index) => ({
@@ -1340,8 +1355,8 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
           <article class="settings-card migration-settings">
             <header class="settings-card-head">
               <span class="settings-card-icon"><icon-import /></span>
-              <div><h2>{{ t("Switcher 账号迁移") }}</h2><p>{{ t("读取当前 Switcher 账号并转换为 OpenCodex OAuth 账号") }}</p></div>
-              <a-button :loading="accountScanLoading" :disabled="accountMutationBusy" @click="scanAccounts"><template #icon><icon-refresh /></template>{{ t(accountScan ? "重新扫描" : "扫描") }}</a-button>
+              <div><h2>{{ t("Switcher 账号") }}</h2><p>{{ t("OAuth 账号与 API Key 提供方") }}</p></div>
+              <a-button :loading="accountScanLoading" :disabled="accountMutationBusy" @click="scanAccounts"><template #icon><icon-refresh /></template>{{ t("刷新") }}</a-button>
             </header>
             <div v-if="accountScan" class="scan-summary">
               <span class="scan-stat"><small>{{ t("发现") }}</small><strong>{{ accountScan.totalCount }}</strong><em>{{ t("个账号") }}</em></span>
@@ -1356,7 +1371,8 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
               </a-select>
               <a-select v-model="accountPlan" :aria-label="t('套餐')">
                 <a-option value="">{{ t("全部套餐") }}</a-option>
-                <a-option v-for="plan in accountPlans" :key="plan" :value="plan">{{ plan === '__unknown__' ? t('未知套餐') : plan }}</a-option>
+                <a-option v-for="plan in accountPlans" :key="plan" :value="plan"><PlanBadge v-if="plan !== '__unknown__'" :label="migrationBadge(plan).label" :badge-class="migrationBadge(plan).className" /><span v-else>{{ t('未知套餐') }}</span></a-option>
+                <template #label="{ data }"><PlanBadge v-if="data.value && data.value !== '__unknown__'" :label="migrationBadge(String(data.value)).label" :badge-class="migrationBadge(String(data.value)).className" /><span v-else>{{ data.label }}</span></template>
               </a-select>
             </div>
             <div v-if="accountScan" class="migration-selection-bar">
@@ -1374,9 +1390,8 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
                       <td><a-checkbox :model-value="selectedAccountIds.includes(account.sourceId)" :disabled="accountMutationBusy || accountScanLoading || (!account.eligible && !account.deletable)" :aria-label="account.email || account.sourceId" @change="toggleMigrationAccount(account)" /></td>
                       <td class="migration-identity">
                         <div><a-tooltip :content="account.email || account.sourceId"><strong>{{ account.email || account.sourceId }}</strong></a-tooltip><a-tag v-if="account.current" size="small" color="blue">{{ t("当前") }}</a-tag></div>
-                        <a-tooltip :content="account.sourceId"><small>{{ account.sourceId }}</small></a-tooltip>
                       </td>
-                      <td class="migration-plan"><a-tooltip :content="account.plan || t('未知套餐')"><span>{{ account.plan || t("未知套餐") }}</span></a-tooltip></td>
+                      <td class="migration-plan"><PlanBadge :label="migrationBadge(account.plan).label" :badge-class="migrationBadge(account.plan).className" /></td>
                       <td><a-tooltip :content="accountStatusLabel(account.status)"><span :class="['migration-status-pill', account.status]">{{ accountStatusLabel(account.status) }}</span></a-tooltip><a-tooltip :content="t(account.reason)"><p class="migration-reason">{{ t(account.reason) }}</p></a-tooltip></td>
                       <td><a-tooltip v-if="account.deletable" :content="t('从 OpenCodex 删除，保留 Switcher 原账号')"><a-button type="text" size="small" status="danger" :loading="deletingAccountId === account.sourceId" :disabled="accountMutationBusy || snapshot?.running" :aria-label="t('删除 OpenCodex 账号')" @click="confirmDeleteMigratedAccount(account)"><template #icon><icon-delete /></template></a-button></a-tooltip><span v-else class="migration-no-action">-</span></td>
                     </tr>
@@ -1385,16 +1400,15 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
               </div>
               <div v-else class="migration-empty">
                 <span class="migration-empty-icon"><icon-user-group /></span>
-                <strong>{{ t(!accountScan ? '尚未扫描账号' : !accountScan.accounts.length ? '暂无账号' : '没有符合筛选条件的账号') }}</strong>
-                <p v-if="!accountScan">{{ t("点击右上角「扫描」读取 Switcher 中的 OAuth 账号，选择后即可导入到当前实例。") }}</p>
+                <strong>{{ t(!accountScan ? (accountScanLoading ? '正在读取账号' : '读取失败，请刷新重试') : !accountScan.accounts.length ? '暂无账号' : '没有符合筛选条件的账号') }}</strong>
               </div>
             </a-spin>
             <footer v-if="accountScan" class="migration-batch-actions">
-              <a-alert v-if="snapshot?.running" type="warning" show-icon>{{ t("导入前请先停止 OpenCodex 服务，避免配置被运行中的 Engine 覆盖。") }}</a-alert>
+              <a-alert v-if="snapshot?.running" type="warning" show-icon>{{ t("绑定时服务将短暂重启；删除前请先停止服务。") }}</a-alert>
               <span v-else class="migration-batch-hint">{{ t("导入的账号会保留在 Switcher 中，删除仅影响 OpenCodex 侧副本。") }}</span>
               <div>
                 <a-button status="danger" :loading="deletingAccountId === '__selected__'" :disabled="accountMutationBusy || accountScanLoading || !selectedDeleteAccounts.length || snapshot?.running" @click="confirmDeleteSelectedAccounts"><template #icon><icon-delete /></template>{{ t("删除所选") }}（{{ selectedDeleteAccounts.length }}）</a-button>
-                <a-button type="primary" :loading="importingAccounts" :disabled="accountMutationBusy || accountScanLoading || !selectedImportAccountIds.length || snapshot?.running" @click="importAccounts"><template #icon><icon-import /></template>{{ t("导入所选") }}（{{ selectedImportAccountIds.length }}）</a-button>
+                <a-button type="primary" :loading="importingAccounts" :disabled="accountMutationBusy || accountScanLoading || !selectedImportAccountIds.length" @click="importAccounts"><template #icon><icon-import /></template>{{ t("新增 / 绑定所选") }}（{{ selectedImportAccountIds.length }}）</a-button>
               </div>
             </footer>
           </article>
@@ -1545,6 +1559,8 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
 .scan-stat.scan-selected strong { color: var(--oc-accent); }
 .migration-toolbar { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr) minmax(0, 1fr); gap: 8px; padding: 14px 18px 0; }
 .migration-toolbar :deep(.arco-input-wrapper), .migration-toolbar :deep(.arco-select-view) { border-radius: 6px; }
+.migration-toolbar :deep(.arco-select-view) { background: var(--color-bg-2); border: 1px solid var(--color-border-2); }
+.migration-toolbar :deep(.arco-select-view-focus) { border-color: rgb(var(--primary-6)); }
 .migration-selection-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 10px 18px 6px; color: var(--oc-muted); font-size: 12px; }
 .migration-selection-bar :deep(.arco-checkbox-label) { font-size: 12px; }
 .migration-selection-bar > .arco-btn { margin-left: auto; padding-inline: 4px; }
@@ -1556,22 +1572,22 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
 .migration-empty-icon { display: grid; width: 52px; height: 52px; place-items: center; margin-bottom: 6px; border-radius: 16px; color: var(--oc-accent); background: var(--oc-accent-soft); font-size: 24px; }
 .migration-empty strong { color: var(--oc-ink); font-size: 14px; }
 .migration-empty p { max-width: 380px; margin: 0; color: var(--oc-muted); font-size: 12px; line-height: 1.6; }
-.migration-table { width: 100%; min-width: 340px; border-collapse: separate; border-spacing: 0; table-layout: fixed; font-size: 13px; text-align: left; }
+.migration-table { width: 100%; min-width: 520px; border-collapse: separate; border-spacing: 0 6px; table-layout: fixed; font-size: 13px; text-align: left; background: var(--oc-soft); }
 .migration-table th { position: sticky; top: 0; z-index: 1; padding: 8px 10px; background: #f6f8fc; color: var(--oc-muted); font-size: 12px; font-weight: 600; }
 .migration-table th:first-child, .migration-table td:first-child { padding-left: 18px; }
 .migration-table th:last-child, .migration-table td:last-child { padding-right: 18px; }
 .migration-table th:first-child { width: 44px; }
-.migration-table th:nth-child(3) { width: 72px; }
+.migration-table th:nth-child(3) { width: 100px; }
 .migration-table th:nth-child(4) { width: 28%; }
 .migration-table th:last-child { width: 52px; }
-.migration-table td { padding: 8px 10px; border-top: 1px solid #eef0f3; vertical-align: middle; background: #fff; }
+.migration-table td { height: 48px; padding: 6px 10px; border-block: 1px solid var(--oc-line); vertical-align: middle; background: #fff; }
 .migration-table tbody tr:hover td { background: #f8fafc; }
 .migration-table tr.selected td { background: #f0f6ff; }
 .migration-identity > div { display: flex; align-items: center; gap: 4px; }
-.migration-identity strong { display: block; min-width: 0; font-weight: 500; color: #1d2939; line-height: 18px; }
+.migration-identity strong { display: block; min-width: 0; font-weight: 600; color: var(--oc-accent); line-height: 18px; }
 .migration-identity :deep(.arco-tag) { flex: 0 0 auto; }
 .migration-identity small { display: block; margin-top: 2px; color: #86909c; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 16px; }
-.migration-plan > span { display: block; color: #667085; font-size: 12px; }
+.migration-plan :deep(.plan-badge) { max-width: 100%; font-size: 12px; }
 .migration-reason { margin: 2px 0 0; color: #667085; font-size: 12px; line-height: 16px; }
 .migration-identity strong, .migration-identity small, .migration-plan > span, .migration-reason, .migration-status-pill { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .migration-status-pill { display: inline-block; max-width: 100%; padding: 1px 5px; border-radius: 4px; background: #f2f3f5; color: #667085; font-size: 12px; line-height: 18px; vertical-align: middle; }

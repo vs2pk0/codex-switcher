@@ -1744,6 +1744,12 @@ impl Backend {
                 })
                 .map(|message| (Some(0), message))
             })
+        } else if matches!(action, CommandAction::Restart) {
+            self.query_background_service_state().and_then(|state| {
+                self.stop_for_account_binding(&launcher, port)?;
+                self.restart_after_account_binding(&launcher, port, account_binding_restart_mode(&state))
+                    .map(|_| (Some(0), format!("服务已在端口 {port} 重启")))
+            })
         } else if matches!(action, CommandAction::Start) {
             if self.owned_health(port).is_some() {
                 self.emit_log(&operation_id, "system", "OpenCodex 服务已经在运行。");
@@ -1893,6 +1899,7 @@ impl Backend {
     ) -> Result<HealthBody, String> {
         validate_port(port)?;
         self.validate_instance_port(port)?;
+        self.cleanup_expired_pool_accounts();
         let args = vec!["start".to_string(), "--port".to_string(), port.to_string()];
         if let Some(id) = operation_id {
             self.emit_log(id, "system", &format!("后台启动：ocx start --port {port}"));
@@ -2159,6 +2166,7 @@ impl Backend {
         launcher: &Launcher,
         port: u16,
     ) -> Result<(), String> {
+        self.cleanup_expired_pool_accounts();
         let args = vec!["service".to_string(), "start".to_string()];
         let mut command = self.command(launcher, &args);
         command
@@ -2823,6 +2831,16 @@ impl Backend {
         } else {
             detail
         })
+    }
+
+    fn cleanup_expired_pool_accounts(&self) {
+        match self.run_switcher_helper::<serde_json::Value>("cleanup-expired", None) {
+            Ok(result) => {
+                let count = result["removedCount"].as_u64().unwrap_or(0);
+                self.persist_log("system", &format!("启动前清理已确认失效的账号池账号：{count} 个，Switcher 原账号保留"));
+            }
+            Err(error) => self.persist_log("stderr", &format!("失效账号清理未完成，继续启动：{error}")),
+        }
     }
 
     fn run_switcher_helper<T: DeserializeOwned>(
