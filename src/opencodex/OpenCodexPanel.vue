@@ -26,7 +26,6 @@ import {
   getOpenCodexVisionSidecarSettings,
   getOpenCodexVisionModels,
   importOpenCodexSwitcherAccounts,
-  bindOpenCodexSwitcherAccounts,
   installOpenCodexEngine,
   openOpenCodexDashboard,
   readOpenCodexLogs,
@@ -739,12 +738,14 @@ async function importAccounts(): Promise<void> {
   }
   importingAccounts.value = true;
   try {
-    const bind = snapshot.value?.running ? bindOpenCodexSwitcherAccounts : importOpenCodexSwitcherAccounts;
-    const result = await bind(selectedImportAccountIds.value, selectedInstanceId.value);
+    const result = await importOpenCodexSwitcherAccounts(selectedImportAccountIds.value, selectedInstanceId.value);
     Message.success(formatTranslatedText("已导入 {importedCount} 个账号，跳过 {skippedCount} 个", {
       importedCount: result.importedCount,
       skippedCount: result.skippedCount,
     }));
+    if (result.skipped.length) {
+      Modal.warning({ title: t("部分账号未导入"), content: [...new Set(result.skipped.map(item => item.reason))].join("；") });
+    }
     emit("accounts-refreshed");
     await scanAccounts();
     await refreshSnapshot(false);
@@ -762,10 +763,6 @@ function confirmDeleteSelectedAccounts(): void {
     Message.warning(t("请至少选择一个已导入且可删除的账号"));
     return;
   }
-  if (snapshot.value?.running) {
-    Message.warning(t("请先停止 OpenCodex 服务，再删除账号"));
-    return;
-  }
   Modal.warning({
     title: t("批量删除 OpenCodex 账号"),
     content: formatTranslatedText("确认从 OpenCodex 删除所选 {count} 个账号？Switcher 账号总览中的原账号会保留。", { count: selected.length }),
@@ -773,7 +770,7 @@ function confirmDeleteSelectedAccounts(): void {
     cancelText: t("取消"),
     hideCancel: false,
     onOk: async () => {
-      if (accountMutationBusy.value || snapshot.value?.running) return false;
+      if (accountMutationBusy.value) return false;
       deletingAccountId.value = "__selected__";
       try {
         const results = [];
@@ -804,10 +801,6 @@ function confirmDeleteMigratedAccount(
 ): void {
   if (accountMutationBusy.value || accountScanLoading.value) return;
   if (!account.deletable || deletingAccountId.value) return;
-  if (snapshot.value?.running) {
-    Message.warning(t("请先停止 OpenCodex 服务，再删除账号"));
-    return;
-  }
   Modal.warning({
     title: t("删除 OpenCodex 账号"),
     content: formatTranslatedText("确认从 OpenCodex 删除 {account}？Switcher 账号总览中的原账号会保留。", { account: account.email || account.sourceId }),
@@ -815,7 +808,7 @@ function confirmDeleteMigratedAccount(
     cancelText: t("取消"),
     hideCancel: false,
     onOk: async () => {
-      if (accountMutationBusy.value || snapshot.value?.running) return false;
+      if (accountMutationBusy.value) return false;
       deletingAccountId.value = account.sourceId;
       try {
         const result = await deleteOpenCodexSwitcherAccount(account.sourceId, selectedInstanceId.value);
@@ -1393,7 +1386,7 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
                       </td>
                       <td class="migration-plan"><PlanBadge :label="migrationBadge(account.plan).label" :badge-class="migrationBadge(account.plan).className" /></td>
                       <td><a-tooltip :content="accountStatusLabel(account.status)"><span :class="['migration-status-pill', account.status]">{{ accountStatusLabel(account.status) }}</span></a-tooltip><a-tooltip :content="t(account.reason)"><p class="migration-reason">{{ t(account.reason) }}</p></a-tooltip></td>
-                      <td><a-tooltip v-if="account.deletable" :content="t('从 OpenCodex 删除，保留 Switcher 原账号')"><a-button type="text" size="small" status="danger" :loading="deletingAccountId === account.sourceId" :disabled="accountMutationBusy || snapshot?.running" :aria-label="t('删除 OpenCodex 账号')" @click="confirmDeleteMigratedAccount(account)"><template #icon><icon-delete /></template></a-button></a-tooltip><span v-else class="migration-no-action">-</span></td>
+                      <td><a-tooltip v-if="account.deletable" :content="t('从 OpenCodex 删除，保留 Switcher 原账号')"><a-button type="text" size="small" status="danger" :loading="deletingAccountId === account.sourceId" :disabled="accountMutationBusy" :aria-label="t('删除 OpenCodex 账号')" @click="confirmDeleteMigratedAccount(account)"><template #icon><icon-delete /></template></a-button></a-tooltip><span v-else class="migration-no-action">-</span></td>
                     </tr>
                   </tbody>
                 </table>
@@ -1404,10 +1397,10 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
               </div>
             </a-spin>
             <footer v-if="accountScan" class="migration-batch-actions">
-              <a-alert v-if="snapshot?.running" type="warning" show-icon>{{ t("绑定时服务将短暂重启；删除前请先停止服务。") }}</a-alert>
+              <a-alert v-if="snapshot?.running" type="warning" show-icon>{{ t("API Key 绑定和账号删除无需停服；OAuth 导入需手动停止服务。删除账号可能影响使用该账号的请求。") }}</a-alert>
               <span v-else class="migration-batch-hint">{{ t("导入的账号会保留在 Switcher 中，删除仅影响 OpenCodex 侧副本。") }}</span>
               <div>
-                <a-button status="danger" :loading="deletingAccountId === '__selected__'" :disabled="accountMutationBusy || accountScanLoading || !selectedDeleteAccounts.length || snapshot?.running" @click="confirmDeleteSelectedAccounts"><template #icon><icon-delete /></template>{{ t("删除所选") }}（{{ selectedDeleteAccounts.length }}）</a-button>
+                <a-button status="danger" :loading="deletingAccountId === '__selected__'" :disabled="accountMutationBusy || accountScanLoading || !selectedDeleteAccounts.length" @click="confirmDeleteSelectedAccounts"><template #icon><icon-delete /></template>{{ t("删除所选") }}（{{ selectedDeleteAccounts.length }}）</a-button>
                 <a-button type="primary" :loading="importingAccounts" :disabled="accountMutationBusy || accountScanLoading || !selectedImportAccountIds.length" @click="importAccounts"><template #icon><icon-import /></template>{{ t("新增 / 绑定所选") }}（{{ selectedImportAccountIds.length }}）</a-button>
               </div>
             </footer>

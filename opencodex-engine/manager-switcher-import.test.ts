@@ -7,6 +7,7 @@ import {
   deleteSwitcherAccount,
   deleteSwitcherAccountForCurrentRuntime,
   importSwitcherAccounts,
+  importSwitcherAccountsForCurrentRuntime,
   scanSwitcherAccounts,
 } from "./manager-switcher-import.ts";
 
@@ -30,6 +31,62 @@ afterEach(() => {
 });
 
 describe("Codex Switcher account import", () => {
+  test("online OAuth is skipped and runtime failures do not expose credentials", async () => {
+    const root = temporaryRoot();
+    process.env.OPENCODEX_HOME = root;
+    const source = join(root, "accounts.json");
+    writeFileSync(join(root, "config.json"), JSON.stringify({ providers: {} }));
+    writeFileSync(source, JSON.stringify({ accounts: [
+      { id: "oauth", email: "test@example.com", tokens: { access_token: jwt({ exp: 4102444800, "https://api.openai.com/auth": { chatgpt_account_id: "test" } }), refresh_token: "refresh" } },
+      { id: "api", openai_api_key: "private-fixture", api_base_url: "https://example.com/v1" },
+    ] }));
+    let requests = 0;
+    const result = await importSwitcherAccountsForCurrentRuntime(["oauth", "api"], source, {
+      findLiveProxy: async () => ({ pid: 42, port: 15800, source: "runtime" }),
+      runtimeRequest: async () => { requests++; throw new Error("private-fixture"); },
+    });
+    expect(requests).toBe(1);
+    expect(result.importedCount).toBe(0);
+    expect(result.skippedCount).toBe(2);
+    expect(result.skipped[0].reason).toContain("OAuth");
+    expect(JSON.stringify(result)).not.toContain("private-fixture");
+  });
+  test("running API import and delete use runtime routes without overwriting unrelated config", async () => {
+    const root = temporaryRoot();
+    process.env.OPENCODEX_HOME = root;
+    const source = join(root, "accounts.json");
+    const configPath = join(root, "config.json");
+    writeFileSync(source, JSON.stringify({ accounts: [{ id: "online", openai_api_key: "fixture-secret", api_base_url: "https://example.com/v1" }] }));
+    writeFileSync(configPath, JSON.stringify({ providers: {} }));
+    const calls: string[] = [];
+    const deps = {
+      findLiveProxy: async () => ({ pid: 42, port: 15800, source: "runtime" as const }),
+      runtimeRequest: async (path: string, init: RequestInit) => {
+        calls.push(`${init.method} ${path}`);
+        const config = JSON.parse(readFileSync(configPath, "utf8"));
+        if (init.method === "POST") {
+          const body = JSON.parse(init.body as string);
+          expect(body.setDefault).toBe(false);
+          config.providers[body.name] = { ...body.provider, name: "Engine enriched" };
+          config.concurrentSetting = "preserve";
+        } else {
+          delete config.providers[new URL(path, "http://localhost").searchParams.get("name")!];
+        }
+        writeFileSync(configPath, JSON.stringify(config));
+        return { ok: true };
+      },
+    };
+    expect((await importSwitcherAccountsForCurrentRuntime(["online"], source, deps)).importedCount).toBe(1);
+    expect(scanSwitcherAccounts(source).accounts[0].deletable).toBe(true);
+    expect((await importSwitcherAccountsForCurrentRuntime(["online"], source, deps)).skippedCount).toBe(1);
+    expect((await deleteSwitcherAccountForCurrentRuntime("online", source, deps)).deleted).toBe(true);
+    expect(calls.length).toBe(2);
+    expect(calls[0]).toBe("POST /api/providers");
+    expect(calls[1]).toStartWith("DELETE /api/providers?name=");
+    expect(JSON.parse(readFileSync(configPath, "utf8")).concurrentSetting).toBe("preserve");
+    expect(JSON.parse(readFileSync(join(root, "switcher-provider-sources.json"), "utf8"))).toEqual({});
+    expect(JSON.parse(readFileSync(source, "utf8")).accounts.length).toBe(1);
+  });
   test("startup cleanup removes only terminal pool accounts in the target home", async () => {
     const root = temporaryRoot();
     process.env.OPENCODEX_HOME = root;

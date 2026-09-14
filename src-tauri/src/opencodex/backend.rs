@@ -2039,12 +2039,6 @@ impl Backend {
         validate_switcher_import_request(&request)?;
         self.begin_mutation()?;
         let result = (|| {
-            if self.open_codex_service_running() {
-                return Err(
-                    "导入账号前请先停止 OpenCodex 服务，避免运行中的 Engine 覆盖账号配置"
-                        .to_string(),
-                );
-            }
             let input = serde_json::to_vec(&request)
                 .map_err(|error| format!("无法生成导入请求：{error}"))?;
             self.run_switcher_helper::<SwitcherImportResult>("import", Some(&input))

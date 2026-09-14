@@ -125,9 +125,8 @@ import {
   type CodexSwitcherSettings,
 } from "./services/codex";
 import {
-  bindOpenCodexSwitcherAccounts,
+  importOpenCodexSwitcherAccounts,
   deleteOpenCodexSwitcherAccount,
-  getOpenCodexSnapshot,
   scanOpenCodexSwitcherAccounts,
 } from "./opencodex/service";
 import {
@@ -2806,11 +2805,6 @@ async function confirmBindSelectedToOpenCodex(): Promise<void> {
     return;
   }
   try {
-    const snapshot = await getOpenCodexSnapshot();
-    if (!snapshot.running) {
-      Message.warning(t("请先启动 OpenCodex 服务，再绑定账号"));
-      return;
-    }
     const scan = await scanOpenCodexSwitcherAccounts();
     const selectedIds = new Set(selectedAccountIdList.value);
     const eligible = scan.accounts.filter(
@@ -2825,11 +2819,11 @@ async function confirmBindSelectedToOpenCodex(): Promise<void> {
       title: t("绑定到 OpenCodex"),
       content: skippedCount
         ? formatTranslatedText(
-            "将绑定 {eligible} 个账号到 OpenCodex；另有 {skipped} 个账号已绑定或不受支持。绑定期间 OpenCodex 会短暂重启，是否继续？",
+            "将绑定 {eligible} 个账号到 OpenCodex；另有 {skipped} 个账号已绑定或不受支持。API Key 支持在线绑定，OAuth 账号需手动停止服务后导入。是否继续？",
             { eligible: eligible.length, skipped: skippedCount },
           )
         : formatTranslatedText(
-            "将绑定 {count} 个账号到 OpenCodex。绑定期间 OpenCodex 会短暂重启，是否继续？",
+            "将绑定 {count} 个账号到 OpenCodex。API Key 支持在线绑定，OAuth 账号需手动停止服务后导入。是否继续？",
             { count: eligible.length },
           ),
       okText: t("确认绑定"),
@@ -2837,11 +2831,14 @@ async function confirmBindSelectedToOpenCodex(): Promise<void> {
       hideCancel: false,
       async onOk() {
         try {
-          const result = await bindOpenCodexSwitcherAccounts(
+          const result = await importOpenCodexSwitcherAccounts(
             eligible.map((account) => account.sourceId),
           );
           await refreshOpenCodexAccountIds();
-          Message.success(
+          if (result.skipped.length) {
+            Message.warning([...new Set(result.skipped.map(item => item.reason))].join("；"));
+          }
+          if (result.importedCount > 0) Message.success(
             formatTranslatedText("已绑定 {count} 个账号到 OpenCodex", {
               count: result.importedCount,
             }),

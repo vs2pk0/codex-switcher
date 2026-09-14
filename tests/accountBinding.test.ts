@@ -24,9 +24,19 @@ test("账号工具栏通过统一绑定入口提供两个目标", () => {
   assert.match(toolbarSource, /t\("绑定到 OpenCodex"\)/);
 });
 
-test("两个绑定目标都在写入前检查服务运行状态", () => {
+test("账号界面使用在线导入入口，不因服务运行禁用删除", () => {
+  const panel = readFileSync(new URL("../src/opencodex/OpenCodexPanel.vue", import.meta.url), "utf8");
+  assert.doesNotMatch(panel, /bindOpenCodexSwitcherAccounts/);
+  assert.doesNotMatch(appSource, /bindOpenCodexSwitcherAccounts/);
+  assert.match(panel, /await importOpenCodexSwitcherAccounts/);
+  assert.doesNotMatch(panel, /selectedDeleteAccounts\.length \|\| snapshot\?\.running/);
+  const handler = openCodexBackendSource.split("pub fn import_codex_switcher_accounts")[1].split("pub fn bind_codex_switcher_accounts")[0];
+  assert.doesNotMatch(handler, /open_codex_service_running|stop_for_account_binding/);
+});
+
+test("API 服务绑定检查运行状态，OpenCodex 导入支持停止和运行状态", () => {
   assert.match(appSource, /!serviceState\.service\.running/);
-  assert.match(appSource, /!snapshot\.running/);
+  assert.doesNotMatch(appSource, /请先启动 OpenCodex 服务，再绑定账号/);
   const apiPanelBindHandler = apiServicePanelSource.slice(
     apiServicePanelSource.indexOf("async function openBindAccounts"),
     apiServicePanelSource.indexOf("async function bindSelectedAccounts"),

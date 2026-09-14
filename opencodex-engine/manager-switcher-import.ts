@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { importEngineModule } from "./manager-engine-package.ts";
@@ -182,6 +182,29 @@ function readSwitcherStore(sourcePath: string): SwitcherStore {
   };
 }
 
+function providerSourcesFor(config: OcxConfig, configDir: string): Record<string, unknown> {
+  const sources = { ...(config.codexSwitcherProviderSources ?? {}) } as Record<string, unknown>;
+  // Online writes keep provenance outside the Engine's cached configuration.
+  for (const [id, entry] of Object.entries(readJsonObject(join(configDir, "switcher-provider-sources.json")))) {
+    const source = entry as { fingerprint?: string } | null;
+    if (source && config.providers?.[id] && source.fingerprint === providerFingerprint(config.providers[id])) sources[id] = entry;
+  }
+  return sources;
+}
+
+function updateProviderSource(
+  targetId: string,
+  source: { sourceId: string; fingerprint: string } | undefined,
+): void {
+  const path = join(getConfigDir(), "switcher-provider-sources.json");
+  const sources = readJsonObject(path);
+  if (source) sources[targetId] = source;
+  else delete sources[targetId];
+  const temporary = `${path}.${process.pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify(sources), { mode: 0o600 });
+  renameSync(temporary, path);
+}
+
 function existingStateFromRaw(configDir: string): ExistingState {
   const config = readJsonObject(join(configDir, "config.json"));
   const credentials = readJsonObject(join(configDir, "codex-accounts.json"));
@@ -225,7 +248,7 @@ function existingStateFromRaw(configDir: string): ExistingState {
     && [...accountIds].filter(id => id.startsWith("switcher-")).length >= 2;
   return {
     providers: (config.providers ?? {}) as Record<string, unknown>,
-    providerSources: (config.codexSwitcherProviderSources ?? {}) as Record<string, unknown>,
+    providerSources: providerSourcesFor(config as OcxConfig, configDir),
     accountIds,
     accountIdentityByTargetId,
     switcherSourceByTargetId,
@@ -260,7 +283,7 @@ function existingStateFromConfig(config: OcxConfig): ExistingState {
       .filter(id => id.startsWith("switcher-")).length >= 2;
   return {
     providers: (config.providers ?? {}) as Record<string, unknown>,
-    providerSources: (config.codexSwitcherProviderSources ?? {}) as Record<string, unknown>,
+    providerSources: providerSourcesFor(config, getConfigDir()),
     accountIds: new Set([
       ...configuredAccountIds,
       ...Object.keys(credentials),
@@ -598,7 +621,18 @@ export async function deleteSwitcherAccountForCurrentRuntime(
   const store = readSwitcherStore(sourcePath);
   const sourceAccount = store.accounts.find(account => text(account.id) === sourceId);
   if (sourceAccount && text(sourceAccount.openai_api_key)) {
-    if (await (deps.findLiveProxy ?? findLiveProxy)()) throw new Error("删除提供方前请先停止 OpenCodex 服务");
+    if (await (deps.findLiveProxy ?? findLiveProxy)()) {
+      const config = loadConfig();
+      const { summary } = inspectAccount(sourceAccount, undefined, existingStateFromConfig(config), new Set());
+      if (!summary.deletable) throw new Error("提供方来源不匹配，已阻止删除");
+      const rest = structuredClone(config);
+      delete rest.providers?.[summary.targetAccountId];
+      delete rest.codexSwitcherProviderSources?.[summary.targetAccountId];
+      if (JSON.stringify(rest).includes(summary.targetAccountId)) throw new Error("提供方仍被配置引用，请先在 OpenCodex 中解除引用");
+      await (deps.runtimeRequest ?? runtimeRequest)(`/api/providers?name=${encodeURIComponent(summary.targetAccountId)}`, { method: "DELETE" });
+      withConfigMutationLockSync(() => updateProviderSource(summary.targetAccountId, undefined));
+      return { sourceId, targetAccountId: summary.targetAccountId, deleted: true, message: "已在线删除提供方，Switcher 原账号仍保留" };
+    }
     return withConfigMutationLockSync(() => {
       const config = loadConfig();
       const { summary } = inspectAccount(sourceAccount, undefined, existingStateFromConfig(config), new Set());
@@ -610,6 +644,7 @@ export async function deleteSwitcherAccountForCurrentRuntime(
       delete rest.codexSwitcherProviderSources?.[id];
       if (JSON.stringify(rest).includes(id)) throw new Error("提供方仍被配置引用，请先在 OpenCodex 中解除引用");
       saveConfigPreservingClaudeCode(rest);
+      updateProviderSource(id, undefined);
       return { sourceId, targetAccountId: id, deleted: true, message: "已删除提供方，Switcher 原账号仍保留" };
     });
   }
@@ -650,6 +685,46 @@ async function readStdin(): Promise<string> {
   return await new Response(Bun.stdin.stream()).text();
 }
 
+export async function importSwitcherAccountsForCurrentRuntime(sourceIds: unknown, sourcePath = defaultSourcePath(), deps: SwitcherDeleteRuntimeDeps = {}): Promise<SwitcherImportResult> {
+  const selected = validateSelection(sourceIds);
+  if (!await (deps.findLiveProxy ?? findLiveProxy)()) return importSwitcherAccounts(selected, sourcePath);
+  const store = readSwitcherStore(sourcePath);
+  const result: SwitcherImportResult = { importedCount: 0, skippedCount: 0, imported: [], skipped: [] };
+  for (const sourceId of selected) {
+    const row = inspectStore(store, existingStateFromConfig(loadConfig())).find(item => item.summary.sourceId === sourceId);
+    if (!row?.material?.provider) {
+      result.skipped.push({ sourceId, reason: row?.material ? "当前 Engine 不支持 OAuth 在线导入，请手动停止服务后导入" : row?.summary.reason ?? "源文件中不存在此账号" });
+      continue;
+    }
+    const material = row.material;
+    try {
+      await (deps.runtimeRequest ?? runtimeRequest)("/api/providers", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: material.targetAccountId, provider: material.provider, setDefault: false }) });
+      try {
+        withConfigMutationLockSync(() => {
+        const saved = loadConfig().providers?.[material.targetAccountId];
+        if (!saved) throw new Error("提供方写入后未能确认，保留服务状态");
+          updateProviderSource(material.targetAccountId, { sourceId, fingerprint: providerFingerprint(saved) });
+        });
+      } catch {
+        // Do not leave a successfully-created provider that Switcher cannot safely identify later.
+        try {
+          await (deps.runtimeRequest ?? runtimeRequest)(
+            `/api/providers?name=${encodeURIComponent(material.targetAccountId)}`,
+            { method: "DELETE" },
+          );
+        } catch { /* surface the original import failure without exposing credentials */ }
+        throw new Error("提供方来源记录未保存，已撤销在线绑定");
+      }
+      result.imported.push({ ...row.summary, eligible: false, deletable: true, status: "already_imported", reason: "API Key 已在线绑定到提供方" });
+    } catch {
+      result.skipped.push({ sourceId, reason: "在线绑定失败或来源记录未保存，请刷新并在 OpenCodex 提供方页面核对" });
+    }
+  }
+  result.importedCount = result.imported.length;
+  result.skippedCount = result.skipped.length;
+  return result;
+}
+
 export async function cleanupExpiredPoolAccounts(): Promise<{ removedCount: number }> {
   if (await findLiveProxy()) throw new Error("清理失效账号前必须停止目标 Engine");
   return withConfigMutationLockSync(() => {
@@ -680,7 +755,7 @@ async function main() {
   }
   if (command === "import") {
     const input = JSON.parse(await readStdin()) as { sourceIds?: unknown };
-    console.log(JSON.stringify(importSwitcherAccounts(input.sourceIds)));
+    console.log(JSON.stringify(await importSwitcherAccountsForCurrentRuntime(input.sourceIds)));
     return;
   }
   if (command === "delete") {
