@@ -21,12 +21,14 @@ const loading = ref(false);
 const workingId = ref("");
 const editorVisible = ref(false);
 const saving = ref(false);
+const isWindows = navigator.userAgent.includes("Windows");
+const fallbackAppPath = isWindows ? "" : "/Applications/ChatGPT.app";
 const form = reactive({
   id: "",
   name: "",
   codexHome: "",
   electronData: "",
-  appPath: "/Applications/ChatGPT.app",
+  appPath: fallbackAppPath,
   workspace: "",
 });
 
@@ -48,7 +50,7 @@ async function refresh(): Promise<void> {
 
 function createInstance(): void {
   const defaultAppPath = instances.value.find((instance) => instance.isDefault)?.appPath
-    || "/Applications/ChatGPT.app";
+    || fallbackAppPath;
   Object.assign(form, {
     id: "",
     name: formatTranslatedText("多开实例 {count}", { count: Math.max(1, instances.value.length) }),
@@ -78,7 +80,13 @@ async function chooseDirectory(field: "codexHome" | "electronData" | "workspace"
 }
 
 async function chooseApp(): Promise<void> {
-  const selected = await open({ directory: false, multiple: false, filters: [{ name: "macOS App", extensions: ["app"] }] });
+  const selected = await open({
+    directory: false,
+    multiple: false,
+    filters: [isWindows
+      ? { name: "Windows App", extensions: ["exe"] }
+      : { name: "macOS App", extensions: ["app"] }],
+  });
   if (typeof selected === "string") form.appPath = selected;
 }
 
@@ -90,7 +98,7 @@ async function save(): Promise<void> {
       name: form.name,
       codexHome: form.codexHome || null,
       electronData: form.electronData || null,
-      appPath: form.appPath,
+      appPath: form.appPath || null,
       workspace: form.workspace || null,
     });
     editorVisible.value = false;

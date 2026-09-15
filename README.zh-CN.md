@@ -34,7 +34,7 @@ Codex Switcher 将多个 Codex 登录配置集中在一个桌面应用中。它�
 - **OAuth 与 API Key 账号**：添加、编辑、导入、导出、筛选、排序、刷新和切换多个账号。
 - **额度监控与重置**：查看可用状态、订阅有效期、额度窗口、GPT 5.3 Codex Spark 额度、重置记录和预约重置。
 - **会话管理与修复**：搜索项目和消息内容，预览 Markdown 与附件，删除单条消息或完整轮次，备份、恢复、修复可见性并恢复被截断的会话。
-- **Codex 桌面多开（macOS）**：为官方桌面 App 隔离 `CODEX_HOME` 和 Electron 数据，并将账号切换、会话、设置及 OpenCodex 操作定向到所选实例。
+- **Codex 桌面多开（macOS / Windows）**：为官方桌面 App 隔离 `CODEX_HOME` 和 Electron 数据，并将账号切换、会话、设置及 OpenCodex 操作定向到所选实例。
 - **OpenCodex Manager**：初始化和控制代理、管理 Engine 版本、打开 Web Dashboard、同步模型、配置图片输入兼容、导入 Switcher 账号、查看日志并恢复原生 Codex。
 - **使用统计**：汇总本地 Token、缓存、模型和来源分布、预估费用，并支持自定义模型计价规则。
 - **CLIProxyAPI 集成**：安装、更新、运行、配置和管理内置 CPA API 服务版本，并绑定选中的账号。
@@ -90,11 +90,13 @@ sudo xattr -rd com.apple.quarantine "/Applications/Codex Switcher.app"
 3. 选择账号并切换，Codex Switcher 会更新本机 Codex 的认证和配置文件。
 4. 通过“会话管理”“使用统计”或“API 服务”进行会话恢复、统计分析和 CLIProxyAPI 管理。
 
-### macOS 多开 Codex 桌面实例
+### macOS / Windows 多开 Codex 桌面实例
 
 进入“Codex 多开”菜单并新建实例，可设置 Codex Home、桌面数据目录、启动工作区和官方 App；数据路径留空时会自动生成在 `~/.codex_switcher/instances` 下。启动前会检查当前官方 App 是否支持独立桌面数据目录。永久删除多开实例时，应用会先停止该实例，再删除它的 Codex Home、Electron 桌面数据、托管目录、会话回收站、配置备份及可确认归属的手动会话备份；工作区、官方 App、系统默认实例和其他实例不会被删除。删除前会校验目录边界，拒绝清理共享目录或相互重叠的数据路径。
 
 存在多个实例时，在账号列表执行切换与重启，以及在 OpenCodex 执行同步或恢复，都会先选择目标实例。会话管理可按实例切换查看与操作，复制会话时也能选择另一个目标实例并生成独立副本。设置页同样可以切换当前实例，查看和编辑该实例的 Codex 路径、`auth.json` 与 `config.toml`。
+
+Windows 会自动查找商店或常见安装目录中的官方桌面程序，也可手动选择安装目录内的 `ChatGPT.exe` 或 `Codex.exe`（不是 CLI 程序）。每个实例独立设置启动环境和桌面数据目录，停止或重启只针对该实例的进程树。商店升级导致旧路径失效时会重新查找安装位置；启动前会检查客户端是否支持数据目录隔离。
 
 默认完整备份只包含官方默认实例的会话，并明确排除所有受管理的多开实例数据。多开实例只能在“会话管理”中切换到对应实例后手动备份。
 

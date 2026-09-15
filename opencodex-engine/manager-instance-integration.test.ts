@@ -82,7 +82,9 @@ test("已下载 Engine 在隔离实例中同步非空目录并可恢复", async 
       env:{...process.env,OPENCODEX_HOME:home === defaultTarget ? source : join(home,".switcher-opencodex"),OPENCODEX_MANAGER_SOURCE_HOME:source,CODEX_HOME:home,OPENCODEX_PACKAGE_ROOT:realEngine,OPENCODEX_MANAGER_DEFAULT_INSTANCE:home === defaultTarget ? "1" : "0"},
       stdout:"pipe",stderr:"pipe",
     });
-    const timeout = setTimeout(() => child.kill(), 20000);
+    // Windows Engine actions launch PowerShell for identity and ACL checks.
+    // Allow their cold-start cost while keeping each child bounded.
+    const timeout = setTimeout(() => child.kill(), process.platform === "win32" ? 60000 : 20000);
     try {
       const [out,err,code] = await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);
       expect({code,detail:code === 0 ? "" : out+err}).toEqual({code:0,detail:""});
@@ -112,7 +114,7 @@ test("已下载 Engine 在隔离实例中同步非空目录并可恢复", async 
   expect(readFileSync(join(defaultTarget,"config.toml"),"utf8")).toBe(defaultConfig);
   expect(readFileSync(join(other,"config.toml"),"utf8")).toBe(otherConfig);
   expect(readFileSync(join(source,"config.json"),"utf8")).toBe(sharedConfig);
-}, 45000);
+}, process.platform === "win32" ? 180000 : 45000);
 
 test("认证兼容只补缺失账号 ID，保留令牌和备份，拒绝冲突或链接", async () => {
   const root = mkdtempSync(join(tmpdir(),"opencodex-auth-repair-"));

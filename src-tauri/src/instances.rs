@@ -14,6 +14,11 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows::discover as windows_desktop_executable;
+
 pub const DEFAULT_INSTANCE_ID: &str = "default";
 const INSTANCES_FILE: &str = "codex-instances.json";
 const OPENCODEX_SECTION_MARKER: &str = "# Auto-injected by opencodex";
@@ -116,7 +121,7 @@ fn default_app_path() -> PathBuf {
     }
     #[cfg(target_os = "windows")]
     {
-        PathBuf::from("Codex.exe")
+        windows_desktop_executable().unwrap_or_else(|| PathBuf::from("Codex.exe"))
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
@@ -138,11 +143,11 @@ fn default_instance() -> StoredCodexInstance {
 }
 
 fn managed_instances_supported() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", target_os = "windows"))
 }
 
 fn managed_instances_unavailable_error() -> String {
-    "Codex 多开目前仅支持 macOS，其他平台暂不开放此功能".to_string()
+    "Codex 多开目前仅支持 macOS 和 Windows".to_string()
 }
 
 fn read_stored_instances() -> Result<Vec<StoredCodexInstance>, String> {
@@ -274,8 +279,13 @@ fn normalize_input(input: SaveCodexInstanceInput) -> Result<StoredCodexInstance,
             .or_else(|| Some(default_app_path().to_string_lossy().to_string())),
         "官方 App 路径",
     )?;
+    #[cfg(windows)]
+    let app_path = windows::executable(&app_path)?
+        .to_string_lossy()
+        .to_string();
     let app = PathBuf::from(&app_path);
-    if !app.is_absolute() || !app.is_dir() {
+    if !app.is_absolute() || (cfg!(windows) && !app.is_file()) || (!cfg!(windows) && !app.is_dir())
+    {
         return Err(format!("官方 App 路径无效：{}", app.display()));
     }
     let app_path = fs::canonicalize(app)
@@ -334,7 +344,12 @@ fn normalize_stored_path(path: &Path, label: &str) -> Result<PathBuf, String> {
 }
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
-    left == right || left.starts_with(right) || right.starts_with(left)
+    #[cfg(windows)]
+    let (left, right) = (
+        PathBuf::from(windows::application_path(&left.to_string_lossy()).to_lowercase()),
+        PathBuf::from(windows::application_path(&right.to_string_lossy()).to_lowercase()),
+    );
+    left == right || left.starts_with(&right) || right.starts_with(&left)
 }
 
 fn normal_component_count(path: &Path) -> usize {
@@ -404,7 +419,22 @@ fn validate_owned_data_target(
             let Some(protected) = protected else {
                 continue;
             };
-            let protected = normalize_stored_path(Path::new(protected), label)?;
+            let protected = Path::new(protected);
+            // With no detected installation, the default's placeholder is not
+            // a filesystem location. A manually selected desktop is still valid.
+            if owner.id == DEFAULT_INSTANCE_ID && label == "官方 App" && !protected.is_absolute()
+            {
+                continue;
+            }
+            #[cfg(windows)]
+            let protected = if label == "官方 App" {
+                protected
+                    .parent()
+                    .ok_or_else(|| "官方 App 目录无效".to_string())?
+            } else {
+                protected
+            };
+            let protected = normalize_stored_path(protected, label)?;
             if paths_overlap(target, &protected) {
                 return Err(format!(
                     "实例数据目录不能与实例“{}”的{label}重叠：{}",
@@ -693,20 +723,30 @@ fn app_executable(instance: &StoredCodexInstance) -> Result<PathBuf, String> {
             .find(|path| path.is_file());
         candidate.ok_or_else(|| format!("App 缺少可执行文件：{}", macos.display()))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        windows::executable(&instance.app_path)
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         Ok(PathBuf::from(&instance.app_path))
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn ensure_isolated_desktop_data_supported(app_path: &str) -> Result<(), String> {
     const MARKER: &[u8] = b"CODEX_ELECTRON_USER_DATA_PATH";
     const CHUNK_SIZE: usize = 1024 * 1024;
+    #[cfg(target_os = "macos")]
     let asar_path = PathBuf::from(app_path)
         .join("Contents")
         .join("Resources")
         .join("app.asar");
+    #[cfg(windows)]
+    let asar_path = Path::new(app_path)
+        .parent()
+        .ok_or_else(|| "官方 App 路径无效".to_string())?
+        .join("resources/app.asar");
     let mut file = File::open(&asar_path).map_err(|error| {
         format!(
             "无法检查官方 App 的多开兼容性（{}）：{error}",
@@ -738,7 +778,7 @@ fn ensure_isolated_desktop_data_supported(app_path: &str) -> Result<(), String> 
     Err("当前官方 App 未检测到独立桌面数据目录能力，暂时不能安全多开".to_string())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn ensure_isolated_desktop_data_supported(_app_path: &str) -> Result<(), String> {
     Ok(())
 }
@@ -760,38 +800,27 @@ fn process_rows() -> Vec<(u32, String)> {
         .collect()
 }
 
-#[cfg(any(windows, test))]
-fn parse_windows_tasklist_codex_pids(output: &str) -> Vec<u32> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.trim().trim_matches('"').split("\",\"");
-            let image_name = fields.next()?;
-            let pid = fields.next()?;
-            image_name
-                .eq_ignore_ascii_case("Codex.exe")
-                .then(|| pid.parse::<u32>().ok())
-                .flatten()
-        })
-        .collect()
-}
-
-#[cfg(windows)]
-fn windows_default_codex_pids() -> Vec<u32> {
-    let mut command = Command::new("tasklist");
-    command.args(["/FI", "IMAGENAME eq Codex.exe", "/FO", "CSV", "/NH"]);
-    hide_command_window(&mut command);
-    let Ok(output) = command.output() else {
-        return Vec::new();
-    };
-    parse_windows_tasklist_codex_pids(&String::from_utf8_lossy(&output.stdout))
-}
-
 fn launch_user_data_arg(instance: &StoredCodexInstance) -> Option<String> {
-    (instance.id != DEFAULT_INSTANCE_ID)
-        .then(|| format!("--user-data-dir={}", instance.electron_data))
+    (instance.id != DEFAULT_INSTANCE_ID).then(|| {
+        format!(
+            "--user-data-dir={}",
+            application_path(&instance.electron_data)
+        )
+    })
 }
 
+fn application_path(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        windows::application_path(path)
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string()
+    }
+}
+
+#[cfg(any(not(windows), test))]
 fn process_matches_instance(
     instance: &StoredCodexInstance,
     executable: &str,
@@ -811,10 +840,7 @@ fn process_matches_instance(
 fn live_pid(instance: &StoredCodexInstance) -> Option<u32> {
     #[cfg(windows)]
     {
-        if instance.id != DEFAULT_INSTANCE_ID {
-            return None;
-        }
-        windows_default_codex_pids().into_iter().next()
+        windows::live_pid(instance).ok().flatten()
     }
     #[cfg(not(windows))]
     {
@@ -825,8 +851,28 @@ fn live_pid(instance: &StoredCodexInstance) -> Option<u32> {
     }
 }
 
+fn checked_live_pid(instance: &StoredCodexInstance) -> Result<Option<u32>, String> {
+    #[cfg(windows)]
+    {
+        windows::live_pid(instance)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(live_pid(instance))
+    }
+}
+
 fn public_instance(instance: StoredCodexInstance) -> CodexInstance {
     let pid = live_pid(&instance);
+    public_instance_with_pid(instance, pid)
+}
+
+fn checked_public_instance(instance: StoredCodexInstance) -> Result<CodexInstance, String> {
+    let pid = checked_live_pid(&instance)?;
+    Ok(public_instance_with_pid(instance, pid))
+}
+
+fn public_instance_with_pid(instance: StoredCodexInstance, pid: Option<u32>) -> CodexInstance {
     let open_codex_connected = codex_home_has_opencodex_routing(Path::new(&instance.codex_home));
     let api_service_connected =
         crate::api_service::codex_home_has_api_service_routing(Path::new(&instance.codex_home));
@@ -959,11 +1005,20 @@ pub(crate) fn resolve_usage_instance_locations(
 
 #[tauri::command]
 pub fn list_codex_instances() -> Result<Vec<CodexInstance>, String> {
-    let mut result = vec![public_instance(default_instance())];
-    if managed_instances_supported() {
-        result.extend(read_stored_instances()?.into_iter().map(public_instance));
+    #[cfg(windows)]
+    {
+        let mut instances = vec![default_instance()];
+        instances.extend(read_stored_instances()?);
+        windows::list(instances)
     }
-    Ok(result)
+    #[cfg(not(windows))]
+    {
+        let mut result = vec![public_instance(default_instance())];
+        if managed_instances_supported() {
+            result.extend(read_stored_instances()?.into_iter().map(public_instance));
+        }
+        Ok(result)
+    }
 }
 
 #[tauri::command]
@@ -987,11 +1042,10 @@ pub fn save_codex_instance(input: SaveCodexInstanceInput) -> Result<CodexInstanc
         .as_deref()
         .and_then(|id| stored.iter().find(|item| item.id == id))
         .cloned();
-    if previous
-        .as_ref()
-        .is_some_and(|item| live_pid(item).is_some())
-    {
-        return Err("请先停止实例再修改配置".to_string());
+    if let Some(previous) = previous.as_ref() {
+        if checked_live_pid(previous)?.is_some() {
+            return Err("请先停止实例再修改配置".to_string());
+        }
     }
     let mut candidate = normalize_input(input)?;
     if let Some(previous) = previous.as_ref() {
@@ -1079,12 +1133,16 @@ fn launch_stored(instance: &StoredCodexInstance) -> Result<CodexInstance, String
     if instance.id != DEFAULT_INSTANCE_ID && !managed_instances_supported() {
         return Err(managed_instances_unavailable_error());
     }
-    if let Some(pid) = live_pid(instance) {
+    if let Some(pid) = checked_live_pid(instance)? {
         return Err(format!("实例已在运行（PID {pid}）"));
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
+        let executable = app_executable(instance)?;
         if instance.id != DEFAULT_INSTANCE_ID {
+            #[cfg(windows)]
+            ensure_isolated_desktop_data_supported(&executable.to_string_lossy())?;
+            #[cfg(not(windows))]
             ensure_isolated_desktop_data_supported(&instance.app_path)?;
         }
         fs::create_dir_all(&instance.codex_home)
@@ -1101,19 +1159,24 @@ fn launch_stored(instance: &StoredCodexInstance) -> Result<CodexInstance, String
         let stderr = stdout
             .try_clone()
             .map_err(|error| format!("复制实例日志句柄失败：{error}"))?;
-        let mut command = Command::new(app_executable(instance)?);
+        let mut command = Command::new(application_path(&executable.to_string_lossy()));
         if let Some(user_data_arg) = launch_user_data_arg(instance) {
             command.arg(user_data_arg);
         }
         command
-            .env("CODEX_HOME", &instance.codex_home)
-            .env("CODEX_ELECTRON_USER_DATA_PATH", &instance.electron_data)
+            .env("CODEX_HOME", application_path(&instance.codex_home))
+            .env(
+                "CODEX_ELECTRON_USER_DATA_PATH",
+                application_path(&instance.electron_data),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         if let Some(workspace) = instance.workspace.as_ref() {
-            command.arg(workspace);
+            command.arg(application_path(workspace));
         }
+        #[cfg(windows)]
+        hide_command_window(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| format!("启动 Codex 实例失败：{error}"))?;
@@ -1140,33 +1203,19 @@ fn launch_stored(instance: &StoredCodexInstance) -> Result<CodexInstance, String
         thread::spawn(move || {
             let _ = child.wait();
         });
-        resolve_instance(&instance.id)
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let mut command = Command::new("powershell");
-        command.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            crate::account::WINDOWS_CODEX_START_SCRIPT,
-        ]);
-        hide_command_window(&mut command);
-        let status = command
-            .status()
-            .map_err(|error| format!("启动 Codex 失败：{error}"))?;
-        if !status.success() {
-            return Err("启动 Codex 失败：未找到桌面应用，请确认已安装并可正常打开".to_string());
+        let launched = checked_public_instance(instance.clone())?;
+        if !launched.running {
+            return Err(format!(
+                "启动后未检测到目标实例，请检查日志：{}",
+                log_path.display()
+            ));
         }
-        thread::sleep(Duration::from_millis(500));
-        resolve_instance(DEFAULT_INSTANCE_ID)
+        Ok(launched)
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         let _ = instance;
-        Err("多开实例启动目前仅支持 macOS".to_string())
+        Err("多开实例启动目前仅支持 macOS 和 Windows".to_string())
     }
 }
 
@@ -1195,29 +1244,25 @@ fn stored_instance(instance_id: &str) -> Result<StoredCodexInstance, String> {
 fn stop_stored(instance: &StoredCodexInstance) -> Result<(), String> {
     #[cfg(windows)]
     {
-        if instance.id != DEFAULT_INSTANCE_ID {
+        let Some(pid) = checked_live_pid(instance)? else {
             return Ok(());
-        }
-        let pid = live_pid(instance);
+        };
         let mut command = Command::new("taskkill");
-        command.args(["/IM", "Codex.exe", "/T", "/F"]);
+        command.args(["/PID", &pid.to_string(), "/T", "/F"]);
         hide_command_window(&mut command);
         let status = command
             .status()
             .map_err(|error| format!("停止实例失败：{error}"))?;
-        if !status.success() && pid.is_some() && live_pid(instance).is_some() {
-            return Err(format!("停止 Codex 进程 PID {} 失败", pid.unwrap()));
+        if !status.success() && checked_live_pid(instance)?.is_some() {
+            return Err(format!("停止 Codex 进程 PID {pid} 失败"));
         }
         for _ in 0..30 {
-            if live_pid(instance).is_none() {
+            if checked_live_pid(instance)?.is_none() {
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(100));
         }
-        return Err(format!(
-            "Codex 进程 PID {} 未在超时时间内退出",
-            pid.unwrap_or_default()
-        ));
+        return Err(format!("Codex 进程 PID {} 未在超时时间内退出", pid));
     }
 
     #[cfg(not(windows))]
@@ -1277,7 +1322,7 @@ pub fn run_with_instance_restarted<T>(
         .lock()
         .map_err(|_| "Codex 实例操作锁已损坏".to_string())?;
     let stored = stored_instance(instance_id)?;
-    let public = public_instance(stored.clone());
+    let public = checked_public_instance(stored.clone())?;
     if public.running {
         stop_stored(&stored)?;
     }
@@ -1306,7 +1351,7 @@ pub fn run_with_instance_stopped<T>(
         .lock()
         .map_err(|_| "Codex 实例操作锁已损坏".to_string())?;
     let stored = stored_instance(instance_id)?;
-    let public = public_instance(stored.clone());
+    let public = checked_public_instance(stored.clone())?;
     let was_running = public.running;
     if was_running {
         stop_stored(&stored)?;
@@ -1324,7 +1369,7 @@ pub fn run_with_instance_restarted_if_running<T>(
         .lock()
         .map_err(|_| "Codex 实例操作锁已损坏".to_string())?;
     let stored = stored_instance(instance_id)?;
-    let public = public_instance(stored.clone());
+    let public = checked_public_instance(stored.clone())?;
     if !public.running {
         return action(&public);
     }
@@ -1352,7 +1397,7 @@ pub(crate) fn run_with_instance_opened_on_success<T>(
         .lock()
         .map_err(|_| "Codex 实例操作锁已损坏".to_string())?;
     let stored = stored_instance(instance_id)?;
-    let public = public_instance(stored.clone());
+    let public = checked_public_instance(stored.clone())?;
     if public.running {
         stop_stored(&stored)?;
     }
@@ -1786,18 +1831,8 @@ mod tests {
     fn capabilities_match_the_supported_platform() {
         assert_eq!(
             get_codex_instance_capabilities().managed_instances_supported,
-            cfg!(target_os = "macos")
+            cfg!(any(target_os = "macos", windows))
         );
-    }
-
-    #[test]
-    fn windows_tasklist_parser_only_returns_codex_processes() {
-        let output = concat!(
-            "\"Codex.exe\",\"1234\",\"Console\",\"1\",\"100,000 K\"\n",
-            "\"codex.EXE\",\"5678\",\"Console\",\"1\",\"80,000 K\"\n",
-            "\"Codex Switcher.exe\",\"9999\",\"Console\",\"1\",\"50,000 K\"\n",
-        );
-        assert_eq!(parse_windows_tasklist_codex_pids(output), vec![1234, 5678]);
     }
 
     #[test]
@@ -1847,7 +1882,10 @@ mod tests {
         assert_eq!(launch_user_data_arg(&default), None);
         assert_eq!(
             launch_user_data_arg(&managed),
-            Some(format!("--user-data-dir={}", managed.electron_data))
+            Some(format!(
+                "--user-data-dir={}",
+                application_path(&managed.electron_data)
+            ))
         );
     }
 
@@ -2018,5 +2056,36 @@ mod tests {
             delete_codex_instance(DEFAULT_INSTANCE_ID.to_string()).unwrap_err(),
             "系统默认实例不能删除"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_app_resources_cannot_be_used_as_instance_data() {
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("desktop");
+        let resources = app.join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        fs::write(app.join("ChatGPT.exe"), []).unwrap();
+        let mut instance = default_instance();
+        instance.id = "resource-protection-test".into();
+        instance.app_path = app.join("ChatGPT.exe").to_string_lossy().into();
+        instance.codex_home = resources.to_string_lossy().into();
+        instance.electron_data = root.path().join("profile").to_string_lossy().into();
+        let error = instance_deletion_roots(&instance, &[]).unwrap_err();
+        assert!(error.contains("官方 App"), "{error}");
+        assert!(resources.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_overlap_checks_ignore_case_and_extended_prefix() {
+        assert!(paths_overlap(
+            Path::new(r"\\?\C:\Users\Owner\Profile"),
+            Path::new(r"c:\users\OWNER\profile\sessions")
+        ));
+        assert!(!paths_overlap(
+            Path::new(r"C:\Users\Owner\Profile"),
+            Path::new(r"C:\Users\Owner\Profile-other")
+        ));
     }
 }
