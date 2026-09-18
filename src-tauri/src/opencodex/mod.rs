@@ -10,7 +10,7 @@ use models::{
     EngineInstallResult, EngineUpdateCatalog, ImageGenerationSettings, ImageGenerationUpdate,
     ImageGenerationUpdateResult, ImportSwitcherAccountsRequest, InstallEngineVersionRequest,
     RunActionRequest, SwitcherAccountScan, SwitcherDeleteResult, SwitcherImportResult,
-    SystemSnapshot, UpdateVisionModelsRequest, VisionModelCatalog, VisionModelsUpdateResult,
+    ConnectionApiKey, ConnectionInfo, SystemSnapshot, UpdateVisionModelsRequest, VisionModelCatalog, VisionModelsUpdateResult,
     VisionSidecarUpdate,
 };
 use std::sync::Arc;
@@ -35,6 +35,78 @@ pub async fn opencodex_transfer_data(
     })
     .await
     .map_err(|e| format!("数据传输任务失败：{e}"))?
+}
+
+#[tauri::command]
+pub async fn opencodex_get_connection_info(
+    backend: State<'_, Arc<OpenCodexBackend>>,
+    instance_id: Option<String>,
+) -> Result<ConnectionInfo, String> {
+    let backend = backend.inner().for_instance(instance_id.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || backend.connection_info(None))
+        .await
+        .map_err(|error| format!("读取连接信息任务失败：{error}"))?
+}
+
+#[tauri::command]
+pub async fn opencodex_update_connection_info(
+    backend: State<'_, Arc<OpenCodexBackend>>,
+    instance_id: Option<String>,
+    api_key: String,
+) -> Result<ConnectionInfo, String> {
+    let backend = backend.inner().for_instance(instance_id.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || backend.connection_info(Some(api_key)))
+        .await
+        .map_err(|error| format!("保存连接信息任务失败：{error}"))?
+}
+
+#[tauri::command]
+pub async fn opencodex_generate_api_key(
+    backend: State<'_, Arc<OpenCodexBackend>>,
+    instance_id: Option<String>,
+    name: Option<String>,
+) -> Result<ConnectionApiKey, String> {
+    let backend = backend.inner().for_instance(instance_id.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || backend.generate_api_key(name))
+        .await
+        .map_err(|error| format!("生成用户密钥任务失败：{error}"))?
+}
+
+#[tauri::command]
+pub async fn opencodex_update_api_key_name(
+    backend: State<'_, Arc<OpenCodexBackend>>,
+    instance_id: Option<String>,
+    key_id: String,
+    name: String,
+) -> Result<ConnectionInfo, String> {
+    let backend = backend.inner().for_instance(instance_id.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || backend.update_api_key_name(&key_id, &name))
+        .await
+        .map_err(|error| format!("编辑用户密钥任务失败：{error}"))?
+}
+
+#[tauri::command]
+pub async fn opencodex_rotate_api_key(
+    backend: State<'_, Arc<OpenCodexBackend>>,
+    instance_id: Option<String>,
+    key_id: String,
+) -> Result<ConnectionInfo, String> {
+    let backend = backend.inner().for_instance(instance_id.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || backend.rotate_api_key(&key_id))
+        .await
+        .map_err(|error| format!("重新生成用户密钥任务失败：{error}"))?
+}
+
+#[tauri::command]
+pub async fn opencodex_delete_api_key(
+    backend: State<'_, Arc<OpenCodexBackend>>,
+    instance_id: Option<String>,
+    key_id: String,
+) -> Result<ConnectionInfo, String> {
+    let backend = backend.inner().for_instance(instance_id.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || backend.delete_api_key(&key_id))
+        .await
+        .map_err(|error| format!("撤销用户密钥任务失败：{error}"))?
 }
 
 #[tauri::command]

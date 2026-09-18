@@ -6,7 +6,7 @@ use super::models::{
     ImageGenerationProviderOption, ImageGenerationRecentRequest, ImageGenerationSettings,
     ImageGenerationUpdate, ImageGenerationUpdateResult, ImportSwitcherAccountsRequest,
     InstallEngineVersionRequest, RunActionRequest, SwitcherAccountScan, SwitcherDeleteResult,
-    SwitcherImportResult, SystemSnapshot, UpdateVisionModelsRequest, VisionModel,
+    ConnectionApiKey, ConnectionInfo, SwitcherImportResult, SystemSnapshot, UpdateVisionModelsRequest, VisionModel,
     VisionModelCatalog, VisionModelsUpdateResult, VisionSidecarUpdate,
 };
 use chrono::Utc;
@@ -19,7 +19,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
+use rand::Rng;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -606,6 +607,16 @@ impl Backend {
         super::isolation::read_port(&self.home.join("runtime-port.json"))
     }
 
+    /// 当前 OpenCodex 服务可能占用的端口（默认 / 配置文件 / 运行时文件），供额度列表接口归属判断。
+    pub(crate) fn known_ports(&self) -> Vec<u16> {
+        let mut ports = vec![self.default_port];
+        ports.extend(self.read_configured_port());
+        ports.extend(self.read_runtime_port());
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+
     fn owned_health(&self, port: u16) -> Option<HealthBody> {
         let health = probe_health(port)?;
         let record: Value =
@@ -644,7 +655,7 @@ impl Backend {
                 continue;
             }
             let home = if other.is_default {
-                config_dir().ok_or("无法定位主实例")?
+                config_dir()
             } else {
                 crate::instances::default_profile_root(&other.id).join(".opencodex")
             };
@@ -678,18 +689,14 @@ impl Backend {
     }
 
     pub fn new(app: AppHandle) -> Result<Self, String> {
-        let root = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| format!("无法解析客户端数据目录：{error}"))?
-            .join("opencodex-manager");
+        let root = crate::switcher_data_dir().join("opencodex-manager");
         fs::create_dir_all(root.join("logs"))
             .map_err(|error| format!("无法创建日志目录：{error}"))?;
         Ok(Self {
             app,
             root,
             instance_id: "default".into(),
-            home: config_dir().ok_or("无法定位 OpenCodex 目录")?,
+            home: config_dir(),
             codex_home: crate::instances::codex_home_for(None)?,
             default_port: DEFAULT_PORT,
             children: Mutex::new(HashMap::new()),
@@ -755,11 +762,11 @@ impl Backend {
     fn persist_log(&self, stream: &str, line: &str) {
         let safe = self.redact(line);
         let record = format!("[{}] [{stream}] {safe}\n", Utc::now().to_rfc3339());
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.manager_log_path())
-        {
+        let path = self.manager_log_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
             let _ = file.write_all(record.as_bytes());
         }
     }
@@ -1006,6 +1013,12 @@ impl Backend {
         command
     }
 
+    /// 配置缺失时预写默认配置，使首次安装无需交互向导即可启动。
+    fn ensure_default_config(&self, port: u16) -> Result<(), String> {
+        write_default_config_if_missing(&self.home, port)?;
+        repair_public_auth_config(&self.home)
+    }
+
     pub fn snapshot(&self) -> SystemSnapshot {
         let configured_port = self.read_configured_port().unwrap_or(self.default_port);
         let runtime_port = self.read_runtime_port();
@@ -1029,6 +1042,9 @@ impl Backend {
             .map_or("missing", |item| item.source)
             .to_string();
         let installed = launcher.is_some();
+        if installed {
+            let _ = self.ensure_default_config(live_port);
+        }
         let configuration = Some(self.home.clone());
         let initialized = configuration.as_deref().is_some_and(config_is_initialized);
         let codex_integration_enabled = configuration
@@ -1332,6 +1348,107 @@ impl Backend {
             .map_err(|error| format!("无法读取 OpenCodex 配置：{error}"))?;
         serde_json::from_str(&config_text)
             .map_err(|error| format!("OpenCodex 配置格式无效：{error}"))
+    }
+
+    fn connection_info_from_config(&self, config: &Value) -> Result<ConnectionInfo, String> {
+        let object = config.as_object().ok_or("OpenCodex 配置格式无效")?;
+        let entries = object.get("apiKeys").and_then(Value::as_array).cloned().unwrap_or_default();
+        let user_keys = entries.iter().filter_map(|entry| {
+            Some(ConnectionApiKey {
+                id: entry.get("id")?.as_str()?.to_string(),
+                name: entry.get("name").and_then(Value::as_str).unwrap_or("未命名密钥").to_string(),
+                key: entry.get("key")?.as_str()?.to_string(),
+                created_at: entry.get("createdAt").and_then(Value::as_str).map(str::to_string),
+            })
+        }).collect::<Vec<_>>();
+        let key = user_keys.iter().find(|item| item.id == "codex-switcher-share")
+            .or_else(|| user_keys.first()).map(|item| item.key.clone())
+            .or_else(|| object.get("apiToken").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default();
+        let port = self.read_configured_port().unwrap_or(self.default_port);
+        let admin_api_token = fs::read_to_string(self.home.join("admin-api-token"))
+            .ok().map(|token| token.trim().to_string()).filter(|token| !token.is_empty());
+        Ok(ConnectionInfo { api_url: format!("http://{}:{port}/v1", share_ip_address()), local_api_url: format!("http://127.0.0.1:{port}/v1"), api_key: key, hostname: object.get("hostname").and_then(Value::as_str).unwrap_or("0.0.0.0").to_string(), port, admin_api_token, user_keys })
+    }
+
+    pub fn connection_info(&self, api_key: Option<String>) -> Result<ConnectionInfo, String> {
+        let mut config = self.read_open_codex_config().unwrap_or_else(|_| serde_json::json!({}));
+        let object = config.as_object_mut().ok_or("OpenCodex 配置格式无效")?;
+        let configured_key = object.get("apiKeys").and_then(Value::as_array).and_then(|entries| {
+            entries.iter().find(|entry| entry.get("id").and_then(Value::as_str) == Some("codex-switcher-share"))
+                .or_else(|| entries.first())
+                .and_then(|entry| entry.get("key").and_then(Value::as_str))
+                .map(str::to_string)
+        });
+        let key = api_key.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
+            .or(configured_key)
+            .or_else(|| object.get("apiToken").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_else(|| format!("ocx-{:016x}", rand::thread_rng().gen::<u64>()));
+        let api_keys = object
+            .entry("apiKeys")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let entries = api_keys.as_array_mut().ok_or("OpenCodex apiKeys 配置格式无效")?;
+        if let Some(entry) = entries.iter_mut().find(|entry| {
+            entry.get("id").and_then(Value::as_str) == Some("codex-switcher-share")
+        }) {
+            entry["key"] = Value::String(key.clone());
+        } else {
+            entries.push(serde_json::json!({
+                "id": "codex-switcher-share",
+                "name": "Codex Switcher 分享",
+                "key": key,
+                "createdAt": chrono::Utc::now().to_rfc3339(),
+            }));
+        }
+        object.insert("hostname".into(), Value::String("0.0.0.0".into()));
+        let text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+        fs::write(self.home.join("config.json"), text).map_err(|e| format!("保存连接配置失败：{e}"))?;
+        self.connection_info_from_config(&config)
+    }
+
+    pub fn generate_api_key(&self, name: Option<String>) -> Result<ConnectionApiKey, String> {
+        let mut config = self.read_open_codex_config().unwrap_or_else(|_| serde_json::json!({}));
+        let object = config.as_object_mut().ok_or("OpenCodex 配置格式无效")?;
+        let label = name.unwrap_or_default().trim().to_string();
+        if label.chars().count() > 64 { return Err("密钥名称不能超过 64 个字符".into()); }
+        let id = format!("codex-switcher-{}", rand::thread_rng().gen::<u64>());
+        let key = format!("ocx_data_{:040x}", (0..5).map(|_| rand::thread_rng().gen::<u64>()).fold(0u128, |acc, value| (acc << 16) ^ (value as u128 & 0xffff)));
+        let created_at = chrono::Utc::now().to_rfc3339();
+        object.entry("apiKeys").or_insert_with(|| Value::Array(Vec::new())).as_array_mut().ok_or("OpenCodex apiKeys 配置格式无效")?.push(serde_json::json!({"id": id, "name": if label.is_empty() { "用户密钥" } else { &label }, "key": key, "createdAt": created_at}));
+        fs::write(self.home.join("config.json"), serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?).map_err(|e| format!("保存用户密钥失败：{e}"))?;
+        Ok(ConnectionApiKey { id, name: if label.is_empty() { "用户密钥".into() } else { label }, key, created_at: Some(created_at) })
+    }
+
+    pub fn update_api_key_name(&self, key_id: &str, name: &str) -> Result<ConnectionInfo, String> {
+        let label = name.trim();
+        if label.is_empty() || label.chars().count() > 64 { return Err("密钥名称需为 1-64 个字符".into()); }
+        let mut config = self.read_open_codex_config()?;
+        let entries = config.get_mut("apiKeys").and_then(Value::as_array_mut).ok_or("未找到用户密钥")?;
+        let entry = entries.iter_mut().find(|item| item.get("id").and_then(Value::as_str) == Some(key_id)).ok_or("未找到用户密钥")?;
+        entry["name"] = Value::String(label.to_string());
+        fs::write(self.home.join("config.json"), serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?).map_err(|e| format!("保存用户密钥失败：{e}"))?;
+        self.connection_info_from_config(&config)
+    }
+
+    pub fn rotate_api_key(&self, key_id: &str) -> Result<ConnectionInfo, String> {
+        let mut config = self.read_open_codex_config()?;
+        let entries = config.get_mut("apiKeys").and_then(Value::as_array_mut).ok_or("未找到用户密钥")?;
+        let entry = entries.iter_mut().find(|item| item.get("id").and_then(Value::as_str) == Some(key_id)).ok_or("未找到用户密钥")?;
+        let replacement = format!("ocx_data_{:040x}", (0..5).map(|_| rand::thread_rng().gen::<u64>()).fold(0u128, |acc, value| (acc << 16) ^ (value as u128 & 0xffff)));
+        entry["key"] = Value::String(replacement);
+        fs::write(self.home.join("config.json"), serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?).map_err(|e| format!("保存用户密钥失败：{e}"))?;
+        self.connection_info_from_config(&config)
+    }
+
+    pub fn delete_api_key(&self, key_id: &str) -> Result<ConnectionInfo, String> {
+        if key_id == "codex-switcher-share" { return Err("默认分享密钥不能撤销，请先生成并切换新的分享密钥".into()); }
+        let mut config = self.read_open_codex_config()?;
+        let entries = config.get_mut("apiKeys").and_then(Value::as_array_mut).ok_or("未找到用户密钥")?;
+        let before = entries.len();
+        entries.retain(|item| item.get("id").and_then(Value::as_str) != Some(key_id));
+        if entries.len() == before { return Err("未找到用户密钥".into()); }
+        fs::write(self.home.join("config.json"), serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?).map_err(|e| format!("保存用户密钥失败：{e}"))?;
+        self.connection_info_from_config(&config)
     }
 
     /// 执行 `ocx config set/unset`，失败时返回脱敏后的错误。
@@ -1735,8 +1852,36 @@ impl Backend {
                             "预检通过，已停止实例，仅同步接口和模型配置…",
                         );
                         let message = self.run_instance_integration_helper(&action, port, home)?;
+                        // 配置同步后、实例重开前执行一键修复（切号修复 + 恢复全部完整会话）：
+                        // 修复只改会话文件并自动备份，不迁移账号；期间实例保持关闭。
+                        self.emit_log(
+                            &operation_id,
+                            "system",
+                            "配置已同步，开始一键修复会话（切号修复 + 恢复全部完整会话），实例暂不启动…",
+                        );
+                        let session_store = crate::session::SessionStore::new(home.to_path_buf());
+                        // 前端同步遮罩只监听 system 日志流，按下面这些标记行推进步骤。
+                        let mut report = |step: u8| {
+                            let text = match step {
+                                1 => "修复切号会话：Provider 模型前缀、线程模型与加密引用…",
+                                2 => "恢复全部会话的完整历史：分页历史、消息序号与本地索引…",
+                                _ => return,
+                            };
+                            self.emit_log(&operation_id, "system", text);
+                        };
+                        let outcome =
+                            crate::one_click_repair_session_store(&session_store, &mut report)
+                                .map_err(|error| {
+                                    format!("配置已同步，但一键修复会话失败：{error}")
+                                })?;
+                        let repair_message = crate::one_click_repair_message(&outcome);
+                        self.emit_log(
+                            &operation_id,
+                            "system",
+                            &format!("一键修复完成：{repair_message}，正在重新打开实例…"),
+                        );
                         Ok(format!(
-                            "{message}；已有账号与会话历史未迁移，正在重新打开实例"
+                            "{message}；一键修复完成（{repair_message}）；已有账号未迁移，正在重新打开实例"
                         ))
                     })
                 } else {
@@ -1747,8 +1892,12 @@ impl Backend {
         } else if matches!(action, CommandAction::Restart) {
             self.query_background_service_state().and_then(|state| {
                 self.stop_for_account_binding(&launcher, port)?;
-                self.restart_after_account_binding(&launcher, port, account_binding_restart_mode(&state))
-                    .map(|_| (Some(0), format!("服务已在端口 {port} 重启")))
+                self.restart_after_account_binding(
+                    &launcher,
+                    port,
+                    account_binding_restart_mode(&state),
+                )
+                .map(|_| (Some(0), format!("服务已在端口 {port} 重启")))
             })
         } else if matches!(action, CommandAction::Start) {
             if self.owned_health(port).is_some() {
@@ -1764,6 +1913,14 @@ impl Backend {
                 .map(|_| (Some(0), format!("服务已在端口 {port} 启动")))
             }
         } else {
+            if matches!(action, CommandAction::Sync) {
+                // 前端同步遮罩靠这行日志推进步骤；默认实例同步没有「重新打开实例」阶段。
+                self.emit_log(
+                    &operation_id,
+                    "system",
+                    "仅同步接口和模型配置，不重置账号与会话历史…",
+                );
+            }
             let args = action.argv(port);
             let preparation = if matches!(action, CommandAction::ServiceInstall) {
                 self.emit_log(
@@ -1899,6 +2056,11 @@ impl Backend {
     ) -> Result<HealthBody, String> {
         validate_port(port)?;
         self.validate_instance_port(port)?;
+        if let Err(error) = self.ensure_default_config(port) {
+            if let Some(id) = operation_id {
+                self.emit_log(id, "system", &format!("自动生成默认配置失败：{error}"));
+            }
+        }
         self.cleanup_expired_pool_accounts();
         let args = vec!["start".to_string(), "--port".to_string(), port.to_string()];
         if let Some(id) = operation_id {
@@ -2792,6 +2954,9 @@ impl Backend {
             .env("OPENCODEX_HOME", integration_home)
             .env("OPENCODEX_MANAGER_SOURCE_HOME", source_home)
             .env("OPENCODEX_MANAGER_DEFAULT_INSTANCE", "1")
+            // 桌面主进程退出后，app-server 仍可能继续持有旧模型缓存。
+            // 仅由已完成实例停机的管理流程显式授权 Engine 清理残留进程。
+            .env("OPENCODEX_MANAGER_STOP_APP_SERVERS", "1")
             .env("NO_COLOR", "1")
             .env("FORCE_COLOR", "0")
             .stdin(Stdio::null())
@@ -2831,9 +2996,14 @@ impl Backend {
         match self.run_switcher_helper::<serde_json::Value>("cleanup-expired", None) {
             Ok(result) => {
                 let count = result["removedCount"].as_u64().unwrap_or(0);
-                self.persist_log("system", &format!("启动前清理已确认失效的账号池账号：{count} 个，Switcher 原账号保留"));
+                self.persist_log(
+                    "system",
+                    &format!("启动前清理已确认失效的账号池账号：{count} 个，Switcher 原账号保留"),
+                );
             }
-            Err(error) => self.persist_log("stderr", &format!("失效账号清理未完成，继续启动：{error}")),
+            Err(error) => {
+                self.persist_log("stderr", &format!("失效账号清理未完成，继续启动：{error}"))
+            }
         }
     }
 
@@ -2902,6 +3072,35 @@ impl Backend {
         serde_json::from_slice(&output.stdout)
             .map_err(|error| format!("Switcher 转换器返回了无效结果：{error}"))
     }
+}
+
+fn share_ip_address() -> String {
+    let routed = UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| { socket.connect("8.8.8.8:80")?; socket.local_addr() })
+        .ok()
+        .map(|address| address.ip().to_string());
+    if let Some(ip) = routed.as_deref().filter(|ip| is_shareable_ipv4(ip)) {
+        return ip.to_string();
+    }
+    // VPN and virtualization adapters can win the default route (for example
+    // 198.18.0.1 on macOS). Prefer a private LAN address for the share dialog.
+    if let Ok(output) = Command::new("ifconfig").output() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        for token in text.split_whitespace().collect::<Vec<_>>().windows(2) {
+            if token[0] == "inet" && is_shareable_ipv4(token[1]) {
+                return token[1].to_string();
+            }
+        }
+    }
+    routed.unwrap_or_else(|| "127.0.0.1".into())
+}
+
+fn is_shareable_ipv4(value: &str) -> bool {
+    let Ok(address) = value.parse::<std::net::Ipv4Addr>() else { return false; };
+    let octets = address.octets();
+    (octets[0] == 10)
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 168)
 }
 
 fn build_engine_update_catalog(
@@ -2990,6 +3189,9 @@ fn read_last_log_lines(path: &Path, limit: usize, max_bytes: u64) -> std::io::Re
 }
 
 fn append_file(path: PathBuf) -> Result<File, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建 Engine 日志目录：{error}"))?;
+    }
     OpenOptions::new()
         .create(true)
         .append(true)
@@ -3112,14 +3314,10 @@ fn managed_versions_to_remove(
         .collect()
 }
 
-fn config_dir() -> Option<PathBuf> {
-    if let Some(raw) = std::env::var_os("OPENCODEX_HOME") {
-        let path = PathBuf::from(raw);
-        if path.is_absolute() {
-            return Some(path);
-        }
-    }
-    dirs::home_dir().map(|home| home.join(".opencodex"))
+fn config_dir() -> PathBuf {
+    // The managed default instance belongs to Switcher, not a standalone
+    // OpenCodex installation or an inherited OPENCODEX_HOME override.
+    crate::switcher_data_dir().join(".opencodex")
 }
 
 fn configured_sidecar_models(config: &Value) -> HashMap<String, HashSet<String>> {
@@ -3393,6 +3591,103 @@ fn config_is_initialized(directory: &Path) -> bool {
         .is_some_and(|providers| providers.contains_key(default_provider))
 }
 
+/// 配置缺失时预写 Engine 工厂默认配置（镜像 Engine `getDefaultConfig()` 与 `ocx init`
+/// 的落盘结构），让首次安装的实例无需回答交互向导即可直接启动。返回是否真正创建。
+fn write_default_config_if_missing(home: &Path, port: u16) -> Result<bool, String> {
+    let path = home.join("config.json");
+    if path.exists() {
+        return Ok(false);
+    }
+    fs::create_dir_all(home).map_err(|error| format!("无法创建实例数据目录：{error}"))?;
+    if path.exists() {
+        return Ok(false);
+    }
+    let config = serde_json::json!({
+        "port": port,
+        "emptyCompletionRetry": false,
+        "dropCodexSafetyBuffering": false,
+        "fastRows": true,
+        // 标记为当前三层 OpenAI 形态，避免 Engine 启动迁移把新配置误判为旧配置。
+        "openaiProviderTierVersion": 2,
+        "providers": {
+            "openai": {
+                "adapter": "openai-responses",
+                "baseUrl": "https://chatgpt.com/backend-api/codex",
+                "authMode": "forward",
+                "codexAccountMode": "pool"
+            }
+        },
+        "defaultProvider": "openai",
+        "multiAgentMode": "v1",
+        "multiAgentSurfaceAdvisoryVersion": 1,
+        "multiAgentGuidanceEnabled": true,
+        "websockets": false,
+        "codexAutoStart": true,
+        "codexShimAutoRestore": true,
+        "modelDiscovery": { "newModelPolicy": "off" }
+    });
+    let bytes = serde_json::to_vec_pretty(&config)
+        .map_err(|error| format!("无法序列化默认配置：{error}"))?;
+    let temporary = home.join(format!(".config-{}.tmp", Utc::now().timestamp_micros()));
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("无法创建默认配置临时文件：{error}"))?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("无法写入默认配置临时文件：{error}"))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("无法设置默认配置权限：{error}"));
+        }
+    }
+    if path.exists() {
+        let _ = fs::remove_file(&temporary);
+        return Ok(false);
+    }
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        if path.exists() {
+            return Ok(false);
+        }
+        return Err(format!("无法发布默认配置：{error}"));
+    }
+    Ok(true)
+}
+
+/// Engine 2.58 requires `apiKeys` for a non-loopback listener. Migrate the
+/// legacy Switcher `apiToken` field before spawning the Engine so an existing
+/// shared configuration remains startable after an upgrade.
+fn repair_public_auth_config(home: &Path) -> Result<(), String> {
+    let path = home.join("config.json");
+    let text = fs::read_to_string(&path).map_err(|e| format!("读取 OpenCodex 配置失败：{e}"))?;
+    let mut config: Value = serde_json::from_str(&text).map_err(|e| format!("OpenCodex 配置格式无效：{e}"))?;
+    let Some(object) = config.as_object_mut() else { return Err("OpenCodex 配置格式无效".into()); };
+    let hostname = object.get("hostname").and_then(Value::as_str).unwrap_or("127.0.0.1");
+    if matches!(hostname, "" | "localhost" | "127.0.0.1" | "::1") { return Ok(()); }
+    let has_key = object.get("apiKeys").and_then(Value::as_array).is_some_and(|keys| {
+        keys.iter().any(|entry| entry.get("key").and_then(Value::as_str).is_some_and(|key| !key.trim().is_empty()))
+    });
+    if has_key { return Ok(()); }
+    let key = object.remove("apiToken").and_then(|value| value.as_str().map(str::to_string))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("ocx-{:016x}", rand::thread_rng().gen::<u64>()));
+    object.insert("apiKeys".into(), serde_json::json!([{
+        "id": "codex-switcher-share",
+        "name": "Codex Switcher 分享",
+        "key": key,
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+    }]));
+    fs::write(path, serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("修复 OpenCodex 鉴权配置失败：{e}"))
+}
+
 fn codex_integration_is_enabled(directory: &Path) -> bool {
     let Ok(text) = fs::read_to_string(directory.join("config.json")) else {
         // Keep the Engine's backward-compatible default: an absent setting is
@@ -3524,6 +3819,31 @@ fn parse_engine_progress(line: &str) -> Option<EngineProgress> {
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
+
+    #[test]
+    fn default_config_is_created_once_and_satisfies_initialization_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(super::write_default_config_if_missing(temp.path(), 15800).unwrap());
+        assert!(!super::write_default_config_if_missing(temp.path(), 15900).unwrap());
+        assert!(super::config_is_initialized(temp.path()));
+        let config: Value = serde_json::from_str(
+            &std::fs::read_to_string(temp.path().join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["defaultProvider"], "openai");
+        assert_eq!(config["port"], 15800);
+        assert_eq!(config["providers"]["openai"]["authMode"], "forward");
+        assert_eq!(config["providers"]["openai"]["codexAccountMode"], "pool");
+    }
+
+    #[test]
+    fn append_file_creates_missing_parent_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("logs").join("engine.log");
+        let mut file = super::append_file(path.clone()).unwrap();
+        std::io::Write::write_all(&mut file, b"line\n").unwrap();
+        assert!(path.is_file());
+    }
 
     fn image_config() -> Value {
         json!({

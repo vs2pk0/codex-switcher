@@ -4,12 +4,14 @@ import { computed, ref } from "vue";
 import { isSubscriptionExpired } from "../accountStatus";
 import { ADAPTIVE_COLUMNS, normalizeMaxColumns, resolveAccountColumns } from "../services/accountLayout";
 import type { CodexApiKeyBalanceState, CodexSwitcherSettings } from "../services/codex";
+import type { QuotaListAccount, QuotaListState, QuotaListWindow } from "../services/quotaList";
 import type { CodexAccount, CodexResetCredit } from "../types/codex";
-import { currentLocale, formatLocalizedDuration, t } from "../i18n";
+import { currentLocale, formatLocalizedDuration, formatTranslatedText, t } from "../i18n";
 import {
   additionalQuotaWindows,
   hasAnyQuotaWindow,
   hasQuotaWindow,
+  stackQuotaAccounts,
   type AdditionalQuotaWindowSnapshot,
 } from "../quota";
 import PlanBadge from "./PlanBadge.vue";
@@ -28,6 +30,7 @@ const props = defineProps<{
   exportingId: string;
   quotaRefreshingId: string;
   apiKeyBalanceStates: Record<string, CodexApiKeyBalanceState>;
+  quotaListStates: Record<string, QuotaListState>;
   privacyMasked: boolean;
   statusClockMs: number;
   apiServiceAccountIds: Set<string>;
@@ -49,6 +52,7 @@ const emit = defineEmits<{
   (event: "switch-account", account: CodexAccount): void;
   (event: "refresh-quota", account: CodexAccount): void;
   (event: "refresh-api-balance", account: CodexAccount): void;
+  (event: "refresh-quota-list", account: CodexAccount): void;
   (event: "open-export", account: CodexAccount): void;
   (event: "confirm-delete", account: CodexAccount): void;
   (event: "open-add", tab: string): void;
@@ -267,6 +271,8 @@ function visibleAdditionalQuotaWindows(account: CodexAccount): AdditionalQuotaWi
 }
 
 function visibleQuotaRowCount(account: CodexAccount): number {
+  // API 列表额度保持卡片原高度；账号切换列表在固定的两行区域内自行滚动。
+  if (quotaListEnabledAccount(account)) return 2;
   if (!canShowQuota(account) || !account.quota) return 0;
   const primaryRows = hasQuotaWindow(account.quota, "hourly") ? 1 : 0;
   const weeklyRows =
@@ -571,6 +577,149 @@ function apiKeyBalanceClass(account: CodexAccount): Record<string, boolean> {
     stale: state?.status === "error" && Boolean(state.balance),
     unlimited: Boolean(state?.balance?.unlimited || state?.balance?.balanceKind === "unlimited"),
   };
+}
+
+interface QuotaListMetric {
+  key: string;
+  label: string;
+  percentage: number;
+  resetTime?: number;
+  windowMinutes?: number;
+  accountCount?: number;
+}
+
+const quotaTabSelection = ref<Record<string, string>>({});
+
+function quotaListState(account: CodexAccount): QuotaListState | undefined {
+  return props.quotaListStates[account.id];
+}
+
+/** ▷ 按钮文案：API Key 账号走「同步配置」流程（停实例 → 写路由 → 一键修复 → 重开），其余为普通切换。 */
+function switchActionLabel(account: CodexAccount): string {
+  return isApiKeyAccount(account) ? t("同步配置") : t("切换");
+}
+
+function quotaListEnabledAccount(account: CodexAccount): boolean {
+  return isApiKeyAccount(account) && Boolean(account.quota_list_enabled);
+}
+
+function quotaListStackedMode(account: CodexAccount): boolean {
+  return account.quota_list_stacked !== false;
+}
+
+function quotaListWindowLabel(window: QuotaListWindow): string {
+  if (window.key === "hourly" || window.key.startsWith("hourly:")) {
+    return quotaWindowShortLabel(window.windowMinutes, 300);
+  }
+  if (window.key === "weekly" || window.key.startsWith("weekly:")) {
+    return quotaWindowShortLabel(window.windowMinutes, 10080);
+  }
+  if (!window.windowMinutes) return window.label;
+  return `${window.label} ${quotaWindowShortLabel(window.windowMinutes, window.windowMinutes)}`;
+}
+
+/** 主 5h / 周窗口；其余（如 GPT 5.3 Codex Spark）属于附加限额，跟随「显示 GPT 5.3 Codex Spark 额度」设置。 */
+function isPrimaryQuotaListWindow(window: QuotaListWindow): boolean {
+  return window.key === "hourly" || window.key === "weekly";
+}
+
+/** 列表额度账号（已按设置过滤附加窗口），按 API 账号 id 缓存。 */
+const quotaListAccountsById = computed(() => {
+  const showAdditional = props.settings.showAdditionalQuotaWindows;
+  const entries = Object.entries(props.quotaListStates).map(([accountId, state]) => {
+    const accounts = (state?.result?.accounts ?? []).map((item) =>
+      showAdditional ? item : { ...item, windows: item.windows.filter(isPrimaryQuotaListWindow) },
+    );
+    return [accountId, accounts] as const;
+  });
+  return new Map(entries);
+});
+
+function quotaListAccounts(account: CodexAccount): QuotaListAccount[] {
+  return quotaListAccountsById.value.get(account.id) ?? [];
+}
+
+function quotaListTabAccounts(account: CodexAccount): QuotaListAccount[] {
+  return quotaListAccounts(account).filter(
+    (item) => item.windows.length > 0 || Boolean(item.error),
+  );
+}
+
+function activeQuotaTabId(account: CodexAccount): string {
+  const tabs = quotaListTabAccounts(account);
+  const selected = quotaTabSelection.value[account.id];
+  if (selected && tabs.some((item) => item.accountId === selected)) return selected;
+  return tabs[0]?.accountId ?? "";
+}
+
+function stackedContributorCount(account: CodexAccount): number {
+  return quotaListAccounts(account).filter((item) => item.windows.length > 0).length;
+}
+
+function quotaListMetrics(account: CodexAccount): QuotaListMetric[] {
+  if (!quotaListState(account)?.result) return [];
+  if (quotaListStackedMode(account)) {
+    return stackQuotaAccounts(quotaListAccounts(account)).map((bucket) => ({
+      key: bucket.key,
+      label: quotaListWindowLabel({
+        key: bucket.key,
+        label: bucket.label,
+        percentage: bucket.percentage,
+        resetTime: bucket.resetTime,
+        windowMinutes: bucket.windowMinutes,
+      }),
+      percentage: bucket.percentage,
+      resetTime: bucket.resetTime,
+      windowMinutes: bucket.windowMinutes,
+      accountCount: bucket.accountCount,
+    }));
+  }
+  const active = quotaListTabAccounts(account).find(
+    (item) => item.accountId === activeQuotaTabId(account),
+  );
+  return (active?.windows ?? []).map((window) => ({
+    key: window.key,
+    label: quotaListWindowLabel(window),
+    percentage: window.percentage,
+    resetTime: window.resetTime,
+    windowMinutes: window.windowMinutes,
+  }));
+}
+
+function quotaPanelCaption(account: CodexAccount): string {
+  if (quotaListStackedMode(account)) {
+    const count = stackedContributorCount(account);
+    return count > 1 ? formatTranslatedText(t("{count} 个账号合计"), { count }) : "";
+  }
+  const active = quotaListTabAccounts(account).find(
+    (item) => item.accountId === activeQuotaTabId(account),
+  );
+  return active?.label ?? "";
+}
+
+function quotaListMetricCaption(account: CodexAccount, metric: QuotaListMetric): string {
+  if (!quotaListStackedMode(account) || !metric.accountCount) return "";
+  const total = stackedContributorCount(account);
+  if (total <= 1 || metric.accountCount >= total) return "";
+  return formatTranslatedText(t("{count} 个账号"), { count: metric.accountCount });
+}
+
+function quotaListNote(account: CodexAccount): string {
+  const state = quotaListState(account);
+  if (!state) return "";
+  if (state.status === "loading" && !state.result) return "…";
+  if (state.status === "error" && !state.result) return t("获取失败");
+  if (!state.result) return "";
+  if (!quotaListStackedMode(account)) {
+    const active = quotaListTabAccounts(account).find(
+      (item) => item.accountId === activeQuotaTabId(account),
+    );
+    if (active?.error) return active.error;
+  }
+  if (!quotaListMetrics(account).length && !quotaListTabAccounts(account).length) {
+    return t("暂无额度数据");
+  }
+  return "";
 }
 
 async function copyText(value: string, successLabel: string): Promise<void> {
@@ -962,7 +1111,7 @@ function formatTime(value?: number | null): string {
                 </a-button>
               </a-tooltip>
             </div>
-            <div class="api-key-info-row">
+            <div v-if="!quotaListEnabledAccount(account)" class="api-key-info-row">
               <span class="api-key-info-icon api-key-info-icon-key"><icon-link /></span>
               <span class="api-key-info-text">
                 <b>API Key</b>
@@ -979,7 +1128,7 @@ function formatTime(value?: number | null): string {
                 </a-button>
               </a-tooltip>
             </div>
-            <div class="api-key-info-row">
+            <div v-if="!quotaListEnabledAccount(account)" class="api-key-info-row">
               <span class="api-key-info-icon api-key-info-icon-url"><icon-link /></span>
               <span class="api-key-info-text">
                 <b>Base URL</b>
@@ -996,9 +1145,103 @@ function formatTime(value?: number | null): string {
                 </a-button>
               </a-tooltip>
             </div>
+            <div v-if="quotaListEnabledAccount(account)" class="quota-panel api-quota-panel">
+              <div class="api-quota-head">
+                <span class="api-quota-head-label">
+                  <icon-safe />
+                  {{ t("列表额度") }}
+                </span>
+                <small v-if="quotaPanelCaption(account)" :title="quotaPanelCaption(account)">
+                  {{ quotaPanelCaption(account) }}
+                </small>
+                <a-button
+                  class="api-quota-refresh"
+                  size="mini"
+                  :title="t('刷新额度')"
+                  :loading="quotaListState(account)?.status === 'loading'"
+                  @click.stop="emit('refresh-quota-list', account)"
+                >
+                  <template #icon><icon-refresh /></template>
+                  {{ t("刷新额度") }}
+                </a-button>
+              </div>
+              <div
+                v-if="quotaListMetrics(account).length"
+                class="quota-metrics"
+                :class="{
+                  single: quotaListMetrics(account).length === 1,
+                  stacked: quotaListStackedMode(account) && quotaListMetrics(account).length > 1,
+                }"
+              >
+                <div
+                  v-for="metric in quotaListMetrics(account)"
+                  :key="metric.key"
+                  class="quota-metric"
+                >
+                  <div class="quota-metric-main">
+                    <span class="quota-window-label" :title="metric.label">
+                      <icon-calendar v-if="(metric.windowMinutes || 0) >= 1440" />
+                      <icon-clock-circle v-else />
+                      <span>{{ metric.label }}</span>
+                      <em
+                        v-if="quotaListMetricCaption(account, metric)"
+                        class="quota-metric-count"
+                      >
+                        {{ quotaListMetricCaption(account, metric) }}
+                      </em>
+                    </span>
+                    <em>{{ quotaResetDateLabel(metric.resetTime) }}</em>
+                    <small>{{ quotaResetLeftLabel(metric.resetTime) }}</small>
+                    <strong :style="{ color: quotaColor(metric.percentage) }">
+                      {{ quotaPercentLabel(metric.percentage) }}
+                    </strong>
+                  </div>
+                  <div class="quota-bar">
+                    <span :style="quotaProgressStyle(metric.percentage)" />
+                  </div>
+                </div>
+              </div>
+              <div
+                v-if="!quotaListStackedMode(account) && quotaListTabAccounts(account).length > 1"
+                class="api-quota-tabs"
+                role="listbox"
+              >
+                <button
+                  v-for="item in quotaListTabAccounts(account)"
+                  :key="item.accountId"
+                  type="button"
+                  class="api-quota-tab"
+                  role="option"
+                  :class="{ active: item.accountId === activeQuotaTabId(account), error: Boolean(item.error) }"
+                  :aria-selected="item.accountId === activeQuotaTabId(account)"
+                  :title="item.error || item.label"
+                  @click.stop="quotaTabSelection[account.id] = item.accountId"
+                >
+                  <span class="api-quota-tab-name">{{ item.label }}</span>
+                  <span v-if="item.error" class="compact-quota-error">{{ t("异常") }}</span>
+                  <span v-else class="compact-quota-pair api-quota-tab-pair">
+                    <span
+                      v-for="window in item.windows"
+                      :key="window.key"
+                      :title="`${quotaListWindowLabel(window)} ${quotaPercentLabel(window.percentage)}`"
+                    >
+                      <i :style="quotaDotStyle(window.percentage)" />
+                      {{ quotaPercentLabel(window.percentage) }}
+                    </span>
+                  </span>
+                </button>
+              </div>
+              <div
+                v-if="quotaListNote(account)"
+                class="api-quota-note"
+                :class="{ error: quotaListNote(account) === t('获取失败') }"
+              >
+                {{ quotaListNote(account) }}
+              </div>
+            </div>
           </div>
           <button
-            v-if="apiOfficialUrl(account)"
+            v-if="apiOfficialUrl(account) && !quotaListEnabledAccount(account)"
             class="official-link"
             type="button"
             :title="apiOfficialUrl(account)"
@@ -1201,10 +1444,10 @@ function formatTime(value?: number | null): string {
                 <template #icon><icon-list /></template>
               </a-button>
             </a-tooltip>
-            <a-tooltip :content="t('切换')">
+            <a-tooltip :content="switchActionLabel(account)">
               <a-button
                 size="small"
-                :title="t('切换')"
+                :title="switchActionLabel(account)"
                 :loading="switchingId === account.id"
                 :disabled="switchingId !== ''"
                 @click="emit('switch-account', account)"
@@ -1370,7 +1613,7 @@ function formatTime(value?: number | null): string {
             <icon-list />
           </button>
         </a-tooltip>
-        <a-tooltip :content="t('切换')">
+        <a-tooltip :content="switchActionLabel(account)">
           <button
             class="compact-icon-action primary"
             type="button"
@@ -1552,7 +1795,7 @@ function formatTime(value?: number | null): string {
                     <template #icon><icon-list /></template>
                   </a-button>
                 </a-tooltip>
-                <a-tooltip :content="t('切换')">
+                <a-tooltip :content="switchActionLabel(account)">
                   <a-button
                     size="mini"
                     :loading="switchingId === account.id"

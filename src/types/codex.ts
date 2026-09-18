@@ -23,6 +23,8 @@ export interface CodexAccount {
   apiProviderName?: string;
   api_official_url?: string;
   apiOfficialUrl?: string;
+  quota_list_enabled?: boolean;
+  quota_list_stacked?: boolean;
   default_model?: string;
   defaultModel?: string;
   plan_type?: string;

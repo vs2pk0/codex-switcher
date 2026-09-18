@@ -6,6 +6,8 @@ import { currentLanguage, t } from "../i18n";
 const props = defineProps<{
   settings: CodexSwitcherSettings;
   isCurrentPageSelected: boolean;
+  selectedAccountCount: number;
+  batchDeleting: boolean;
   accountTypeOptions: Array<{ label: string; value: string }>;
   accountSearchKeyword: string;
   showSortDirection: boolean;
@@ -20,6 +22,7 @@ const emit = defineEmits<{
   (event: "save-settings"): void;
   (event: "open-sort-editor"): void;
   (event: "bind-selected", target: "api-service" | "open-codex"): void;
+  (event: "batch-delete"): void;
   (event: "batch-export"): void;
   (event: "open-add", tab: "oauth" | "token" | "apikey"): void;
 }>();
@@ -169,6 +172,16 @@ function handleBindTarget(value: string | number | Record<string, unknown> | und
             <a-doption value="open-codex">{{ t("绑定到 OpenCodex") }}</a-doption>
           </template>
         </a-dropdown>
+        <a-button
+          class="batch-action batch-delete"
+          status="danger"
+          :disabled="selectedAccountCount === 0"
+          :loading="batchDeleting"
+          @click="$emit('batch-delete')"
+        >
+          <template #icon><icon-delete /></template>
+          {{ t("批量删除") }}
+        </a-button>
         <a-button class="batch-action batch-export" @click="$emit('batch-export')">
           <template #icon><icon-download /></template>
           {{ t("批量导出") }}

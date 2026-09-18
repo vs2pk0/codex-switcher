@@ -217,6 +217,8 @@ export function updateCodexApiKeyCredentials(input: {
   accountName?: string;
   tags?: string[];
   isHidden?: boolean;
+  quotaListEnabled?: boolean;
+  quotaListStacked?: boolean;
 }): Promise<CodexAccount> {
   return invoke("update_codex_api_key_credentials", {
     input: {
@@ -228,6 +230,8 @@ export function updateCodexApiKeyCredentials(input: {
       accountName: input.accountName || null,
       tags: input.tags || [],
       isHidden: Boolean(input.isHidden),
+      quotaListEnabled: input.quotaListEnabled ?? null,
+      quotaListStacked: input.quotaListStacked ?? null,
     },
   });
 }
@@ -328,6 +332,27 @@ export function switchCodexAccount(
   return invoke("switch_codex_account", { accountId, instanceId });
 }
 
+/** API Key 账号「同步配置」的进度事件；payload 为 { step }：0 关闭实例并同步配置，1 修复切号会话，2 恢复完整历史，3 重新打开实例。 */
+export const API_KEY_ACCOUNT_SYNC_PROGRESS_EVENT = "codex-api-key-account-sync-progress";
+
+export interface ApiKeyAccountSyncSummary {
+  instanceId: string;
+  instanceName: string;
+  account: CodexAccount;
+  synchronizedSessionProviderCount: number;
+  sessionCount: number;
+  repairMessage: string;
+  message: string;
+}
+
+/** API Key 账号「启动」：停止实例 → 重置并写入 Provider 路由与模型目录 → 一键修复会话 → 重新打开实例。 */
+export function syncApiKeyAccountToInstance(
+  accountId: string,
+  instanceId = "default",
+): Promise<ApiKeyAccountSyncSummary> {
+  return invoke("sync_api_key_account_to_instance", { accountId, instanceId });
+}
+
 export function restartCodexApp(instanceId = "default"): Promise<string> {
   return invoke("restart_codex_app", { instanceId });
 }
@@ -346,6 +371,7 @@ export interface CodexSessionOneClickRepairSummary {
   sessionCount: number;
   modelCompatibility: CodexSessionModelCompatibilityRepairSummary;
   visibility: CodexSessionVisibilityRepairSummary;
+  warnings: string[];
   message: string;
 }
 

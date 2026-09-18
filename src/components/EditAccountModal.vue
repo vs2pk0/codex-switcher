@@ -1,8 +1,10 @@
 <script setup lang="ts">
+import { ref, watch } from "vue";
 import { t } from "../i18n";
 import type { CodexAccount } from "../types/codex";
+import { checkQuotaListStatus } from "../services/quotaList";
 
-defineProps<{
+const props = defineProps<{
   visible: boolean;
   title: string;
   activeTab: string;
@@ -15,6 +17,8 @@ defineProps<{
     apiBaseUrl: string;
     apiProviderName: string;
     apiOfficialUrl: string;
+    quotaListEnabled: boolean;
+    quotaListStacked: boolean;
   };
   editSwitcherJsonText: string;
   editTokenJsonText: string;
@@ -30,6 +34,30 @@ defineEmits<{
   (event: "update:edit-token-json-text", value: string): void;
   (event: "save"): void;
 }>();
+
+const quotaListAvailable = ref(false);
+
+watch(
+  () => [props.visible, props.editForm.apiBaseUrl, props.editingAccount?.id ?? ""] as const,
+  async ([visible, baseUrl]) => {
+    if (
+      !visible
+      || !props.editingAccount
+      || !props.isApiKeyAccount(props.editingAccount)
+      || !baseUrl.trim()
+    ) {
+      quotaListAvailable.value = false;
+      return;
+    }
+    try {
+      const status = await checkQuotaListStatus(baseUrl);
+      quotaListAvailable.value = status.available;
+    } catch {
+      quotaListAvailable.value = false;
+    }
+  },
+  { immediate: true },
+);
 </script>
 
 <template>
@@ -81,6 +109,23 @@ defineEmits<{
                 autocomplete="new-password"
                 placeholder="sk-..."
               />
+            </a-form-item>
+            <a-form-item v-if="quotaListAvailable" :label="t('列表额度')">
+              <a-switch v-model="editForm.quotaListEnabled" />
+              <template #extra>{{ t('查询该 Base URL 背后所有 Codex 账号的额度列表') }}</template>
+            </a-form-item>
+            <a-form-item v-if="quotaListAvailable && editForm.quotaListEnabled" :label="t('额度列表显示')">
+              <a-switch
+                :model-value="editForm.quotaListStacked"
+                @change="editForm.quotaListStacked = true"
+              />
+              <span class="edit-account-visibility-label">{{ t('叠加显示') }}</span>
+              <a-switch
+                :model-value="!editForm.quotaListStacked"
+                @change="editForm.quotaListStacked = false"
+              />
+              <span class="edit-account-visibility-label">{{ t('tab 显示') }}</span>
+              <template #extra>{{ t('叠加显示汇总所有账号额度，tab 显示按账号切换查看') }}</template>
             </a-form-item>
           </a-form>
         </a-tab-pane>

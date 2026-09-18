@@ -161,3 +161,77 @@ export function quotaWindowForMinutes(
   }
   return undefined;
 }
+
+export interface QuotaListStackInput {
+  accountId: string;
+  windows: Array<{ key: string; label: string; percentage: number; resetTime?: number; windowMinutes?: number }>;
+}
+
+export interface StackedQuotaBucket {
+  key: string;
+  label: string;
+  percentage: number;
+  accountCount: number;
+  windowMinutes?: number;
+  resetTime?: number;
+}
+
+/** 叠加显示：把同一窗口的额度百分比跨账号相加。
+ * 5h / 周 / 30 天按窗口时长分桶，避免 Free 月额度与 Plus 5h 混成一行；
+ * 任一账号有该窗口就显示（不再要求全部账号共有）。命名窗口即使周期相同也不与基础窗口合并。 */
+export function stackQuotaAccounts(accounts: QuotaListStackInput[]): StackedQuotaBucket[] {
+  const contributors = accounts.filter((account) => account.windows.length > 0);
+  if (!contributors.length) return [];
+  const buckets = new Map<
+    string,
+    { percentage: number; accountIds: Set<string>; windowMinutes?: number; label: string; resetTime?: number }
+  >();
+  for (const account of contributors) {
+    for (const window of account.windows) {
+      const key = quotaStackKey(window);
+      const bucket = buckets.get(key) ?? {
+        percentage: 0,
+        accountIds: new Set<string>(),
+        windowMinutes: window.windowMinutes,
+        label: window.label,
+        resetTime: undefined,
+      };
+      bucket.percentage += window.percentage;
+      bucket.accountIds.add(account.accountId);
+      if (window.resetTime !== undefined) {
+        bucket.resetTime = bucket.resetTime === undefined
+          ? window.resetTime
+          : Math.min(bucket.resetTime, window.resetTime);
+      }
+      buckets.set(key, bucket);
+    }
+  }
+  return [...buckets.entries()]
+    .map(([key, bucket]) => ({
+      key,
+      label: bucket.label,
+      percentage: Math.round(bucket.percentage * 10) / 10,
+      accountCount: bucket.accountIds.size,
+      windowMinutes: bucket.windowMinutes,
+      resetTime: bucket.resetTime,
+    }))
+    .sort((left, right) => {
+      const leftRank = quotaStackSortRank(left.key, left.windowMinutes);
+      const rightRank = quotaStackSortRank(right.key, right.windowMinutes);
+      return leftRank - rightRank || left.label.localeCompare(right.label, "zh");
+    });
+}
+
+function quotaStackKey(window: QuotaListStackInput["windows"][number]): string {
+  // 同一 key 但窗口时长不同（5h vs 30 天）必须分开，否则叠加后只剩一行「30 天」。
+  if (window.key === "hourly" || window.key === "weekly") {
+    return `${window.key}:${window.windowMinutes ?? "unknown"}`;
+  }
+  return `named:${window.label}:${window.windowMinutes ?? "unknown"}`;
+}
+
+function quotaStackSortRank(key: string, windowMinutes?: number): number {
+  if (key.startsWith("hourly:")) return windowMinutes ?? 300;
+  if (key.startsWith("weekly:")) return 100_000 + (windowMinutes ?? 10_080);
+  return 1_000_000 + (windowMinutes ?? Number.MAX_SAFE_INTEGER);
+}

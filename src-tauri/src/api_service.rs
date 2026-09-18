@@ -205,7 +205,7 @@ pub struct ApiServiceAccountSyncSummary {
 #[serde(rename_all = "camelCase")]
 pub struct ApiServiceBoundAccount {
     id: String,
-    account_id: Option<String>,
+    pub(crate) account_id: Option<String>,
     account_id_exact: bool,
     kind: String,
     label: String,
@@ -2246,7 +2246,9 @@ fn replace_auth_directory(auth_dir: &Path, staging_dir: &Path) -> Result<(), Str
     Ok(())
 }
 
-fn list_all_bound_accounts(dirs: &ApiServiceDirs) -> Result<Vec<ApiServiceBoundAccount>, String> {
+pub(crate) fn list_all_bound_accounts(
+    dirs: &ApiServiceDirs,
+) -> Result<Vec<ApiServiceBoundAccount>, String> {
     let auth_dir = api_auth_dir(dirs);
     let local_accounts = AccountStore::default().list_accounts()?;
     let mut bound = list_bound_auth_accounts(&auth_dir)?;
@@ -3726,7 +3728,7 @@ fn set_executable(_path: &Path) -> Result<(), String> {
 }
 
 #[derive(Debug, Clone)]
-struct ApiServiceDirs {
+pub(crate) struct ApiServiceDirs {
     base_dir: PathBuf,
     runtime_dir: PathBuf,
     staging_dir: PathBuf,
@@ -3737,7 +3739,7 @@ struct ApiServiceDirs {
 }
 
 impl ApiServiceDirs {
-    fn new() -> Result<Self, String> {
+    pub(crate) fn new() -> Result<Self, String> {
         let home = dirs::home_dir()
             .or_else(|| std::env::current_dir().ok())
             .ok_or_else(|| "无法定位用户主目录".to_string())?;
@@ -3942,6 +3944,8 @@ fn ensure_api_service_account(api_key: &str, base_url: &str) -> Result<String, S
                     .or_else(|| Some(API_SERVICE_ACCOUNT_NAME.to_string())),
                 tags: None,
                 is_hidden: None,
+                quota_list_enabled: None,
+                quota_list_stacked: None,
             })?;
         }
         return Ok(account.id.clone());

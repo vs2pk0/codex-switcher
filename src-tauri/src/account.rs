@@ -90,6 +90,10 @@ pub struct CodexAccount {
     pub api_provider_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_official_url: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub quota_list_enabled: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub quota_list_stacked: bool,
     #[serde(
         default,
         alias = "defaultModel",
@@ -152,6 +156,8 @@ pub struct ApiKeyAccountUpdateInput {
     pub account_name: Option<String>,
     pub tags: Option<Vec<String>>,
     pub is_hidden: Option<bool>,
+    pub quota_list_enabled: Option<bool>,
+    pub quota_list_stacked: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -807,6 +813,12 @@ impl AccountStore {
         if let Some(is_hidden) = input.is_hidden {
             account.hidden_cleanup_pending = is_hidden;
             account.is_hidden = is_hidden;
+        }
+        if let Some(quota_list_enabled) = input.quota_list_enabled {
+            account.quota_list_enabled = quota_list_enabled;
+        }
+        if let Some(quota_list_stacked) = input.quota_list_stacked {
+            account.quota_list_stacked = quota_list_stacked;
         }
         account.last_used = now_timestamp();
         let updated = account.clone();
@@ -1798,6 +1810,8 @@ impl AccountStore {
             api_base_url: None,
             api_provider_name: None,
             api_official_url: None,
+            quota_list_enabled: false,
+            quota_list_stacked: true,
             default_model: None,
             plan_type: None,
             auth_file_plan_type: None,
@@ -2140,6 +2154,14 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn default_true() -> bool {
+    true
+}
+
 fn normalize_account_tags(tags: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::new();
     for tag in tags {
@@ -2341,6 +2363,8 @@ fn build_api_key_account_record(
         api_base_url,
         api_provider_name: normalize_optional(api_provider_name.as_deref()),
         api_official_url,
+        quota_list_enabled: false,
+        quota_list_stacked: true,
         default_model: None,
         plan_type: Some("api_key".to_string()),
         auth_file_plan_type: None,
@@ -2446,6 +2470,10 @@ fn apply_import_metadata(account: &mut CodexAccount, value: &Value) {
     }
     account.is_hidden =
         read_bool(value, &["is_hidden", "isHidden", "hidden", "隐身"]).unwrap_or(account.is_hidden);
+    account.quota_list_enabled = read_bool(value, &["quota_list_enabled", "quotaListEnabled"])
+        .unwrap_or(account.quota_list_enabled);
+    account.quota_list_stacked = read_bool(value, &["quota_list_stacked", "quotaListStacked"])
+        .unwrap_or(account.quota_list_stacked);
     account.plan_type = read_string(
         value,
         &[
@@ -2758,7 +2786,7 @@ fn resolve_subscription_expiry(account: &CodexAccount) -> Option<String> {
     })
 }
 
-fn resolve_access_token_expiry(account: &CodexAccount) -> Option<String> {
+pub(crate) fn resolve_access_token_expiry(account: &CodexAccount) -> Option<String> {
     normalize_timestamp_to_iso(account.access_token_expires_at.as_deref())
         .or_else(|| {
             jwt_claim_string(&account.tokens.access_token, "exp")
@@ -3027,15 +3055,15 @@ fn write_auth_json(codex_home: &Path, auth_value: &Value) -> Result<(), String> 
 /// 本地网关模式下向网关传递 API Key 的请求头（CLIProxyAPI 支持 Authorization / X-Api-Key / X-Goog-Api-Key 任一命中）。
 pub(crate) const LOCAL_GATEWAY_API_KEY_HEADER: &str = "X-Api-Key";
 
-/// API Key 账号是否以「本地网关 + ChatGPT 登录态」模式写入 config.toml：
-/// 绑定了 OAuth 且勾选了 `bound_oauth_use_local_gateway`。
+/// API Key 账号是否以「OAuth 登录态 + API Key 请求头」模式写入 config.toml。
+/// 只要存在绑定 OAuth，就必须让 Codex 使用 auth.json 中的登录态；旧的
+/// `bound_oauth_use_local_gateway` 只作为历史兼容字段保留，不能再让已绑定账号落回 API 模式。
 fn uses_local_gateway_login(account: &CodexAccount) -> bool {
-    account.bound_oauth_use_local_gateway
-        && account
-            .bound_oauth_account_id
-            .as_deref()
-            .and_then(|value| normalize_optional(Some(value)))
-            .is_some()
+    account
+        .bound_oauth_account_id
+        .as_deref()
+        .and_then(|value| normalize_optional(Some(value)))
+        .is_some()
 }
 
 /// OAuth 账号的 Token 是否齐备（access_token / refresh_token 都有），可直接写入 auth.json。
@@ -3168,6 +3196,7 @@ fn write_api_key_provider_config(
     let config_path = codex_home.join("config.toml");
     let mut document = read_toml_document(&config_path)?;
     document["model_provider"] = value(provider_id.clone());
+    crate::api_model_catalog::detach_other_catalog(&mut document, codex_home, Some(&account.id));
     let default_model = account
         .default_model
         .as_deref()
@@ -3241,6 +3270,7 @@ fn write_official_provider_config(
     let mut document = read_toml_document(&config_path)?;
     apply_managed_model_transition(&mut document, &model_transition)?;
     document["model_provider"] = value("openai");
+    crate::api_model_catalog::detach_other_catalog(&mut document, codex_home, None);
     write_string_atomic(&config_path, &document.to_string())
 }
 

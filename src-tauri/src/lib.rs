@@ -1,10 +1,12 @@
 mod account;
+mod api_model_catalog;
 mod api_service;
 mod app_update;
 mod instances;
 mod oauth;
 mod opencodex;
 mod push;
+mod quota_list;
 mod reset;
 mod service_binding;
 mod session;
@@ -31,7 +33,7 @@ use session::{
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, TcpListener};
+use std::net::{IpAddr, Ipv6Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
@@ -63,6 +65,8 @@ pub(crate) struct CodexApiKeyModel {
     pub(crate) id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) owned_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) input_modalities: Option<Vec<String>>,
 }
 
 const MAX_API_MODEL_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -497,6 +501,7 @@ fn parse_codex_api_key_models(body: &str) -> Result<Vec<CodexApiKeyModel>, Strin
         models.push(CodexApiKeyModel {
             id: id.to_string(),
             owned_by,
+            input_modalities: api_model_catalog::parse_input_modalities(item),
         });
         if models.len() >= MAX_API_MODELS {
             break;
@@ -1152,14 +1157,16 @@ fn open_path_in_file_manager(path: String) -> Result<(), String> {
 }
 
 fn start_oauth_callback_listener(app_handle: AppHandle, login_id: String) -> Result<(), String> {
+    let listeners = bind_oauth_callback_listeners()?;
     let listener_generation = OAUTH_CALLBACK_LISTENER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    let listener = bind_oauth_callback_listener()?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| format!("OAuth 回调监听配置失败: {}", error))?;
+    for listener in &listeners {
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("OAuth 回调监听配置失败: {}", error))?;
+    }
 
     thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10 * 60);
+        let deadline = Instant::now() + Duration::from_secs(30 * 60);
         let mut callback_received = false;
         let mut close_deadline: Option<Instant> = None;
         while Instant::now() < deadline
@@ -1169,8 +1176,15 @@ fn start_oauth_callback_listener(app_handle: AppHandle, login_id: String) -> Res
             if close_deadline.is_some_and(|target| Instant::now() >= target) {
                 break;
             }
-            match listener.accept() {
-                Ok((mut stream, _)) => {
+            let accepted = listeners
+                .iter()
+                .find_map(|listener| match listener.accept() {
+                    Ok(connection) => Some(Ok(connection)),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+                    Err(error) => Some(Err(error)),
+                });
+            match accepted {
+                Some(Ok((mut stream, _))) => {
                     let mut buffer = [0_u8; 4096];
                     let size = stream.read(&mut buffer).unwrap_or(0);
                     let request = String::from_utf8_lossy(&buffer[..size]);
@@ -1268,10 +1282,10 @@ fn start_oauth_callback_listener(app_handle: AppHandle, login_id: String) -> Res
                         );
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                None => {
                     thread::sleep(Duration::from_millis(200));
                 }
-                Err(error) => {
+                Some(Err(error)) => {
                     let _ = app_handle.emit(
                         "codex-oauth-callback-received",
                         CodexOAuthCallbackEvent {
@@ -1497,7 +1511,16 @@ fn oauth_callback_html(success: bool, title: &str, description: &str) -> String 
     )
 }
 
-fn bind_oauth_callback_listener() -> Result<TcpListener, String> {
+fn bind_oauth_callback_listeners() -> Result<Vec<TcpListener>, String> {
+    let ipv4 = bind_oauth_callback_ipv4_listener()?;
+    let mut listeners = vec![ipv4];
+    if let Ok(ipv6) = bind_ipv6_listener_with_retries(oauth::CALLBACK_PORT, 10) {
+        listeners.push(ipv6);
+    }
+    Ok(listeners)
+}
+
+fn bind_oauth_callback_ipv4_listener() -> Result<TcpListener, String> {
     match bind_tcp_listener_with_retries(oauth::CALLBACK_PORT, 10) {
         Ok(listener) => return Ok(listener),
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
@@ -1507,6 +1530,23 @@ fn bind_oauth_callback_listener() -> Result<TcpListener, String> {
     reclaim_oauth_callback_port()?;
     bind_tcp_listener_with_retries(oauth::CALLBACK_PORT, 40)
         .map_err(format_oauth_callback_bind_error)
+}
+
+fn bind_ipv6_listener_with_retries(port: u16, attempts: usize) -> io::Result<TcpListener> {
+    let mut last_error = None;
+    for attempt in 0..attempts.max(1) {
+        match TcpListener::bind((Ipv6Addr::LOCALHOST, port)) {
+            Ok(listener) => return Ok(listener),
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                last_error = Some(error);
+                if attempt + 1 < attempts.max(1) {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrInUse, "端口被占用")))
 }
 
 fn bind_tcp_listener_with_retries(port: u16, attempts: usize) -> io::Result<TcpListener> {
@@ -1663,6 +1703,15 @@ async fn switch_codex_account(
     } else {
         Some(target.id.clone())
     };
+    // Discover before stopping the instance or replacing its working configuration.
+    let model_catalog = if target.auth_mode.as_deref() == Some("apikey") {
+        let models = fetch_codex_api_key_models_for_account(target)
+            .await
+            .map_err(|error| format!("获取模型列表失败，未切换账号：{error}"))?;
+        Some(api_model_catalog::encode(&models)?)
+    } else {
+        None
+    };
     if let Some(oauth_account_id) = oauth_account_id {
         token_keeper::ensure_fresh_access_token_for_store(
             &selected_account_store,
@@ -1683,9 +1732,131 @@ async fn switch_codex_account(
             codex_home.clone(),
             &instance.id,
         );
-        let session_store = SessionStore::new(codex_home);
-        switch_account_and_sync_session_provider(&account_store, &session_store, &account_id)
+        let session_store = SessionStore::new(codex_home.clone());
+        let switched =
+            switch_account_and_sync_session_provider(&account_store, &session_store, &account_id)?;
+        if let Some(catalog) = &model_catalog {
+            api_model_catalog::install(&codex_home, &account_id, catalog)
+                .map_err(|error| format!("账号已切换，但模型目录写入失败，请重试：{error}"))?;
+        }
+        Ok(switched)
     })
+}
+
+/// API Key 账号「同步配置」的进度事件名；payload 为 [`ApiKeyAccountSyncProgress`]。
+pub(crate) const API_KEY_ACCOUNT_SYNC_PROGRESS_EVENT: &str = "codex-api-key-account-sync-progress";
+
+/// API Key 账号同步配置的阶段：0 关闭实例并同步配置，1 切号会话修复，2 全部会话完整历史修复，3 重新打开实例。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApiKeyAccountSyncProgress {
+    pub step: u8,
+}
+
+/// API Key 账号「同步配置」的结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApiKeyAccountSyncSummary {
+    pub instance_id: String,
+    pub instance_name: String,
+    pub account: CodexAccount,
+    pub synchronized_session_provider_count: usize,
+    pub session_count: usize,
+    pub repair_message: String,
+    pub message: String,
+}
+
+/// API Key 账号「启动」：与 OpenCodex / API 服务的「同步配置」保持同一套流程——
+/// 停止实例 → 重置基础配置并写入该 API Key 的 Provider 路由与模型目录 → 一键修复会话
+/// （切号修复 + 恢复全部完整会话）→ 成功后重新打开实例。修复期间实例保持关闭，失败则不打开。
+#[tauri::command]
+async fn sync_api_key_account_to_instance(
+    app_handle: AppHandle,
+    account_id: String,
+    instance_id: Option<String>,
+) -> Result<ApiKeyAccountSyncSummary, String> {
+    let instance_id = instance_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value != "__default__")
+        .unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
+    let selected_instance = instances::resolve_instance(&instance_id)?;
+    let selected_account_store = AccountStore::new_for_instance(
+        switcher_account_dir(),
+        PathBuf::from(&selected_instance.codex_home),
+        &selected_instance.id,
+    );
+    let accounts = AccountStore::default().list_accounts()?;
+    let target = accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .ok_or_else(|| "账号不存在".to_string())?;
+    if target.auth_mode.as_deref() != Some("apikey") {
+        return Err("该账号不是 API Key 账号，请使用普通切换".to_string());
+    }
+    // 先在异步上下文完成网络操作：拉取模型目录、续期绑定的 OAuth Token，再进入阻塞流程。
+    let models = fetch_codex_api_key_models_for_account(target)
+        .await
+        .map_err(|error| format!("获取模型列表失败，未同步配置：{error}"))?;
+    let model_catalog = api_model_catalog::encode(&models)?;
+    if let Some(oauth_account_id) = target.bound_oauth_account_id.clone() {
+        token_keeper::ensure_fresh_access_token_for_store(
+            &selected_account_store,
+            &oauth_account_id,
+            "同步配置前 Token 需要续期",
+        )
+        .await?;
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let emit = |step: u8| {
+            let _ = app_handle.emit(
+                API_KEY_ACCOUNT_SYNC_PROGRESS_EVENT,
+                ApiKeyAccountSyncProgress { step },
+            );
+        };
+        emit(0);
+        let (instance_name, switched, outcome) =
+            instances::run_with_instance_opened_on_success(&instance_id, |instance| {
+                let codex_home = PathBuf::from(&instance.codex_home);
+                if codex_home_needs_config_reset_before_switch(&codex_home) {
+                    reset_codex_config_for_instance(&instance.id)?;
+                }
+                let account_store = AccountStore::new_for_instance(
+                    switcher_account_dir(),
+                    codex_home.clone(),
+                    &instance.id,
+                );
+                let session_store = SessionStore::new(codex_home.clone());
+                let switched = switch_account_and_sync_session_provider(
+                    &account_store,
+                    &session_store,
+                    &account_id,
+                )?;
+                api_model_catalog::install(&codex_home, &account_id, &model_catalog)
+                    .map_err(|error| format!("账号已切换，但模型目录写入失败，请重试：{error}"))?;
+                // 切换时的会话 provider 同步告警无需中断：随后的一键修复会再次全量同步。
+                let mut report = |step: u8| emit(step);
+                let outcome = one_click_repair_session_store(&session_store, &mut report)
+                    .map_err(|error| format!("配置已同步，但一键修复会话失败：{error}"))?;
+                emit(3);
+                Ok((instance.name.clone(), switched, outcome))
+            })?;
+        let repair_message = one_click_repair_message(&outcome);
+        let message = format!(
+            "实例“{instance_name}”已同步到 API Key 账号并重新打开；同步 {} 条已有会话；一键修复完成：{repair_message}",
+            switched.synchronized_session_provider_count
+        );
+        Ok(ApiKeyAccountSyncSummary {
+            instance_id,
+            instance_name,
+            account: switched.account,
+            synchronized_session_provider_count: switched.synchronized_session_provider_count,
+            session_count: outcome.session_count,
+            repair_message,
+            message,
+        })
+    })
+    .await
+    .map_err(|error| format!("API Key 账号同步配置任务失败：{error}"))?
 }
 
 /// 切换账号前是否需要先重置 config.toml：已接入 OpenCodex、本地 API 服务，或 `model_provider` 指向非官方 Provider（API Key）。
@@ -1815,6 +1986,7 @@ pub struct CodexSessionOneClickRepairSummary {
     pub session_count: usize,
     pub model_compatibility: CodexSessionModelCompatibilityRepairSummary,
     pub visibility: CodexSessionVisibilityRepairSummary,
+    pub warnings: Vec<String>,
     pub message: String,
 }
 
@@ -1855,39 +2027,81 @@ pub(crate) struct OneClickStoreRepairOutcome {
     pub session_count: usize,
     pub model_compatibility: CodexSessionModelCompatibilityRepairSummary,
     pub visibility: CodexSessionVisibilityRepairSummary,
+    /// 修复失败但已跳过的项目；调用方仍可继续重开实例和完成同步。
+    pub warnings: Vec<String>,
 }
 
 pub(crate) fn one_click_repair_session_store(
     session_store: &SessionStore,
     report_progress: &mut impl FnMut(u8),
 ) -> Result<OneClickStoreRepairOutcome, String> {
-    let target_provider = session_store.read_target_provider()?;
+    let mut warnings = Vec::new();
+    let target_provider = match session_store.read_target_provider() {
+        Ok(provider) => provider,
+        Err(error) => {
+            warnings.push(format!("读取目标 Provider 失败，已跳过会话修复：{error}"));
+            report_progress(1);
+            report_progress(2);
+            return Ok(OneClickStoreRepairOutcome {
+                session_count: 0,
+                model_compatibility: CodexSessionModelCompatibilityRepairSummary::default(),
+                visibility: CodexSessionVisibilityRepairSummary::default(),
+                warnings,
+            });
+        }
+    };
     report_progress(1);
-    let model_compatibility = session_store.repair_model_compatibility(&target_provider)?;
-    let session_ids = session_store
-        .list_sessions(None, None)?
-        .into_iter()
-        .map(|session| session.id)
-        .collect::<Vec<_>>();
+    let model_compatibility = match session_store.repair_model_compatibility(&target_provider) {
+        Ok(summary) => summary,
+        Err(error) => {
+            warnings.push(format!("切号会话修复未完成，已继续下一阶段：{error}"));
+            CodexSessionModelCompatibilityRepairSummary {
+                target_provider: target_provider.clone(),
+                ..Default::default()
+            }
+        }
+    };
+    let session_ids = match session_store.list_sessions(None, None) {
+        Ok(sessions) => sessions
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            warnings.push(format!("读取会话列表失败，已跳过完整历史修复：{error}"));
+            Vec::new()
+        }
+    };
     let session_count = session_ids.len();
     report_progress(2);
-    let visibility = session_store.repair_visibility_with_options(
-        Some("deep"),
-        Some(target_provider),
-        None,
-        None,
-        Some(session_ids),
-    )?;
+    let visibility = if session_ids.is_empty() {
+        CodexSessionVisibilityRepairSummary::default()
+    } else {
+        match session_store.repair_visibility_with_options(
+            Some("deep"),
+            Some(target_provider),
+            None,
+            None,
+            Some(session_ids),
+        ) {
+            Ok(summary) => summary,
+            Err(error) => {
+                warnings.push(format!("完整历史修复未完成，已跳过并继续：{error}"));
+                CodexSessionVisibilityRepairSummary::default()
+            }
+        }
+    };
+    warnings.extend(visibility.warnings.iter().cloned());
     Ok(OneClickStoreRepairOutcome {
         session_count,
         model_compatibility,
         visibility,
+        warnings,
     })
 }
 
 /// 把一键修复结果压成一行人类可读的摘要。
 pub(crate) fn one_click_repair_message(outcome: &OneClickStoreRepairOutcome) -> String {
-    format!(
+    let mut message = format!(
         "切号修复 {} 条会话、{} 个会话文件，清理加密引用 {} 个；完整历史修复扫描 {} 条会话，校正 {} 个会话文件，重置 {} 条分页历史投影",
         outcome.model_compatibility.repaired_thread_count,
         outcome.model_compatibility.repaired_rollout_file_count,
@@ -1896,7 +2110,25 @@ pub(crate) fn one_click_repair_message(outcome: &OneClickStoreRepairOutcome) -> 
         outcome.visibility.scanned,
         outcome.visibility.changed_rollout_file_count,
         outcome.visibility.reset_history_projection_count
-    )
+    );
+    if !outcome.warnings.is_empty() {
+        let examples = outcome
+            .warnings
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("；");
+        message.push_str(&format!(
+            "；跳过 {} 项无法修复的内容：{}",
+            outcome.warnings.len(),
+            examples
+        ));
+        if outcome.warnings.len() > 3 {
+            message.push_str("；其余错误已省略");
+        }
+    }
+    message
 }
 
 pub(crate) fn one_click_repair_sessions_blocking(
@@ -1919,6 +2151,7 @@ pub(crate) fn one_click_repair_sessions_blocking(
         session_count,
         model_compatibility,
         mut visibility,
+        warnings,
     } = outcome;
     if let Some(item) = visibility.items.first_mut() {
         item.instance_id = instance_id.clone();
@@ -1932,6 +2165,7 @@ pub(crate) fn one_click_repair_sessions_blocking(
         session_count,
         model_compatibility,
         visibility,
+        warnings,
         message,
     })
 }
@@ -3098,14 +3332,20 @@ fn codex_copy_session_history_across_instances(
     source_instance_id: String,
     target_instance_id: String,
 ) -> Result<CodexSessionMutationResult, String> {
-    let source_store = session_store_for_instance(Some(&source_instance_id))?;
-    let target_store = session_store_for_instance(Some(&target_instance_id))?;
-    source_store.copy_session_to_store(
-        &target_store,
-        &source_session_id,
-        &copy_suffix,
-        &target_project_path,
-    )
+    instances::run_with_instance_restarted(&target_instance_id, |target_instance| {
+        let target_store = SessionStore::new(PathBuf::from(&target_instance.codex_home));
+        let source_store = if source_instance_id == target_instance_id {
+            SessionStore::new(PathBuf::from(&target_instance.codex_home))
+        } else {
+            session_store_for_instance(Some(&source_instance_id))?
+        };
+        source_store.copy_session_to_store(
+            &target_store,
+            &source_session_id,
+            &copy_suffix,
+            &target_project_path,
+        )
+    })
 }
 
 #[tauri::command]
@@ -3264,6 +3504,7 @@ fn merge_visibility_repair_summary(
     total.desktop_reload_performed |= next.desktop_reload_performed;
     total.backup_dirs.append(&mut next.backup_dirs);
     total.items.append(&mut next.items);
+    total.warnings.append(&mut next.warnings);
 }
 
 #[tauri::command]
@@ -4095,7 +4336,7 @@ fn write_switcher_settings(settings: &CodexSwitcherSettings) -> Result<(), Strin
         .map_err(|error| format!("写入设置失败: {}", error))
 }
 
-async fn fetch_codex_quota_for_account(account_id: &str) -> Result<CodexQuota, String> {
+pub(crate) async fn fetch_codex_quota_for_account(account_id: &str) -> Result<CodexQuota, String> {
     let source = refreshed_quota_source_account(account_id).await?;
     let accounts = AccountStore::default().list_accounts()?;
     let target = accounts
@@ -4575,7 +4816,7 @@ fn quota_window_minutes(window: Option<&Value>) -> Option<i64> {
         .map(|seconds| (seconds / 60).max(1))
 }
 
-fn compact_http_body(body: &str) -> String {
+pub(crate) fn compact_http_body(body: &str) -> String {
     let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
     compact.chars().take(300).collect()
 }
@@ -4763,10 +5004,12 @@ mod tests {
                 CodexApiKeyModel {
                     id: "gpt-5.5".to_string(),
                     owned_by: None,
+                    input_modalities: None,
                 },
                 CodexApiKeyModel {
                     id: "gpt-5.6-sol".to_string(),
                     owned_by: Some("custom".to_string()),
+                    input_modalities: None,
                 },
             ]
         );
@@ -5747,6 +5990,7 @@ pub fn run() {
             instances::stop_codex_instance,
             instances::restart_codex_instance,
             switch_codex_account,
+            sync_api_key_account_to_instance,
             restart_codex_app,
             repair_codex_session_model_compatibility,
             codex_one_click_repair_sessions,
@@ -5779,6 +6023,8 @@ pub fn run() {
             import_codex_switcher_backup,
             refresh_codex_quota,
             refresh_all_codex_quotas,
+            quota_list::check_quota_list_status,
+            quota_list::fetch_quota_list,
             consume_codex_reset_credit,
             codex_get_usage_dashboard,
             codex_get_usage_activity,
@@ -5825,6 +6071,12 @@ pub fn run() {
             opencodex::opencodex_update_vision_sidecar_settings,
             opencodex::opencodex_get_image_generation_settings,
             opencodex::opencodex_update_image_generation_settings,
+            opencodex::opencodex_get_connection_info,
+            opencodex::opencodex_update_connection_info,
+            opencodex::opencodex_generate_api_key,
+            opencodex::opencodex_update_api_key_name,
+            opencodex::opencodex_rotate_api_key,
+            opencodex::opencodex_delete_api_key,
         ])
         .on_window_event(|window, event| {
             // 只有主窗口销毁才代表应用退出；OpenCodex Web 管理等子窗口关闭时不能停掉 API 服务，

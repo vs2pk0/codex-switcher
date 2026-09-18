@@ -109,6 +109,10 @@ Windows 会自动查找商店或常见安装目录中的官方桌面程序，也
 - 使用统计：`~/.codex_switcher/statistics`
 - 设置：`~/.codex_switcher/data/settings.json`
 - 备份：`~/.codex_switcher/backup`
+- 主实例 OpenCodex Engine、管理状态与日志：`~/.codex_switcher/opencodex-manager`
+- 主实例 OpenCodex 配置与服务数据：`~/.codex_switcher/.opencodex`
+
+主实例 OpenCodex 使用上述固定目录，不读取外部 `OPENCODEX_HOME` 覆盖。多开实例的 OpenCodex 目录规则保持不变。旧版位于用户主目录的 `.opencodex` 和系统应用数据目录中的 `opencodex-manager` 不会自动迁移或删除；已有安装需要迁移数据后再使用新目录。
 
 当前账号会写入本机 Codex 目录 `~/.codex`。账号导出文件可能包含认证信息，请妥善保管。
 

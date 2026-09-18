@@ -25,7 +25,33 @@ import type {
   OpenCodexVisionModelsUpdateResult,
   OpenCodexVisionSidecarResponse,
   OpenCodexVisionSidecarSettings,
+  ConnectionInfo,
+  ConnectionApiKey,
 } from "./types";
+
+export function getOpenCodexConnectionInfo(instanceId?: string): Promise<ConnectionInfo> {
+  return invoke("opencodex_get_connection_info", { instanceId });
+}
+
+export function updateOpenCodexConnectionInfo(apiKey: string, instanceId?: string): Promise<ConnectionInfo> {
+  return invoke("opencodex_update_connection_info", { instanceId, apiKey });
+}
+
+export function generateOpenCodexApiKey(name?: string, instanceId?: string): Promise<ConnectionApiKey> {
+  return invoke("opencodex_generate_api_key", { instanceId, name });
+}
+
+export function updateOpenCodexApiKeyName(keyId: string, name: string, instanceId?: string): Promise<ConnectionInfo> {
+  return invoke("opencodex_update_api_key_name", { instanceId, keyId, name });
+}
+
+export function rotateOpenCodexApiKey(keyId: string, instanceId?: string): Promise<ConnectionInfo> {
+  return invoke("opencodex_rotate_api_key", { instanceId, keyId });
+}
+
+export function deleteOpenCodexApiKey(keyId: string, instanceId?: string): Promise<ConnectionInfo> {
+  return invoke("opencodex_delete_api_key", { instanceId, keyId });
+}
 
 export function getOpenCodexSnapshot(instanceId?: string): Promise<OpenCodexSystemSnapshot> {
   return invoke("opencodex_get_system_snapshot", { instanceId });

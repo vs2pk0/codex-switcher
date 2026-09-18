@@ -761,6 +761,18 @@ textarea {
   box-shadow: 0 8px 18px rgba(79, 70, 229, 0.1);
 }
 
+.account-batch-actions .batch-delete.arco-btn {
+  border-color: rgba(220, 38, 38, 0.2);
+  color: #dc2626;
+  background: #fef2f2;
+}
+
+.account-batch-actions .batch-delete.arco-btn:hover {
+  border-color: rgba(220, 38, 38, 0.36);
+  background: #fee2e2;
+  box-shadow: 0 8px 18px rgba(220, 38, 38, 0.1);
+}
+
 .account-batch-actions .batch-export.arco-btn {
   border-color: rgba(5, 150, 105, 0.18);
   color: #047857;
@@ -2496,6 +2508,7 @@ textarea {
 }
 
 .session-content-shell {
+  position: relative;
   display: grid;
   grid-template-rows: auto auto auto minmax(0, 1fr);
   gap: 12px;
@@ -3066,6 +3079,127 @@ textarea {
 
 .session-content-load-more {
   min-height: 38px;
+}
+
+.session-pdf-loading {
+  position: absolute;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 12px;
+  border-radius: 10px;
+  color: #334155;
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(3px);
+}
+
+.session-pdf-loading strong {
+  font-size: 15px;
+}
+
+.session-pdf-loading span {
+  color: #718096;
+  font-size: 12px;
+}
+
+.session-pdf-stage {
+  position: fixed;
+  top: 0;
+  left: -10000px;
+  z-index: -1;
+  width: 760px;
+  padding: 18px;
+  color: #1f2937;
+  background: #fff;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+}
+
+.session-pdf-title,
+.session-pdf-turn-header,
+.session-pdf-message {
+  box-sizing: border-box;
+  width: 724px;
+  background: #fff;
+}
+
+.session-pdf-title {
+  padding: 20px;
+  border: 1px solid #d9e7fb;
+  border-radius: 10px;
+}
+
+.session-pdf-title h1 {
+  margin: 0 0 8px;
+  color: #172033;
+  font-size: 24px;
+}
+
+.session-pdf-title p {
+  margin: 0;
+  color: #70819b;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.session-pdf-turn-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 11px 14px;
+  border: 1px solid #dbe5f2;
+  border-radius: 8px;
+  color: #24324a;
+  background: #f8fafd;
+}
+
+.session-pdf-turn-header span,
+.session-pdf-message > header span {
+  color: #7a899e;
+  font-size: 11px;
+}
+
+.session-pdf-message {
+  padding: 14px 16px;
+  border: 1px solid #e1e8f2;
+  border-radius: 10px;
+}
+
+.session-pdf-message.is-user {
+  border-color: #cfe0ff;
+  background: #edf5ff;
+}
+
+.session-pdf-message > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  color: #2f5f9d;
+}
+
+.session-pdf-skill,
+.session-pdf-file {
+  padding: 9px 11px;
+  border: 1px solid #d9e2ee;
+  border-radius: 7px;
+  color: #334155;
+  background: #f8fafc;
+}
+
+.session-pdf-image {
+  display: block;
+  max-width: 100%;
+  max-height: 680px;
+  margin-top: 12px;
+  object-fit: contain;
+}
+
+.session-pdf-file {
+  margin-top: 10px;
+  font-size: 12px;
 }
 
 @media (max-width: 760px) {
@@ -6180,6 +6314,154 @@ textarea {
 .api-key-info-icon-url {
   color: #2563eb;
   background: rgba(219, 234, 254, 0.95);
+}
+
+.api-quota-panel {
+  gap: 8px;
+  padding: 10px;
+  border-top: 1px solid rgba(85, 113, 156, 0.14);
+}
+
+.api-quota-panel .quota-metrics {
+  grid-auto-rows: minmax(70px, auto);
+}
+
+/* 叠加多窗口时与 ChatGPT 账号额度列表一致：同一边框内按行分隔 */
+.api-quota-panel .quota-metrics.stacked {
+  grid-auto-rows: minmax(64px, auto);
+}
+
+.quota-window-label .quota-metric-count {
+  flex: 0 0 auto;
+  margin-left: 2px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: #64748b;
+  background: rgba(100, 116, 139, 0.12);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 760;
+  line-height: 1.3;
+}
+
+.api-quota-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.api-quota-head-label {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  color: #7c3aed;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.api-quota-head small {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: #94a3b8;
+  font-size: 11px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-quota-refresh {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+/* tab 模式：账号切换按紧凑列表行展示（账号名 + 各窗口百分比圆点），与账号页列表模式一致 */
+.api-quota-tabs {
+  display: grid;
+  gap: 0;
+  /* 固定展示两行（34px/行）；更多账号内部滚动，不再撑高账号卡片。 */
+  max-height: 70px;
+  overflow-y: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  border: 1px solid rgba(85, 113, 156, 0.18);
+  border-radius: 10px;
+  background: rgba(248, 250, 252, 0.7);
+}
+
+.api-quota-tabs::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.api-quota-tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #526176;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
+
+.api-quota-tab + .api-quota-tab {
+  border-top: 1px solid rgba(85, 113, 156, 0.14);
+}
+
+.api-quota-tab:hover {
+  background: rgba(241, 245, 249, 0.95);
+}
+
+.api-quota-tab.active {
+  background: rgba(224, 231, 255, 0.7);
+  color: #312e81;
+  box-shadow: inset 3px 0 0 #4f46e5;
+}
+
+.api-quota-tab-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 760;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-quota-tab.active .api-quota-tab-name {
+  font-weight: 820;
+}
+
+.api-quota-tab-pair {
+  flex: 0 0 auto;
+  color: #334155;
+}
+
+.api-quota-tab.error .api-quota-tab-name {
+  color: #b91c1c;
+}
+
+.api-quota-note {
+  overflow: hidden;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.api-quota-note.error {
+  color: #b91c1c;
 }
 
 .api-key-info-text {

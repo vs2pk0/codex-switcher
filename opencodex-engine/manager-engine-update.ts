@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { patchGuiAccountColumn } from "./manager-logs-account-column";
 
 const REPOSITORY = "lidge-jun/opencodex";
 const PACKAGE_NAME = "@bitkyc08/opencodex";
@@ -217,6 +218,12 @@ export async function installVersion(request: InstallRequest): Promise<{ version
     }
     reportProgress({ stage: "validating" });
     validateInstalledPackage(tempDir, version);
+    try {
+      const guiPatch = patchGuiAccountColumn(tempDir);
+      if (!guiPatch.patched) console.error(`日志账号列补丁跳过：${guiPatch.reason ?? "未知原因"}`);
+    } catch (error) {
+      console.error(`日志账号列补丁失败（不影响 Engine 安装）：${error instanceof Error ? error.message : String(error)}`);
+    }
     writeFileSync(join(tempDir, ".install.json"), JSON.stringify({
       version,
       integrity,

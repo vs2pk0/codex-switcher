@@ -22,6 +22,7 @@ const originalOpenCodexHome = process.env.OPENCODEX_HOME;
 const originalCodexHome = process.env.CODEX_HOME;
 const originalOpenCodexPackageRoot = process.env.OPENCODEX_PACKAGE_ROOT;
 const originalDefaultInstance = process.env.OPENCODEX_MANAGER_DEFAULT_INSTANCE;
+const originalStopAppServers = process.env.OPENCODEX_MANAGER_STOP_APP_SERVERS;
 
 test("关闭实例的 WAL 数据库可以预检且不修改会话", async () => {
   const root = mkdtempSync(join(tmpdir(), "opencodex-wal-preflight-"));
@@ -159,6 +160,8 @@ afterEach(() => {
   else process.env.CODEX_HOME = originalCodexHome;
   if (originalOpenCodexPackageRoot === undefined) delete process.env.OPENCODEX_PACKAGE_ROOT;
   else process.env.OPENCODEX_PACKAGE_ROOT = originalOpenCodexPackageRoot;
+  if (originalStopAppServers === undefined) delete process.env.OPENCODEX_MANAGER_STOP_APP_SERVERS;
+  else process.env.OPENCODEX_MANAGER_STOP_APP_SERVERS = originalStopAppServers;
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -252,24 +255,39 @@ test("未下载 Engine 时仍可停用旧实例接入以重置配置，不启用
   expect(readFileSync(join(target, "config.toml"), "utf8")).toBe("[broken");
 });
 
-test("Engine 未提交更新时不把旧目录当成功，冲突可有界重试且关闭意图优先", async () => {
-  for (const mode of ["unchanged", "retry", "disabled", "converged"]) {
+test("Engine 提交结果优先于目录改写状态，冲突可有界重试且关闭意图优先", async () => {
+  for (const mode of ["unchanged", "retry", "disabled", "converged", "committed-noop"]) {
     const source = mkdtempSync(join(tmpdir(), "opencodex-retry-source-"));
     const target = mkdtempSync(join(tmpdir(), "opencodex-retry-target-"));
     const pkg = mkdtempSync(join(tmpdir(), "opencodex-retry-package-"));
     temporaryRoots.push(source, target, pkg);
     writeFileSync(join(source, "config.json"), '{"clientIntegrations":{"codex":true}}');
     writeActiveEnginePackage(pkg);
-    writeFileSync(join(pkg, "src/codex/refresh.ts"), `
+    writeFileSync(join(pkg, "src/codex/app-server-processes.ts"), `
       import {writeFileSync} from "node:fs";
+      import {join} from "node:path";
+      export function listCodexAppServerProcesses() {
+        return [{pid:123,commandLine:"codex app-server"}];
+      }
+      export function restartCodexAppServers(processes) {
+        writeFileSync(join(process.env.CODEX_HOME, "app-servers-stopped"), String(processes.length));
+        return {requested:[123],stopped:[123],surviving:[],failed:[]};
+      }
+    `);
+    writeFileSync(join(pkg, "src/codex/refresh.ts"), `
+      import {existsSync,writeFileSync} from "node:fs";
       import {join} from "node:path";
       let attempts = 0;
       export async function refreshCodexModelCatalog() {
+        if (!existsSync(join(process.env.CODEX_HOME, "app-servers-stopped"))) {
+          throw new Error("app-server was not stopped before catalog refresh");
+        }
         attempts++;
         const path = join(process.env.CODEX_HOME, "opencodex-catalog.json");
         writeFileSync(path, JSON.stringify({models:[{slug:"old/model"}]}));
         writeFileSync(join(process.env.CODEX_HOME, "attempts"), String(attempts));
         return {path,catalogExists:true,added:${JSON.stringify(mode)} === "converged" ? 1 : 0,catalogWritten:${JSON.stringify(mode)} === "retry" && attempts === 3,
+          refreshOutcome:${JSON.stringify(mode)} === "committed-noop" ? "committed" : undefined,
           skippedReason:${JSON.stringify(mode)} === "disabled" ? "desired_disabled" : undefined};
       }
     `);
@@ -277,11 +295,42 @@ test("Engine 未提交更新时不把旧目录当成功，冲突可有界重试�
     process.env.CODEX_HOME = target;
     process.env.OPENCODEX_PACKAGE_ROOT = pkg;
     process.env.OPENCODEX_MANAGER_DEFAULT_INSTANCE = "0";
+    process.env.OPENCODEX_MANAGER_STOP_APP_SERVERS = "1";
     const result = await syncInstance(15800);
-    expect(result.success).toBe(mode === "retry" || mode === "converged");
-    expect(existsSync(join(target, "active-engine-marker"))).toBe(mode === "retry" || mode === "converged");
-    expect(readFileSync(join(target, "attempts"), "utf8")).toBe(mode === "disabled" || mode === "converged" ? "1" : "3");
+    const expectedSuccess = mode === "retry" || mode === "converged" || mode === "committed-noop";
+    expect(result.success).toBe(expectedSuccess);
+    expect(existsSync(join(target, "active-engine-marker"))).toBe(expectedSuccess);
+    expect(readFileSync(join(target, "attempts"), "utf8")).toBe(
+      mode === "disabled" || mode === "converged" || mode === "committed-noop" ? "1" : "3",
+    );
   }
+});
+
+test("残留 app-server 无法退出时停止同步且不注入旧模型目录", async () => {
+  const source = mkdtempSync(join(tmpdir(), "opencodex-stale-source-"));
+  const target = mkdtempSync(join(tmpdir(), "opencodex-stale-target-"));
+  const pkg = mkdtempSync(join(tmpdir(), "opencodex-stale-package-"));
+  temporaryRoots.push(source, target, pkg);
+  writeFileSync(join(source, "config.json"), '{"clientIntegrations":{"codex":true}}');
+  writeActiveEnginePackage(pkg);
+  writeFileSync(join(pkg, "src/codex/app-server-processes.ts"), `
+    export function listCodexAppServerProcesses() {
+      return [{pid:456,commandLine:"codex app-server"}];
+    }
+    export function restartCodexAppServers() {
+      return {requested:[456],stopped:[],surviving:[456],failed:[]};
+    }
+  `);
+  process.env.OPENCODEX_HOME = source;
+  process.env.CODEX_HOME = target;
+  process.env.OPENCODEX_PACKAGE_ROOT = pkg;
+  process.env.OPENCODEX_MANAGER_DEFAULT_INSTANCE = "0";
+  process.env.OPENCODEX_MANAGER_STOP_APP_SERVERS = "1";
+  const result = await syncInstance(15800);
+  expect(result.success).toBe(false);
+  expect(result.message).toContain("PID：456");
+  expect(existsSync(join(target, "active-engine-marker"))).toBe(false);
+  expect(existsSync(join(target, "opencodex-catalog.json"))).toBe(false);
 });
 
 test("只读预检拒绝分页迁移时保留配置、账号和接入状态", async () => {

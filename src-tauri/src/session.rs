@@ -1,5 +1,12 @@
 use crate::account::{replace_file_atomic, write_bytes_atomic};
+
+/// 同一线程多段 rollout（history_base 续写链）的解析与合并。
+mod lineage;
 use base64::{engine::general_purpose, Engine as _};
+use lineage::{
+    lineage_projection_targets, materialize_lineage, physical_rollout_id, resolve_lineage,
+    RolloutLineage, SegmentInput, SegmentProjectionTarget,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -153,7 +160,7 @@ pub struct CodexSessionMessageMutationResult {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexSessionVisibilityRepairSummary {
     pub scanned: usize,
@@ -181,10 +188,12 @@ pub struct CodexSessionVisibilityRepairSummary {
     pub desktop_reload_performed: bool,
     pub backup_dirs: Vec<String>,
     pub items: Vec<CodexSessionVisibilityRepairItem>,
+    /// 单个会话无法修复时的警告；不会中断同批次其他会话。
+    pub warnings: Vec<String>,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexSessionModelCompatibilityRepairSummary {
     pub target_provider: String,
@@ -247,6 +256,12 @@ struct SessionRepairRecord {
     updated_at: i64,
 }
 
+/// 一条会话记录及其背后的物理段链。
+struct SessionLineageEntry {
+    lineage: RolloutLineage,
+    record: CodexSessionRecord,
+}
+
 #[derive(Debug, Default)]
 struct DesktopCatalogRepairResult {
     updated: usize,
@@ -298,6 +313,7 @@ struct RolloutRewriteOutcome {
     changed_session_ids: HashSet<String>,
     backup_dirs: Vec<String>,
     skipped_protected_ancestors: Vec<String>,
+    warnings: Vec<String>,
 }
 
 /// 被 fork 子会话 `history_base` 引用的祖先 rollout：thread_id -> 受保护的前缀字节数。
@@ -305,6 +321,19 @@ struct RolloutRewriteOutcome {
 /// 子会话把祖先文件 `end_byte_offset` 之前的字节当作自己不可变的历史前缀，
 /// 一旦这段字节被改写（重排 ordinal、重写 provider、删行），所有子会话的历史都会失效。
 type ProtectedRolloutPrefixes = HashMap<String, u64>;
+
+/// 查某个 rollout 文件受保护的前缀字节数：history_base 引用的是物理段 id，
+/// 续写段的物理 id 来自文件名后缀，首段与逻辑线程 id 相同。
+fn protected_prefix_bytes(
+    protected: &ProtectedRolloutPrefixes,
+    path: &Path,
+    logical_id: &str,
+) -> Option<u64> {
+    protected
+        .get(&physical_rollout_id(path, logical_id))
+        .copied()
+        .filter(|bytes| *bytes > 0)
+}
 
 /// 判断重写后的内容是否原样保留了受保护前缀。
 fn rollout_prefix_preserved(original: &str, rewritten: &str, protected_bytes: u64) -> bool {
@@ -729,9 +758,25 @@ impl SessionStore {
             backup_dirs: Vec::new(),
         };
 
+        let protected = self.protected_rollout_prefixes();
         for path in collect_jsonl_files(&self.sessions_dir())? {
+            // 被后继段引用的前缀必须保持字节级不变，只改写前缀之后的记录。
+            let protected_prefix = if protected.is_empty() {
+                0
+            } else {
+                read_session_record_header(&path)
+                    .ok()
+                    .and_then(|header| header.id)
+                    .and_then(|id| protected_prefix_bytes(&protected, &path, &id))
+                    .unwrap_or(0)
+            };
             let Some((tmp_path, rewrite_stats)) =
-                prepare_rollout_model_compatibility_rewrite(&path, target_provider, None)?
+                prepare_rollout_model_compatibility_rewrite_guarded(
+                    &path,
+                    target_provider,
+                    None,
+                    protected_prefix,
+                )?
             else {
                 continue;
             };
@@ -929,7 +974,11 @@ impl SessionStore {
         let content_query = normalize_query(content_query);
         let custom_titles = self.read_session_titles();
         let mut sessions = Vec::new();
-        for mut record in self.canonical_session_records()? {
+        for entry in self.session_lineage_entries()? {
+            let SessionLineageEntry {
+                lineage,
+                mut record,
+            } = entry;
             if let Some(title) = custom_titles.get(&record.id) {
                 record.title = title.clone();
             }
@@ -939,7 +988,9 @@ impl SessionStore {
                 }
             }
             if let Some(query) = content_query.as_deref() {
-                if !session_file_contains_query(Path::new(&record.path), query)? {
+                // 多段会话要搜索拼接后的完整历史，而不只是当前写入段。
+                let read_path = materialize_lineage(&lineage, &self.lineage_cache_dir())?;
+                if !session_file_contains_query(&read_path, query)? {
                     continue;
                 }
             }
@@ -950,21 +1001,89 @@ impl SessionStore {
     }
 
     fn canonical_session_records(&self) -> Result<Vec<CodexSessionRecord>, String> {
-        let mut records = HashMap::<String, CodexSessionRecord>::new();
+        Ok(self
+            .session_lineage_entries()?
+            .into_iter()
+            .map(|entry| entry.record)
+            .collect())
+    }
+
+    /// 按逻辑线程 id 归并 sessions 目录下的所有 rollout：同一线程被 Codex 切成多段时，
+    /// 列表记录的路径是当前写入段，大小/Token 是各段有效字节的合计，标题取首段。
+    fn session_lineage_entries(&self) -> Result<Vec<SessionLineageEntry>, String> {
+        let mut groups =
+            HashMap::<String, Vec<(CodexSessionRecord, Option<RolloutHistoryBase>)>>::new();
         for path in collect_jsonl_files(&self.sessions_dir())? {
-            let candidate = build_session_record_summary(&path)?;
-            match records.entry(candidate.id.clone()) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(candidate);
-                }
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    if session_record_is_more_complete(&candidate, entry.get()) {
-                        entry.insert(candidate);
+            let summary = build_session_record_summary(&path)?;
+            let base = read_rollout_history_base(&path);
+            groups
+                .entry(summary.id.clone())
+                .or_default()
+                .push((summary, base));
+        }
+        let mut entries = Vec::with_capacity(groups.len());
+        for (id, files) in groups {
+            let inputs = files
+                .iter()
+                .map(|(summary, base)| SegmentInput {
+                    path: PathBuf::from(&summary.path),
+                    base: base.clone(),
+                    file_len: summary.size_bytes,
+                    updated_at: summary.updated_at,
+                })
+                .collect();
+            let Some((lineage, _orphans)) = resolve_lineage(&id, inputs) else {
+                continue;
+            };
+            let summary_for = |path: &Path| {
+                files
+                    .iter()
+                    .find(|(summary, _)| Path::new(&summary.path) == path)
+                    .map(|(summary, _)| summary)
+            };
+            let Some(first) = summary_for(&lineage.segments[0].path) else {
+                continue;
+            };
+            let mut record = first.clone();
+            if lineage.is_split() {
+                let head = lineage.head();
+                record.path = head.path.to_string_lossy().to_string();
+                record.size_bytes = lineage.total_bytes();
+                record.approximate_tokens =
+                    usize::try_from(record.size_bytes.div_ceil(4)).unwrap_or(usize::MAX);
+                record.updated_at = lineage.updated_at();
+                // 首段没有可用标题（例如从 fork 起步）时退回链尾的标题。
+                if record.title == file_stem(&lineage.segments[0].path) {
+                    if let Some(head_summary) = summary_for(&head.path) {
+                        if head_summary.title != file_stem(&head.path) {
+                            record.title = head_summary.title.clone();
+                        }
                     }
                 }
             }
+            entries.push(SessionLineageEntry { lineage, record });
         }
-        Ok(records.into_values().collect())
+        Ok(entries)
+    }
+
+    fn find_session_lineage(&self, session_id: &str) -> Result<RolloutLineage, String> {
+        self.session_lineage_entries()?
+            .into_iter()
+            .find(|entry| entry.record.id == session_id)
+            .map(|entry| entry.lineage)
+            .ok_or_else(|| format!("会话不存在: {}", session_id))
+    }
+
+    /// 只读场景（查看内容、搜索、统计）使用的路径：多段会话返回按 lineage 拼接的缓存文件。
+    fn find_session_read_path(&self, session_id: &str) -> Result<PathBuf, String> {
+        let lineage = self.find_session_lineage(session_id)?;
+        materialize_lineage(&lineage, &self.lineage_cache_dir())
+    }
+
+    fn lineage_cache_dir(&self) -> PathBuf {
+        switcher_root_dir()
+            .join("session-lineage-cache")
+            .join(short_hash(&self.codex_home.to_string_lossy()))
     }
 
     pub fn list_session_content(
@@ -975,7 +1094,7 @@ impl SessionStore {
         direction: Option<&str>,
     ) -> Result<CodexSessionContentPage, String> {
         let session_id = normalize_required_session_id(session_id)?;
-        let path = self.find_session_path(&session_id)?;
+        let path = self.find_session_read_path(&session_id)?;
         let limit = limit.unwrap_or(20).clamp(1, 50);
         let direction = direction.unwrap_or("asc");
         let (cursor, turns, next_cursor) = match direction {
@@ -1009,7 +1128,7 @@ impl SessionStore {
         asset_id: &str,
     ) -> Result<CodexSessionAsset, String> {
         let session_id = normalize_required_session_id(session_id)?;
-        let path = self.find_session_path(&session_id)?;
+        let path = self.find_session_read_path(&session_id)?;
         read_session_asset(&path, asset_id)
     }
 
@@ -1025,7 +1144,8 @@ impl SessionStore {
         }
         let path = self.find_session_path(&session_id)?;
         let before = session_file_fingerprint(&path)?;
-        let (target_turn, has_open_turn) = find_session_turn(&path, turn_id)?;
+        let (target_turn, has_open_turn) =
+            self.find_mutable_session_turn(&session_id, &path, turn_id)?;
         if has_open_turn {
             return Err("该会话仍在生成或写入内容，请等待当前对话结束后再删除".to_string());
         }
@@ -1086,7 +1206,8 @@ impl SessionStore {
 
         let path = self.find_session_path(&session_id)?;
         let before = session_file_fingerprint(&path)?;
-        let (target_turn, has_open_turn) = find_session_turn(&path, turn_id)?;
+        let (target_turn, has_open_turn) =
+            self.find_mutable_session_turn(&session_id, &path, turn_id)?;
         if has_open_turn {
             return Err("该会话仍在生成或写入内容，请等待当前对话结束后再删除".to_string());
         }
@@ -1197,6 +1318,25 @@ impl SessionStore {
             &target_project_path,
             &target_provider,
         )?;
+        let title = copied_session_title(&source.title, copy_suffix);
+        if source_history_mode == "paginated" {
+            if let Err(error) = target_store.copy_staged_history_projection(self, &staged) {
+                let cleanup_error = target_store.cleanup_staged_fork_source(&staged).err();
+                return Err(match cleanup_error {
+                    Some(cleanup_error) => {
+                        format!("生成副本分页历史索引失败: {error}；清理失败: {cleanup_error}")
+                    }
+                    None => format!("生成副本分页历史索引失败: {error}"),
+                });
+            }
+            return Ok(target_store.finalize_copied_session(
+                staged.session.id,
+                title,
+                target_project_path,
+                target_provider,
+                Vec::new(),
+            ));
+        }
         let fork_result = run_codex_thread_fork(
             &target_store.codex_home,
             &staged.session,
@@ -1256,39 +1396,53 @@ impl SessionStore {
             ));
         }
 
-        let title = copied_session_title(&source.title, copy_suffix);
         let mut warnings = Vec::new();
         if let Err(error) = target_store.archive_staged_fork_source(&staged) {
             warnings.push(format!("隐藏副本历史底稿失败: {error}"));
         }
-        if let Err(error) = target_store.write_session_title(&fork.session_id, &title) {
+        Ok(target_store.finalize_copied_session(
+            fork.session_id,
+            title,
+            target_project_path,
+            target_provider,
+            warnings,
+        ))
+    }
+
+    fn finalize_copied_session(
+        &self,
+        session_id: String,
+        title: String,
+        target_project_path: String,
+        target_provider: String,
+        mut warnings: Vec<String>,
+    ) -> CodexSessionMutationResult {
+        if let Err(error) = self.write_session_title(&session_id, &title) {
             warnings.push(error);
         }
-        if let Err(error) = target_store.update_sqlite_session_title(&fork.session_id, &title) {
+        if let Err(error) = self.update_sqlite_session_title(&session_id, &title) {
             warnings.push(error);
         }
-        if let Err(error) =
-            target_store.update_sqlite_session_cwd(&fork.session_id, &target_project_path)
-        {
+        if let Err(error) = self.update_sqlite_session_cwd(&session_id, &target_project_path) {
             warnings.push(error);
         }
-        if let Err(error) = target_store.repair_visibility_with_options(
+        if let Err(error) = self.repair_visibility_with_options(
             Some("quick"),
             Some(target_provider),
             None,
             None,
-            Some(vec![fork.session_id.clone()]),
+            Some(vec![session_id.clone()]),
         ) {
             warnings.push(format!("副本已创建，但同步 Codex 侧栏失败: {error}"));
         }
 
-        Ok(CodexSessionMutationResult {
-            session_id: fork.session_id,
+        CodexSessionMutationResult {
+            session_id,
             title,
             project_path: Some(target_project_path),
             backup_path: None,
             warnings,
-        })
+        }
     }
 
     fn stage_fork_source(
@@ -1304,7 +1458,7 @@ impl SessionStore {
         let staged_session_id = new_session_id();
         let staged_path =
             new_session_rollout_path(&self.sessions_dir(), &staged_session_id, created_at);
-        create_staged_fork_rollout(
+        let projection = create_staged_fork_rollout(
             source_codex_home,
             source_path,
             &staged_path,
@@ -1336,6 +1490,7 @@ impl SessionStore {
         let staged = StagedForkSource {
             session: staged_session,
             path: staged_path,
+            projection,
         };
         if let Err(error) = self.register_staged_fork_source(&staged, target_provider) {
             let cleanup_error = self.cleanup_staged_fork_source(&staged).err();
@@ -1383,6 +1538,356 @@ impl SessionStore {
         }
         if !registered {
             return Err("目标实例缺少可写的 Codex thread store，无法创建分页会话副本".to_string());
+        }
+        Ok(())
+    }
+
+    fn copy_staged_history_projection(
+        &self,
+        source_store: &SessionStore,
+        staged: &StagedForkSource,
+    ) -> Result<(), String> {
+        let global_positions = staged
+            .projection
+            .positions
+            .values()
+            .flat_map(|positions| {
+                positions
+                    .iter()
+                    .map(|(ordinal, position)| (*ordinal, *position))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut items = HashMap::<(String, String), CopiedProjectionItem>::new();
+        let mut turns = HashMap::<String, CopiedProjectionTurn>::new();
+        for db_path in source_store.thread_history_db_paths() {
+            let connection = Connection::open(&db_path).map_err(|error| {
+                format!(
+                    "打开源会话分页历史数据库失败 ({}): {error}",
+                    db_path.display()
+                )
+            })?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| format!("设置源会话分页历史数据库等待时间失败: {error}"))?;
+            let item_columns = sqlite_table_columns_with_connection(&connection, "thread_items")?;
+            let turn_columns = sqlite_table_columns_with_connection(&connection, "thread_turns")?;
+            let required_item_columns = [
+                "thread_id",
+                "turn_id",
+                "item_id",
+                "rollout_ordinal",
+                "updated_at_ordinal",
+                "created_at_ms",
+                "item_type",
+                "item_json",
+            ];
+            let required_turn_columns = [
+                "thread_id",
+                "turn_id",
+                "rollout_ordinal",
+                "status",
+                "error_json",
+                "started_at",
+                "completed_at",
+                "duration_ms",
+                "first_user_item_id",
+                "final_agent_item_id",
+                "rollout_byte_offset",
+                "rollout_end_ordinal",
+                "rollout_end_byte_offset",
+            ];
+            if !required_item_columns
+                .iter()
+                .all(|column| item_columns.contains(*column))
+                || !required_turn_columns
+                    .iter()
+                    .all(|column| turn_columns.contains(*column))
+            {
+                continue;
+            }
+            for (physical_id, positions) in &staged.projection.positions {
+                let mut item_statement = connection
+                    .prepare(
+                        "SELECT turn_id, item_id, rollout_ordinal, updated_at_ordinal, \
+                         created_at_ms, item_type, item_json FROM thread_items \
+                         WHERE thread_id = ?1 ORDER BY rollout_ordinal",
+                    )
+                    .map_err(|error| format!("读取源会话分页项目失败: {error}"))?;
+                let item_rows = item_statement
+                    .query_map(params![physical_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                        ))
+                    })
+                    .map_err(|error| format!("查询源会话分页项目失败: {error}"))?;
+                for row in item_rows {
+                    let (
+                        turn_id,
+                        item_id,
+                        rollout_ordinal,
+                        updated_at_ordinal,
+                        created_at_ms,
+                        item_type,
+                        item_json,
+                    ) = row.map_err(|error| format!("解析源会话分页项目失败: {error}"))?;
+                    let Some(position) = u64::try_from(rollout_ordinal).ok().and_then(|ordinal| {
+                        positions
+                            .get(&ordinal)
+                            .or_else(|| global_positions.get(&ordinal))
+                    }) else {
+                        continue;
+                    };
+                    let updated_at_ordinal = u64::try_from(updated_at_ordinal)
+                        .ok()
+                        .and_then(|ordinal| {
+                            positions
+                                .get(&ordinal)
+                                .or_else(|| global_positions.get(&ordinal))
+                        })
+                        .unwrap_or(position)
+                        .ordinal;
+                    items.insert(
+                        (turn_id.clone(), item_id.clone()),
+                        CopiedProjectionItem {
+                            turn_id,
+                            item_id,
+                            rollout_ordinal: i64::try_from(position.ordinal)
+                                .map_err(|_| "副本分页项目 ordinal 超出范围".to_string())?,
+                            updated_at_ordinal: i64::try_from(updated_at_ordinal)
+                                .map_err(|_| "副本分页项目更新 ordinal 超出范围".to_string())?,
+                            created_at_ms,
+                            item_type,
+                            item_json,
+                        },
+                    );
+                }
+
+                let mut turn_statement = connection
+                    .prepare(
+                        "SELECT turn_id, rollout_ordinal, status, error_json, started_at, \
+                         completed_at, duration_ms, first_user_item_id, final_agent_item_id, \
+                         rollout_end_ordinal FROM thread_turns WHERE thread_id = ?1 \
+                         ORDER BY rollout_ordinal",
+                    )
+                    .map_err(|error| format!("读取源会话分页轮次失败: {error}"))?;
+                let turn_rows = turn_statement
+                    .query_map(params![physical_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                            row.get::<_, Option<i64>>(5)?,
+                            row.get::<_, Option<i64>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                            row.get::<_, Option<String>>(8)?,
+                            row.get::<_, Option<i64>>(9)?,
+                        ))
+                    })
+                    .map_err(|error| format!("查询源会话分页轮次失败: {error}"))?;
+                for row in turn_rows {
+                    let (
+                        turn_id,
+                        rollout_ordinal,
+                        status,
+                        error_json,
+                        started_at,
+                        completed_at,
+                        duration_ms,
+                        first_user_item_id,
+                        final_agent_item_id,
+                        rollout_end_ordinal,
+                    ) = row.map_err(|error| format!("解析源会话分页轮次失败: {error}"))?;
+                    let Some(start) = u64::try_from(rollout_ordinal).ok().and_then(|ordinal| {
+                        positions
+                            .get(&ordinal)
+                            .or_else(|| global_positions.get(&ordinal))
+                    }) else {
+                        continue;
+                    };
+                    let end = rollout_end_ordinal
+                        .and_then(|ordinal| u64::try_from(ordinal).ok())
+                        .and_then(|ordinal| {
+                            positions
+                                .get(&ordinal)
+                                .or_else(|| global_positions.get(&ordinal))
+                        });
+                    turns.insert(
+                        turn_id.clone(),
+                        CopiedProjectionTurn {
+                            turn_id,
+                            rollout_ordinal: i64::try_from(start.ordinal)
+                                .map_err(|_| "副本分页轮次 ordinal 超出范围".to_string())?,
+                            status,
+                            error_json,
+                            started_at,
+                            completed_at,
+                            duration_ms,
+                            first_user_item_id,
+                            final_agent_item_id,
+                            rollout_byte_offset: i64::try_from(start.start_byte_offset)
+                                .map_err(|_| "副本分页轮次偏移超出范围".to_string())?,
+                            rollout_end_ordinal: end
+                                .map(|position| i64::try_from(position.ordinal))
+                                .transpose()
+                                .map_err(|_| "副本分页轮次结束 ordinal 超出范围".to_string())?,
+                            rollout_end_byte_offset: end
+                                .map(|position| i64::try_from(position.end_byte_offset))
+                                .transpose()
+                                .map_err(|_| "副本分页轮次结束偏移超出范围".to_string())?,
+                        },
+                    );
+                }
+            }
+        }
+        if items.is_empty() || turns.is_empty() {
+            return Err("源会话缺少可复制的分页历史投影，请先修复源会话可见性".to_string());
+        }
+
+        let mut projected = false;
+        for db_path in self.thread_history_db_paths() {
+            let mut connection = Connection::open(&db_path).map_err(|error| {
+                format!(
+                    "打开目标会话分页历史数据库失败 ({}): {error}",
+                    db_path.display()
+                )
+            })?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| format!("设置目标会话分页历史数据库等待时间失败: {error}"))?;
+            let item_columns = sqlite_table_columns_with_connection(&connection, "thread_items")?;
+            let turn_columns = sqlite_table_columns_with_connection(&connection, "thread_turns")?;
+            let projection_columns = sqlite_table_columns_with_connection(
+                &connection,
+                "thread_history_projection_state",
+            )?;
+            if ![
+                "thread_id",
+                "turn_id",
+                "item_id",
+                "rollout_ordinal",
+                "updated_at_ordinal",
+                "created_at_ms",
+                "item_type",
+                "item_json",
+            ]
+            .iter()
+            .all(|column| item_columns.contains(*column))
+                || ![
+                    "thread_id",
+                    "turn_id",
+                    "rollout_ordinal",
+                    "status",
+                    "error_json",
+                    "started_at",
+                    "completed_at",
+                    "duration_ms",
+                    "first_user_item_id",
+                    "final_agent_item_id",
+                    "rollout_byte_offset",
+                    "rollout_end_ordinal",
+                    "rollout_end_byte_offset",
+                ]
+                .iter()
+                .all(|column| turn_columns.contains(*column))
+                || ![
+                    "thread_id",
+                    "next_rollout_byte_offset",
+                    "next_rollout_ordinal",
+                ]
+                .iter()
+                .all(|column| projection_columns.contains(*column))
+            {
+                continue;
+            }
+            let transaction = connection
+                .transaction()
+                .map_err(|error| format!("开启副本分页历史写入事务失败: {error}"))?;
+            for table in [
+                "thread_items",
+                "thread_turns",
+                "thread_history_projection_state",
+            ] {
+                transaction
+                    .execute(
+                        &format!("DELETE FROM {table} WHERE thread_id = ?1"),
+                        params![staged.session.id],
+                    )
+                    .map_err(|error| format!("清理副本分页历史旧记录失败 ({table}): {error}"))?;
+            }
+            for item in items.values() {
+                transaction
+                    .execute(
+                        "INSERT INTO thread_items (thread_id, turn_id, item_id, \
+                         rollout_ordinal, updated_at_ordinal, created_at_ms, item_type, item_json) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![
+                            staged.session.id,
+                            item.turn_id,
+                            item.item_id,
+                            item.rollout_ordinal,
+                            item.updated_at_ordinal,
+                            item.created_at_ms,
+                            item.item_type,
+                            item.item_json,
+                        ],
+                    )
+                    .map_err(|error| format!("写入副本分页项目失败: {error}"))?;
+            }
+            for turn in turns.values() {
+                transaction
+                    .execute(
+                        "INSERT INTO thread_turns (thread_id, turn_id, rollout_ordinal, \
+                         rollout_byte_offset, rollout_end_ordinal, rollout_end_byte_offset, \
+                         status, error_json, started_at, completed_at, duration_ms, \
+                         first_user_item_id, final_agent_item_id) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                        params![
+                            staged.session.id,
+                            turn.turn_id,
+                            turn.rollout_ordinal,
+                            turn.rollout_byte_offset,
+                            turn.rollout_end_ordinal,
+                            turn.rollout_end_byte_offset,
+                            turn.status,
+                            turn.error_json,
+                            turn.started_at,
+                            turn.completed_at,
+                            turn.duration_ms,
+                            turn.first_user_item_id,
+                            turn.final_agent_item_id,
+                        ],
+                    )
+                    .map_err(|error| format!("写入副本分页轮次失败: {error}"))?;
+            }
+            transaction
+                .execute(
+                    "INSERT INTO thread_history_projection_state \
+                     (thread_id, next_rollout_byte_offset, next_rollout_ordinal) \
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        staged.session.id,
+                        i64::try_from(staged.projection.next_byte_offset)
+                            .map_err(|_| "副本分页历史文件偏移超出范围".to_string())?,
+                        i64::try_from(staged.projection.next_ordinal)
+                            .map_err(|_| "副本分页历史 ordinal 超出范围".to_string())?,
+                    ],
+                )
+                .map_err(|error| format!("写入副本分页历史状态失败: {error}"))?;
+            transaction
+                .commit()
+                .map_err(|error| format!("提交副本分页历史写入事务失败: {error}"))?;
+            projected = true;
+        }
+        if !projected {
+            return Err("目标实例缺少兼容的 Codex 分页历史数据库".to_string());
         }
         Ok(())
     }
@@ -1653,7 +2158,7 @@ impl SessionStore {
     ) -> Result<Vec<CodexSessionTokenStats>, String> {
         let mut stats = Vec::with_capacity(session_ids.len());
         for session_id in session_ids {
-            let Ok(path) = self.find_session_path(session_id) else {
+            let Ok(path) = self.find_session_read_path(session_id) else {
                 continue;
             };
             let char_count = count_session_characters(&path)?;
@@ -1917,6 +2422,7 @@ impl SessionStore {
                 desktop_reload_performed: false,
                 backup_dirs: Vec::new(),
                 items: Vec::new(),
+                warnings: Vec::new(),
                 message: "没有匹配到需要修复的 Codex 实例".to_string(),
             });
         }
@@ -1957,6 +2463,7 @@ impl SessionStore {
         let mut changed_rollout_files = rollout_outcome.changed;
         let mut rollout_backup_dirs = rollout_outcome.backup_dirs;
         let mut skipped_protected_ancestors = rollout_outcome.skipped_protected_ancestors;
+        let mut repair_warnings = rollout_outcome.warnings;
         let rewritten_session_ids = rollout_outcome.changed_session_ids;
         let (updated_rows, backup_dirs) = self.repair_sqlite_visibility(
             &target_provider,
@@ -1994,7 +2501,16 @@ impl SessionStore {
         let mut changed_session_ids = local_images.changed_session_ids.clone();
         changed_session_ids.extend(rewritten_session_ids);
         if deep && selected_ids.is_some() {
-            changed_session_ids.extend(repair_records.iter().map(|session| session.id.clone()));
+            // Native resume rebuilds the active segment only. Clearing an unchanged
+            // ancestor's valid projection hides inherited turns from the desktop.
+            // Actually rewritten files remain forced above; stale ancestors are
+            // still detected by the offset/ordinal/turn-count checks below.
+            changed_session_ids.extend(
+                repair_records
+                    .iter()
+                    .filter(|session| !protected_prefixes.contains_key(&session.id))
+                    .map(|session| session.id.clone()),
+            );
         }
         let projection_targets = if deep {
             repair_records.clone()
@@ -2005,11 +2521,16 @@ impl SessionStore {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        let (reset_history_projections, history_backup_dirs) = if projection_targets.is_empty() {
-            (0, Vec::new())
-        } else {
-            self.reset_stale_thread_history_projections(&projection_targets, &changed_session_ids)?
-        };
+        let (reset_history_projections, history_backup_dirs, projection_warnings) =
+            if projection_targets.is_empty() {
+                (0, Vec::new(), Vec::new())
+            } else {
+                self.reset_stale_thread_history_projections(
+                    &projection_targets,
+                    &changed_session_ids,
+                )?
+            };
+        repair_warnings.extend(projection_warnings);
         let repaired = changed_rollout_files
             + updated_rows
             + added_index_entries
@@ -2054,6 +2575,7 @@ impl SessionStore {
                 "invalidGeneratedImages": generated_images.invalid,
                 "resetHistoryProjections": reset_history_projections,
                 "skippedProtectedAncestors": skipped_protected_ancestors,
+                "warnings": repair_warnings,
                 "desktopReloadRequired": !sessions.is_empty(),
                 "updatedAt": now_timestamp()
             }))
@@ -2106,6 +2628,7 @@ impl SessionStore {
                 backup_dir: all_backup_dirs.first().cloned(),
                 running: false,
             }],
+            warnings: repair_warnings,
             message: format!(
                 "已修复 Codex 会话、项目目录与图片：校正 {} 个会话文件，重置 {} 条分页历史投影，更新 {} 条线程记录，同步 {} 条侧栏目录，目录校验通过 {} 条；创建 {} 个本地项目，归组 {} 条会话，项目校验通过 {} 个，恢复 {} 张图片、校验 {} 张，跳过 {} 条非侧栏或无效目录会话{}；需要重载 ChatGPT/Codex 才会刷新当前侧栏",
                 changed_rollout_files,
@@ -2615,7 +3138,9 @@ impl SessionStore {
             let Some(rewritten) = rewritten else {
                 continue;
             };
-            if let Some(&protected_bytes) = protected.get(&session.id) {
+            if let Some(protected_bytes) =
+                protected_prefix_bytes(protected, &session.path, &session.id)
+            {
                 if !rollout_prefix_preserved(&content, &rewritten, protected_bytes) {
                     result.skipped_protected_ancestors.push(session.id.clone());
                     continue;
@@ -3188,6 +3713,33 @@ impl SessionStore {
         Ok(removed)
     }
 
+    /// 删除轮次/消息只能作用于当前写入段：更早的分段被后继段的 history_base 按字节引用，
+    /// 一旦改写整条会话历史就会失效。
+    fn find_mutable_session_turn(
+        &self,
+        session_id: &str,
+        head_path: &Path,
+        turn_id: &str,
+    ) -> Result<(ParsedSessionTurn, bool), String> {
+        match find_session_turn(head_path, turn_id) {
+            Ok(found) => Ok(found),
+            Err(error) => {
+                let split = self
+                    .find_session_lineage(session_id)
+                    .map(|lineage| lineage.is_split())
+                    .unwrap_or(false);
+                if split {
+                    Err(
+                        "该轮次位于 Codex 已固定的历史分段中，只能删除当前分段里的对话内容"
+                            .to_string(),
+                    )
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     fn find_session_path(&self, session_id: &str) -> Result<PathBuf, String> {
         self.canonical_session_records()?
             .into_iter()
@@ -3319,18 +3871,71 @@ impl SessionStore {
         &self,
         sessions: &[SessionRepairRecord],
         force_session_ids: &HashSet<String>,
-    ) -> Result<(usize, Vec<String>), String> {
+    ) -> Result<(usize, Vec<String>, Vec<String>), String> {
         if sessions.is_empty() {
-            return Ok((0, Vec::new()));
+            return Ok((0, Vec::new(), Vec::new()));
         }
-        let mut targets = Vec::new();
+        // 投影按物理段记录。被后继段引用的段在切段前就已经投影完整，Codex 读取时按
+        // 继承边界过滤，这里不去触碰它们（删掉后 Codex 未必会为非当前段重建）；只校对
+        // 当前写入段（链尾）。
+        let lineages = self
+            .session_lineage_entries()?
+            .into_iter()
+            .map(|entry| (entry.record.id.clone(), entry.lineage))
+            .collect::<HashMap<_, _>>();
+        let mut targets: Vec<(String, SegmentProjectionTarget)> = Vec::new();
+        let mut warnings = Vec::new();
         for session in sessions {
-            if let Some(target) = paginated_rollout_projection_target(&session.path)? {
-                targets.push((session.id.clone(), target));
+            match lineages.get(&session.id) {
+                Some(lineage) => {
+                    let lineage_targets = match lineage_projection_targets(lineage) {
+                        Ok(targets) => targets,
+                        Err(error) => {
+                            warnings.push(format!(
+                                "分页历史投影跳过会话 {} ({}): {}",
+                                session.id,
+                                session.path.display(),
+                                error
+                            ));
+                            continue;
+                        }
+                    };
+                    for target in lineage_targets {
+                        if !target.retained {
+                            targets.push((session.id.clone(), target));
+                        }
+                    }
+                }
+                None => {
+                    let target = match paginated_rollout_projection_target(&session.path) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            warnings.push(format!(
+                                "分页历史投影跳过会话 {} ({}): {}",
+                                session.id,
+                                session.path.display(),
+                                error
+                            ));
+                            continue;
+                        }
+                    };
+                    if let Some(target) = target {
+                        targets.push((
+                            session.id.clone(),
+                            SegmentProjectionTarget {
+                                physical_id: session.id.clone(),
+                                retained: false,
+                                next_byte_offset: target.next_byte_offset,
+                                next_ordinal: target.next_ordinal,
+                                turn_count: target.turn_count,
+                            },
+                        ));
+                    }
+                }
             }
         }
         if targets.is_empty() {
-            return Ok((0, Vec::new()));
+            return Ok((0, Vec::new(), warnings));
         }
 
         let mut reset_session_ids = HashSet::new();
@@ -3353,10 +3958,11 @@ impl SessionStore {
             let has_items = sqlite_table_exists_with_connection(&connection, "thread_items")?;
             let mut stale_ids = Vec::new();
             for (session_id, target) in &targets {
+                let physical_id = &target.physical_id;
                 let state = connection
                     .query_row(
                         "SELECT next_rollout_byte_offset, next_rollout_ordinal FROM thread_history_projection_state WHERE thread_id = ?1",
-                        params![session_id],
+                        params![physical_id],
                         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                     )
                     .optional()
@@ -3365,7 +3971,7 @@ impl SessionStore {
                     connection
                         .query_row(
                             "SELECT COUNT(*) FROM thread_turns WHERE thread_id = ?1",
-                            params![session_id],
+                            params![physical_id],
                             |row| row.get::<_, usize>(0),
                         )
                         .map_err(|error| format!("统计分页历史对话轮次失败: {error}"))?
@@ -3376,7 +3982,7 @@ impl SessionStore {
                     connection
                         .query_row(
                             "SELECT COUNT(*) FROM thread_items WHERE thread_id = ?1",
-                            params![session_id],
+                            params![physical_id],
                             |row| row.get::<_, usize>(0),
                         )
                         .map_err(|error| format!("统计分页历史项目失败: {error}"))?
@@ -3395,7 +4001,7 @@ impl SessionStore {
                     || rows_without_state
                     || turn_projection_is_stale
                 {
-                    stale_ids.push(session_id.clone());
+                    stale_ids.push(physical_id.clone());
                 }
             }
             drop(connection);
@@ -3445,7 +4051,7 @@ impl SessionStore {
         }
         backup_dirs.sort();
         backup_dirs.dedup();
-        Ok((reset_session_ids.len(), backup_dirs))
+        Ok((reset_session_ids.len(), backup_dirs, warnings))
     }
 
     /// 扫描 sessions/archived_sessions 下所有 rollout 首行，收集被 fork 子会话引用的祖先前缀。
@@ -3516,50 +4122,101 @@ impl SessionStore {
         for session in sessions {
             let content = match fs::read_to_string(&session.path) {
                 Ok(content) => content,
-                Err(_) => continue,
+                Err(error) => {
+                    outcome.warnings.push(format!(
+                        "完整历史修复跳过会话 {} ({}): 读取失败：{}",
+                        session.id,
+                        session.path.display(),
+                        error
+                    ));
+                    continue;
+                }
             };
             let compatibility_rewrite = if rewrite_all_meta {
-                prepare_rollout_model_compatibility_rewrite(
+                match prepare_rollout_model_compatibility_rewrite(
                     &session.path,
                     target_provider,
                     Some("gpt-5.5"),
-                )?
+                ) {
+                    Ok(rewrite) => rewrite,
+                    Err(error) => {
+                        outcome.warnings.push(format!(
+                            "完整历史修复跳过会话 {} ({}): {}",
+                            session.id,
+                            session.path.display(),
+                            error
+                        ));
+                        continue;
+                    }
+                }
             } else {
                 None
             };
             let compatibility_content = match compatibility_rewrite {
                 Some((tmp_path, _)) => {
-                    let result = fs::read_to_string(&tmp_path).map_err(|error| {
-                        format!(
-                            "读取会话模型修复临时文件失败 ({}): {}",
-                            session.path.display(),
-                            error
-                        )
-                    });
+                    let result = fs::read_to_string(&tmp_path);
                     let _ = fs::remove_file(&tmp_path);
-                    Some(result?)
+                    match result {
+                        Ok(content) => Some(content),
+                        Err(error) => {
+                            outcome.warnings.push(format!(
+                                "完整历史修复跳过会话 {} ({}): 读取模型修复临时文件失败：{}",
+                                session.id,
+                                session.path.display(),
+                                error
+                            ));
+                            continue;
+                        }
+                    }
                 }
                 None => None,
             };
             let base_content = compatibility_content.as_deref().unwrap_or(&content);
-            let provider_rewrite =
-                rewrite_session_meta_provider(base_content, target_provider, rewrite_all_meta)?;
-            let ordinal_rewrite = normalize_paginated_rollout_ordinals(
+            let provider_rewrite = match rewrite_session_meta_provider(
+                base_content,
+                target_provider,
+                rewrite_all_meta,
+            ) {
+                Ok(rewrite) => rewrite,
+                Err(error) => {
+                    outcome.warnings.push(format!(
+                        "完整历史修复跳过会话 {} ({}): {}",
+                        session.id,
+                        session.path.display(),
+                        error
+                    ));
+                    continue;
+                }
+            };
+            let ordinal_rewrite = match normalize_paginated_rollout_ordinals(
                 provider_rewrite.as_deref().unwrap_or(base_content),
-            )?;
+            ) {
+                Ok(rewrite) => rewrite,
+                Err(error) => {
+                    outcome.warnings.push(format!(
+                        "完整历史修复跳过会话 {} ({}): {}",
+                        session.id,
+                        session.path.display(),
+                        error
+                    ));
+                    continue;
+                }
+            };
             let visibility_rewrite = ordinal_rewrite
                 .or(provider_rewrite)
                 .or(compatibility_content);
-            let candidate = visibility_rewrite.as_deref().unwrap_or(&content);
-            let local_compaction = if rewrite_all_meta {
-                append_local_recovery_compaction(candidate)?
-            } else {
-                None
-            };
-            let Some(next) = local_compaction.or(visibility_rewrite) else {
+            // Do not append a synthetic `compacted` record during visibility repair.
+            // Its replacement_history is sent back to the Responses API on the next
+            // turn, but locally reconstructed assistant messages are not valid input
+            // items for every Codex model (the API reports `content` max length 0).
+            // Visibility repair must preserve the rollout and only remove/normalize
+            // records that are known to be incompatible.
+            let Some(next) = visibility_rewrite else {
                 continue;
             };
-            if let Some(&protected_bytes) = protected.get(&session.id) {
+            if let Some(protected_bytes) =
+                protected_prefix_bytes(protected, &session.path, &session.id)
+            {
                 if !rollout_prefix_preserved(&content, &next, protected_bytes) {
                     // 这个会话是其他会话的 fork 来源，前缀一旦改动子会话历史就会失效，宁可跳过。
                     outcome.skipped_protected_ancestors.push(session.id.clone());
@@ -3567,8 +4224,15 @@ impl SessionStore {
                 }
             }
             if !backup_created {
-                fs::create_dir_all(&backup_dir)
-                    .map_err(|error| format!("创建会话文件备份目录失败: {}", error))?;
+                if let Err(error) = fs::create_dir_all(&backup_dir) {
+                    outcome.warnings.push(format!(
+                        "完整历史修复跳过会话 {} ({}): 创建备份目录失败：{}",
+                        session.id,
+                        session.path.display(),
+                        error
+                    ));
+                    continue;
+                }
                 backup_created = true;
             }
             let backup_path = backup_dir.join(
@@ -3578,12 +4242,24 @@ impl SessionStore {
                     .and_then(|item| item.to_str())
                     .unwrap_or("session.jsonl"),
             );
-            fs::copy(&session.path, &backup_path).map_err(|error| {
-                format!("备份会话文件失败 ({}): {}", session.path.display(), error)
-            })?;
-            fs::write(&session.path, next).map_err(|error| {
-                format!("写入会话文件失败 ({}): {}", session.path.display(), error)
-            })?;
+            if let Err(error) = fs::copy(&session.path, &backup_path) {
+                outcome.warnings.push(format!(
+                    "完整历史修复跳过会话 {} ({}): 备份失败：{}",
+                    session.id,
+                    session.path.display(),
+                    error
+                ));
+                continue;
+            }
+            if let Err(error) = fs::write(&session.path, next) {
+                outcome.warnings.push(format!(
+                    "完整历史修复跳过会话 {} ({}): 写入失败：{}",
+                    session.id,
+                    session.path.display(),
+                    error
+                ));
+                continue;
+            }
             let _ = Command::new("touch")
                 .arg("-r")
                 .arg(&backup_path)
@@ -4768,6 +5444,17 @@ fn prepare_rollout_model_compatibility_rewrite(
     target_provider: &str,
     forced_model: Option<&str>,
 ) -> Result<Option<(PathBuf, RolloutModelCompatibilityRewriteStats)>, String> {
+    prepare_rollout_model_compatibility_rewrite_guarded(path, target_provider, forced_model, 0)
+}
+
+/// 同上，但 `protected_prefix_bytes` 之前的字节原样保留：这段前缀被其他物理段的
+/// `history_base` 引用，一旦长度或内容变化，Codex 就无法再拼出完整历史。
+fn prepare_rollout_model_compatibility_rewrite_guarded(
+    path: &Path,
+    target_provider: &str,
+    forced_model: Option<&str>,
+    protected_prefix_bytes: u64,
+) -> Result<Option<(PathBuf, RolloutModelCompatibilityRewriteStats)>, String> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -4797,6 +5484,7 @@ fn prepare_rollout_model_compatibility_rewrite(
     let mut writer = BufWriter::new(output);
     let mut line = Vec::new();
     let mut rewrite_stats = RolloutModelCompatibilityRewriteStats::default();
+    let mut line_offset = 0u64;
     let result = (|| -> Result<(), String> {
         loop {
             line.clear();
@@ -4805,6 +5493,15 @@ fn prepare_rollout_model_compatibility_rewrite(
                 .map_err(|error| format!("读取会话模型状态失败 ({}): {}", path.display(), error))?;
             if read == 0 {
                 break;
+            }
+            let starts_in_protected_prefix = line_offset < protected_prefix_bytes;
+            line_offset = line_offset.saturating_add(read as u64);
+            if starts_in_protected_prefix {
+                // 受保护前缀内的记录不做任何改写，保证 history_base 边界仍然有效。
+                writer.write_all(&line).map_err(|error| {
+                    format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
+                })?;
+                continue;
             }
 
             let may_contain_model = line
@@ -4825,12 +5522,16 @@ fn prepare_rollout_model_compatibility_rewrite(
             let may_contain_remote_compaction_id = line
                 .windows(b"\"cmp_".len())
                 .any(|window| window == b"\"cmp_");
+            let may_contain_local_recovery_compaction = line
+                .windows(b"Earlier messages and oversized tool outputs".len())
+                .any(|window| window == b"Earlier messages and oversized tool outputs");
             if !may_contain_model
                 && !may_contain_provider
                 && !may_be_session_meta
                 && !may_contain_encrypted_content
                 && !may_contain_remote_reasoning_id
                 && !may_contain_remote_compaction_id
+                && !may_contain_local_recovery_compaction
             {
                 writer.write_all(&line).map_err(|error| {
                     format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
@@ -4847,6 +5548,20 @@ fn prepare_rollout_model_compatibility_rewrite(
                     continue;
                 }
             };
+            if value.get("type").and_then(Value::as_str) == Some("compacted")
+                && value
+                    .pointer("/payload/message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| {
+                        message.starts_with("Earlier messages and oversized tool outputs")
+                            || message
+                                .starts_with("Earlier messages and oversized tool outputs remain")
+                    })
+            {
+                // This was produced by the old recovery-context experiment. Its
+                // synthetic assistant content is not accepted as Responses input.
+                continue;
+            }
             let line_stats = rewrite_rollout_model_compatibility_value(
                 &mut value,
                 target_provider,
@@ -5287,27 +6002,6 @@ fn session_file_fingerprint(path: &Path) -> Result<SessionFileFingerprint, Strin
     })
 }
 
-fn session_file_has_id(path: &Path, session_id: &str) -> Result<bool, String> {
-    let file = fs::File::open(path)
-        .map_err(|error| format!("读取会话失败 {}: {}", path.display(), error))?;
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    for _ in 0..20 {
-        line.clear();
-        if reader
-            .read_line(&mut line)
-            .map_err(|error| format!("读取会话失败 {}: {}", path.display(), error))?
-            == 0
-        {
-            break;
-        }
-        if let Some(found) = extract_session_id(&line) {
-            return Ok(found == session_id);
-        }
-    }
-    Ok(false)
-}
-
 fn read_session_turn_page(
     path: &Path,
     cursor: u64,
@@ -5738,8 +6432,13 @@ fn parse_response_message(value: &Value, line_offset: u64) -> Option<CodexSessio
             });
         }
     }
-    let text = text_parts.join("\n\n");
-    attachments.extend(extract_mentioned_files(&text));
+    let raw_text = text_parts.join("\n\n");
+    attachments.extend(extract_mentioned_files(&raw_text));
+    let text = if role == "user" {
+        clean_user_facing_message_text(&raw_text)
+    } else {
+        raw_text
+    };
     Some(CodexSessionMessage {
         id,
         role: role.to_string(),
@@ -5761,7 +6460,7 @@ fn parse_event_user_message(
     if payload.get("type").and_then(Value::as_str) != Some("user_message") {
         return None;
     }
-    let text = payload
+    let raw_text = payload
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -5774,7 +6473,8 @@ fn parse_event_user_message(
         .filter_map(Value::as_str)
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let attachments = extract_mentioned_files(&text);
+    let attachments = extract_mentioned_files(&raw_text);
+    let text = clean_user_facing_message_text(&raw_text);
     Some((
         CodexSessionMessage {
             id: payload
@@ -5835,6 +6535,28 @@ fn should_display_session_message(message: &CodexSessionMessage) -> bool {
         return !message.attachments.is_empty();
     }
     !is_internal_session_title(text) || text.contains("My request") || text.contains("我的请求")
+}
+
+fn clean_user_facing_message_text(text: &str) -> String {
+    let source = extract_user_request_text(text).unwrap_or_else(|| text.to_string());
+    let normalized = source.trim().to_lowercase();
+    if normalized.starts_with("<recommended_plugins>")
+        || normalized.starts_with("here is a list of plugins that are available but not installed")
+    {
+        return String::new();
+    }
+    source
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.starts_with("<image name=")
+                && !line.starts_with("<file name=")
+                && !line.starts_with("<audio name=")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 fn is_technical_session_line(line: &str) -> bool {
@@ -6445,16 +7167,6 @@ fn build_session_record_summary(path: &Path) -> Result<CodexSessionRecord, Strin
     })
 }
 
-fn session_record_is_more_complete(
-    candidate: &CodexSessionRecord,
-    current: &CodexSessionRecord,
-) -> bool {
-    candidate.size_bytes > current.size_bytes
-        || (candidate.size_bytes == current.size_bytes
-            && (candidate.updated_at > current.updated_at
-                || (candidate.updated_at == current.updated_at && candidate.path > current.path)))
-}
-
 #[derive(Default)]
 struct SessionRecordHeader {
     id: Option<String>,
@@ -6598,12 +7310,55 @@ struct CodexThreadForkResult {
 struct StagedForkSource {
     session: CodexSessionRecord,
     path: PathBuf,
+    projection: StagedHistoryProjection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ForkSourceSegment {
+    physical_id: String,
     path: PathBuf,
     end_byte_offset: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StagedProjectionPosition {
+    ordinal: u64,
+    start_byte_offset: u64,
+    end_byte_offset: u64,
+}
+
+#[derive(Debug, Default)]
+struct StagedHistoryProjection {
+    positions: HashMap<String, HashMap<u64, StagedProjectionPosition>>,
+    next_byte_offset: u64,
+    next_ordinal: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CopiedProjectionItem {
+    turn_id: String,
+    item_id: String,
+    rollout_ordinal: i64,
+    updated_at_ordinal: i64,
+    created_at_ms: i64,
+    item_type: String,
+    item_json: String,
+}
+
+#[derive(Debug, Clone)]
+struct CopiedProjectionTurn {
+    turn_id: String,
+    rollout_ordinal: i64,
+    status: String,
+    error_json: Option<String>,
+    started_at: Option<i64>,
+    completed_at: Option<i64>,
+    duration_ms: Option<i64>,
+    first_user_item_id: Option<String>,
+    final_agent_item_id: Option<String>,
+    rollout_byte_offset: i64,
+    rollout_end_ordinal: Option<i64>,
+    rollout_end_byte_offset: Option<i64>,
 }
 
 fn fork_history_modes_are_compatible(source_mode: &str, fork_mode: &str) -> bool {
@@ -6637,7 +7392,7 @@ fn create_staged_fork_rollout(
     target_project_path: &str,
     target_provider: &str,
     created_at: chrono::DateTime<chrono::Utc>,
-) -> Result<(), String> {
+) -> Result<StagedHistoryProjection, String> {
     let segments = fork_source_segments(source_codex_home, source_path)?;
     let parent = staged_path
         .parent()
@@ -6664,13 +7419,19 @@ fn create_staged_fork_rollout(
         &timestamp,
     )?;
     let mut history_count = 0_u64;
+    let mut written_bytes = 0_u64;
+    let mut projection = StagedHistoryProjection::default();
     let mut recovery_context = LocalRecoveryContext::default();
-    let write_result = (|| {
-        serde_json::to_writer(&mut writer, &meta)
-            .map_err(|error| format!("生成临时会话身份失败: {error}"))?;
+    let write_result = (|| -> Result<(), String> {
+        let encoded_meta =
+            serde_json::to_vec(&meta).map_err(|error| format!("生成临时会话身份失败: {error}"))?;
+        writer
+            .write_all(&encoded_meta)
+            .map_err(|error| format!("写入临时会话身份失败: {error}"))?;
         writer
             .write_all(b"\n")
             .map_err(|error| format!("写入临时会话失败: {error}"))?;
+        written_bytes = encoded_meta.len() as u64 + 1;
         for segment in &segments {
             let source = fs::File::open(&segment.path)
                 .map_err(|error| format!("读取源会话失败 ({}): {error}", segment.path.display()))?;
@@ -6704,6 +7465,7 @@ fn create_staged_fork_rollout(
                 if value.get("type").and_then(Value::as_str) == Some("session_meta") {
                     continue;
                 }
+                let source_ordinal = value.get("ordinal").and_then(Value::as_u64);
                 let compatibility =
                     rewrite_rollout_model_compatibility_value(&mut value, target_provider, None);
                 if compatibility.removed_encrypted_reasoning_items > 0 {
@@ -6715,11 +7477,30 @@ fn create_staged_fork_rollout(
                     .as_object_mut()
                     .ok_or_else(|| "源会话记录格式无效".to_string())?
                     .insert("ordinal".to_string(), Value::from(history_count));
-                serde_json::to_writer(&mut writer, &value)
+                let encoded = serde_json::to_vec(&value)
                     .map_err(|error| format!("生成临时会话记录失败: {error}"))?;
+                let start_byte_offset = written_bytes;
+                writer
+                    .write_all(&encoded)
+                    .map_err(|error| format!("写入临时会话记录失败: {error}"))?;
                 writer
                     .write_all(b"\n")
                     .map_err(|error| format!("写入临时会话失败: {error}"))?;
+                written_bytes = written_bytes.saturating_add(encoded.len() as u64 + 1);
+                if let Some(source_ordinal) = source_ordinal {
+                    projection
+                        .positions
+                        .entry(segment.physical_id.clone())
+                        .or_default()
+                        .insert(
+                            source_ordinal,
+                            StagedProjectionPosition {
+                                ordinal: history_count,
+                                start_byte_offset,
+                                end_byte_offset: written_bytes,
+                            },
+                        );
+                }
             }
         }
         if history_count == 0 {
@@ -6731,11 +7512,15 @@ fn create_staged_fork_rollout(
                 .as_object_mut()
                 .ok_or_else(|| "本地会话压缩记录格式无效".to_string())?
                 .insert("ordinal".to_string(), Value::from(history_count));
-            serde_json::to_writer(&mut writer, &compacted)
+            let encoded = serde_json::to_vec(&compacted)
                 .map_err(|error| format!("生成临时会话压缩记录失败: {error}"))?;
+            writer
+                .write_all(&encoded)
+                .map_err(|error| format!("写入临时会话压缩记录失败: {error}"))?;
             writer
                 .write_all(b"\n")
                 .map_err(|error| format!("写入临时会话压缩记录失败: {error}"))?;
+            written_bytes = written_bytes.saturating_add(encoded.len() as u64 + 1);
         }
         writer
             .flush()
@@ -6750,7 +7535,9 @@ fn create_staged_fork_rollout(
         let _ = fs::remove_file(staged_path);
         return Err(error);
     }
-    Ok(())
+    projection.next_byte_offset = written_bytes;
+    projection.next_ordinal = history_count.saturating_add(1);
+    Ok(projection)
 }
 
 fn read_session_meta_value(path: &Path) -> Result<Value, String> {
@@ -6839,6 +7626,15 @@ fn fork_source_segments(
             .get("payload")
             .and_then(Value::as_object)
             .ok_or_else(|| "源会话的 session_meta 缺少 payload".to_string())?;
+        let logical_id = extract_session_id(
+            &serde_json::to_string(&meta)
+                .map_err(|error| format!("解析源会话 ID 失败: {error}"))?,
+        )
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
+        let physical_id = physical_rollout_id(&path, &logical_id);
+        if !seen.insert(physical_id.clone()) {
+            return Err(format!("源会话历史引用存在循环: {physical_id}"));
+        }
         let history_base = payload
             .get("history_base")
             .or_else(|| meta.get("history_base"));
@@ -6855,26 +7651,18 @@ fn fork_source_segments(
                 .or_else(|| base.get("endByteOffset"))
                 .and_then(Value::as_u64)
                 .ok_or_else(|| "源会话 history_base 缺少 end_byte_offset".to_string())?;
-            if !seen.insert(parent_id.to_string()) {
-                return Err(format!("源会话历史引用存在循环: {parent_id}"));
-            }
-            let parent_path = find_rollout_path_in_store(codex_home, parent_id)?;
+            let parent_path = find_rollout_path_in_store(codex_home, parent_id, parent_end)?;
             collect(codex_home, parent_path, Some(parent_end), seen, segments)?;
         }
         segments.push(ForkSourceSegment {
+            physical_id,
             path,
             end_byte_offset,
         });
         Ok(())
     }
 
-    let source_meta = read_session_meta_value(source_path)?;
-    let source_id = extract_session_id(
-        &serde_json::to_string(&source_meta)
-            .map_err(|error| format!("解析源会话 ID 失败: {error}"))?,
-    )
-    .unwrap_or_else(|| source_path.to_string_lossy().to_string());
-    let mut seen = HashSet::from([source_id]);
+    let mut seen = HashSet::new();
     let mut segments = Vec::new();
     collect(
         source_codex_home,
@@ -6886,23 +7674,44 @@ fn fork_source_segments(
     Ok(segments)
 }
 
-fn find_rollout_path_in_store(codex_home: &Path, rollout_id: &str) -> Result<PathBuf, String> {
+fn find_rollout_path_in_store(
+    codex_home: &Path,
+    rollout_id: &str,
+    required_prefix: u64,
+) -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
     for root in [
         codex_home.join("sessions"),
         codex_home.join("archived_sessions"),
     ] {
         for path in collect_jsonl_files(&root)? {
-            if path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .is_some_and(|stem| stem.ends_with(rollout_id))
-                || session_file_has_id(&path, rollout_id)?
-            {
-                return Ok(path);
+            let Ok(meta) = read_session_meta_value(&path) else {
+                continue;
+            };
+            let Some(logical_id) = extract_session_id(
+                &serde_json::to_string(&meta)
+                    .map_err(|error| format!("解析源会话 ID 失败: {error}"))?,
+            ) else {
+                continue;
+            };
+            if physical_rollout_id(&path, &logical_id) == rollout_id {
+                let len = fs::metadata(&path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or_default();
+                candidates.push((len >= required_prefix, len, path));
             }
         }
     }
-    Err(format!("源会话引用的历史底稿不存在: {rollout_id}"))
+    candidates
+        .into_iter()
+        .max_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        })
+        .map(|(_, _, path)| path)
+        .ok_or_else(|| format!("源会话引用的历史底稿不存在: {rollout_id}"))
 }
 
 fn remove_staged_thread_rows(db_path: &Path, session_id: &str) -> Result<(), String> {
@@ -7999,8 +8808,12 @@ fn extract_user_request_text(text: &str) -> Option<String> {
     for marker in [
         "## My request for Codex:",
         "My request for Codex:",
+        "## My request:",
+        "My request:",
         "## 我的请求：",
         "## 我的请求:",
+        "我的请求：",
+        "我的请求:",
     ] {
         if let Some((_, after_marker)) = text.split_once(marker) {
             let cleaned = after_marker.trim();
@@ -8033,6 +8846,8 @@ fn is_internal_session_title(text: &str) -> bool {
         || normalized.starts_with("<personality_spec>")
         || normalized.starts_with("<skills_instructions>")
         || normalized.starts_with("<plugins_instructions>")
+        || normalized.starts_with("<recommended_plugins>")
+        || normalized.starts_with("here is a list of plugins that are available but not installed")
         || normalized.starts_with("<extremely_important>")
         || normalized.starts_with("<system>")
         || normalized.starts_with("<developer>")
@@ -9326,6 +10141,355 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
             vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn stages_paginated_segments_that_share_one_logical_session_id() {
+        const LOGICAL: &str = "01a088de-9a36-71c0-ab5f-b60a28439539";
+        const SEGMENT: &str = "01a09f84-79d9-7c63-8988-ce010baed7ca";
+        let source_home = tempdir().expect("source home");
+        let target_dir = tempdir().expect("target directory");
+        let sessions_dir = source_home.path().join("sessions/2026/09/14");
+        fs::create_dir_all(&sessions_dir).expect("sessions directory");
+
+        let first_path = sessions_dir.join(format!("rollout-2026-09-10T09-11-25-{LOGICAL}.jsonl"));
+        let first_meta = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {"id": LOGICAL},
+                "ordinal": 0
+            })
+        );
+        let first_message = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"第一段内容"}]},"ordinal":1}"#,
+            "\n"
+        );
+        fs::write(&first_path, format!("{first_meta}{first_message}"))
+            .expect("write first segment");
+        let cutoff = (first_meta.len() + first_message.len()) as u64;
+
+        let second_path = sessions_dir.join(format!(
+            "rollout-2026-09-14T18-44-14-{LOGICAL}_{SEGMENT}.jsonl"
+        ));
+        fs::write(
+            &second_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": LOGICAL,
+                        "history_base": {
+                            "thread_id": LOGICAL,
+                            "end_ordinal_exclusive": 2,
+                            "end_byte_offset": cutoff
+                        }
+                    },
+                    "ordinal": 2
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"text": "第二段内容"}]
+                    },
+                    "ordinal": 3
+                })
+            ),
+        )
+        .expect("write second segment");
+        let staged_path = target_dir.path().join("staged.jsonl");
+
+        create_staged_fork_rollout(
+            source_home.path(),
+            &second_path,
+            &staged_path,
+            "staged-id",
+            &target_dir.path().to_string_lossy(),
+            "openai",
+            chrono::Utc::now(),
+        )
+        .expect("stage split lineage");
+
+        let staged = fs::read_to_string(staged_path).expect("read staged");
+        assert!(staged.contains("第一段内容"));
+        assert!(staged.contains("第二段内容"));
+        assert!(!staged.contains("history_base"));
+        assert_eq!(
+            staged
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<Value>(line).expect("valid staged line")["ordinal"]
+                        .as_u64()
+                        .expect("ordinal")
+                })
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn copies_a_paginated_session_without_calling_unsupported_native_fork() {
+        const ANCESTOR_ID: &str = "b9c369f0-d9af-43f6-bfc0-469a7564e7c3";
+        const SOURCE_ID: &str = "01a088de-9a36-71c0-ab5f-b60a28439539";
+        const SEGMENT_ID: &str = "01a09f84-79d9-7c63-8988-ce010baed7ca";
+        let source_home = tempdir().expect("source home");
+        let target_home = tempdir().expect("target home");
+        let source_project = tempdir().expect("source project");
+        let target_project = tempdir().expect("target project");
+        let source_sessions = source_home.path().join("sessions/2026/09/17");
+        fs::create_dir_all(&source_sessions).expect("source sessions directory");
+        let archived_sessions = source_home.path().join("archived_sessions");
+        fs::create_dir_all(&archived_sessions).expect("archived sessions directory");
+        let ancestor_path =
+            archived_sessions.join(format!("rollout-2026-09-16T09-00-00-{ANCESTOR_ID}.jsonl"));
+        let ancestor_content = format!(
+            "{}\n{}\n",
+            json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": ANCESTOR_ID,
+                    "cwd": source_project.path(),
+                    "history_mode": "paginated"
+                },
+                "ordinal": 0
+            }),
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"text": "祖先会话内容"}]
+                },
+                "ordinal": 1
+            })
+        );
+        fs::write(&ancestor_path, &ancestor_content).expect("write ancestor segment");
+        let first_path =
+            source_sessions.join(format!("rollout-2026-09-17T10-00-00-{SOURCE_ID}.jsonl"));
+        let first_content = format!(
+            "{}\n{}\n",
+            json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": SOURCE_ID,
+                    "session_id": SOURCE_ID,
+                    "cwd": source_project.path(),
+                    "model_provider": "openai",
+                    "history_mode": "paginated",
+                    "history_base": {
+                        "thread_id": ANCESTOR_ID,
+                        "end_ordinal_exclusive": 2,
+                        "end_byte_offset": ancestor_content.len()
+                    }
+                },
+                "ordinal": 2
+            }),
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"text": "需要跨目录复制的分页会话"}]
+                },
+                "ordinal": 3
+            })
+        );
+        fs::write(&first_path, &first_content).expect("write first source segment");
+        let source_path = source_sessions.join(format!(
+            "rollout-2026-09-17T11-00-00-{SOURCE_ID}_{SEGMENT_ID}.jsonl"
+        ));
+        fs::write(
+            &source_path,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": SOURCE_ID,
+                        "session_id": SOURCE_ID,
+                        "cwd": source_project.path(),
+                        "model_provider": "openai",
+                        "history_mode": "paginated",
+                        "history_base": {
+                            "thread_id": SOURCE_ID,
+                            "end_ordinal_exclusive": 4,
+                            "end_byte_offset": first_content.len()
+                        }
+                    },
+                    "ordinal": 4
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"text": "分页续写内容也必须保留"}]
+                    },
+                    "ordinal": 5
+                })
+            ),
+        )
+        .expect("write second source segment");
+        let history_schema = r#"
+            CREATE TABLE thread_items (
+                thread_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                rollout_ordinal INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                item_json TEXT NOT NULL,
+                item_type TEXT NOT NULL DEFAULT '',
+                updated_at_ordinal INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (thread_id, turn_id, item_id)
+            );
+            CREATE UNIQUE INDEX idx_thread_items_page
+                ON thread_items(thread_id, rollout_ordinal);
+            CREATE TABLE thread_turns (
+                thread_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                rollout_ordinal INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error_json TEXT,
+                started_at INTEGER,
+                completed_at INTEGER,
+                duration_ms INTEGER,
+                first_user_item_id TEXT,
+                final_agent_item_id TEXT,
+                rollout_byte_offset INTEGER,
+                rollout_end_ordinal INTEGER,
+                rollout_end_byte_offset INTEGER,
+                PRIMARY KEY (thread_id, turn_id)
+            );
+            CREATE UNIQUE INDEX idx_thread_turns_page
+                ON thread_turns(thread_id, rollout_ordinal);
+            CREATE TABLE thread_history_projection_state (
+                thread_id TEXT PRIMARY KEY,
+                next_rollout_byte_offset INTEGER NOT NULL,
+                next_rollout_ordinal INTEGER NOT NULL
+            );
+        "#;
+        let source_history_db = source_home.path().join("thread_history_1.sqlite");
+        run_sqlite_test(&source_history_db, history_schema);
+        run_sqlite_test(
+            &source_history_db,
+            &format!(
+                r#"
+                    INSERT INTO thread_items VALUES
+                        ('{ANCESTOR_ID}', 'turn-0', 'ancestor-1', 1, 500,
+                         '{{"type":"userMessage","id":"ancestor-1","content":[]}}',
+                         'userMessage', 1),
+                        ('{SOURCE_ID}', 'turn-1', 'user-1', 3, 1000,
+                         '{{"type":"userMessage","id":"user-1","content":[]}}',
+                         'userMessage', 3),
+                        ('{SEGMENT_ID}', 'turn-2', 'agent-1', 5, 2000,
+                         '{{"type":"agentMessage","id":"agent-1","text":"续写"}}',
+                         'agentMessage', 5);
+                    INSERT INTO thread_turns VALUES
+                        ('{ANCESTOR_ID}', 'turn-0', 1, 'completed', NULL, 0, 1, 500,
+                         'ancestor-1', NULL, 0, 1, 1),
+                        ('{SOURCE_ID}', 'turn-1', 3, 'completed', NULL, 1, 2, 1000,
+                         'user-1', NULL, 0, 3, 1),
+                        ('{SEGMENT_ID}', 'turn-2', 5, 'completed', NULL, 3, 4, 1000,
+                         NULL, 'agent-1', 0, 5, 1);
+                "#,
+            ),
+        );
+        fs::write(
+            target_home.path().join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .expect("write target config");
+        let state_db = target_home.path().join("state_5.sqlite");
+        run_sqlite_test(
+            &state_db,
+            r#"
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    cwd TEXT,
+                    model_provider TEXT,
+                    history_mode TEXT,
+                    rollout_path TEXT
+                );
+            "#,
+        );
+        let target_history_db = target_home.path().join("thread_history_1.sqlite");
+        run_sqlite_test(&target_history_db, history_schema);
+
+        let result = SessionStore::new(source_home.path().to_path_buf())
+            .copy_session_to_store(
+                &SessionStore::new(target_home.path().to_path_buf()),
+                SOURCE_ID,
+                "副本",
+                &target_project.path().to_string_lossy(),
+            )
+            .expect("copy paginated session directly");
+
+        assert_ne!(result.session_id, SOURCE_ID);
+        assert!(result.title.ends_with("副本"));
+        assert_eq!(
+            result.project_path.as_deref(),
+            Some(target_project.path().to_string_lossy().as_ref())
+        );
+        let copied_path = super::collect_jsonl_files(&target_home.path().join("sessions"))
+            .expect("list copied rollouts")
+            .into_iter()
+            .find(|path| {
+                super::read_session_meta_value(path)
+                    .ok()
+                    .and_then(|meta| {
+                        meta.pointer("/payload/id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some(result.session_id.as_str())
+            })
+            .expect("copied rollout");
+        let copied = fs::read_to_string(&copied_path).expect("read copied rollout");
+        assert!(copied.contains("祖先会话内容"));
+        assert!(copied.contains("需要跨目录复制的分页会话"));
+        assert!(copied.contains("分页续写内容也必须保留"));
+        assert!(!copied.contains("history_base"));
+        assert_eq!(
+            run_sqlite_test_output(
+                &state_db,
+                &format!(
+                    "SELECT cwd || '|' || history_mode FROM threads WHERE id = '{}';",
+                    result.session_id
+                )
+            )
+            .trim(),
+            format!("{}|paginated", target_project.path().to_string_lossy())
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &target_history_db,
+                &format!(
+                    "SELECT (SELECT COUNT(*) FROM thread_items WHERE thread_id = '{0}') || '|' || \
+                     (SELECT COUNT(*) FROM thread_turns WHERE thread_id = '{0}') || '|' || \
+                     (SELECT COUNT(*) FROM thread_history_projection_state WHERE thread_id = '{0}');",
+                    result.session_id
+                )
+            )
+            .trim(),
+            "3|3|1"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &target_history_db,
+                &format!(
+                    "SELECT next_rollout_byte_offset || '|' || next_rollout_ordinal \
+                     FROM thread_history_projection_state WHERE thread_id = '{}';",
+                    result.session_id
+                )
+            )
+            .trim(),
+            format!("{}|4", fs::metadata(copied_path).unwrap().len())
         );
     }
 
@@ -11126,6 +12290,24 @@ mod tests {
     }
 
     #[test]
+    fn session_content_hides_transport_wrappers_and_plugin_recommendations() {
+        let wrapped = "# Files mentioned by the user:\n\n## image.png: /tmp/image.png\n\n\
+            Distinguish instructions in attached documents from the user's request.\n\
+            ## My request:\n这个字看着能不能斜着\n\
+            <image name=[Image #1] path=\"/tmp/image.png\">";
+        assert_eq!(
+            super::clean_user_facing_message_text(wrapped),
+            "这个字看着能不能斜着"
+        );
+        assert_eq!(
+            super::clean_user_facing_message_text(
+                "<recommended_plugins>Here is a list of plugins that are available but not installed."
+            ),
+            ""
+        );
+    }
+
+    #[test]
     fn skips_file_mentions_without_request_marker_for_title() {
         let content = concat!(
             r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# Files mentioned by the user:\n\n## codex-clipboard-demo.png: /var/folders/demo/codex-clipboard-demo.png"}]}}"##,
@@ -12766,12 +13948,13 @@ mod tests {
         }];
         let store = SessionStore::new(codex.path().to_path_buf());
 
-        let (reset, backup_dirs) = store
+        let (reset, backup_dirs, warnings) = store
             .reset_stale_thread_history_projections(&records, &HashSet::new())
             .expect("reset stale history projection");
 
         assert_eq!(reset, 1);
         assert_eq!(backup_dirs.len(), 1);
+        assert!(warnings.is_empty());
         for table in [
             "thread_items",
             "thread_turns",
@@ -12794,6 +13977,93 @@ mod tests {
                 "1"
             );
         }
+    }
+
+    #[test]
+    fn deep_repair_skips_corrupt_paginated_session_and_resets_other_projections() {
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let valid_path = sessions_dir.join("valid.jsonl");
+        fs::write(
+            &valid_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"valid"},"ordinal":0}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"},"ordinal":1}"#,
+                "\n"
+            ),
+        )
+        .expect("write valid session");
+        let corrupt_path = sessions_dir.join("corrupt.jsonl");
+        fs::write(
+            &corrupt_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"corrupt"},"ordinal":0}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_started","message":"truncated"#,
+            ),
+        )
+        .expect("write corrupt session");
+        let history_db = codex.path().join("thread_history_1.sqlite");
+        run_sqlite_test(
+            &history_db,
+            r#"
+                CREATE TABLE thread_items (thread_id TEXT NOT NULL, item_id TEXT NOT NULL);
+                CREATE TABLE thread_turns (thread_id TEXT NOT NULL, turn_id TEXT NOT NULL);
+                CREATE TABLE thread_history_projection_state (
+                    thread_id TEXT PRIMARY KEY,
+                    next_rollout_byte_offset INTEGER NOT NULL,
+                    next_rollout_ordinal INTEGER NOT NULL
+                );
+                INSERT INTO thread_items VALUES ('valid', 'old-item'), ('corrupt', 'keep-item');
+                INSERT INTO thread_turns VALUES ('valid', 'old-turn'), ('corrupt', 'keep-turn');
+                INSERT INTO thread_history_projection_state VALUES
+                    ('valid', 1, 1),
+                    ('corrupt', 1, 1);
+            "#,
+        );
+        let records = vec![
+            SessionRepairRecord {
+                id: "valid".to_string(),
+                title: "Valid".to_string(),
+                path: valid_path,
+                updated_at: 10,
+            },
+            SessionRepairRecord {
+                id: "corrupt".to_string(),
+                title: "Corrupt".to_string(),
+                path: corrupt_path,
+                updated_at: 9,
+            },
+        ];
+        let store = SessionStore::new(codex.path().to_path_buf());
+
+        let result = store.reset_stale_thread_history_projections(&records, &HashSet::new());
+        assert!(
+            result.is_ok(),
+            "单个损坏会话不应中断其余会话修复：{result:?}"
+        );
+        let (reset, _, warnings) = result.expect("best-effort projection reset");
+        assert_eq!(reset, 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("corrupt"));
+        assert_eq!(
+            run_sqlite_test_output(
+                &history_db,
+                "SELECT COUNT(*) FROM thread_turns WHERE thread_id = 'valid';"
+            )
+            .trim(),
+            "0"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &history_db,
+                "SELECT COUNT(*) FROM thread_turns WHERE thread_id = 'corrupt';"
+            )
+            .trim(),
+            "1"
+        );
     }
 
     #[test]
@@ -12841,12 +14111,13 @@ mod tests {
         }];
         let store = SessionStore::new(codex.path().to_path_buf());
 
-        let (reset, backup_dirs) = store
+        let (reset, backup_dirs, warnings) = store
             .reset_stale_thread_history_projections(&records, &HashSet::new())
             .expect("preserve complete history projection");
 
         assert_eq!(reset, 0);
         assert!(backup_dirs.is_empty());
+        assert!(warnings.is_empty());
         assert_eq!(
             run_sqlite_test_output(
                 &history_db,
@@ -12856,7 +14127,7 @@ mod tests {
             "1"
         );
 
-        let (forced_reset, forced_backup_dirs) = store
+        let (forced_reset, forced_backup_dirs, warnings) = store
             .reset_stale_thread_history_projections(
                 &records,
                 &HashSet::from(["target".to_string()]),
@@ -12864,6 +14135,7 @@ mod tests {
             .expect("force reset changed image projection");
         assert_eq!(forced_reset, 1);
         assert_eq!(forced_backup_dirs.len(), 1);
+        assert!(warnings.is_empty());
         assert_eq!(
             run_sqlite_test_output(
                 &history_db,
@@ -12872,6 +14144,231 @@ mod tests {
             .trim(),
             "0"
         );
+    }
+
+    /// Codex 0.154 会把同一线程续写到 `..._<段 id>.jsonl`：列表要按线程归并，
+    /// 内容要拼接各段，投影要按物理段分别校对（首段只到 history_base 边界）。
+    #[test]
+    fn split_lineage_is_listed_once_and_projection_is_reset_per_physical_segment() {
+        const LOGICAL: &str = "01a06a6e-489b-7953-b7a2-46c08f772a12";
+        const SEGMENT: &str = "01a09f06-f038-70e1-8cfc-ba9feba3c47e";
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions").join("2026").join("09");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let line = |ordinal: u64, body: &str| format!("{{\"ordinal\":{ordinal},{body}}}\n");
+        let first_lines = [
+            line(
+                0,
+                &format!(r#""type":"session_meta","payload":{{"id":"{LOGICAL}","cwd":"/work"}}"#),
+            ),
+            line(
+                1,
+                r#""type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"首段标题"}]}"#,
+            ),
+            line(
+                2,
+                r#""type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}"#,
+            ),
+            // 边界之外：Codex 已经把这个失败的轮次丢弃，续写段从 ordinal 3 重新开始。
+            line(
+                3,
+                r#""type":"event_msg","payload":{"type":"task_started","turn_id":"beyond-cutoff-marker"}"#,
+            ),
+        ];
+        let cutoff = first_lines[..3].iter().map(String::len).sum::<usize>() as u64;
+        let first_path = sessions_dir.join(format!("rollout-2026-09-04T11-20-07-{LOGICAL}.jsonl"));
+        fs::write(&first_path, first_lines.concat()).expect("write first segment");
+        let second_lines = [
+            line(
+                3,
+                &format!(
+                    r#""type":"session_meta","payload":{{"id":"{LOGICAL}","cwd":"/work","history_base":{{"thread_id":"{LOGICAL}","end_byte_offset":{cutoff},"end_ordinal_exclusive":3}}}}"#
+                ),
+            ),
+            line(
+                4,
+                r#""type":"event_msg","payload":{"type":"task_started","turn_id":"second-segment-marker"}"#,
+            ),
+        ];
+        let second_path = sessions_dir.join(format!(
+            "rollout-2026-09-14T16-27-07-{LOGICAL}_{SEGMENT}.jsonl"
+        ));
+        fs::write(&second_path, second_lines.concat()).expect("write second segment");
+        let first_len = fs::metadata(&first_path).unwrap().len();
+        let second_len = fs::metadata(&second_path).unwrap().len();
+
+        let store = SessionStore::new(codex.path().to_path_buf());
+        let sessions = store.list_sessions(None, None).expect("list sessions");
+        assert_eq!(sessions.len(), 1, "同一线程的多段文件只能列出一条会话");
+        let record = &sessions[0];
+        assert_eq!(record.id, LOGICAL);
+        assert_eq!(record.title, "首段标题");
+        assert_eq!(record.path, second_path.to_string_lossy());
+        assert_eq!(record.size_bytes, cutoff + second_len);
+
+        // 内容搜索覆盖续写段，但不包含首段边界之外被丢弃的记录。
+        assert_eq!(
+            store
+                .list_sessions(None, Some("second-segment-marker".to_string()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .list_sessions(None, Some("beyond-cutoff-marker".to_string()))
+            .unwrap()
+            .is_empty());
+        let read_path = store.find_session_read_path(LOGICAL).expect("read path");
+        assert_ne!(read_path, first_path);
+        assert_ne!(read_path, second_path);
+        let merged = fs::read_to_string(&read_path).unwrap();
+        assert_eq!(merged.lines().count(), 5);
+        // 写操作仍然落在当前写入段。
+        assert_eq!(store.find_session_path(LOGICAL).unwrap(), second_path);
+
+        // 首段在切段前已被 Codex 投影到文件末尾（含边界外的轮次），这是正常状态；
+        // 续写段的投影过期（少一条 ordinal），只应重置续写段。
+        let history_db = codex.path().join("thread_history_1.sqlite");
+        run_sqlite_test(
+            &history_db,
+            &format!(
+                r#"
+                    CREATE TABLE thread_items (thread_id TEXT NOT NULL, item_id TEXT NOT NULL);
+                    CREATE TABLE thread_turns (thread_id TEXT NOT NULL, turn_id TEXT NOT NULL);
+                    CREATE TABLE thread_history_projection_state (
+                        thread_id TEXT PRIMARY KEY,
+                        next_rollout_byte_offset INTEGER NOT NULL,
+                        next_rollout_ordinal INTEGER NOT NULL
+                    );
+                    INSERT INTO thread_turns VALUES ('{LOGICAL}', 'turn-1'), ('{LOGICAL}', 'beyond-cutoff-marker'), ('{SEGMENT}', 'second-segment-marker');
+                    INSERT INTO thread_history_projection_state VALUES
+                        ('{LOGICAL}', {first_len}, 4),
+                        ('{SEGMENT}', {second_len}, 4);
+                "#
+            ),
+        );
+        let records = vec![SessionRepairRecord {
+            id: LOGICAL.to_string(),
+            title: "首段标题".to_string(),
+            path: second_path.clone(),
+            updated_at: 10,
+        }];
+        let (reset, backup_dirs, warnings) = store
+            .reset_stale_thread_history_projections(&records, &HashSet::new())
+            .expect("reset lineage projection");
+        assert_eq!(reset, 1, "只重置当前写入段，被引用的首段保持不动");
+        assert_eq!(backup_dirs.len(), 1);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            run_sqlite_test_output(
+                &history_db,
+                &format!("SELECT COUNT(*) FROM thread_turns WHERE thread_id = '{LOGICAL}';")
+            )
+            .trim(),
+            "2"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &history_db,
+                &format!("SELECT COUNT(*) FROM thread_turns WHERE thread_id = '{SEGMENT}';")
+            )
+            .trim(),
+            "0"
+        );
+
+        // 续写段投影完整后不再重置。
+        run_sqlite_test(
+            &history_db,
+            &format!(
+                "INSERT INTO thread_turns VALUES ('{SEGMENT}', 'second-segment-marker'); INSERT INTO thread_history_projection_state VALUES ('{SEGMENT}', {second_len}, 5);"
+            ),
+        );
+        let (reset_again, _, warnings) = store
+            .reset_stale_thread_history_projections(&records, &HashSet::new())
+            .expect("recheck lineage projection");
+        assert_eq!(reset_again, 0);
+        assert!(warnings.is_empty());
+
+        // 强制重置（例如文件被改写）时也只重建当前写入段。
+        let (forced, _, warnings) = store
+            .reset_stale_thread_history_projections(&records, &HashSet::from([LOGICAL.to_string()]))
+            .expect("force reset lineage projection");
+        assert_eq!(forced, 1);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            run_sqlite_test_output(
+                &history_db,
+                &format!("SELECT COUNT(*) FROM thread_turns WHERE thread_id = '{LOGICAL}';")
+            )
+            .trim(),
+            "2"
+        );
+    }
+
+    /// 切号会话修复会改写所有 rollout；被续写段引用的前缀必须逐字节保留。
+    #[test]
+    fn model_compatibility_rewrite_keeps_protected_prefix_untouched() {
+        const LOGICAL: &str = "01a06a6e-489b-7953-b7a2-46c08f772a12";
+        const SEGMENT: &str = "01a09f06-f038-70e1-8cfc-ba9feba3c47e";
+        let codex = tempdir().expect("codex tempdir");
+        let sessions_dir = codex.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("session dir");
+        let line = |ordinal: u64, body: &str| format!("{{\"ordinal\":{ordinal},{body}}}\n");
+        let protected_lines = [
+            line(
+                0,
+                &format!(
+                    r#""type":"session_meta","payload":{{"id":"{LOGICAL}","model_provider":"old-provider"}}"#
+                ),
+            ),
+            line(
+                1,
+                r#""type":"turn_context","payload":{"model":"Zc/qwen3.8-max","turn_id":"turn-1"}"#,
+            ),
+        ];
+        let cutoff = protected_lines.iter().map(String::len).sum::<usize>() as u64;
+        let tail_line = line(
+            2,
+            r#""type":"turn_context","payload":{"model":"Zc/qwen3.8-max","turn_id":"turn-2"}"#,
+        );
+        let first_path = sessions_dir.join(format!("rollout-2026-09-04T11-20-07-{LOGICAL}.jsonl"));
+        fs::write(
+            &first_path,
+            format!("{}{tail_line}", protected_lines.concat()),
+        )
+        .expect("write first segment");
+        let second_path = sessions_dir.join(format!(
+            "rollout-2026-09-14T16-27-07-{LOGICAL}_{SEGMENT}.jsonl"
+        ));
+        fs::write(
+            &second_path,
+            line(
+                2,
+                &format!(
+                    r#""type":"session_meta","payload":{{"id":"{LOGICAL}","model_provider":"old-provider","history_base":{{"thread_id":"{LOGICAL}","end_byte_offset":{cutoff},"end_ordinal_exclusive":2}}}}"#
+                ),
+            ),
+        )
+        .expect("write second segment");
+
+        let store = SessionStore::new(codex.path().to_path_buf());
+        store
+            .repair_model_compatibility("openai")
+            .expect("repair model compatibility");
+
+        let first = fs::read_to_string(&first_path).unwrap();
+        assert!(
+            first.starts_with(&protected_lines.concat()),
+            "受保护前缀必须逐字节保留:\n{first}"
+        );
+        let rewritten_tail = first[protected_lines.concat().len()..].to_string();
+        assert!(
+            !rewritten_tail.contains("Zc/qwen3.8-max"),
+            "边界之后的记录仍要修复:\n{rewritten_tail}"
+        );
+        let second = fs::read_to_string(&second_path).unwrap();
+        assert!(second.contains(r#""model_provider":"openai""#));
+        assert!(second.contains(&format!(r#""end_byte_offset":{cutoff}"#)));
     }
 
     fn run_sqlite_test(db_path: &std::path::Path, sql: &str) {

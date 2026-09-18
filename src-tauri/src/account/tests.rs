@@ -963,6 +963,8 @@ fn invalid_api_key_edit_does_not_persist_profile_or_visibility_changes() {
             account_name: Some("Replacement Name".to_string()),
             tags: Some(vec!["replacement".to_string()]),
             is_hidden: Some(true),
+            quota_list_enabled: None,
+            quota_list_stacked: None,
         })
         .expect_err("invalid official URL must reject the whole edit");
     assert!(error.contains("官网地址"));
@@ -3558,7 +3560,7 @@ fn local_gateway_binding_keeps_chatgpt_login_and_passes_key_via_header() {
         Some(api.id.clone())
     );
 
-    // 普通绑定（不走本地网关）：恢复 Bearer Token 写法并清理网关头
+    // 绑定关系无论历史开关为何，都必须保持 OAuth 登录态；API Key 通过请求头传递。
     store
         .update_api_key_bound_oauth_account(&api.id, Some(oauth.id.clone()), false)
         .unwrap();
@@ -3566,12 +3568,12 @@ fn local_gateway_binding_keeps_chatgpt_login_and_passes_key_via_header() {
     let config = fs::read_to_string(codex.path().join("config.toml")).unwrap();
     let document: toml_edit::Document = config.parse().unwrap();
     let provider = &document["model_providers"]["cliproxyapi"];
-    assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
+    assert_eq!(provider["requires_openai_auth"].as_bool(), Some(true));
     assert_eq!(
-        provider["experimental_bearer_token"].as_str(),
+        provider["http_headers"]["X-Api-Key"].as_str(),
         Some("sk-cpa-gateway")
     );
-    assert!(provider.get("http_headers").is_none());
+    assert!(provider.get("experimental_bearer_token").is_none());
 }
 
 #[test]

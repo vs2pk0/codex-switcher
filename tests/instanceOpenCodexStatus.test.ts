@@ -18,6 +18,10 @@ const openCodexBackendSource = readFileSync(
   new URL("../src-tauri/src/opencodex/backend.rs", import.meta.url),
   "utf8",
 );
+const instancesBackendSource = readFileSync(
+  new URL("../src-tauri/src/instances.rs", import.meta.url),
+  "utf8",
+);
 const openCodexPanelSource = readFileSync(new URL("../src/opencodex/OpenCodexPanel.vue", import.meta.url), "utf8");
 
 test("OpenCodex 常驻实例下拉为同步、恢复和图片模型传递相同目标", () => {
@@ -28,19 +32,40 @@ test("OpenCodex 常驻实例下拉为同步、恢复和图片模型传递相同�
   assert.doesNotMatch(openCodexBackendSource, /run_instance_integration_process\("isolate-default"/);
 });
 
-test("同步先预检再停止实例，不重置配置或修复历史；显式重置先停用集成", () => {
+test("同步先预检再停止实例，不重置配置；同步后一键修复会话再重开；显式重置先停用集成", () => {
   assert.match(openCodexBackendSource, /run_with_instance_opened_on_success/);
   assert.match(
     openCodexBackendSource,
     /run_instance_integration_process\("preflight", port, home\)\?;\s*crate::instances::run_with_instance_opened_on_success/,
   );
   const actionWorker = openCodexBackendSource.slice(openCodexBackendSource.indexOf("fn action_worker("), openCodexBackendSource.indexOf("fn run_instance_integration_helper("));
-  assert.doesNotMatch(actionWorker, /one_click_repair_session_store/);
+  // 同步后、重开前执行一键修复（切号修复 + 恢复完整历史），并按日志标记推进前端遮罩
+  const helperIndex = actionWorker.indexOf("run_instance_integration_helper(&action, port, home)?;");
+  const repairIndex = actionWorker.indexOf("one_click_repair_session_store(&session_store, &mut report)");
+  assert.ok(helperIndex >= 0 && repairIndex > helperIndex);
+  assert.match(actionWorker, /1 => "修复切号会话：/);
+  assert.match(actionWorker, /2 => "恢复全部会话的完整历史：/);
+  assert.match(actionWorker, /一键修复完成：\{repair_message\}，正在重新打开实例…/);
   assert.doesNotMatch(actionWorker, /reset_instance_config_inner\(&instance.id\)/);
+  assert.match(openCodexPanelSource, /\{ marker: "修复切号会话", step: 1 \}/);
+  assert.match(openCodexPanelSource, /\{ marker: "恢复全部会话的完整历史", step: 2 \}/);
+  assert.match(openCodexPanelSource, /\{ marker: "正在重新打开实例", step: 3 \}/);
   assert.match(openCodexPanelSource, /syncOverlay\.value = \{[\s\S]*?steps: syncOverlaySteps\(\)/);
   assert.match(openCodexPanelSource, /if \(event\.action === "sync"\) syncOverlay\.value = null;/);
   assert.match(openCodexBackendSource, /run_instance_integration_process\("disable"[\s\S]*?reset_codex_config_for_instance/);
   assert.match(openCodexPanelSource, /service-control-card[\s\S]*?instance-target-bar[\s\S]*?health-indicator/);
+});
+
+test("同步失败时恢复原本运行的实例，原本关闭的实例保持关闭", () => {
+  const helper = instancesBackendSource.slice(
+    instancesBackendSource.indexOf("pub(crate) fn run_with_instance_opened_on_success"),
+    instancesBackendSource.indexOf("/// 会话编辑备份", instancesBackendSource.indexOf("pub(crate) fn run_with_instance_opened_on_success")),
+  );
+  assert.match(helper, /let was_running = public\.running/);
+  assert.match(helper, /let action_result = action\(&public\)/);
+  assert.match(helper, /if action_result\.is_err\(\) && !was_running/);
+  assert.match(helper, /同步未完成，已恢复打开原本运行的实例/);
+  assert.match(helper, /同时未能恢复打开实例/);
 });
 
 test("实例状态公开并展示 OpenCodex 接入标识", () => {
@@ -102,7 +127,7 @@ test("切换账号前对已接入服务或第三方 Provider 的实例先重置 
   assert.match(libSource, /codex_home_has_opencodex_routing\(codex_home\)\s*\|\|\s*api_service::codex_home_has_api_service_routing\(codex_home\)/);
 });
 
-test("OpenCodex 同步保留账号，API 服务仍自动绑定 OAuth，两个面板保留手动绑定入口", () => {
+test("OpenCodex 同步保留账号且不绑定 OAuth，API 服务仍自动绑定 OAuth，两个面板保留手动绑定入口", () => {
   const syncStart = openCodexBackendSource.indexOf("run_with_instance_opened_on_success(&instance.id");
   const syncBlock = openCodexBackendSource.slice(
     syncStart,
@@ -113,7 +138,8 @@ test("OpenCodex 同步保留账号，API 服务仍自动绑定 OAuth，两个面
   const repairIndex = syncBlock.indexOf("one_click_repair_session_store(&session_store");
   assert.ok(helperIndex >= 0);
   assert.equal(bindIndex, -1);
-  assert.equal(repairIndex, -1);
+  // 一键修复只修会话文件，不迁移账号，所以保留在同步流程中
+  assert.ok(repairIndex > helperIndex);
 
   // API 服务：先挑选并续期 OAuth 账号，再在同步闭包里绑定到「本地 API 服务」账号
   const apiSync = apiServiceBackendSource.slice(

@@ -21,6 +21,27 @@ pub struct SystemSnapshot {
     pub background_service: BackgroundServiceState,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionInfo {
+    pub api_url: String,
+    pub local_api_url: String,
+    pub api_key: String,
+    pub hostname: String,
+    pub port: u16,
+    pub admin_api_token: Option<String>,
+    pub user_keys: Vec<ConnectionApiKey>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionApiKey {
+    pub id: String,
+    pub name: String,
+    pub key: String,
+    pub created_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundServiceState {

@@ -364,6 +364,8 @@ mod tests {
             api_base_url: None,
             api_provider_name: None,
             api_official_url: None,
+            quota_list_enabled: false,
+            quota_list_stacked: true,
             default_model: None,
             plan_type: None,
             auth_file_plan_type: None,

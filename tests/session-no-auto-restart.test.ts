@@ -21,10 +21,10 @@ test("移入回收站不会停止或重新启动 Codex 实例", () => {
   assert.match(body, /session_store_for_instance/);
 });
 
-test("复制会话不会停止或重新启动目标 Codex 实例", () => {
+test("复制会话会重启目标 Codex 实例以刷新客户端索引", () => {
   const body = rustCommandBody("codex_copy_session_history_across_instances");
-  assert.doesNotMatch(body, /run_with_instance_restarted|restart_codex_instance/);
-  assert.match(body, /session_store_for_instance\(Some\(&target_instance_id\)\)/);
+  assert.match(body, /run_with_instance_restarted\(&target_instance_id/);
+  assert.match(body, /SessionStore::new\(PathBuf::from\(&target_instance\.codex_home\)\)/);
 });
 
 test("复制完成提示不再声称目标实例已自动重启", () => {

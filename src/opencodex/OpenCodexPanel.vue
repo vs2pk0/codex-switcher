@@ -15,6 +15,8 @@ import {
   type ServiceOauthBinding,
   type ServiceOauthBindingRequest,
 } from "../services/codex";
+import { deleteOpenCodexApiKey, generateOpenCodexApiKey, getOpenCodexConnectionInfo, rotateOpenCodexApiKey, updateOpenCodexApiKeyName, updateOpenCodexConnectionInfo } from "./service";
+import type { ConnectionApiKey, ConnectionInfo } from "./types";
 import { currentLanguage, formatTranslatedText, t } from "../i18n";
 import { filterMigrationAccounts, orderMigrationAccounts, toggleVisibleAccounts } from "./accounts";
 import {
@@ -78,26 +80,30 @@ const page = ref<OpenCodexPage>("console");
 const snapshot = ref<OpenCodexSystemSnapshot | null>(null);
 const logs = ref<OpenCodexCommandLogEvent[]>([]);
 const busy = ref(false);
-/** 同步配置期间的全屏遮罩：同步 → 一键修复 → 重新打开实例，全程禁止操作其他页面。 */
+/** 同步配置期间的全屏遮罩：同步接口和模型配置 → 一键修复（切号修复 + 恢复完整历史）→（多开实例）重新打开实例，全程禁止操作其他页面。 */
 const syncOverlay = ref<{ title: string; message: string; steps: string[]; activeStep: number } | null>(null);
 const SYNC_OVERLAY_STEP_MARKERS: Array<{ marker: string; step: number }> = [
-  { marker: "已停止实例", step: 0 },
-  { marker: "正在绑定 OAuth 账号登录态", step: 1 },
-  { marker: "修复切号会话", step: 2 },
-  { marker: "恢复全部会话的完整历史", step: 3 },
-  { marker: "正在重新打开实例", step: 4 },
+  { marker: "仅同步接口和模型配置", step: 0 },
+  { marker: "修复切号会话", step: 1 },
+  { marker: "恢复全部会话的完整历史", step: 2 },
+  { marker: "正在重新打开实例", step: 3 },
 ];
 
 function syncOverlaySteps(): string[] {
-  return [t("重置并同步配置"), t("绑定 OAuth 登录态"), t("修复切号会话"), t("恢复全部会话的完整历史"), t("重新打开 Codex 实例")];
+  const steps = [t("仅同步接口和模型配置"), t("修复切号会话"), t("恢复全部会话的完整历史")];
+  // 只有多开实例的同步会以「重新打开实例」收尾；系统默认实例没有该阶段。
+  if (selectedInstance.value) steps.push(t("重新打开 Codex 实例"));
+  return steps;
 }
 
 /** 根据后端日志行推进遮罩步骤。 */
 function advanceSyncOverlay(line: string): void {
   if (!syncOverlay.value) return;
   const matched = SYNC_OVERLAY_STEP_MARKERS.find((item) => line.includes(item.marker));
-  if (!matched || matched.step < syncOverlay.value.activeStep) return;
-  syncOverlay.value = { ...syncOverlay.value, activeStep: matched.step };
+  if (!matched) return;
+  const step = Math.min(matched.step, syncOverlay.value.steps.length - 1);
+  if (step < syncOverlay.value.activeStep) return;
+  syncOverlay.value = { ...syncOverlay.value, activeStep: step };
 }
 const loading = ref(false);
 const interactiveOperationId = ref("");
@@ -134,6 +140,16 @@ const imageGenLoading = ref(false);
 const imageGenSaving = ref(false);
 const imageGenError = ref("");
 const selectedInstanceId = ref("default");
+const connectionInfoVisible = ref(false);
+const connectionInfoLoading = ref(false);
+const connectionInfoSaving = ref(false);
+const connectionInfo = ref<ConnectionInfo | null>(null);
+const connectionApiKey = ref("");
+const connectionTab = ref("user");
+const newKeyName = ref("");
+const connectionKeyBusy = ref(false);
+const editingConnectionKeyId = ref<string | null>(null);
+const editingConnectionKeyName = ref("");
 const selectedInstance = computed(() => props.instances.find((instance) => instance.id === selectedInstanceId.value));
 watch(() => props.instances, (instances) => {
   if (!instances.some((instance) => instance.id === selectedInstanceId.value)) selectedInstanceId.value = "default";
@@ -439,7 +455,7 @@ async function executeAction(action: OpenCodexAction, instanceId = selectedInsta
   if (action === "sync") {
     syncOverlay.value = {
       title: `${t("正在同步配置并一键修复")}「${selectedInstance.value ? instanceDisplayName(selectedInstance.value) : t("系统默认实例（原版）")}」`,
-      message: t("同步配置后会先对该实例执行一键修复（切号修复 + 恢复全部完整会话），修复完成后再重新打开 Codex。请勿关闭应用。"),
+      message: t("同步仅更新接口和模型配置，不会重置账号或绑定 OAuth；随后对该实例执行一键修复（切号修复 + 恢复全部完整会话），修复完成后多开实例会自动重新打开。请勿关闭应用。"),
       steps: syncOverlaySteps(),
       activeStep: 0,
     };
@@ -620,6 +636,15 @@ async function scanAccounts(): Promise<void> {
   const request = ++accountScanRequest;
   accountScanLoading.value = true;
   try {
+    // First entry can race the initial snapshot request. An uninstalled Engine
+    // is an expected setup state, not an account refresh failure.
+    const state = snapshot.value ?? await getOpenCodexSnapshot(instanceId);
+    if (instanceId !== selectedInstanceId.value || request !== accountScanRequest || disposed) return;
+    if (!state.installed) {
+      accountScan.value = null;
+      selectedAccountIds.value = [];
+      return;
+    }
     const result = await scanOpenCodexSwitcherAccounts(instanceId);
     if (instanceId !== selectedInstanceId.value || request !== accountScanRequest || disposed) return;
     accountScan.value = result;
@@ -627,10 +652,102 @@ async function scanAccounts(): Promise<void> {
       .filter((account) => (account.eligible || account.deletable) && selectedAccountIds.value.includes(account.sourceId))
       .map((account) => account.sourceId);
   } catch (error) {
-    if (request === accountScanRequest && !disposed) Message.error(formatTranslatedText("刷新 Switcher 账号失败：{error}", { error: errorText(error) }));
+    if (instanceId === selectedInstanceId.value && request === accountScanRequest && !disposed) Message.error(formatTranslatedText("刷新 Switcher 账号失败：{error}", { error: errorText(error) }));
   } finally {
     if (request === accountScanRequest) accountScanLoading.value = false;
   }
+}
+
+async function showConnectionInfo(): Promise<void> {
+  connectionInfoLoading.value = true;
+  try {
+    const value = await getOpenCodexConnectionInfo(selectedInstanceId.value);
+    connectionInfo.value = value;
+    connectionApiKey.value = value.apiKey;
+    connectionInfoVisible.value = true;
+  } catch (error) {
+    Message.error(formatTranslatedText("读取连接信息失败：{error}", { error: errorText(error) }));
+  } finally { connectionInfoLoading.value = false; }
+}
+
+async function saveConnectionInfo(): Promise<void> {
+  if (!connectionApiKey.value.trim()) { Message.warning(t("连接密钥不能为空")); return; }
+  connectionInfoSaving.value = true;
+  try {
+    connectionInfo.value = await updateOpenCodexConnectionInfo(connectionApiKey.value.trim(), selectedInstanceId.value);
+    if (snapshot.value?.running) {
+      connectionInfoVisible.value = false;
+      Message.success(t("连接信息已保存，正在重启服务以应用设置"));
+      await executeAction("restart", selectedInstanceId.value);
+    } else {
+      Message.success(t("连接信息已保存，启动服务后生效"));
+    }
+  } catch (error) {
+    Message.error(formatTranslatedText("保存连接信息失败：{error}", { error: errorText(error) }));
+  } finally { connectionInfoSaving.value = false; }
+}
+
+async function copyConnectionValue(value: string): Promise<void> {
+  try { await navigator.clipboard.writeText(value); Message.success(t("已复制")); }
+  catch { Message.error(t("复制失败")); }
+}
+
+async function generateUserKey(): Promise<void> {
+  connectionKeyBusy.value = true;
+  try {
+    const created = await generateOpenCodexApiKey(newKeyName.value.trim() || undefined, selectedInstanceId.value);
+    connectionInfo.value = connectionInfo.value ? { ...connectionInfo.value, userKeys: [created, ...connectionInfo.value.userKeys] } : connectionInfo.value;
+    newKeyName.value = "";
+    Message.success(t("用户密钥已生成，重启服务后生效"));
+    if (snapshot.value?.running) await executeAction("restart", selectedInstanceId.value);
+  } catch (error) { Message.error(formatTranslatedText("生成用户密钥失败：{error}", { error: errorText(error) })); }
+  finally { connectionKeyBusy.value = false; }
+}
+
+async function editUserKey(key: ConnectionApiKey): Promise<void> {
+  editingConnectionKeyId.value = key.id;
+  editingConnectionKeyName.value = key.name;
+}
+
+function cancelEditUserKey(): void {
+  editingConnectionKeyId.value = null;
+  editingConnectionKeyName.value = "";
+}
+
+async function saveEditedUserKey(key: ConnectionApiKey): Promise<void> {
+  const nextName = editingConnectionKeyName.value.trim();
+  if (!nextName || nextName === key.name) { cancelEditUserKey(); return; }
+  connectionKeyBusy.value = true;
+  try {
+    connectionInfo.value = await updateOpenCodexApiKeyName(key.id, nextName, selectedInstanceId.value);
+    Message.success(t("密钥名称已更新"));
+    cancelEditUserKey();
+  } catch (error) { Message.error(formatTranslatedText("编辑用户密钥失败：{error}", { error: errorText(error) })); }
+  finally { connectionKeyBusy.value = false; }
+}
+
+async function rotateUserKey(key: ConnectionApiKey): Promise<void> {
+  const confirmed = await new Promise<boolean>((resolve) => Modal.warning({ title: t("重新生成用户密钥"), content: t("重新生成后旧密钥会立即失效，是否继续？"), onOk: () => resolve(true), onCancel: () => resolve(false) }));
+  if (!confirmed) return;
+  connectionKeyBusy.value = true;
+  try {
+    connectionInfo.value = await rotateOpenCodexApiKey(key.id, selectedInstanceId.value);
+    Message.success(t("用户密钥已重新生成"));
+    if (snapshot.value?.running) await executeAction("restart", selectedInstanceId.value);
+  } catch (error) { Message.error(formatTranslatedText("重新生成用户密钥失败：{error}", { error: errorText(error) })); }
+  finally { connectionKeyBusy.value = false; }
+}
+
+async function revokeUserKey(key: ConnectionApiKey): Promise<void> {
+  const confirmed = await new Promise<boolean>((resolve) => Modal.warning({ title: t("撤销用户密钥"), content: t("撤销后使用该密钥的设备将无法继续访问，是否继续？"), onOk: () => resolve(true), onCancel: () => resolve(false) }));
+  if (!confirmed) return;
+  connectionKeyBusy.value = true;
+  try {
+    connectionInfo.value = await deleteOpenCodexApiKey(key.id, selectedInstanceId.value);
+    Message.success(t("用户密钥已撤销"));
+    if (snapshot.value?.running) await executeAction("restart", selectedInstanceId.value);
+  } catch (error) { Message.error(formatTranslatedText("撤销用户密钥失败：{error}", { error: errorText(error) })); }
+  finally { connectionKeyBusy.value = false; }
 }
 
 async function loadVisionModels(): Promise<void> {
@@ -1046,7 +1163,7 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
           <div class="section-heading"><div><h2>{{ t("快捷操作") }}</h2><p>{{ t("所有命令均经过 Rust 白名单和参数校验") }}</p></div></div>
           <div class="quick-grid">
             <button :disabled="busy || !snapshot?.initialized" @click="run('doctor')"><span><icon-bug /></span><div><strong>{{ t("环境诊断") }}</strong><small>{{ t("检查运行环境与配置") }}</small></div><icon-right /></button>
-            <button :disabled="busy || !snapshot?.initialized" @click="run('sync')"><span><icon-sync /></span><div><strong>{{ t("同步配置") }}</strong><small>{{ t("恢复基础配置，绑定 OAuth 并一键修复后打开实例") }}</small></div><icon-right /></button>
+            <button :disabled="busy || !snapshot?.initialized" @click="run('sync')"><span><icon-sync /></span><div><strong>{{ t("同步配置") }}</strong><small>{{ t("同步接口与模型配置，并一键修复会话后重新打开实例") }}</small></div><icon-right /></button>
             <button :disabled="busy || selectionLocked" @click="requestOauthBinding">
               <span><icon-user /></span>
               <div>
@@ -1071,8 +1188,49 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
               </em>
             </button>
             <button :disabled="busy || !snapshot?.initialized" @click="run('restore')"><span><icon-undo /></span><div><strong>{{ t("恢复 Codex") }}</strong><small>{{ t("仅还原所选实例配置") }}</small></div><icon-right /></button>
+            <button :disabled="busy || !snapshot?.initialized || connectionInfoLoading" @click="showConnectionInfo"><span><icon-link /></span><div><strong>{{ t("连接信息") }}</strong><small>{{ t("查看可供其他 Codex 使用的 API 地址与密钥") }}</small></div><icon-right /></button>
           </div>
         </section>
+
+        <a-modal v-model:visible="connectionInfoVisible" :title="t('OpenCodex 连接信息')" width="760px" :ok-loading="connectionInfoSaving" @ok="saveConnectionInfo">
+          <a-tabs v-model:active-key="connectionTab">
+            <a-tab-pane key="user" :title="t('用户 API 密钥')">
+              <a-alert type="warning" show-icon>{{ t("请只把用户密钥分享给可信用户。修改后请重启 OpenCodex 服务，其他设备才能连接。") }}</a-alert>
+              <a-form :model="connectionInfo ?? {}" layout="vertical" style="margin-top: 16px">
+                <a-form-item :label="t('共享 API 地址')"><a-input :model-value="connectionInfo?.apiUrl" readonly><template #suffix><icon-copy @click="connectionInfo?.apiUrl && copyConnectionValue(connectionInfo.apiUrl)" /></template></a-input></a-form-item>
+                <a-form-item :label="t('本机 API 地址')"><a-input :model-value="connectionInfo?.localApiUrl" readonly /></a-form-item>
+              </a-form>
+              <a-card :title="t('生成用户密钥')" :bordered="true" style="margin-top: 8px">
+                <a-space fill>
+                  <a-input v-model="newKeyName" :placeholder="t('密钥名称（可选）')" allow-clear />
+                  <a-button type="primary" :loading="connectionKeyBusy" @click="generateUserKey"><template #icon><icon-plus /></template>{{ t("生成密钥") }}</a-button>
+                </a-space>
+              </a-card>
+              <a-card :title="`${t('用户密钥')}（${connectionInfo?.userKeys.length ?? 0}）`" :bordered="true" style="margin-top: 12px">
+                <a-empty v-if="!connectionInfo?.userKeys.length" :description="t('暂无用户密钥')" />
+                <div v-for="key in connectionInfo?.userKeys" :key="key.id" class="connection-key-row">
+                  <div class="connection-key-main"><a-input v-if="editingConnectionKeyId === key.id" v-model="editingConnectionKeyName" size="small" @keyup.enter="saveEditedUserKey(key)" @keyup.esc="cancelEditUserKey" /><strong v-else>{{ key.name }}</strong><small>{{ key.createdAt ? new Date(key.createdAt).toLocaleString() : t("未记录创建时间") }}</small></div>
+                  <a-input-password :model-value="key.key" readonly hide-button class="connection-key-value" />
+                  <a-button type="text" @click="copyConnectionValue(key.key)"><template #icon><icon-copy /></template></a-button>
+                  <a-button v-if="editingConnectionKeyId === key.id" type="text" status="success" :loading="connectionKeyBusy" @click="saveEditedUserKey(key)"><template #icon><icon-check /></template></a-button>
+                  <a-button v-else type="text" @click="editUserKey(key)"><template #icon><icon-edit /></template></a-button>
+                  <a-button type="text" :loading="connectionKeyBusy" @click="rotateUserKey(key)"><template #icon><icon-refresh /></template></a-button>
+                  <a-button type="text" status="danger" :disabled="key.id === 'codex-switcher-share'" @click="revokeUserKey(key)"><template #icon><icon-delete /></template></a-button>
+                </div>
+              </a-card>
+            </a-tab-pane>
+            <a-tab-pane key="admin" :title="t('管理密钥')">
+              <a-alert type="info" show-icon>{{ t("管理密钥仅用于 OpenCodex 的 /api 管理页面，不是给其他 Codex 客户端使用的用户 API 密钥。请勿将管理密钥分享给普通用户。") }}</a-alert>
+              <a-form :model="connectionInfo ?? {}" layout="vertical" style="margin-top: 20px">
+                <a-form-item :label="t('管理后台令牌')">
+                  <a-input-password :model-value="connectionInfo?.adminApiToken ?? ''" readonly />
+                  <template #extra>{{ t("用于管理后台、密钥管理和配置操作") }}</template>
+                </a-form-item>
+                <a-button :disabled="!connectionInfo?.adminApiToken" @click="connectionInfo?.adminApiToken && copyConnectionValue(connectionInfo.adminApiToken)"><template #icon><icon-copy /></template>{{ t("复制管理密钥") }}</a-button>
+              </a-form>
+            </a-tab-pane>
+          </a-tabs>
+        </a-modal>
 
         <section class="console-card">
           <div class="section-heading">
@@ -1729,8 +1887,18 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
 .opencodex-page :deep(.arco-btn-primary.arco-btn-status-normal:not(.arco-btn-disabled):hover) { background: var(--oc-accent-hover); border-color: var(--oc-accent-hover); }
 .opencodex-page .instance-target-bar :deep(.arco-select-view),
 .opencodex-page .release-picker :deep(.arco-select-view) { border-color: var(--oc-line); }
+.connection-key-row { display: grid; grid-template-columns: minmax(120px, .9fr) minmax(180px, 1.5fr) auto auto auto auto; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--oc-line, #e5e7eb); }
+.connection-key-row:last-child { border-bottom: 0; }
+.connection-key-main { display: grid; gap: 3px; min-width: 0; }
+.connection-key-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.connection-key-main small { color: var(--oc-muted, #6d788a); font-size: 11px; }
+.connection-key-value :deep(input) { font-size: 12px; }
 @container (max-width: 780px) {
   .opencodex-page .vision-manager-header { grid-template-columns: minmax(0, 1fr); }
+}
+@container (max-width: 600px) {
+  .connection-key-row { grid-template-columns: 1fr auto auto auto; }
+  .connection-key-value { grid-column: 1 / -1; }
 }
 @container (max-width: 480px) {
   .vision-sidecar-editor { grid-template-columns: minmax(0, 1fr); }

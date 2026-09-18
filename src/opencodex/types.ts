@@ -1,5 +1,22 @@
 export type OpenCodexPage = "console" | "web" | "vision" | "versions" | "logs" | "settings" | "transfer";
 
+export interface ConnectionInfo {
+  apiUrl: string;
+  localApiUrl: string;
+  apiKey: string;
+  hostname: string;
+  port: number;
+  adminApiToken?: string | null;
+  userKeys: ConnectionApiKey[];
+}
+
+export interface ConnectionApiKey {
+  id: string;
+  name: string;
+  key: string;
+  createdAt?: string | null;
+}
+
 export type OpenCodexAction =
   | "init"
   | "start"

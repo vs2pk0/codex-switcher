@@ -2,6 +2,8 @@
 import { computed, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import DOMPurify from "dompurify";
+import html2canvas from "html2canvas";
+import { jsPDF } from "jspdf";
 import { marked, Renderer } from "marked";
 import { t } from "../i18n";
 import {
@@ -35,6 +37,8 @@ const loadingMore = ref(false);
 const deletingTurnIds = ref<Set<string>>(new Set());
 const deletingMessageIds = ref<Set<string>>(new Set());
 const restoring = ref(false);
+const exportingPdf = ref(false);
+const exportProgress = ref("");
 const searchQuery = ref("");
 const sortDirection = ref<"asc" | "desc">("desc");
 const renderMarkdownEnabled = ref(true);
@@ -99,6 +103,8 @@ function resetState(): void {
   deletingTurnIds.value = new Set();
   deletingMessageIds.value = new Set();
   restoring.value = false;
+  exportingPdf.value = false;
+  exportProgress.value = "";
   searchQuery.value = "";
   sortDirection.value = "desc";
   renderMarkdownEnabled.value = true;
@@ -247,7 +253,7 @@ function handleMarkdownClick(event: MouseEvent): void {
 }
 
 function updateVisible(visible: boolean): void {
-  if (!deletingTurnIds.value.size && !deletingMessageIds.value.size && !restoring.value) {
+  if (!deletingTurnIds.value.size && !deletingMessageIds.value.size && !restoring.value && !exportingPdf.value) {
     emit("update:visible", visible);
   }
 }
@@ -472,6 +478,213 @@ function confirmRestore(): void {
   });
 }
 
+async function loadAllTurnsForPdf(session: CodexSessionRecord): Promise<CodexSessionTurn[]> {
+  const allTurns: CodexSessionTurn[] = [];
+  const knownIds = new Set<string>();
+  let cursor: number | null = null;
+  let pageNumber = 0;
+  do {
+    pageNumber += 1;
+    exportProgress.value = `${t("正在读取全部会话内容")}（${pageNumber}）`;
+    const page = await listSessionContent(session.id, cursor, 50, "asc", props.instanceId);
+    for (const turn of page.turns) {
+      if (!knownIds.has(turn.id)) {
+        knownIds.add(turn.id);
+        allTurns.push(turn);
+      }
+    }
+    cursor = page.nextCursor ?? null;
+  } while (cursor !== null);
+  return allTurns;
+}
+
+async function loadPdfImageAssets(allTurns: CodexSessionTurn[], sessionId: string): Promise<void> {
+  const attachments = allTurns
+    .flatMap((turn) => turn.messages)
+    .flatMap((message) => message.attachments)
+    .filter((attachment) => attachment.kind === "image" && attachment.available);
+  const unique = [...new Map(attachments.map((attachment) => [attachment.id, attachment])).values()];
+  const urls = { ...assetUrls.value };
+  for (let index = 0; index < unique.length; index += 4) {
+    exportProgress.value = `${t("正在加载 PDF 图片")}（${Math.min(index + 4, unique.length)}/${unique.length}）`;
+    const batch = unique.slice(index, index + 4);
+    await Promise.all(
+      batch.map(async (attachment) => {
+        if (urls[attachment.id]) return;
+        try {
+          const asset = await getSessionAsset(sessionId, attachment.id, props.instanceId);
+          urls[attachment.id] = asset.dataUrl;
+        } catch {
+          // 单张图片不可用时保留附件名称，不中断整份 PDF。
+        }
+      }),
+    );
+    assetUrls.value = { ...urls };
+  }
+  markdownCache.clear();
+}
+
+function createPdfTitleBlock(session: CodexSessionRecord): HTMLElement {
+  const block = document.createElement("section");
+  block.className = "session-pdf-title";
+  const title = document.createElement("h1");
+  title.textContent = session.title || t("未命名会话");
+  const path = document.createElement("p");
+  path.textContent = session.projectPath || t("未归属项目");
+  block.append(title, path);
+  return block;
+}
+
+function createPdfTurnHeader(turn: CodexSessionTurn, sequence: number): HTMLElement {
+  const block = document.createElement("section");
+  block.className = "session-pdf-turn-header";
+  const title = document.createElement("strong");
+  title.textContent = `${t("对话轮次")} ${sequence}`;
+  const time = document.createElement("span");
+  time.textContent = formatTime(turn.timestamp);
+  block.append(title, time);
+  return block;
+}
+
+function createPdfMessageBlock(entry: SessionMessageEntry): HTMLElement {
+  const block = document.createElement("section");
+  block.className = `session-pdf-message is-${entry.message.role}`;
+  const meta = document.createElement("header");
+  const role = document.createElement("strong");
+  role.textContent = t(entry.message.role === "user" ? "用户" : "助手");
+  const time = document.createElement("span");
+  time.textContent = formatTime(entry.message.timestamp);
+  meta.append(role, time);
+  block.append(meta);
+
+  if (entry.skill) {
+    const skill = document.createElement("div");
+    skill.className = "session-pdf-skill";
+    skill.textContent = `${entry.skill.label} · ${entry.skill.request || t("查看技能说明")}`;
+    block.append(skill);
+  } else if (entry.message.text) {
+    const content = document.createElement("div");
+    content.className = "session-message-markdown";
+    content.innerHTML = renderMessageMarkdown(entry.message);
+    block.append(content);
+  }
+
+  for (const attachment of entry.message.attachments) {
+    const source = assetUrls.value[attachment.id];
+    if (attachment.kind === "image" && source) {
+      const image = document.createElement("img");
+      image.className = "session-pdf-image";
+      image.src = source;
+      image.alt = attachment.name;
+      block.append(image);
+    } else {
+      const file = document.createElement("div");
+      file.className = "session-pdf-file";
+      file.textContent = `${attachment.name} · ${attachment.mimeType || t("文件")}`;
+      block.append(file);
+    }
+  }
+  return block;
+}
+
+async function waitForPdfBlock(block: HTMLElement): Promise<void> {
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  const images = [...block.querySelectorAll("img")];
+  images.forEach((image) => {
+    image.loading = "eager";
+  });
+  await Promise.all(images.map((image) => image.decode().catch(() => undefined)));
+}
+
+function appendCanvasToPdf(
+  pdf: jsPDF,
+  canvas: HTMLCanvasElement,
+  state: { y: number },
+): void {
+  const margin = 28;
+  const gap = 8;
+  const pageWidth = pdf.internal.pageSize.getWidth();
+  const pageHeight = pdf.internal.pageSize.getHeight();
+  const contentWidth = pageWidth - margin * 2;
+  const pointScale = contentWidth / canvas.width;
+  let sourceY = 0;
+  while (sourceY < canvas.height) {
+    let availablePoints = pageHeight - margin - state.y;
+    if (availablePoints < 80) {
+      pdf.addPage();
+      state.y = margin;
+      availablePoints = pageHeight - margin * 2;
+    }
+    const sliceHeight = Math.min(
+      canvas.height - sourceY,
+      Math.max(1, Math.floor(availablePoints / pointScale)),
+    );
+    const slice = document.createElement("canvas");
+    slice.width = canvas.width;
+    slice.height = sliceHeight;
+    slice
+      .getContext("2d")
+      ?.drawImage(canvas, 0, sourceY, canvas.width, sliceHeight, 0, 0, canvas.width, sliceHeight);
+    const renderedHeight = sliceHeight * pointScale;
+    pdf.addImage(slice.toDataURL("image/jpeg", 0.9), "JPEG", margin, state.y, contentWidth, renderedHeight);
+    state.y += renderedHeight;
+    sourceY += sliceHeight;
+    if (sourceY < canvas.height) {
+      pdf.addPage();
+      state.y = margin;
+    }
+  }
+  state.y += gap;
+}
+
+async function exportSessionPdf(): Promise<void> {
+  const session = props.session;
+  if (!session || exportingPdf.value) return;
+  exportingPdf.value = true;
+  exportProgress.value = t("正在准备 PDF");
+  const stage = document.createElement("div");
+  stage.className = "session-pdf-stage";
+  document.body.appendChild(stage);
+  try {
+    const allTurns = await loadAllTurnsForPdf(session);
+    if (!allTurns.length) throw new Error(t("此会话暂无可导出的内容"));
+    await loadPdfImageAssets(allTurns, session.id);
+    await document.fonts.ready;
+
+    const pdf = new jsPDF({ orientation: "portrait", unit: "pt", format: "a4", compress: true });
+    const pdfState = { y: 28 };
+    const blocks: HTMLElement[] = [createPdfTitleBlock(session)];
+    allTurns.forEach((turn, index) => {
+      blocks.push(createPdfTurnHeader(turn, index + 1));
+      blocks.push(...messageEntries(turn).map(createPdfMessageBlock));
+    });
+    for (let index = 0; index < blocks.length; index += 1) {
+      exportProgress.value = `${t("正在生成 PDF")}（${index + 1}/${blocks.length}）`;
+      stage.replaceChildren(blocks[index]);
+      await waitForPdfBlock(blocks[index]);
+      const canvas = await html2canvas(blocks[index], {
+        backgroundColor: "#ffffff",
+        logging: false,
+        scale: 1.5,
+        useCORS: true,
+      });
+      appendCanvasToPdf(pdf, canvas, pdfState);
+    }
+    exportProgress.value = t("正在保存 PDF");
+    const fileName = `${session.title || t("未命名会话")}`
+      .replace(/[\\/:*?"<>|]/g, "_")
+      .slice(0, 80);
+    pdf.save(`${fileName}.pdf`);
+    Message.success(t("PDF 导出成功"));
+  } catch (error) {
+    Message.error(`${t("PDF 导出失败")}：${String(error)}`);
+  } finally {
+    stage.remove();
+    exportingPdf.value = false;
+    exportProgress.value = "";
+  }
+}
+
 function formatFileSize(bytes?: number | null): string {
   const safeBytes = typeof bytes === "number" && Number.isFinite(bytes) ? bytes : 0;
   if (safeBytes <= 0) return "0 B";
@@ -504,7 +717,7 @@ function formatTime(value?: string | number | null): string {
   <a-modal
     :visible="visible"
     :footer="false"
-    :closable="!deletingTurnIds.size && !deletingMessageIds.size && !restoring"
+    :closable="!deletingTurnIds.size && !deletingMessageIds.size && !restoring && !exportingPdf"
     :mask-closable="false"
     width="min(1180px, calc(100vw - 32px))"
     modal-class="session-content-modal"
@@ -545,6 +758,14 @@ function formatTime(value?: string | number | null): string {
           <a-radio value="desc">{{ t("倒序") }}</a-radio>
           <a-radio value="asc">{{ t("正序") }}</a-radio>
         </a-radio-group>
+        <a-button
+          type="primary"
+          :loading="exportingPdf"
+          :disabled="loading || loadingMore || deletingTurnIds.size > 0 || deletingMessageIds.size > 0 || restoring"
+          @click="exportSessionPdf"
+        >
+          <template #icon><icon-download /></template>{{ t("导出 PDF") }}
+        </a-button>
         <a-button v-if="lastBackupId" status="warning" :loading="restoring" @click="confirmRestore">
           <template #icon><icon-undo /></template>{{ t("撤销上次删除") }}
         </a-button>
@@ -688,6 +909,11 @@ function formatTime(value?: string | number | null): string {
           </a-button>
         </main>
       </a-spin>
+      <div v-if="exportingPdf" class="session-pdf-loading">
+        <a-spin dot />
+        <strong>{{ exportProgress }}</strong>
+        <span>{{ t("会话较大或图片较多时可能需要较长时间，请勿关闭窗口") }}</span>
+      </div>
     </div>
   </a-modal>
 

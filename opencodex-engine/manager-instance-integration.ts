@@ -59,6 +59,26 @@ async function importOpenCodexModule(packageRoot: string, segments: readonly str
   return import(openCodexModuleUrl(packageRoot, segments));
 }
 
+async function stopCodexAppServersBeforeCatalogRefresh(packageRoot: string): Promise<void> {
+  if (process.env.OPENCODEX_MANAGER_STOP_APP_SERVERS !== "1") return;
+  const segments = ["src", "codex", "app-server-processes.ts"];
+  if (!existsSync(join(packageRoot, ...segments))) return;
+  const processModule = await importOpenCodexModule(packageRoot, segments);
+  if (typeof processModule.listCodexAppServerProcesses !== "function"
+      || typeof processModule.restartCodexAppServers !== "function") {
+    throw new Error("当前 Engine 的 Codex 进程管理接口不完整");
+  }
+  const processes = processModule.listCodexAppServerProcesses();
+  if (!Array.isArray(processes) || processes.length === 0) return;
+  const outcome = processModule.restartCodexAppServers(processes);
+  const surviving = Array.isArray(outcome?.surviving) ? outcome.surviving : [];
+  const failed = Array.isArray(outcome?.failed) ? outcome.failed : [];
+  if (surviving.length > 0 || failed.length > 0) {
+    const pids = surviving.filter((pid: unknown) => Number.isSafeInteger(pid)).join(", ");
+    throw new Error(`无法停止仍持有旧模型缓存的 Codex app-server${pids ? `（PID：${pids}）` : ""}`);
+  }
+}
+
 function copyRegularConfigFile(sourceDir: string, overlayDir: string, name: string): void {
   const source = join(sourceDir, name);
   const target = join(overlayDir, name);
@@ -230,15 +250,22 @@ async function syncInstanceInner(port: number): Promise<InstanceIntegrationResul
     applyProxyEnv(config);
     let catalogPath: string | null = null;
     try {
+      // 外层已停止桌面实例，但 app-server 可能脱离父进程继续持有或改写旧缓存。
+      // 在目录刷新前使用 Engine 自身的进程识别逻辑清理它们，避免提交被拒绝，
+      // 也确保稍后重开的 Codex 从磁盘加载新模型列表。
+      await stopCodexAppServersBeforeCatalogRefresh(packageRoot);
       for (let attempt = 0; attempt < 3; attempt++) {
         const catalog = await refreshCodexModelCatalog(config);
         if (catalog.skippedReason === "desired_disabled") {
           return { action: "sync", success: false, message: "所选实例的 OpenCodex 接入已关闭，模型目录未更新；已停止同步。" };
         }
-        // Engine reports added > 0 after a serialized, validated no-op commit.
-        // A conflict/absent baseline instead returns added: 0. A merely valid
-        // old file is insufficient evidence that discovery has converged.
-        if (catalog.catalogWritten === false && !(catalog.added > 0)) {
+        // Engine 2.55+ 用 refreshOutcome 区分「已提交但内容未变化」和真正拒绝提交。
+        // 旧 Engine 没有该字段时，继续用 catalogWritten/added 的历史协议判断。
+        const catalogCommitRefused = catalog.refreshOutcome === "refused"
+          || (catalog.refreshOutcome === undefined
+            && catalog.catalogWritten === false
+            && !(catalog.added > 0));
+        if (catalogCommitRefused) {
           if (attempt === 0) {
             const lockModule = ["src", "codex", "catalog-write-serialization.ts"];
             if (existsSync(join(packageRoot, ...lockModule))) {

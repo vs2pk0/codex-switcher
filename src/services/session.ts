@@ -129,6 +129,7 @@ export interface CodexSessionVisibilityRepairSummary {
   desktopReloadPerformed?: boolean;
   backupDirs?: string[];
   items?: CodexSessionVisibilityRepairItem[];
+  warnings?: string[];
 }
 
 export type CodexSessionVisibilityRepairMode = "quick" | "deep";

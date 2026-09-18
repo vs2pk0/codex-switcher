@@ -52,6 +52,10 @@ import {
   t,
 } from "./i18n";
 import { additionalQuotaWindows, hasQuotaWindow, quotaWindowForMinutes } from "./quota";
+import {
+  fetchQuotaList,
+  type QuotaListState,
+} from "./services/quotaList";
 import { resolveResetScheduleEntry } from "./services/resetScheduleEntry";
 import { shouldCleanupHiddenAccount } from "./services/accountVisibility";
 import {
@@ -87,6 +91,8 @@ import {
   readCodexConfigFile,
   oneClickRepairCodexSessions,
   type CodexSessionOneClickRepairSummary,
+  syncApiKeyAccountToInstance,
+  API_KEY_ACCOUNT_SYNC_PROGRESS_EVENT,
   repairCodexSessionModelCompatibility,
   reloadCodexAfterSessionVisibilityRepair,
   listCodexSwitcherBackups,
@@ -232,6 +238,7 @@ const detectingCurrentAccount = ref(false);
 const accountSearchKeyword = ref("");
 const switchingId = ref("");
 const deletingId = ref("");
+const batchDeleting = ref(false);
 const quotaRefreshingId = ref("");
 const apiKeyBalanceStates = reactive<Record<string, CodexApiKeyBalanceState>>({});
 const apiKeyBalanceRequestSequences = new Map<string, number>();
@@ -289,6 +296,7 @@ const sessionOneClickRepairing = ref(false);
 /** 全局忙碌遮罩状态：非空时覆盖整个窗口并拦截所有交互（一键修复等长耗时流程）。 */
 const appBusy = ref<{ title: string; message?: string; steps?: string[]; activeStep?: number } | null>(null);
 let oneClickRepairProgressUnlisten: UnlistenFn | null = null;
+let apiKeyAccountSyncProgressUnlisten: UnlistenFn | null = null;
 const appPaths = ref<CodexSwitcherPaths | null>(null);
 const backupFiles = ref<CodexSwitcherBackupFile[]>([]);
 const backupLoading = ref(false);
@@ -372,6 +380,8 @@ const editForm = reactive({
   apiBaseUrl: "",
   apiProviderName: "",
   apiOfficialUrl: "",
+  quotaListEnabled: false,
+  quotaListStacked: true,
 });
 const editing = ref(false);
 
@@ -1833,6 +1843,7 @@ async function drainAccountLoadQueue(): Promise<void> {
         }
         accounts.value = nextAccounts;
         currentAccount.value = nextCurrent;
+        syncQuotaListStates();
         if (shouldPrefetchBalances && activeView.value === "accounts") {
           void nextTick(() => prefetchVisibleApiKeyBalances());
         }
@@ -1933,6 +1944,54 @@ async function loadApiKeyBalance(
     apiKeyBalanceLastAttemptAt.set(account.id, Date.now());
     if (!options.silent) Message.warning(`${t("余额获取失败")}：${message}`);
   }
+}
+
+const quotaListStates = reactive<Record<string, QuotaListState>>({});
+
+function quotaListBaseUrl(account: CodexAccount): string {
+  return (account.api_base_url || account.apiBaseUrl || "").trim();
+}
+
+async function loadQuotaListState(account: CodexAccount, force = false): Promise<void> {
+  const baseUrl = quotaListBaseUrl(account);
+  if (!isApiKeyAccount(account) || !account.quota_list_enabled || !baseUrl) {
+    delete quotaListStates[account.id];
+    return;
+  }
+  const previous = quotaListStates[account.id];
+  if (!force && previous?.status === "loading") return;
+  quotaListStates[account.id] = { status: "loading", result: previous?.result ?? null };
+  try {
+    const result = await fetchQuotaList(baseUrl, force);
+    quotaListStates[account.id] = { status: "ready", result };
+  } catch (error) {
+    quotaListStates[account.id] = {
+      status: "error",
+      result: previous?.result ?? null,
+      error: errorText(error),
+    };
+  }
+}
+
+function syncQuotaListStates(): void {
+  const activeIds = new Set<string>();
+  for (const account of accounts.value) {
+    if (
+      isApiKeyAccount(account) &&
+      account.quota_list_enabled &&
+      quotaListBaseUrl(account)
+    ) {
+      activeIds.add(account.id);
+      void loadQuotaListState(account);
+    }
+  }
+  for (const accountId of Object.keys(quotaListStates)) {
+    if (!activeIds.has(accountId)) delete quotaListStates[accountId];
+  }
+}
+
+async function handleRefreshQuotaList(account: CodexAccount): Promise<void> {
+  await loadQuotaListState(account, true);
 }
 
 function runApiKeyBalancePrefetchWorkers(): void {
@@ -2604,6 +2663,10 @@ async function performAccountSwitch(instanceId: string): Promise<void> {
   switchingId.value = account.id;
   try {
     const targetInstance = codexInstances.value.find((instance) => instance.id === instanceId);
+    if (isApiKeyAccount(account)) {
+      await performApiKeyAccountSync(account, instanceId, targetInstance?.name || "Codex");
+      return;
+    }
     const result = await switchCodexAccount(account.id, instanceId);
     currentAccount.value = result.account;
     await Promise.all([loadAccounts(), loadCodexInstances()]);
@@ -2620,6 +2683,40 @@ async function performAccountSwitch(instanceId: string): Promise<void> {
   } finally {
     switchingId.value = "";
     pendingSwitchAccount.value = null;
+  }
+}
+
+/** API Key 账号同步配置的阶段文案，顺序与 Rust 侧 `codex-api-key-account-sync-progress` 的 step 一致。 */
+function apiKeyAccountSyncSteps(): string[] {
+  return [t("关闭实例并同步配置"), t("修复切号会话"), t("恢复全部会话的完整历史"), t("重新打开 Codex 实例")];
+}
+
+/**
+ * API Key 账号「启动」：与 OpenCodex / API 服务的同步配置同一套流程 ——
+ * 停止实例 → 重置并写入 Provider 路由 → 一键修复会话 → 重新打开实例，全程全屏遮罩。
+ */
+async function performApiKeyAccountSync(
+  account: CodexAccount,
+  instanceId: string,
+  instanceName: string,
+): Promise<void> {
+  appBusy.value = {
+    title: `${t("正在同步配置并一键修复")}「${instanceName}」`,
+    message: t("同步配置后会先对该实例执行一键修复（切号修复 + 恢复全部完整会话），修复完成后再重新打开 Codex。请勿关闭应用。"),
+    steps: apiKeyAccountSyncSteps(),
+    activeStep: 0,
+  };
+  try {
+    const summary = await syncApiKeyAccountToInstance(account.id, instanceId);
+    appBusy.value = null;
+    currentAccount.value = summary.account;
+    await Promise.all([loadAccounts(), loadCodexInstances()]);
+    if (activeView.value === "sessions") void loadSessions({ silent: true });
+    Message.success(`${t("同步配置完成")}：${summary.message}`);
+  } catch (error) {
+    appBusy.value = null;
+    await loadCodexInstances().catch(() => undefined);
+    Message.error(`${t("同步配置失败")}：${errorText(error)}`);
   }
 }
 
@@ -2708,6 +2805,61 @@ async function handleDelete(account: CodexAccount): Promise<void> {
   } catch (error) {
     Message.error(`删除失败：${errorText(error)}`);
   } finally {
+    deletingId.value = "";
+  }
+}
+
+function confirmBatchDelete(): void {
+  const selected = selectedAccountIdList.value
+    .map((id) => accounts.value.find((account) => account.id === id))
+    .filter((account): account is CodexAccount => Boolean(account));
+  if (!selected.length) {
+    Message.warning("请先勾选要删除的账号");
+    return;
+  }
+  const includesCurrent = selected.some((account) => account.id === currentId.value);
+  Modal.warning({
+    title: "批量删除账号",
+    content: `确认删除已选中的 ${selected.length} 个账号？此操作只删除本工具保存的账号记录，不会删除 Codex 程序本身。${includesCurrent ? "其中包含当前账号，删除后需要重新选择账号。" : ""}`,
+    okText: "删除",
+    cancelText: "取消",
+    hideCancel: false,
+    onOk: () => handleBatchDelete(selected),
+  });
+}
+
+async function handleBatchDelete(selected: CodexAccount[]): Promise<void> {
+  batchDeleting.value = true;
+  deletingId.value = "__batch__";
+  const deletedIds: string[] = [];
+  const failures: Array<{ account: CodexAccount; error: string }> = [];
+  try {
+    for (const account of selected) {
+      try {
+        await deleteCodexAccount(account.id);
+        deletedIds.push(account.id);
+      } catch (error) {
+        failures.push({ account, error: errorText(error) });
+      }
+    }
+    cancelApiKeyBalancePrefetch();
+    for (const accountId of deletedIds) forgetApiKeyBalance(accountId);
+    selectedAccountIds.value = new Set(failures.map(({ account }) => account.id));
+    await loadAccounts();
+    if (failures.length) {
+      const failedNames = failures
+        .slice(0, 3)
+        .map(({ account }) => displayName(account))
+        .join("、");
+      const omitted = failures.length > 3 ? ` 等 ${failures.length} 个账号` : "";
+      Message.warning(
+        `批量删除完成：成功 ${deletedIds.length} 个，失败 ${failures.length} 个（${failedNames}${omitted}）`,
+      );
+    } else {
+      Message.success(`已删除 ${deletedIds.length} 个账号`);
+    }
+  } finally {
+    batchDeleting.value = false;
     deletingId.value = "";
   }
 }
@@ -3121,6 +3273,7 @@ async function handleApiKeyAdd(): Promise<void> {
 }
 
 async function prepareOAuthLogin(): Promise<void> {
+  if (oauthPreparing.value) return;
   oauthPreparing.value = true;
   oauthError.value = "";
   try {
@@ -3366,6 +3519,8 @@ async function openEdit(account: CodexAccount): Promise<void> {
   editForm.apiBaseUrl = account.api_base_url ?? account.apiBaseUrl ?? "https://api.openai.com/v1";
   editForm.apiProviderName = account.api_provider_name ?? account.apiProviderName ?? "OpenAI Official";
   editForm.apiOfficialUrl = account.api_official_url ?? account.apiOfficialUrl ?? "";
+  editForm.quotaListEnabled = Boolean(account.quota_list_enabled);
+  editForm.quotaListStacked = account.quota_list_stacked !== false;
   editVisible.value = true;
   try {
     const [switcherJson, tokenJson] = await Promise.all([
@@ -3425,6 +3580,8 @@ async function handleEditSave(): Promise<void> {
         accountName: editForm.accountName.trim(),
         tags: editForm.tags,
         isHidden: editForm.isHidden,
+        quotaListEnabled: editForm.quotaListEnabled,
+        quotaListStacked: editForm.quotaListStacked,
       });
     } else {
       updated = await updateCodexAccountProfile({
@@ -4775,6 +4932,13 @@ onMounted(() => {
   }).then((unlisten) => {
     oneClickRepairProgressUnlisten = unlisten;
   });
+  void listen<{ step: number }>(API_KEY_ACCOUNT_SYNC_PROGRESS_EVENT, (event) => {
+    if (appBusy.value?.steps) {
+      appBusy.value = { ...appBusy.value, activeStep: event.payload.step };
+    }
+  }).then((unlisten) => {
+    apiKeyAccountSyncProgressUnlisten = unlisten;
+  });
 });
 
 onUnmounted(() => {
@@ -4783,6 +4947,7 @@ onUnmounted(() => {
   apiServiceAutoUpdateUnlisten?.();
   accountStateUnlisten?.();
   oneClickRepairProgressUnlisten?.();
+  apiKeyAccountSyncProgressUnlisten?.();
   window.removeEventListener("resize", handleWindowResize);
   if (windowResizeFrame) window.cancelAnimationFrame(windowResizeFrame);
   if (viewLoadTimer) window.clearTimeout(viewLoadTimer);
@@ -4833,6 +4998,8 @@ onUnmounted(() => {
       v-if="activeView === 'accounts'"
       :settings="settings"
       :is-current-page-selected="isCurrentPageSelected"
+      :selected-account-count="selectedAccountIdList.length"
+      :batch-deleting="batchDeleting"
       :account-type-options="accountTypeOptions"
       :account-search-keyword="accountSearchKeyword"
       :show-sort-direction="showSortDirection"
@@ -4844,6 +5011,7 @@ onUnmounted(() => {
       @save-settings="saveSettings"
       @open-sort-editor="openSortEditor"
       @bind-selected="confirmBindSelected"
+      @batch-delete="confirmBatchDelete"
       @batch-export="openBatchExport"
       @open-add="openAddModal"
     />
@@ -4863,6 +5031,7 @@ onUnmounted(() => {
         :exporting-id="exportingId"
         :quota-refreshing-id="quotaRefreshingId"
         :api-key-balance-states="apiKeyBalanceStates"
+        :quota-list-states="quotaListStates"
         :privacy-masked="privacyMasked"
         :status-clock-ms="accountStatusClockMs"
         :api-service-account-ids="apiServiceAccountIds"
@@ -4881,6 +5050,7 @@ onUnmounted(() => {
         @switch-account="handleSwitch"
         @refresh-quota="handleRefreshQuota"
         @refresh-api-balance="handleRefreshApiKeyBalance"
+        @refresh-quota-list="handleRefreshQuotaList"
         @open-export="openExport"
         @confirm-delete="confirmDelete"
         @open-add="openAddModal"

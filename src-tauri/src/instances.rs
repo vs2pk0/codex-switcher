@@ -1387,8 +1387,7 @@ pub fn run_with_instance_restarted_if_running<T>(
     }
 }
 
-/// Explicit sync opens even a previously closed instance, but never launches
-/// a client against configuration that failed reset/sync/validation.
+/// 显式同步成功后总是打开实例；同步失败时只恢复操作前正在运行的实例。
 pub(crate) fn run_with_instance_opened_on_success<T>(
     instance_id: &str,
     action: impl FnOnce(&CodexInstance) -> Result<T, String>,
@@ -1398,13 +1397,24 @@ pub(crate) fn run_with_instance_opened_on_success<T>(
         .map_err(|_| "Codex 实例操作锁已损坏".to_string())?;
     let stored = stored_instance(instance_id)?;
     let public = checked_public_instance(stored.clone())?;
-    if public.running {
+    let was_running = public.running;
+    if was_running {
         stop_stored(&stored)?;
     }
-    let value =
-        action(&public).map_err(|error| format!("{error}；目标实例未自动打开，请修复后重试"))?;
-    launch_stored(&stored).map_err(|error| format!("配置已同步，但实例打开失败：{error}"))?;
-    Ok(value)
+    let action_result = action(&public);
+    if action_result.is_err() && !was_running {
+        return action_result;
+    }
+    let start_result = launch_stored(&stored).map(|_| ());
+    match (action_result, start_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(format!("{error}；同步未完成，已恢复打开原本运行的实例")),
+        (Ok(_), Err(error)) => Err(format!("配置已同步，但实例打开失败：{error}")),
+        (Err(action_error), Err(start_error)) => Err(format!(
+            "{action_error}；同时未能恢复打开实例“{}”：{start_error}",
+            stored.name
+        )),
+    }
 }
 
 /// 会话编辑备份（删除轮次 / 删除消息 / 修改工作目录 / 切号修复等操作前的原文件副本）。
