@@ -334,6 +334,7 @@ const settings = reactive<CodexSwitcherSettings>({
   sidebarEnabled: true,
   showQuotaCountdowns: true,
   showAdditionalQuotaWindows: true,
+  tokenKeeperEnabled: true,
   badgeStyle: "classic",
   badgeStyles: defaultBadgeStyles(),
   maxColumns: ADAPTIVE_COLUMNS,
@@ -2127,6 +2128,7 @@ async function loadSettings(options: { includeStorage?: boolean } = {}): Promise
       currentAccountNextRefreshAt: Number(nextSettings.currentAccountNextRefreshAt || 0),
       showQuotaCountdowns: nextSettings.showQuotaCountdowns ?? true,
       showAdditionalQuotaWindows: nextSettings.showAdditionalQuotaWindows ?? true,
+      tokenKeeperEnabled: nextSettings.tokenKeeperEnabled ?? true,
       maxColumns: normalizeMaxColumns(nextSettings.maxColumns),
       language: nextSettings.language || "zh-CN",
     });
@@ -2188,6 +2190,7 @@ async function saveSettings(): Promise<void> {
         : 0,
       showQuotaCountdowns: settings.showQuotaCountdowns ?? true,
       showAdditionalQuotaWindows: settings.showAdditionalQuotaWindows ?? true,
+      tokenKeeperEnabled: settings.tokenKeeperEnabled ?? true,
       maxColumns: normalizeMaxColumns(settings.maxColumns),
       language: settings.language || "zh-CN",
     });

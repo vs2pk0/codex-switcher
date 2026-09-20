@@ -127,6 +127,8 @@ struct CodexSwitcherSettings {
     show_quota_countdowns: bool,
     #[serde(default = "default_show_additional_quota_windows")]
     show_additional_quota_windows: bool,
+    #[serde(default = "default_token_keeper_enabled")]
+    token_keeper_enabled: bool,
     #[serde(default = "default_badge_style")]
     badge_style: String,
     #[serde(default = "default_badge_styles")]
@@ -158,6 +160,7 @@ impl Default for CodexSwitcherSettings {
             sidebar_enabled: default_sidebar_enabled(),
             show_quota_countdowns: default_show_quota_countdowns(),
             show_additional_quota_windows: default_show_additional_quota_windows(),
+            token_keeper_enabled: default_token_keeper_enabled(),
             badge_style: default_badge_style(),
             badge_styles: default_badge_styles(),
             max_columns: default_max_columns(),
@@ -244,6 +247,10 @@ fn default_show_quota_countdowns() -> bool {
 }
 
 fn default_show_additional_quota_windows() -> bool {
+    true
+}
+
+fn default_token_keeper_enabled() -> bool {
     true
 }
 
@@ -1936,9 +1943,6 @@ async fn launch_codex_instance_with_services(
             {
                 started_services.push("OpenCodex".to_string());
             }
-            // OpenCodex 重新注入配置时会把 Provider 写回 requires_openai_auth = false；
-            // 若实例已绑定 OAuth 登录态，启动前把登录模式补回去，保证 Codex 显示账号。
-            service_binding::ensure_opencodex_login_mode(&instance.id)?;
         }
         if instance.api_service_connected
             && api_service::ensure_service_started(&app)
@@ -2212,6 +2216,12 @@ fn mark_visibility_desktop_reloaded(summary: &mut CodexSessionVisibilityRepairSu
 fn get_codex_switcher_settings() -> Result<CodexSwitcherSettings, String> {
     let _settings_guard = lock_switcher_settings()?;
     read_switcher_settings()
+}
+
+pub(crate) fn token_keeper_enabled() -> bool {
+    read_switcher_settings()
+        .map(|settings| settings.token_keeper_enabled)
+        .unwrap_or(true)
 }
 
 #[tauri::command]
@@ -4978,6 +4988,16 @@ mod tests {
     }
 
     #[test]
+    fn token_keeper_is_enabled_by_default_and_can_be_disabled() {
+        assert!(super::CodexSwitcherSettings::default().token_keeper_enabled);
+        let settings = super::CodexSwitcherSettings {
+            token_keeper_enabled: false,
+            ..Default::default()
+        };
+        assert!(!settings.token_keeper_enabled);
+    }
+
+    #[test]
     fn model_endpoint_preserves_provider_prefix_and_avoids_duplicate_suffix() {
         assert_eq!(
             super::codex_models_endpoint(Some("https://relay.example/sub2api/"))
@@ -6073,6 +6093,7 @@ pub fn run() {
             opencodex::opencodex_update_image_generation_settings,
             opencodex::opencodex_get_connection_info,
             opencodex::opencodex_update_connection_info,
+            opencodex::opencodex_update_admin_api_enabled,
             opencodex::opencodex_generate_api_key,
             opencodex::opencodex_update_api_key_name,
             opencodex::opencodex_rotate_api_key,

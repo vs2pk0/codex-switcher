@@ -30,6 +30,7 @@ pub struct ConnectionInfo {
     pub hostname: String,
     pub port: u16,
     pub admin_api_token: Option<String>,
+    pub admin_api_enabled: bool,
     pub user_keys: Vec<ConnectionApiKey>,
 }
 

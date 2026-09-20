@@ -185,17 +185,6 @@ pub(crate) fn apply_service_oauth_binding(
     }
 }
 
-/// 已接入 OpenCodex 且绑定了 OAuth 登录态的实例：确保代理 Provider 处于 ChatGPT 登录模式。
-/// 返回本次是否修改了 config.toml。
-pub(crate) fn ensure_opencodex_login_mode(instance_id: &str) -> Result<bool, String> {
-    let binding = read_service_oauth_binding(ServiceKind::OpenCodex, instance_id)?;
-    if binding.bound_account_id.is_none() {
-        return Ok(false);
-    }
-    let store = instance_account_store(instance_id)?;
-    crate::account::set_active_provider_login_mode(store.codex_home(), true)
-}
-
 /// 同步配置时的自动绑定：挑选默认 OAuth 账号并绑定；返回给用户看的说明文字。
 pub(crate) fn auto_bind_default_oauth(
     kind: ServiceKind,

@@ -35,6 +35,7 @@ export interface CodexSwitcherSettings {
   sidebarEnabled: boolean;
   showQuotaCountdowns: boolean;
   showAdditionalQuotaWindows: boolean;
+  tokenKeeperEnabled: boolean;
   badgeStyle: string;
   badgeStyles: Record<string, string>;
   maxColumns: AccountColumnsSetting;

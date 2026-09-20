@@ -7,6 +7,7 @@ export interface ConnectionInfo {
   hostname: string;
   port: number;
   adminApiToken?: string | null;
+  adminApiEnabled: boolean;
   userKeys: ConnectionApiKey[];
 }
 

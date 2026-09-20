@@ -1366,9 +1366,32 @@ impl Backend {
             .or_else(|| object.get("apiToken").and_then(Value::as_str).map(str::to_string))
             .unwrap_or_default();
         let port = self.read_configured_port().unwrap_or(self.default_port);
-        let admin_api_token = fs::read_to_string(self.home.join("admin-api-token"))
-            .ok().map(|token| token.trim().to_string()).filter(|token| !token.is_empty());
-        Ok(ConnectionInfo { api_url: format!("http://{}:{port}/v1", share_ip_address()), local_api_url: format!("http://127.0.0.1:{port}/v1"), api_key: key, hostname: object.get("hostname").and_then(Value::as_str).unwrap_or("0.0.0.0").to_string(), port, admin_api_token, user_keys })
+        let hostname = object.get("hostname").and_then(Value::as_str).unwrap_or("0.0.0.0").to_string();
+        let api_host = if matches!(hostname.as_str(), "127.0.0.1" | "localhost" | "::1") {
+            "127.0.0.1".to_string()
+        } else {
+            share_ip_address()
+        };
+        let admin_api_enabled = object.get("adminApiEnabled").and_then(Value::as_bool).unwrap_or(true);
+        let admin_api_token = admin_api_enabled.then(|| fs::read_to_string(self.home.join("admin-api-token")).ok())
+            .flatten().map(|token| token.trim().to_string()).filter(|token| !token.is_empty());
+        Ok(ConnectionInfo { api_url: format!("http://{api_host}:{port}/v1"), local_api_url: format!("http://127.0.0.1:{port}/v1"), api_key: key, hostname, port, admin_api_token, admin_api_enabled, user_keys })
+    }
+
+    pub fn update_admin_api_enabled(&self, enabled: bool) -> Result<ConnectionInfo, String> {
+        let mut config = self.read_open_codex_config().unwrap_or_else(|_| serde_json::json!({}));
+        let object = config.as_object_mut().ok_or("OpenCodex 配置格式无效")?;
+        object.insert("adminApiEnabled".into(), Value::Bool(enabled));
+        if enabled {
+            object.insert("hostname".into(), Value::String("0.0.0.0".into()));
+            object.remove("unauthenticatedLoopbackListener");
+        } else {
+            object.insert("hostname".into(), Value::String("127.0.0.1".into()));
+            object.remove("unauthenticatedLoopbackListener");
+        }
+        fs::write(self.home.join("config.json"), serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("保存管理密钥设置失败：{e}"))?;
+        self.connection_info_from_config(&config)
     }
 
     pub fn connection_info(&self, api_key: Option<String>) -> Result<ConnectionInfo, String> {
@@ -1400,7 +1423,11 @@ impl Backend {
                 "createdAt": chrono::Utc::now().to_rfc3339(),
             }));
         }
-        object.insert("hostname".into(), Value::String("0.0.0.0".into()));
+        let admin_api_enabled = object.get("adminApiEnabled").and_then(Value::as_bool).unwrap_or(true);
+        object.insert(
+            "hostname".into(),
+            Value::String(if admin_api_enabled { "0.0.0.0" } else { "127.0.0.1" }.into()),
+        );
         let text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
         fs::write(self.home.join("config.json"), text).map_err(|e| format!("保存连接配置失败：{e}"))?;
         self.connection_info_from_config(&config)
@@ -3670,6 +3697,15 @@ fn repair_public_auth_config(home: &Path) -> Result<(), String> {
     let mut config: Value = serde_json::from_str(&text).map_err(|e| format!("OpenCodex 配置格式无效：{e}"))?;
     let Some(object) = config.as_object_mut() else { return Err("OpenCodex 配置格式无效".into()); };
     let hostname = object.get("hostname").and_then(Value::as_str).unwrap_or("127.0.0.1");
+    if object.get("adminApiEnabled").and_then(Value::as_bool) == Some(false)
+        && !matches!(hostname, "" | "localhost" | "127.0.0.1" | "::1")
+    {
+        object.insert("hostname".into(), Value::String("127.0.0.1".into()));
+        object.remove("unauthenticatedLoopbackListener");
+        fs::write(path, serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("修复本机管理模式配置失败：{e}"))?;
+        return Ok(());
+    }
     if matches!(hostname, "" | "localhost" | "127.0.0.1" | "::1") { return Ok(()); }
     let has_key = object.get("apiKeys").and_then(Value::as_array).is_some_and(|keys| {
         keys.iter().any(|entry| entry.get("key").and_then(Value::as_str).is_some_and(|key| !key.trim().is_empty()))

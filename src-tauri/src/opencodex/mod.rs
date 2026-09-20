@@ -61,6 +61,18 @@ pub async fn opencodex_update_connection_info(
 }
 
 #[tauri::command]
+pub async fn opencodex_update_admin_api_enabled(
+    backend: tauri::State<'_, Arc<OpenCodexBackend>>,
+    instance_id: Option<String>,
+    enabled: bool,
+) -> Result<ConnectionInfo, String> {
+    let backend = backend.for_instance(instance_id.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || backend.update_admin_api_enabled(enabled))
+        .await
+        .map_err(|error| format!("更新管理密钥设置任务失败：{error}"))?
+}
+
+#[tauri::command]
 pub async fn opencodex_generate_api_key(
     backend: State<'_, Arc<OpenCodexBackend>>,
     instance_id: Option<String>,

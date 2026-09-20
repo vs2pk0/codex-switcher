@@ -37,6 +37,10 @@ export function updateOpenCodexConnectionInfo(apiKey: string, instanceId?: strin
   return invoke("opencodex_update_connection_info", { instanceId, apiKey });
 }
 
+export function updateOpenCodexAdminApiEnabled(enabled: boolean, instanceId?: string): Promise<ConnectionInfo> {
+  return invoke("opencodex_update_admin_api_enabled", { instanceId, enabled });
+}
+
 export function generateOpenCodexApiKey(name?: string, instanceId?: string): Promise<ConnectionApiKey> {
   return invoke("opencodex_generate_api_key", { instanceId, name });
 }

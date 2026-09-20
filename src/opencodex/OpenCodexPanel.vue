@@ -15,7 +15,7 @@ import {
   type ServiceOauthBinding,
   type ServiceOauthBindingRequest,
 } from "../services/codex";
-import { deleteOpenCodexApiKey, generateOpenCodexApiKey, getOpenCodexConnectionInfo, rotateOpenCodexApiKey, updateOpenCodexApiKeyName, updateOpenCodexConnectionInfo } from "./service";
+import { deleteOpenCodexApiKey, generateOpenCodexApiKey, getOpenCodexConnectionInfo, rotateOpenCodexApiKey, updateOpenCodexAdminApiEnabled, updateOpenCodexApiKeyName, updateOpenCodexConnectionInfo } from "./service";
 import type { ConnectionApiKey, ConnectionInfo } from "./types";
 import { currentLanguage, formatTranslatedText, t } from "../i18n";
 import { filterMigrationAccounts, orderMigrationAccounts, toggleVisibleAccounts } from "./accounts";
@@ -687,6 +687,24 @@ async function saveConnectionInfo(): Promise<void> {
   } finally { connectionInfoSaving.value = false; }
 }
 
+async function toggleAdminApi(enabled: boolean): Promise<void> {
+  if (!connectionInfo.value || connectionInfo.value.adminApiEnabled === enabled) return;
+  connectionInfoSaving.value = true;
+  try {
+    connectionInfo.value = await updateOpenCodexAdminApiEnabled(enabled, selectedInstanceId.value);
+    if (snapshot.value?.running) {
+      connectionInfoVisible.value = false;
+      Message.success(`${enabled ? t("管理密钥已开启") : t("管理密钥已关闭")}，${t("正在重启服务以应用设置")}`);
+      await executeAction("restart", selectedInstanceId.value);
+    } else {
+      Message.success(enabled ? t("管理密钥已开启") : t("管理密钥已关闭"));
+    }
+  } catch (error) {
+    connectionInfo.value = { ...connectionInfo.value, adminApiEnabled: !enabled };
+    Message.error(formatTranslatedText("保存管理密钥设置失败：{error}", { error: errorText(error) }));
+  } finally { connectionInfoSaving.value = false; }
+}
+
 async function copyConnectionValue(value: string): Promise<void> {
   try { await navigator.clipboard.writeText(value); Message.success(t("已复制")); }
   catch { Message.error(t("复制失败")); }
@@ -1222,11 +1240,14 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
             <a-tab-pane key="admin" :title="t('管理密钥')">
               <a-alert type="info" show-icon>{{ t("管理密钥仅用于 OpenCodex 的 /api 管理页面，不是给其他 Codex 客户端使用的用户 API 密钥。请勿将管理密钥分享给普通用户。") }}</a-alert>
               <a-form :model="connectionInfo ?? {}" layout="vertical" style="margin-top: 20px">
+                <a-form-item :label="t('启用管理密钥')" :extra="t('关闭后服务仅监听本机，连接信息中不再显示管理密钥。')">
+                  <a-switch :model-value="connectionInfo?.adminApiEnabled ?? true" @change="(value: string | number | boolean) => toggleAdminApi(value === true)" />
+                </a-form-item>
                 <a-form-item :label="t('管理后台令牌')">
-                  <a-input-password :model-value="connectionInfo?.adminApiToken ?? ''" readonly />
+                  <a-input-password :model-value="connectionInfo?.adminApiEnabled ? (connectionInfo.adminApiToken ?? '') : ''" readonly />
                   <template #extra>{{ t("用于管理后台、密钥管理和配置操作") }}</template>
                 </a-form-item>
-                <a-button :disabled="!connectionInfo?.adminApiToken" @click="connectionInfo?.adminApiToken && copyConnectionValue(connectionInfo.adminApiToken)"><template #icon><icon-copy /></template>{{ t("复制管理密钥") }}</a-button>
+                <a-button :disabled="!connectionInfo?.adminApiEnabled || !connectionInfo?.adminApiToken" @click="connectionInfo?.adminApiToken && copyConnectionValue(connectionInfo.adminApiToken)"><template #icon><icon-copy /></template>{{ t("复制管理密钥") }}</a-button>
               </a-form>
             </a-tab-pane>
           </a-tabs>

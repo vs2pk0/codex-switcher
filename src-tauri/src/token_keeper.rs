@@ -135,6 +135,9 @@ async fn refresh_account(
 }
 
 async fn run_refresh_cycle(app: &AppHandle) {
+    if !crate::token_keeper_enabled() {
+        return;
+    }
     let accounts = match AccountStore::default().list_accounts() {
         Ok(accounts) => accounts,
         Err(error) => {

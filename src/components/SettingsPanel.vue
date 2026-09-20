@@ -184,6 +184,9 @@ function changeLanguage(value: unknown): void {
             <a-form-item :label="t('等待刷新倒计时')">
               <a-switch v-model="settings.showQuotaCountdowns" @change="emit('save')" />
             </a-form-item>
+            <a-form-item :label="t('自动续期登录令牌')" :extra="t('关闭后不再后台自动刷新 OAuth Token，手动操作仍可按需续期。')">
+              <a-switch v-model="settings.tokenKeeperEnabled" @change="emit('save')" />
+            </a-form-item>
             <a-button type="primary" :loading="saving" @click="emit('save')">{{ t("保存") }}</a-button>
           </a-form>
         </a-card>

@@ -81,6 +81,26 @@ test("实例状态公开 API 服务接入标识，启动实例前先拉起依赖
   assert.match(instancePanelSource, /startedServices = \(await launchCodexInstance\(instance\.id\)\)\.startedServices/);
 });
 
+test("启动已接入实例只拉起依赖服务，不同步 OpenCodex 配置", () => {
+  const launch = libSource.slice(
+    libSource.indexOf("async fn launch_codex_instance_with_services("),
+    libSource.indexOf("#[tauri::command]", libSource.indexOf("async fn launch_codex_instance_with_services(") + 1),
+  );
+  assert.match(launch, /ensure_service_running\(\)/);
+  assert.doesNotMatch(launch, /sync_codex|sync_instance|ensure_opencodex_login_mode|run_instance_integration/);
+});
+
+test("关闭管理密钥改为本机监听，不写入冲突的回环伴侣监听", () => {
+  const toggle = openCodexBackendSource.slice(
+    openCodexBackendSource.indexOf("pub fn update_admin_api_enabled"),
+    openCodexBackendSource.indexOf("pub fn connection_info", openCodexBackendSource.indexOf("pub fn update_admin_api_enabled")),
+  );
+  assert.match(toggle, /hostname.*127\.0\.0\.1/);
+  assert.match(toggle, /hostname.*0\.0\.0\.0/);
+  assert.doesNotMatch(toggle, /unauthenticatedLoopbackListener.*enabled/);
+  assert.match(openCodexBackendSource, /adminApiEnabled.*Some\(false\)[\s\S]*?hostname.*127\.0\.0\.1/);
+});
+
 test("实例卡片和选择弹窗保持等高及状态列对齐", () => {
   assert.match(instancePanelSource, /grid-template-rows: auto 1fr auto/);
   assert.match(instancePanelSource, /grid-template-columns: auto minmax\(0, 1fr\) auto/);
