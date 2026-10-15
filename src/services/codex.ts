@@ -322,6 +322,15 @@ export function exportCodexAccounts(
   return invoke("export_codex_accounts", { accountIds, format });
 }
 
+export interface ExportDownloadResult {
+  fileName: string;
+  path: string;
+}
+
+export function downloadCodexExport(content: string, filename: string): Promise<ExportDownloadResult> {
+  return invoke("download_codex_export", { content, filename });
+}
+
 export function deleteCodexAccount(accountId: string): Promise<void> {
   return invoke("delete_codex_account", { accountId });
 }

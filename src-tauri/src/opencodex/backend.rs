@@ -3262,31 +3262,7 @@ fn validate_port(port: u16) -> Result<(), String> {
 }
 
 fn open_browser_url(url: &str) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("open");
-        command.arg(url);
-        command
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", "", url]);
-        command.creation_flags(CREATE_NO_WINDOW);
-        command
-    };
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let mut command = {
-        let mut command = Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("无法打开系统浏览器：{error}"))
+    crate::external_url::open(url)
 }
 
 fn platform_name() -> String {

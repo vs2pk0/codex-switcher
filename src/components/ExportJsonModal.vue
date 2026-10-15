@@ -11,6 +11,7 @@ defineProps<{
   text: string;
   summary: string;
   width?: string;
+  downloading?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -63,7 +64,7 @@ function handleFormatChange(value: unknown): void {
             <template #icon><icon-copy /></template>
             {{ t("复制") }}
           </a-button>
-          <a-button type="primary" @click="$emit('download')">
+          <a-button type="primary" :loading="downloading" @click="$emit('download')">
             <template #icon><icon-download /></template>
             {{ t("下载") }}
           </a-button>

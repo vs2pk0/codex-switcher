@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { accountProPlan, proPlanLabel } from "../accountPlan";
 import { isSubscriptionExpired } from "../accountStatus";
 import {
   addCodexAccountWithApiKey,
@@ -453,13 +454,6 @@ function normalizePlanKey(planType?: string): string {
   return normalized;
 }
 
-function normalizeAuthFilePlan(value?: string): "prolite" | "promax" | undefined {
-  const normalized = (value || "").trim().toLowerCase().replace(/[_\s]+/g, "-");
-  if (["prolite", "pro-lite", "pro-5x", "codex-pro-5x"].includes(normalized)) return "prolite";
-  if (["promax", "pro-max", "pro-20x", "codex-pro-20x"].includes(normalized)) return "promax";
-  return undefined;
-}
-
 function planDisplayName(planType?: string): string {
   const key = normalizePlanKey(planType);
   if (key === "enterprise") return "ENTERPRISE";
@@ -478,15 +472,14 @@ function planLabel(account: CodexAccount): string {
   if (isApiKeyAccount(account)) return "API_KEY";
   const base = planDisplayName(effectivePlanKey(account));
   if (base !== "PRO") return base;
-  const authPlan = normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type);
-  return authPlan === "prolite" ? "PRO 5X" : "PRO 20X";
+  return proPlanLabel(account);
 }
 
 function badgeTypeKey(account: CodexAccount): string {
   if (isApiKeyAccount(account)) return "api";
   const key = effectivePlanKey(account);
   if (key === "pro") {
-    return normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type) === "prolite"
+    return accountProPlan(account) === "prolite"
       ? "proLite"
       : "proMax";
   }
@@ -506,7 +499,7 @@ function planClass(account: CodexAccount): string {
   const key = effectivePlanKey(account);
   if (key === "pro") {
     const proClass =
-      normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type) === "prolite"
+      accountProPlan(account) === "prolite"
         ? "pro-lite"
         : "pro-max";
     return `${proClass} ${style}`;

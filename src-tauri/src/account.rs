@@ -3031,10 +3031,19 @@ fn write_codex_auth_projection(
 
 /// 生成 OAuth 账号对应的 auth.json 内容（ChatGPT 登录态）。
 fn oauth_auth_json_value(account: &CodexAccount) -> Value {
+    // 仅含 access token 的导入没有 ID token，Codex 仍要求此字段可解析为 JWT。
+    // 复用现有 access token 提供账号元数据；网络认证继续使用原 access token。
+    let id_token = if account.tokens.id_token.trim().is_empty()
+        && jwt_payload_value(&account.tokens.access_token).is_some()
+    {
+        &account.tokens.access_token
+    } else {
+        &account.tokens.id_token
+    };
     serde_json::json!({
         "OPENAI_API_KEY": Value::Null,
         "tokens": {
-            "id_token": account.tokens.id_token,
+            "id_token": id_token,
             "access_token": account.tokens.access_token,
             "account_id": chatgpt_account_id(account).unwrap_or_default(),
             "refresh_token": account.tokens.refresh_token.clone().unwrap_or_default()

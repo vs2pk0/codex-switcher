@@ -18,6 +18,43 @@ fn test_store() -> (tempfile::TempDir, tempfile::TempDir, AccountStore) {
 }
 
 #[test]
+fn token_only_projection_uses_existing_jwt_for_required_identity_metadata() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let (_storage, codex, store) = test_store();
+    let token = format!(
+        "e30.{}.fixture",
+        URL_SAFE_NO_PAD.encode(
+            json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "native-account",
+                    "chatgpt_plan_type": "prolite"
+                },
+                "email": "fixture@example.com"
+            })
+            .to_string()
+        )
+    );
+    let oauth = store
+        .import_from_json(&json!({"access_token": token}).to_string())
+        .unwrap()
+        .remove(0);
+    assert!(oauth.tokens.id_token.is_empty());
+    let check = || {
+        let auth: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(codex.path().join("auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(auth["tokens"]["id_token"], token);
+        assert_eq!(auth["tokens"]["access_token"], token);
+        assert_eq!(auth["tokens"]["account_id"], "native-account");
+        assert_eq!(auth["tokens"]["refresh_token"], "");
+    };
+    store.switch_account(&oauth.id).unwrap();
+    check();
+    store.apply_oauth_login_only(Some(&oauth.id)).unwrap();
+    check();
+}
+
+#[test]
 fn oauth_and_bound_api_key_projections_include_native_account_id() {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     let (_storage, codex, store) = test_store();
@@ -1218,7 +1255,14 @@ fn binds_api_key_to_oauth_account_and_writes_combined_projection() {
 
     let config_toml = fs::read_to_string(codex.path().join("config.toml")).expect("config toml");
     assert!(config_toml.contains("model_provider = \"relay\""));
-    assert!(config_toml.contains("experimental_bearer_token = \"sk-bound-123456\""));
+    let config = config_toml.parse::<toml_edit::Document>().unwrap();
+    let provider = &config["model_providers"]["relay"];
+    assert_eq!(provider["requires_openai_auth"].as_bool(), Some(true));
+    assert_eq!(
+        provider["http_headers"][super::LOCAL_GATEWAY_API_KEY_HEADER].as_str(),
+        Some("sk-bound-123456")
+    );
+    assert!(provider.get("experimental_bearer_token").is_none());
     assert!(!config_toml.contains("env_key = \"OPENAI_API_KEY\""));
 }
 

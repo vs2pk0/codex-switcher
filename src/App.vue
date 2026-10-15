@@ -12,6 +12,7 @@ import {
 import { Message, Modal } from "@arco-design/web-vue";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { accountProPlan, proPlanLabel } from "./accountPlan";
 import { isSubscriptionExpired } from "./accountStatus";
 import AccountList from "./components/AccountList.vue";
 import AboutPanel from "./components/AboutPanel.vue";
@@ -27,6 +28,7 @@ import CodexConfigEditorModal from "./components/CodexConfigEditorModal.vue";
 import CodexInstancesPanel from "./components/CodexInstancesPanel.vue";
 import EditAccountModal from "./components/EditAccountModal.vue";
 import ExportJsonModal from "./components/ExportJsonModal.vue";
+import ExportDownloadModal from "./components/ExportDownloadModal.vue";
 import OAuthBindingModal from "./components/OAuthBindingModal.vue";
 import PhoneModal from "./components/PhoneModal.vue";
 import PushSettingsPanel from "./components/PushSettingsPanel.vue";
@@ -80,6 +82,7 @@ import {
   deleteCodexSwitcherBackup,
   detectCurrentCodexAccount,
   exportCodexAccounts,
+  downloadCodexExport,
   fetchCodexApiKeyBalance,
   fetchCodexApiKeyModels,
   formatCodexConfigFile,
@@ -121,6 +124,7 @@ import {
   updateServiceOauthBinding,
   type ServiceOauthBindingRequest,
   type CodexExportFormat,
+  type ExportDownloadResult,
   type CodexApiKeyBalanceState,
   type CodexApiKeyModel,
   type CodexConfigFileContent,
@@ -395,6 +399,9 @@ const exportingId = ref("");
 const batchExportVisible = ref(false);
 const batchExportText = ref("");
 const batchExportPreviewVisible = ref(false);
+const exportDownloading = ref(false);
+const exportDownloadResult = ref<ExportDownloadResult | null>(null);
+const openingExportFolder = ref(false);
 const exportFormatOptions: { label: string; value: CodexExportFormat }[] = [
   { label: "Switcher JSON", value: "switcher_json" },
   { label: "Token JSON", value: "token_json" },
@@ -1020,8 +1027,7 @@ function planLabel(account: CodexAccount): string {
   if (isApiKeyAccount(account)) return "API_KEY";
   const base = planDisplayName(effectivePlanKey(account));
   if (base !== "PRO") return base;
-  const authPlan = normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type);
-  return authPlan === "prolite" ? "PRO 5X" : "PRO 20X";
+  return proPlanLabel(account);
 }
 
 function planClass(account: CodexAccount): string {
@@ -1034,7 +1040,7 @@ function planClass(account: CodexAccount): string {
   if (isApiKeyAccount(account)) return `api ${style}`;
   const key = effectivePlanKey(account);
   if (key === "pro") {
-    const proClass = normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type) === "prolite"
+    const proClass = accountProPlan(account) === "prolite"
       ? "pro-lite"
       : "pro-max";
     return `${proClass} ${style}`;
@@ -1046,7 +1052,7 @@ function badgeTypeKey(account: CodexAccount): string {
   if (isApiKeyAccount(account)) return "api";
   const key = effectivePlanKey(account);
   if (key === "pro") {
-    return normalizeAuthFilePlan(account.auth_file_plan_type || account.plan_type) === "prolite"
+    return accountProPlan(account) === "prolite"
       ? "proLite"
       : "proMax";
   }
@@ -1092,13 +1098,6 @@ function effectivePlanKey(account: CodexAccount): string {
     return "free";
   }
   return normalizePlanKey(account.plan_type);
-}
-
-function normalizeAuthFilePlan(value?: string): "prolite" | "promax" | undefined {
-  const normalized = (value || "").trim().toLowerCase().replace(/[_\s]+/g, "-");
-  if (["prolite", "pro-lite", "pro-5x", "codex-pro-5x"].includes(normalized)) return "prolite";
-  if (["promax", "pro-max", "pro-20x", "codex-pro-20x"].includes(normalized)) return "promax";
-  return undefined;
 }
 
 function accountLoginLine(account: CodexAccount): string {
@@ -3033,27 +3032,34 @@ async function copyBatchExportText(): Promise<void> {
   }
 }
 
-function downloadJsonText(content: string, filename: string): void {
-  let url = "";
+async function downloadJsonText(content: string, filename: string): Promise<void> {
+  if (exportDownloading.value) return;
+  exportDownloading.value = true;
   try {
-    const blob = new Blob([content], { type: "application/json;charset=utf-8" });
-    url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = filename;
-    link.click();
-    Message.success(`已开始下载 ${filename}`);
+    exportDownloadResult.value = await downloadCodexExport(content, filename);
   } catch (error) {
-    Message.error(`下载失败：${errorText(error)}`);
+    Message.error(`${t("下载失败")}：${errorText(error)}`);
   } finally {
-    if (url) URL.revokeObjectURL(url);
+    exportDownloading.value = false;
+  }
+}
+
+async function openExportDownloadFolder(): Promise<void> {
+  if (!exportDownloadResult.value || openingExportFolder.value) return;
+  openingExportFolder.value = true;
+  try {
+    await openPathInFileManager(exportDownloadResult.value.path);
+  } catch (error) {
+    Message.error(`${t("打开文件夹失败")}：${errorText(error)}`);
+  } finally {
+    openingExportFolder.value = false;
   }
 }
 
 function downloadBatchExportText(): void {
   const suffix = exportFormat.value === "switcher_json" ? "" : `_${exportFormat.value}`;
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  downloadJsonText(batchExportText.value, `codex-switcher-batch${suffix}_${timestamp}.json`);
+  void downloadJsonText(batchExportText.value, `codex-switcher-batch${suffix}_${timestamp}.json`);
 }
 
 function handleDragStart(account: CodexAccount): void {
@@ -3234,6 +3240,13 @@ async function handleFileImport(files: File[]): Promise<void> {
     }
     addModalVisible.value = false;
     await loadAccounts();
+    if (files.length > 10) {
+      Message.success(formatTranslatedText(
+        "已从 {files} 个文件导入 {accounts} 个账号，已跳过自动刷新，可稍后手动刷新",
+        { files: files.length, accounts: importedAccounts.length },
+      ));
+      return;
+    }
     const quotaFailures = await refreshAccountsAfterMutation(importedAccounts);
     Message.success(`已从 ${files.length} 个文件导入 ${importedAccounts.length} 个账号`);
     warnQuotaRefreshFailures(quotaFailures);
@@ -3683,7 +3696,7 @@ async function copyExportText(): Promise<void> {
 function downloadExportText(): void {
   const name = exportAccount.value ? displayName(exportAccount.value).replace(/[^\w.-]+/g, "_") : "codex-account";
   const suffix = exportFormat.value === "switcher_json" ? "" : `_${exportFormat.value}`;
-  downloadJsonText(exportText.value, `${name}${suffix}.json`);
+  void downloadJsonText(exportText.value, `${name}${suffix}.json`);
 }
 
 function openPhone(account: CodexAccount): void {
@@ -5415,6 +5428,7 @@ onUnmounted(() => {
       :preview-visible="exportPreviewVisible"
       :text="exportText"
       :summary="exportJsonSummary(exportText)"
+      :downloading="exportDownloading"
       @update:export-format="exportFormat = $event"
       @update:preview-visible="exportPreviewVisible = $event"
       @format-change="refreshExportText"
@@ -5430,12 +5444,20 @@ onUnmounted(() => {
       :preview-visible="batchExportPreviewVisible"
       :text="batchExportText"
       :summary="exportJsonSummary(batchExportText)"
+      :downloading="exportDownloading"
       width="820px"
       @update:export-format="exportFormat = $event"
       @update:preview-visible="batchExportPreviewVisible = $event"
       @format-change="refreshBatchExportText"
       @copy="copyBatchExportText"
       @download="downloadBatchExportText"
+    />
+
+    <ExportDownloadModal
+      :result="exportDownloadResult"
+      :opening="openingExportFolder"
+      @close="exportDownloadResult = null"
+      @open-folder="openExportDownloadFolder"
     />
 
     <PhoneModal

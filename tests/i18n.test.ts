@@ -4,6 +4,15 @@ import { currentLanguage, formatTranslatedText, t } from "../src/i18n.ts";
 
 const originalLanguage = currentLanguage.value;
 
+test("下载完成弹窗和文件夹操作支持全部界面语言", () => {
+  for (const language of ["en", "ru", "zh-TW"] as const) {
+    currentLanguage.value = language;
+    for (const text of ["下载完成", "文件已保存到以下位置", "保存位置", "下载失败", "打开文件夹", "打开文件夹失败"]) {
+      assert.notEqual(t(text), text, `${language}: ${text}`);
+    }
+  }
+});
+
 afterEach(() => {
   currentLanguage.value = originalLanguage;
 });

@@ -2,6 +2,8 @@ mod account;
 mod api_model_catalog;
 mod api_service;
 mod app_update;
+mod external_url;
+mod export_file;
 mod instances;
 mod oauth;
 mod opencodex;
@@ -1137,16 +1139,7 @@ fn codex_oauth_login_cancel(login_id: Option<String>) -> Result<(), String> {
 
 #[tauri::command]
 fn open_external_url(url: String) -> Result<(), String> {
-    let trimmed = url.trim();
-    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
-        return Err("只能打开 http/https 链接".to_string());
-    }
-    let status = open_url_with_system(trimmed)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("系统浏览器打开失败".to_string())
-    }
+    external_url::open(&url)
 }
 
 #[tauri::command]
@@ -1607,7 +1600,7 @@ fn reclaim_oauth_callback_port() -> Result<(), String> {
 fn open_path_with_system(path: &PathBuf) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let status = Command::new("open")
+        let status = Command::new("/usr/bin/open")
             .arg(path)
             .status()
             .map_err(|error| format!("打开文件夹失败: {}", error))?;
@@ -1638,41 +1631,6 @@ fn open_path_with_system(path: &PathBuf) -> Result<(), String> {
         } else {
             Err("打开文件夹失败".to_string())
         }
-    }
-}
-
-fn open_url_with_system(url: &str) -> Result<std::process::ExitStatus, String> {
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("open")
-            .arg(url)
-            .status()
-            .map_err(|error| format!("打开浏览器失败: {}", error))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let mut command = Command::new("powershell");
-        command
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                "Start-Process -FilePath $args[0]",
-            ])
-            .arg(url);
-        hide_command_window(&mut command);
-        command
-            .status()
-            .map_err(|error| format!("打开浏览器失败: {}", error))
-    }
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    {
-        Command::new("xdg-open")
-            .arg(url)
-            .status()
-            .map_err(|error| format!("打开浏览器失败: {}", error))
     }
 }
 
@@ -5992,6 +5950,7 @@ pub fn run() {
             update_codex_api_key_bound_oauth_account,
             update_codex_account_phone,
             export_codex_accounts,
+            export_file::download_codex_export,
             codex_oauth_login_start,
             codex_oauth_submit_callback_url,
             codex_oauth_login_completed,
