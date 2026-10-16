@@ -4395,7 +4395,8 @@ async function runOneClickRepairSessions(instanceId: string, instanceName: strin
     const summary = await oneClickRepairCodexSessions(instanceId);
     appBusy.value = null;
     await Promise.all([loadSessions({ silent: true }), loadCodexInstances()]);
-    Message.success(`${t("一键修复完成")}：${summary.message}`);
+    const notify = summary.warnings.length ? Message.warning : Message.success;
+    notify(`${t("一键修复完成")}：${summary.message}`);
     await askRestartCodexAfterRepair(instanceId, instanceName, summary);
   } catch (error) {
     appBusy.value = null;

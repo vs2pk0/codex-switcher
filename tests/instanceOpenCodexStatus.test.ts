@@ -41,7 +41,7 @@ test("同步先预检再停止实例，不重置配置；同步后一键修复�
   const actionWorker = openCodexBackendSource.slice(openCodexBackendSource.indexOf("fn action_worker("), openCodexBackendSource.indexOf("fn run_instance_integration_helper("));
   // 同步后、重开前执行一键修复（切号修复 + 恢复完整历史），并按日志标记推进前端遮罩
   const helperIndex = actionWorker.indexOf("run_instance_integration_helper(&action, port, home)?;");
-  const repairIndex = actionWorker.indexOf("one_click_repair_session_store(&session_store, &mut report)");
+  const repairIndex = actionWorker.indexOf("one_click_repair_session_store_with_native_history(&session_store, &mut report)");
   assert.ok(helperIndex >= 0 && repairIndex > helperIndex);
   assert.match(actionWorker, /1 => "修复切号会话：/);
   assert.match(actionWorker, /2 => "恢复全部会话的完整历史：/);
@@ -155,7 +155,7 @@ test("OpenCodex 同步保留账号且不绑定 OAuth，API 服务仍自动绑定
   );
   const helperIndex = syncBlock.indexOf("run_instance_integration_helper(&action, port, home)");
   const bindIndex = syncBlock.indexOf("prepare_default_oauth_account_blocking(");
-  const repairIndex = syncBlock.indexOf("one_click_repair_session_store(&session_store");
+  const repairIndex = syncBlock.indexOf("one_click_repair_session_store_with_native_history(&session_store");
   assert.ok(helperIndex >= 0);
   assert.equal(bindIndex, -1);
   // 一键修复只修会话文件，不迁移账号，所以保留在同步流程中

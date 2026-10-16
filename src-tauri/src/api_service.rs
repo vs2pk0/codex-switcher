@@ -3113,7 +3113,7 @@ pub(crate) fn listener_pid_on_port(_port: u16) -> Result<Option<u32>, String> {
 
 #[cfg(unix)]
 fn pid_command(pid: u32) -> Option<String> {
-    let output = Command::new("ps")
+    let output = crate::system_command::new("ps")
         .arg("-p")
         .arg(pid.to_string())
         .arg("-o")
@@ -3156,7 +3156,7 @@ fn pid_matches_managed_runtime(dirs: &ApiServiceDirs, pid: u32) -> bool {
 
 #[cfg(unix)]
 fn pid_is_running(pid: u32) -> bool {
-    Command::new("kill")
+    crate::system_command::new("kill")
         .arg("-0")
         .arg(pid.to_string())
         .status()
@@ -3183,7 +3183,7 @@ fn pid_is_running(_pid: u32) -> bool {
 
 #[cfg(unix)]
 pub(crate) fn terminate_pid(pid: u32) -> Result<(), String> {
-    let status = Command::new("kill")
+    let status = crate::system_command::new("kill")
         .arg("-TERM")
         .arg(pid.to_string())
         .status()
@@ -3197,7 +3197,7 @@ pub(crate) fn terminate_pid(pid: u32) -> Result<(), String> {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    let status = Command::new("kill")
+    let status = crate::system_command::new("kill")
         .arg("-KILL")
         .arg(pid.to_string())
         .status()
@@ -4034,7 +4034,7 @@ pub async fn api_service_sync_codex_instance(
                     &account_id,
                 )?;
                 let mut report = |step: u8| emit(step + 1);
-                let mut outcome = crate::one_click_repair_session_store(&session_store, &mut report)
+                let mut outcome = crate::one_click_repair_session_store_with_native_history(&session_store, &mut report)
                     .map_err(|error| format!("配置已同步，但一键修复会话失败：{error}"))?;
                 outcome.include_switch_warning(switched.warning);
                 emit(4);

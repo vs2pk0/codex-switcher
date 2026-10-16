@@ -1897,7 +1897,7 @@ impl Backend {
                             self.emit_log(&operation_id, "system", text);
                         };
                         let outcome =
-                            crate::one_click_repair_session_store(&session_store, &mut report)
+                            crate::one_click_repair_session_store_with_native_history(&session_store, &mut report)
                                 .map_err(|error| {
                                     format!("配置已同步，但一键修复会话失败：{error}")
                                 })?;

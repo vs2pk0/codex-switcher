@@ -20,6 +20,7 @@ fn validate_url(input: &str) -> Result<&str, String> {
 
 #[cfg(not(windows))]
 fn run_opener(command: &mut Command) -> Result<(), String> {
+    crate::system_command::prepare(command);
     let output = command
         .output()
         .map_err(|error| format!("系统浏览器打开失败：{error}"))?;

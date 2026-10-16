@@ -13,6 +13,7 @@ mod reset;
 mod service_binding;
 mod session;
 mod subscription;
+mod system_command;
 mod token_keeper;
 mod usage;
 
@@ -37,6 +38,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv6Addr, TcpListener};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "macos"))]
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -1336,7 +1338,7 @@ tell application "System Events"
   end if
 end tell
 "#;
-    let _ = Command::new("osascript").arg("-e").arg(script).status();
+    let _ = system_command::new("osascript").arg("-e").arg(script).status();
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1600,7 +1602,7 @@ fn reclaim_oauth_callback_port() -> Result<(), String> {
 fn open_path_with_system(path: &PathBuf) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let status = Command::new("/usr/bin/open")
+        let status = system_command::new("/usr/bin/open")
             .arg(path)
             .status()
             .map_err(|error| format!("打开文件夹失败: {}", error))?;
@@ -1800,7 +1802,7 @@ async fn sync_api_key_account_to_instance(
                 api_model_catalog::install(&codex_home, &account_id, &model_catalog)
                     .map_err(|error| format!("账号已切换，但模型目录写入失败，请重试：{error}"))?;
                 let mut report = |step: u8| emit(step);
-                let mut outcome = one_click_repair_session_store(&session_store, &mut report)
+                let mut outcome = one_click_repair_session_store_with_native_history(&session_store, &mut report)
                     .map_err(|error| format!("配置已同步，但一键修复会话失败：{error}"))?;
                 outcome.include_switch_warning(switched.warning.clone());
                 emit(3);
@@ -2099,6 +2101,22 @@ pub(crate) fn one_click_repair_session_store(
     })
 }
 
+/// 实例停止期间执行修复，并通过原生运行时重建缺失的分页显示索引。
+pub(crate) fn one_click_repair_session_store_with_native_history(
+    store: &SessionStore,
+    report_progress: &mut impl FnMut(u8),
+) -> Result<OneClickStoreRepairOutcome, String> {
+    let mut outcome = one_click_repair_session_store(store, report_progress)?;
+    if outcome.visibility.reset_history_projection_count > 0 {
+        if let Err(error) = store.hydrate_missing_history_projections(None) {
+            outcome
+                .warnings
+                .push(format!("分页历史重建未完成：{error}"));
+        }
+    }
+    Ok(outcome)
+}
+
 /// 把一键修复结果压成一行人类可读的摘要。
 pub(crate) fn one_click_repair_message(outcome: &OneClickStoreRepairOutcome) -> String {
     let mut message = format!(
@@ -2143,7 +2161,7 @@ pub(crate) fn one_click_repair_sessions_blocking(
     let ((instance_name, outcome), was_running) =
         instances::run_with_instance_stopped(&instance_id, |instance| {
             let session_store = SessionStore::new(PathBuf::from(&instance.codex_home));
-            let outcome = one_click_repair_session_store(&session_store, &mut report_progress)?;
+            let outcome = one_click_repair_session_store_with_native_history(&session_store, &mut report_progress)?;
             Ok((instance.name.clone(), outcome))
         })?;
     let message = format!("已完成一键修复：{}", one_click_repair_message(&outcome));
@@ -3043,19 +3061,25 @@ fn restore_codex_switcher_session_backup_to(
         backup_session_entry_restore_target_for(codex_home, name)
     })?;
     apply_prepared_backup_archive(&prepared)?;
-    match SessionStore::new(codex_home.to_path_buf()).repair_visibility_with_options(
-        Some("quick"),
-        None,
-        None,
-        None,
-        None,
-    ) {
-        Ok(visibility) => Ok(CodexSessionRestoreResult {
-            restored: true,
-            visibility_repaired: visibility.remaining_invisible_session_count == 0,
-            visibility: Some(visibility),
-            warning: None,
-        }),
+    let store = SessionStore::new(codex_home.to_path_buf());
+    match store.repair_visibility_with_options(Some("quick"), None, None, None, None) {
+        Ok(visibility) => {
+            let warning = if visibility.reset_history_projection_count > 0 {
+                store
+                    .hydrate_missing_history_projections(None)
+                    .err()
+                    .map(|error| format!("会话文件已恢复，但分页历史重建未完成：{error}"))
+            } else {
+                None
+            };
+            Ok(CodexSessionRestoreResult {
+                restored: true,
+                visibility_repaired: visibility.remaining_invisible_session_count == 0
+                    && warning.is_none(),
+                visibility: Some(visibility),
+                warning,
+            })
+        }
         Err(error) => Ok(CodexSessionRestoreResult {
             restored: true,
             visibility_repaired: false,
@@ -3067,6 +3091,7 @@ fn restore_codex_switcher_session_backup_to(
         }),
     }
 }
+
 
 #[tauri::command]
 fn delete_codex_switcher_backup(backup_path: String) -> Result<(), String> {
@@ -3378,7 +3403,29 @@ fn session_store_for_instance(instance_id: Option<&str>) -> Result<SessionStore,
 }
 
 #[tauri::command]
-fn codex_repair_session_visibility_across_instances(
+async fn codex_repair_session_visibility_across_instances(
+    mode: Option<String>,
+    run_id: Option<String>,
+    target_provider: Option<String>,
+    target_instance_id: Option<String>,
+    repair_instance_ids: Option<Vec<String>>,
+    session_ids: Option<Vec<String>>,
+) -> Result<CodexSessionVisibilityRepairSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        repair_session_visibility_across_instances_impl(
+            mode,
+            run_id,
+            target_provider,
+            target_instance_id,
+            repair_instance_ids,
+            session_ids,
+        )
+    })
+    .await
+    .map_err(|error| format!("恢复完整会话任务失败：{error}"))?
+}
+
+fn repair_session_visibility_across_instances_impl(
     mode: Option<String>,
     run_id: Option<String>,
     target_provider: Option<String>,
@@ -3429,13 +3476,18 @@ fn codex_repair_session_visibility_across_instances(
         let selected_session_ids = session_ids.clone();
         let repair_mode = mode.clone();
         let mut summary = instances::run_with_instance_restarted(&instance_id, |target| {
-            SessionStore::new(PathBuf::from(&target.codex_home)).repair_visibility_with_options(
+            let store = SessionStore::new(PathBuf::from(&target.codex_home));
+            let summary = store.repair_visibility_with_options(
                 repair_mode.as_deref(),
                 provider,
                 None,
                 None,
-                selected_session_ids,
-            )
+                selected_session_ids.clone(),
+            )?;
+            if summary.reset_history_projection_count > 0 {
+                store.hydrate_missing_history_projections(selected_session_ids.as_deref())?;
+            }
+            Ok(summary)
         })?;
         if let Some(item) = summary.items.first_mut() {
             item.instance_id = instance_id.clone();

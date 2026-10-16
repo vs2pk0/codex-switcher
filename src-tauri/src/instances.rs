@@ -785,7 +785,9 @@ fn ensure_isolated_desktop_data_supported(_app_path: &str) -> Result<(), String>
 
 #[cfg(not(windows))]
 fn process_rows() -> Vec<(u32, String)> {
-    let output = Command::new("ps").args(["-axo", "pid=,command="]).output();
+    let output = crate::system_command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output();
     let Ok(output) = output else {
         return Vec::new();
     };

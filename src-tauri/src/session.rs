@@ -1,4 +1,5 @@
 use crate::account::{replace_file_atomic, write_bytes_atomic};
+use crate::system_command;
 
 /// 同一线程多段 rollout（history_base 续写链）的解析与合并。
 mod lineage;
@@ -885,7 +886,7 @@ impl SessionStore {
                     error
                 ));
             }
-            let _ = Command::new("touch")
+            let _ = system_command::new("touch")
                 .arg("-r")
                 .arg(&backup_path)
                 .arg(&path)
@@ -2560,6 +2561,7 @@ impl SessionStore {
             .map(|value| value.eq_ignore_ascii_case("deep"))
             .unwrap_or(false);
         let protected_prefixes = self.protected_rollout_prefixes();
+        self.preflight_visibility_databases()?;
         let rollout_outcome = self.repair_rollout_visibility_guarded(
             &target_provider,
             &repair_records,
@@ -2574,7 +2576,7 @@ impl SessionStore {
         let (updated_rows, backup_dirs) = self.repair_sqlite_visibility(
             &target_provider,
             Some(&repair_records),
-            deep.then_some("gpt-5.5"),
+            None,
         )?;
         let added_index_entries = if deep {
             self.repair_session_index(&repair_records)?
@@ -3273,7 +3275,7 @@ impl SessionStore {
                     session.path.display()
                 )
             })?;
-            let _ = Command::new("touch")
+            let _ = system_command::new("touch")
                 .arg("-r")
                 .arg(&backup_path)
                 .arg(&session.path)
@@ -3973,6 +3975,95 @@ impl SessionStore {
         Ok((repaired, backup_dirs))
     }
 
+    /// Call while the desktop instance is stopped, after resetting stale projections.
+    /// Loading the thread through the native runtime builds its paginated display index;
+    /// simply restarting the desktop does not populate an absent projection.
+    pub(crate) fn hydrate_missing_history_projections(
+        &self,
+        session_ids: Option<&[String]>,
+    ) -> Result<usize, String> {
+        let selected = normalized_id_set(session_ids.map(|ids| ids.to_vec()));
+        let protected = self.protected_rollout_prefixes();
+        let sessions = self.session_lineage_entries()?;
+        let mut missing = HashSet::new();
+        let mut expected = HashSet::new();
+        for path in self.thread_history_db_paths() {
+            let db = Connection::open(path).map_err(|e| e.to_string())?;
+            if !sqlite_table_exists_with_connection(&db, "thread_history_projection_state")? {
+                continue;
+            }
+            for entry in &sessions {
+                let session = &entry.record;
+                if selected
+                    .as_ref()
+                    .is_some_and(|ids| !ids.contains(&session.id))
+                {
+                    continue;
+                }
+                for target in lineage_projection_targets(&entry.lineage)? {
+                    if target.retained || protected.contains_key(&target.physical_id) {
+                        continue;
+                    }
+                    let exists: bool = db.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM thread_history_projection_state WHERE thread_id=?1)",
+                        params![target.physical_id], |row| row.get(0),
+                    ).map_err(|e| e.to_string())?;
+                    if !exists {
+                        missing.insert(session.id.clone());
+                        expected.insert(target.physical_id);
+                    }
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(0);
+        }
+        let mut ids = missing.into_iter().collect::<Vec<_>>();
+        ids.sort();
+        run_codex_history_hydration(&self.codex_home, &ids)?;
+        for path in self.thread_history_db_paths() {
+            let db = Connection::open(path).map_err(|e| e.to_string())?;
+            for id in expected.clone() {
+                let exists: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM thread_history_projection_state WHERE thread_id=?1)",
+                    params![id], |row| row.get(0),
+                ).map_err(|e| e.to_string())?;
+                if exists {
+                    expected.remove(&id);
+                }
+            }
+        }
+        if !expected.is_empty() {
+            return Err(format!(
+                "Codex 未能重建 {} 条分页历史，请重试恢复",
+                expected.len()
+            ));
+        }
+        Ok(ids.len())
+    }
+
+    fn preflight_visibility_databases(&self) -> Result<(), String> {
+        let paths = self.sqlite_candidate_paths();
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let output = match system_command::new("sqlite3").arg("-version").output() {
+            Ok(output) => output,
+            // Keep support for installations without the optional sqlite CLI.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("启动 SQLite 工具失败，尚未修改会话文件：{error}")),
+        };
+        if !output.status.success() {
+            return Err(format!(
+                "SQLite 工具不可用，尚未修改会话文件：{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        for path in paths {
+            run_sqlite(&path, "SELECT name FROM sqlite_master LIMIT 1;")?;
+        }
+        Ok(())
+    }
     fn reset_stale_thread_history_projections(
         &self,
         sessions: &[SessionRepairRecord],
@@ -4246,46 +4337,9 @@ impl SessionStore {
                     continue;
                 }
             };
-            let compatibility_rewrite = if rewrite_all_meta {
-                match prepare_rollout_model_compatibility_rewrite(
-                    &session.path,
-                    target_provider,
-                    Some("gpt-5.5"),
-                ) {
-                    Ok(rewrite) => rewrite,
-                    Err(error) => {
-                        outcome.warnings.push(format!(
-                            "完整历史修复跳过会话 {} ({}): {}",
-                            session.id,
-                            session.path.display(),
-                            error
-                        ));
-                        continue;
-                    }
-                }
-            } else {
-                None
-            };
-            let compatibility_content = match compatibility_rewrite {
-                Some((tmp_path, _)) => {
-                    let result = fs::read_to_string(&tmp_path);
-                    let _ = fs::remove_file(&tmp_path);
-                    match result {
-                        Ok(content) => Some(content),
-                        Err(error) => {
-                            outcome.warnings.push(format!(
-                                "完整历史修复跳过会话 {} ({}): 读取模型修复临时文件失败：{}",
-                                session.id,
-                                session.path.display(),
-                                error
-                            ));
-                            continue;
-                        }
-                    }
-                }
-                None => None,
-            };
-            let base_content = compatibility_content.as_deref().unwrap_or(&content);
+            // Visibility repair must preserve the model and encrypted context.
+            // Account/provider migration has a separate compatibility operation.
+            let base_content = &content;
             let provider_rewrite = match rewrite_session_meta_provider(
                 base_content,
                 target_provider,
@@ -4316,9 +4370,7 @@ impl SessionStore {
                     continue;
                 }
             };
-            let visibility_rewrite = ordinal_rewrite
-                .or(provider_rewrite)
-                .or(compatibility_content);
+            let visibility_rewrite = ordinal_rewrite.or(provider_rewrite);
             // Do not append a synthetic `compacted` record during visibility repair.
             // Its replacement_history is sent back to the Responses API on the next
             // turn, but locally reconstructed assistant messages are not valid input
@@ -4374,7 +4426,7 @@ impl SessionStore {
                 ));
                 continue;
             }
-            let _ = Command::new("touch")
+            let _ = system_command::new("touch")
                 .arg("-r")
                 .arg(&backup_path)
                 .arg(&session.path)
@@ -5482,53 +5534,6 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn append_local_recovery_compaction(content: &str) -> Result<Option<String>, String> {
-    let mut context = LocalRecoveryContext::default();
-    let mut last_ordinal = None;
-    let mut paginated = false;
-    let mut saw_first_record = false;
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if !saw_first_record {
-            paginated = value.get("ordinal").and_then(Value::as_u64).is_some();
-            saw_first_record = true;
-        }
-        if let Some(ordinal) = value.get("ordinal").and_then(Value::as_u64) {
-            last_ordinal = Some(last_ordinal.map_or(ordinal, |last: u64| last.max(ordinal)));
-        }
-        context.observe(&value);
-    }
-    let Some(mut compacted) = context.build_compaction() else {
-        return Ok(None);
-    };
-    if paginated {
-        compacted
-            .as_object_mut()
-            .ok_or_else(|| "本地会话压缩记录格式无效".to_string())?
-            .insert(
-                "ordinal".to_string(),
-                Value::from(last_ordinal.unwrap_or(0).saturating_add(1)),
-            );
-    }
-    let mut output = String::with_capacity(
-        content
-            .len()
-            .saturating_add(LOCAL_RECOVERY_CONTEXT_MAX_BYTES),
-    );
-    output.push_str(content);
-    if !output.ends_with('\n') {
-        output.push('\n');
-    }
-    output.push_str(
-        &serde_json::to_string(&compacted)
-            .map_err(|error| format!("生成本地会话压缩记录失败: {}", error))?,
-    );
-    output.push('\n');
-    Ok(Some(output))
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct RolloutModelCompatibilityRewriteStats {
     rewritten_model_fields: usize,
@@ -5553,15 +5558,7 @@ impl RolloutModelCompatibilityRewriteStats {
     }
 }
 
-fn prepare_rollout_model_compatibility_rewrite(
-    path: &Path,
-    target_provider: &str,
-    forced_model: Option<&str>,
-) -> Result<Option<(PathBuf, RolloutModelCompatibilityRewriteStats)>, String> {
-    prepare_rollout_model_compatibility_rewrite_guarded(path, target_provider, forced_model, 0)
-}
-
-/// 同上，但 `protected_prefix_bytes` 之前的字节原样保留：这段前缀被其他物理段的
+/// `protected_prefix_bytes` 之前的字节原样保留：这段前缀被其他物理段的
 /// `history_base` 引用，一旦长度或内容变化，Codex 就无法再拼出完整历史。
 fn prepare_rollout_model_compatibility_rewrite_guarded(
     path: &Path,
@@ -6005,7 +6002,8 @@ fn rewrite_session_meta_cwd(content: &str, cwd: &str) -> Result<Option<String>, 
 }
 
 fn run_sqlite(db_path: &Path, sql: &str) -> Result<String, String> {
-    let output = Command::new("sqlite3")
+    let output = system_command::new("sqlite3")
+        .args(["-batch", "-bail", "-cmd", ".timeout 5000"])
         .arg(db_path)
         .arg(sql)
         .output()
@@ -6027,7 +6025,10 @@ fn run_sqlite(db_path: &Path, sql: &str) -> Result<String, String> {
 }
 
 fn sqlite3_available() -> bool {
-    Command::new("sqlite3").arg("-version").output().is_ok()
+    system_command::new("sqlite3")
+        .arg("-version")
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 fn sql_quote(value: &str) -> String {
@@ -7972,6 +7973,8 @@ fn codex_cli_path() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         for path in [
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+            "/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
             "/Applications/ChatGPT.app/Contents/Resources/codex",
             "/Applications/Codex.app/Contents/Resources/codex",
         ] {
@@ -8072,6 +8075,99 @@ fn parse_codex_thread_fork_response(response: &Value) -> Result<CodexThreadForkR
         history_mode: history_mode.to_string(),
         project_path: project_path.to_string(),
     })
+}
+
+fn run_codex_history_hydration(codex_home: &Path, ids: &[String]) -> Result<(), String> {
+    let mut command = Command::new(codex_cli_path());
+    system_command::prepare(&mut command);
+    let mut child = command
+        .args(["app-server", "--stdio"])
+        .env("CODEX_HOME", codex_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("无法启动 Codex 分页历史重建服务：{e}"))?;
+    let mut input = child.stdin.take().ok_or("历史重建服务缺少输入流")?;
+    let output = child.stdout.take().ok_or("历史重建服务缺少输出流")?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            let value = line
+                .map_err(|e| e.to_string())
+                .and_then(|line| serde_json::from_str::<Value>(&line).map_err(|e| e.to_string()));
+            if sender.send(value).is_err() {
+                break;
+            }
+        }
+    });
+    let operation = (|| {
+        let mut request = |id: i64, method: &str, params: Value| -> Result<(), String> {
+            write_codex_app_server_request(
+                &mut input,
+                &serde_json::json!({"id":id,"method":method,"params":params}),
+            )?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err("Codex 分页历史重建超时，请重试恢复".to_string());
+                }
+                let value = receiver.recv_timeout(remaining).map_err(|_| {
+                    "Codex 分页历史重建服务无响应或已退出，请重试恢复".to_string()
+                })??;
+                if value.get("id").and_then(Value::as_i64) != Some(id) {
+                    continue;
+                }
+                if let Some(error) = value.get("error") {
+                    return Err(error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Codex 分页历史重建失败")
+                        .to_string());
+                }
+                return Ok(());
+            }
+        };
+        request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "clientInfo":{"name":"codex-switcher-history-repair","version":env!("CARGO_PKG_VERSION")},
+                "capabilities":{"experimentalApi":true}
+            }),
+        )?;
+        for (index, id) in ids.iter().enumerate() {
+            // Resume only reconstructs local state. Never submit a turn or user input.
+            request(
+                index as i64 * 2 + 2,
+                "thread/resume",
+                serde_json::json!({"threadId":id,"excludeTurns":true,"deferGoalContinuation":true}),
+            )?;
+            // Release each loaded runtime before moving to the next thread. The
+            // display projection stays on disk; older CLIs may not support this.
+            let _ = request(
+                index as i64 * 2 + 3,
+                "thread/unsubscribe",
+                serde_json::json!({"threadId":id}),
+            );
+        }
+        Ok(())
+    })();
+    drop(input);
+    drop(receiver);
+    // The runtime must finish writing its projection before the desktop reopens it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while child.try_wait().map_err(|e| e.to_string())?.is_none() {
+        if std::time::Instant::now() >= deadline || operation.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let _ = reader.join();
+    operation
 }
 
 fn run_codex_thread_fork(
@@ -9665,6 +9761,7 @@ fn now_timestamp() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::system_command;
     use super::{
         archive_staged_thread_row, copy_history_onto_target, create_staged_fork_rollout,
         extract_title, find_task_started_offsets_reverse, fork_history_modes_are_compatible,
@@ -9679,7 +9776,6 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::path::Path;
-    use std::process::Command;
     use tempfile::tempdir;
 
     #[test]
@@ -13896,7 +13992,7 @@ mod tests {
     }
 
     #[test]
-    fn deep_repair_appends_local_compaction_after_forked_ordinals() {
+    fn deep_visibility_repair_keeps_forked_context_and_ordinals() {
         let codex = tempdir().expect("codex tempdir");
         let sessions_dir = codex.path().join("sessions");
         fs::create_dir_all(&sessions_dir).expect("session dir");
@@ -13925,19 +14021,21 @@ mod tests {
         }];
         let store = SessionStore::new(codex.path().to_path_buf());
 
+        let original = fs::read(&session_path).unwrap();
         let (changed, _) = store
             .repair_rollout_visibility("openai", &records, true)
             .expect("deep repair forked rollout");
 
-        assert_eq!(changed, 1);
+        assert_eq!(changed, 0);
+        assert_eq!(fs::read(&session_path).unwrap(), original);
         let repaired = fs::read_to_string(&session_path).expect("read repaired rollout");
         let last = repaired
             .lines()
             .rfind(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str::<Value>(line).expect("valid record"))
             .expect("last record");
-        assert_eq!(last["type"], "compacted");
-        assert_eq!(last["ordinal"], 43);
+        assert_eq!(last["type"], "response_item");
+        assert_eq!(last["ordinal"], 42);
     }
 
     /// 作为其他会话 fork 来源的祖先，其 `end_byte_offset` 之前的字节被子会话当作不可变历史，
@@ -14031,7 +14129,7 @@ mod tests {
     }
 
     #[test]
-    fn deep_repair_removes_cross_instance_encrypted_items_and_forces_gpt_5_5() {
+    fn deep_visibility_repair_preserves_model_and_encrypted_items() {
         let codex = tempdir().expect("codex tempdir");
         let sessions_dir = codex.path().join("sessions");
         fs::create_dir_all(&sessions_dir).expect("session dir");
@@ -14068,12 +14166,12 @@ mod tests {
         assert_eq!(backup_dirs.len(), 1);
         let repaired = fs::read_to_string(&session_path).expect("read repaired session");
         assert!(repaired.contains(r#""model_provider":"openai""#));
-        assert!(repaired.contains(r#""model":"gpt-5.5""#));
+        assert!(repaired.contains(r#""model":"gpt-5.6-sol""#));
         assert!(repaired.contains("保留用户消息"));
         assert!(repaired.contains("保留可读历史"));
-        assert!(!repaired.contains("rs_other-instance"));
-        assert!(!repaired.contains("cmp_other-instance"));
-        assert!(!repaired.contains("other-instance-ciphertext"));
+        assert!(repaired.contains("rs_other-instance"));
+        assert!(repaired.contains("cmp_other-instance"));
+        assert!(repaired.contains("other-instance-ciphertext"));
 
         let (second_changed, second_backup_dirs) = store
             .repair_rollout_visibility("openai", &records, true)
@@ -14083,7 +14181,7 @@ mod tests {
     }
 
     #[test]
-    fn deep_repair_adds_a_bounded_snapshot_when_remote_compaction_would_overflow() {
+    fn deep_visibility_repair_preserves_existing_compaction_and_oversized_history() {
         let codex = tempdir().expect("codex tempdir");
         let sessions_dir = codex.path().join("sessions");
         fs::create_dir_all(&sessions_dir).expect("session dir");
@@ -14140,11 +14238,13 @@ mod tests {
         }];
         let store = SessionStore::new(codex.path().to_path_buf());
 
+        let original = fs::read(&session_path).unwrap();
         let (changed, _) = store
             .repair_rollout_visibility("openai", &records, true)
             .expect("repair oversized context");
 
-        assert_eq!(changed, 1);
+        assert_eq!(changed, 0);
+        assert_eq!(fs::read(&session_path).unwrap(), original);
         let repaired = fs::read_to_string(&session_path).expect("read repaired session");
         let compacted = repaired
             .lines()
@@ -14155,11 +14255,11 @@ mod tests {
         let replacement_history = compacted["payload"]["replacement_history"]
             .as_array()
             .expect("replacement history");
-        assert_eq!(replacement_history.len(), 3);
+        assert_eq!(replacement_history.len(), 1);
         let portable_context = compacted["payload"].to_string();
         assert!(portable_context.contains("早期问题"));
-        assert!(portable_context.contains("最近问题"));
-        assert!(portable_context.contains("最近回答"));
+        assert!(!portable_context.contains("最近问题"));
+        assert!(!portable_context.contains("最近回答"));
         assert!(!portable_context.contains("oversized-output"));
 
         let (second_changed, second_backups) = store
@@ -14167,6 +14267,142 @@ mod tests {
             .expect("repeat oversized repair");
         assert_eq!(second_changed, 0);
         assert!(second_backups.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires an isolated copy of a local session; never run against the live Codex home"]
+    fn visibility_repair_verifies_an_isolated_local_session_copy() {
+        let home = std::env::var("CODEX_SWITCHER_REPAIR_FIXTURE_HOME").unwrap();
+        let fixture = Path::new(&home).canonicalize().unwrap();
+        assert!(fixture.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        assert!(fixture
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("codex-switcher-session-check-"));
+        let id = std::env::var("CODEX_SWITCHER_REPAIR_FIXTURE_THREAD").unwrap();
+        let store = SessionStore::new(Path::new(&home).to_path_buf());
+        let record = store
+            .list_sessions(None, None)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap();
+        let before = fs::read(&record.path).unwrap();
+        let summary = store
+            .repair_visibility_with_options(
+                Some("deep"),
+                Some("openai".into()),
+                None,
+                None,
+                Some(vec![id]),
+            )
+            .unwrap();
+        assert_eq!(summary.reset_history_projection_count, 1);
+        assert_eq!(fs::read(&record.path).unwrap(), before);
+        assert_eq!(
+            store
+                .hydrate_missing_history_projections(Some(&[record.id.clone()]))
+                .unwrap(),
+            1
+        );
+        let db =
+            rusqlite::Connection::open(Path::new(&home).join("thread_history_1.sqlite")).unwrap();
+        let items: usize = db
+            .query_row(
+                "SELECT COUNT(*) FROM thread_items WHERE thread_id=?1",
+                rusqlite::params![record.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            items > 20,
+            "native runtime must rebuild the full display index"
+        );
+        assert!(fs::read(&record.path).unwrap().starts_with(&before));
+        println!("isolated fixture: stale projection reset; rollout bytes preserved");
+    }
+
+    #[test]
+    fn visibility_repair_aborts_before_touching_rollout_when_database_is_invalid() {
+        let home = tempdir().unwrap();
+        fs::create_dir(home.path().join("sessions")).unwrap();
+        let path = home.path().join("sessions/target.jsonl");
+        let content = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"target\",\"model_provider\":\"old\",\"cwd\":\"/tmp/project\"},\"ordinal\":0}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"keep\"}]},\"ordinal\":1}\n"
+        );
+        fs::write(&path, content).unwrap();
+        fs::write(home.path().join("state_5.sqlite"), b"not a sqlite database").unwrap();
+        let store = SessionStore::new(home.path().to_path_buf());
+        let result = store.repair_visibility_with_options(
+            Some("deep"),
+            Some("openai".into()),
+            None,
+            None,
+            Some(vec!["target".into()]),
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), content);
+    }
+
+    #[test]
+    fn deep_visibility_repair_resets_out_of_bounds_projection_and_keeps_live_context() {
+        let home = tempdir().unwrap();
+        fs::create_dir(home.path().join("sessions")).unwrap();
+        let path = home.path().join("sessions/target.jsonl");
+        let values = vec![
+            json!({"type":"session_meta","ordinal":0,"payload":{"id":"target","model_provider":"openai","cwd":"/tmp/project","history_mode":"paginated"}}),
+            json!({"type":"event_msg","ordinal":1,"payload":{"type":"task_started","turn_id":"turn"}}),
+            json!({"type":"turn_context","ordinal":2,"payload":{"model":"gpt-6.1-sol","effort":"high"}}),
+            json!({"type":"response_item","ordinal":3,"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"question"}]}}),
+            json!({"type":"response_item","ordinal":4,"payload":{"type":"reasoning","id":"rs_keep","encrypted_content":"keep-reasoning"}}),
+            json!({"type":"compacted","ordinal":5,"payload":{"message":"","replacement_history":[{"type":"compaction","id":"cmp_keep","encrypted_content":"keep-compaction"}]}}),
+            json!({"type":"response_item","ordinal":6,"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}),
+            json!({"type":"event_msg","ordinal":7,"payload":{"type":"task_complete","turn_id":"turn"}}),
+        ];
+        write_jsonl(&path, &values);
+        let original = fs::read(&path).unwrap();
+        run_sqlite_test(&home.path().join("state_5.sqlite"), "CREATE TABLE threads (id TEXT PRIMARY KEY,model_provider TEXT,model TEXT,reasoning_effort TEXT,history_mode TEXT); INSERT INTO threads VALUES ('target','openai','gpt-6.1-sol','high','paginated');");
+        let history = home.path().join("thread_history_1.sqlite");
+        run_sqlite_test(&history, "CREATE TABLE thread_turns (thread_id TEXT,turn_id TEXT); CREATE TABLE thread_items (thread_id TEXT,item_id TEXT); CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY,next_rollout_byte_offset INTEGER,next_rollout_ordinal INTEGER); INSERT INTO thread_turns VALUES ('target','turn'),('other','other-turn'); INSERT INTO thread_items VALUES ('target','stale'),('other','keep'); INSERT INTO thread_history_projection_state VALUES ('target',9999999,688),('other',42,1);");
+        let store = SessionStore::new(home.path().to_path_buf());
+        let summary = store
+            .repair_visibility_with_options(
+                Some("deep"),
+                Some("openai".into()),
+                None,
+                None,
+                Some(vec!["target".into()]),
+            )
+            .unwrap();
+        assert_eq!(summary.reset_history_projection_count, 1);
+        assert!(summary.desktop_reload_required);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            run_sqlite_test_output(
+                &home.path().join("state_5.sqlite"),
+                "SELECT model || '|' || reasoning_effort FROM threads WHERE id='target';"
+            )
+            .trim(),
+            "gpt-6.1-sol|high"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &history,
+                "SELECT COUNT(*) FROM thread_history_projection_state WHERE thread_id='target';"
+            )
+            .trim(),
+            "0"
+        );
+        assert_eq!(
+            run_sqlite_test_output(
+                &history,
+                "SELECT COUNT(*) FROM thread_items WHERE thread_id='other';"
+            )
+            .trim(),
+            "1"
+        );
     }
 
     #[test]
@@ -14688,7 +14924,7 @@ mod tests {
     }
 
     fn run_sqlite_test(db_path: &std::path::Path, sql: &str) {
-        let output = Command::new("sqlite3")
+        let output = system_command::new("sqlite3")
             .arg(db_path)
             .arg(sql)
             .output()
@@ -14701,7 +14937,7 @@ mod tests {
     }
 
     fn run_sqlite_test_output(db_path: &std::path::Path, sql: &str) -> String {
-        let output = Command::new("sqlite3")
+        let output = system_command::new("sqlite3")
             .arg(db_path)
             .arg(sql)
             .output()

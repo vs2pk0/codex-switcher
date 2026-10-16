@@ -1,10 +1,11 @@
 use semver::Version;
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use std::process::Command;
 use std::{
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -687,7 +688,7 @@ fn open_installer_with_system(path: &Path) -> Result<(), String> {
     if path.extension().and_then(|value| value.to_str()) != Some("dmg") {
         return Err("macOS 在线更新只允许打开 DMG 安装包".to_string());
     }
-    Command::new("open")
+    crate::system_command::new("open")
         .arg(path)
         .spawn()
         .map(|_| ())

@@ -1,6 +1,7 @@
 use super::{
     emit_progress, install_error_path, parse_version, safe_file_name, CLEANUP_MARKER_FILE,
 };
+use crate::system_command::new as command;
 use semver::Version;
 use std::{
     fs,
@@ -13,13 +14,6 @@ use tauri::AppHandle;
 
 const RESTART_STAGE_ARG: &str = "--codex-switcher-update-stage";
 const INSTALL_SCRIPT: &str = include_str!("macos-install.sh");
-
-fn command(program: &str) -> Command {
-    let mut cmd = Command::new(program);
-    // User-injected libraries must not change the behavior of Apple's installer tools.
-    cmd.env_remove("DYLD_INSERT_LIBRARIES");
-    cmd
-}
 
 fn run(cmd: &mut Command, action: &str) -> Result<(), String> {
     let output = cmd.output().map_err(|error| format!("{action}: {error}"))?;
