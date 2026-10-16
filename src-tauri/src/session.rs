@@ -206,6 +206,8 @@ pub struct CodexSessionModelCompatibilityRepairSummary {
     pub synchronized_catalog_row_count: usize,
     pub repaired_database_count: usize,
     pub backup_dirs: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -736,6 +738,72 @@ impl SessionStore {
         Ok(updated)
     }
 
+    /// 在实例停止期间保存历史图片，避免重启后仍引用已清理的剪贴板临时文件。
+    /// 只修复图片和受影响的分页投影，不执行模型、上下文或会话可见性的深度修复。
+    pub(crate) fn preserve_images_before_restart(&self) -> Result<Vec<String>, String> {
+        let protected = self.protected_rollout_prefixes();
+        let mut warnings = Vec::new();
+        let mut changed_records = Vec::new();
+        let mut changed_ids = HashSet::new();
+        for directory in [
+            self.sessions_dir(),
+            self.codex_home.join("archived_sessions"),
+        ] {
+            for path in collect_jsonl_files(&directory)? {
+                let header = match read_session_record_header(&path) {
+                    Ok(header) => header,
+                    Err(error) => {
+                        warnings.push(format!("图片恢复跳过 {}：{error}", path.display()));
+                        continue;
+                    }
+                };
+                let Some(id) = header.id else { continue };
+                let record = SessionRepairRecord {
+                    id,
+                    title: String::new(),
+                    updated_at: 0,
+                    path,
+                };
+                let records = std::slice::from_ref(&record);
+                match self.repair_generated_images(records) {
+                    Ok(result) if result.invalid > 0 => warnings.push(format!(
+                        "会话 {} 的 {} 张生成图片无法从内嵌数据恢复",
+                        record.id, result.invalid
+                    )),
+                    Err(error) => warnings.push(error),
+                    _ => {}
+                }
+                match self.repair_local_image_attachments(records, &protected) {
+                    Ok(result) => {
+                        if result.changed_rollout_files > 0 {
+                            changed_ids.insert(record.id.clone());
+                            changed_records.push(record);
+                        }
+                        if result.images.invalid > 0 {
+                            warnings.push(format!(
+                                "{} 张历史图片无法从会话内嵌数据恢复",
+                                result.images.invalid
+                            ));
+                        }
+                        if !result.skipped_protected_ancestors.is_empty() {
+                            warnings.push(format!(
+                                "以下会话的图片路径位于受保护的分段历史中，已保留原始历史：{}",
+                                result.skipped_protected_ancestors.join(", ")
+                            ));
+                        }
+                    }
+                    Err(error) => warnings.push(error),
+                }
+            }
+        }
+        if !changed_records.is_empty() {
+            let (_, _, projection_warnings) =
+                self.reset_stale_thread_history_projections(&changed_records, &changed_ids)?;
+            warnings.extend(projection_warnings);
+        }
+        Ok(warnings)
+    }
+
     pub fn repair_model_compatibility(
         &self,
         target_provider: &str,
@@ -756,10 +824,15 @@ impl SessionStore {
             synchronized_catalog_row_count: 0,
             repaired_database_count: 0,
             backup_dirs: Vec::new(),
+            warnings: Vec::new(),
         };
 
         let protected = self.protected_rollout_prefixes();
-        for path in collect_jsonl_files(&self.sessions_dir())? {
+        let mut changed_records = Vec::new();
+        let mut changed_ids = HashSet::new();
+        let mut paths = collect_jsonl_files(&self.sessions_dir())?;
+        paths.extend(collect_jsonl_files(&self.codex_home.join("archived_sessions"))?);
+        for path in paths {
             // 被后继段引用的前缀必须保持字节级不变，只改写前缀之后的记录。
             let protected_prefix = if protected.is_empty() {
                 0
@@ -780,6 +853,24 @@ impl SessionStore {
             else {
                 continue;
             };
+            let normalized = fs::read_to_string(&tmp_path)
+                .map_err(|error| format!("读取会话模型修复临时文件失败：{error}"))
+                .and_then(|content| {
+                    normalize_paginated_rollout_ordinals_guarded(&content, protected_prefix)
+                });
+            match normalized {
+                Ok(Some(content)) => {
+                    if let Err(error) = fs::write(&tmp_path, content) {
+                        let _ = fs::remove_file(&tmp_path);
+                        return Err(format!("写入会话分页序号修复失败：{error}"));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(error);
+                }
+            }
             let backup_path = match self.backup_session_file(&path, "model-compatibility") {
                 Ok(path) => path,
                 Err(error) => {
@@ -812,6 +903,21 @@ impl SessionStore {
                 rewrite_stats.removed_encrypted_reasoning_items;
             summary.removed_encrypted_compaction_item_count +=
                 rewrite_stats.removed_encrypted_compaction_items;
+            if let Some(id) = read_session_record_header(&path)?.id {
+                changed_ids.insert(id.clone());
+                changed_records.push(SessionRepairRecord {
+                    id,
+                    path,
+                    title: String::new(),
+                    updated_at: 0,
+                });
+            }
+        }
+        if !changed_records.is_empty() {
+            let (_, backup_dirs, warnings) =
+                self.reset_stale_thread_history_projections(&changed_records, &changed_ids)?;
+            summary.backup_dirs.extend(backup_dirs);
+            summary.warnings.extend(warnings);
         }
 
         for db_path in self.sqlite_candidate_paths() {
@@ -3885,6 +3991,7 @@ impl SessionStore {
             .collect::<HashMap<_, _>>();
         let mut targets: Vec<(String, SegmentProjectionTarget)> = Vec::new();
         let mut warnings = Vec::new();
+        let protected = self.protected_rollout_prefixes();
         for session in sessions {
             match lineages.get(&session.id) {
                 Some(lineage) => {
@@ -4001,6 +4108,13 @@ impl SessionStore {
                     || rows_without_state
                     || turn_projection_is_stale
                 {
+                    // fork 祖先可能仍在会话列表中；删除其投影会连同子会话继承的图片一起隐藏。
+                    if protected.contains_key(physical_id) {
+                        warnings.push(format!(
+                            "会话 {physical_id} 的分页投影仍被其他会话引用，已保留祖先投影"
+                        ));
+                        continue;
+                    }
                     stale_ids.push(physical_id.clone());
                 }
             }
@@ -8507,6 +8621,13 @@ fn read_rollout_history_base(path: &Path) -> Option<RolloutHistoryBase> {
 }
 
 fn normalize_paginated_rollout_ordinals(content: &str) -> Result<Option<String>, String> {
+    normalize_paginated_rollout_ordinals_guarded(content, 0)
+}
+
+fn normalize_paginated_rollout_ordinals_guarded(
+    content: &str,
+    protected_prefix_bytes: u64,
+) -> Result<Option<String>, String> {
     let Some(first_record) = content.lines().find(|line| !line.trim().is_empty()) else {
         return Ok(None);
     };
@@ -8526,7 +8647,10 @@ fn normalize_paginated_rollout_ordinals(content: &str) -> Result<Option<String>,
         .unwrap_or(0);
     let mut changed = false;
     let mut saw_session_meta = false;
+    let mut offset = 0u64;
     for segment in content.split_inclusive('\n') {
+        let protected = offset < protected_prefix_bytes;
+        offset += segment.len() as u64;
         let (body, ending) = if let Some(body) = segment.strip_suffix("\r\n") {
             (body, "\r\n")
         } else if let Some(body) = segment.strip_suffix('\n') {
@@ -8544,6 +8668,14 @@ fn normalize_paginated_rollout_ordinals(content: &str) -> Result<Option<String>,
                 expected_ordinal, error
             )
         })?;
+        if protected {
+            output.push_str(segment);
+            if let Some(ordinal) = value.get("ordinal").and_then(Value::as_u64) {
+                expected_ordinal = ordinal.saturating_add(1);
+            }
+            saw_session_meta |= value.get("type").and_then(Value::as_str) == Some("session_meta");
+            continue;
+        }
         let object = value
             .as_object_mut()
             .ok_or_else(|| format!("分页会话第 {} 条记录不是 JSON 对象", expected_ordinal))?;
@@ -9064,21 +9196,39 @@ fn rewrite_local_image_attachments(
                 .filter(|value| safe_generated_image_id(value))
                 .map(str::to_string)
                 .unwrap_or_else(|| {
-                    let fingerprint = images
-                        .iter()
-                        .map(|image| {
-                            format!(
-                                "{}:{}",
-                                image.encoded.len(),
-                                image.encoded.chars().take(64).collect::<String>()
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(":");
-                    short_hash(&fingerprint)
+                    // 同尺寸图片的头部可能完全相同，必须以完整内容生成资源标识。
+                    let mut digest = Sha256::new();
+                    for image in &images {
+                        digest.update(image.encoded.len().to_le_bytes());
+                        digest.update(image.encoded.as_bytes());
+                    }
+                    format!("{:x}", digest.finalize())
                 });
             let mut repaired_images = Vec::with_capacity(images.len());
             for (index, image) in images.into_iter().enumerate() {
+                // 已持久化的图片只检查文件头，切号时无需反复解码历史 base64。
+                if let Some(extension) = encoded_generated_image_extension(&image.encoded) {
+                    let image_path = codex_home
+                        .join("generated_images")
+                        .join(session_id)
+                        .join(format!("recovered-{image_key}-{index}.{extension}"));
+                    if generated_image_extension_from_file(&image_path) == Some(extension) {
+                        result.verified += 1;
+                        let stable_path = image_path.to_string_lossy().to_string();
+                        if let Some(source_path) = image.source_path.as_deref() {
+                            line_changed |= rewrite_user_message_image_path(
+                                &mut value,
+                                source_path,
+                                &stable_path,
+                            );
+                        }
+                        repaired_images.push(RepairedInlineUserImage {
+                            source_path: image.source_path,
+                            stable_path: Some(stable_path),
+                        });
+                        continue;
+                    }
+                }
                 let Some((bytes, extension)) = decode_generated_image(&image.encoded) else {
                     result.invalid += 1;
                     repaired_images.push(RepairedInlineUserImage {
@@ -13086,6 +13236,172 @@ mod tests {
         assert_eq!(unsafe_result.recreated, 0);
         assert_eq!(unsafe_result.verified, 0);
         assert_eq!(unsafe_result.invalid, 1);
+    }
+
+    #[test]
+    fn switch_image_preservation_handles_archives_and_keeps_protected_history_bytes() {
+        let codex = tempdir().unwrap();
+        let archived = codex.path().join("archived_sessions");
+        let sessions = codex.path().join("sessions");
+        fs::create_dir_all(&archived).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        let image_records = |id: &str| {
+            vec![
+                json!({"type":"session_meta","payload":{"id":id}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","id":"image-message","content":[
+                    {"type":"input_image","image_url":format!("data:image/png;base64,{png}")}
+                ]}}),
+                json!({"type":"event_msg","payload":{"type":"user_message","message":"image","local_images":["/missing/clipboard.png"]}}),
+            ]
+        };
+        let parent = archived.join("parent.jsonl");
+        write_jsonl(&parent, &image_records("parent"));
+        let original_parent = fs::read(&parent).unwrap();
+        write_jsonl(
+            &sessions.join("child.jsonl"),
+            &[
+                json!({"type":"session_meta","payload":{"id":"child","history_mode":"paginated","history_base":{
+                    "thread_id":"parent","end_byte_offset":original_parent.len(),"end_ordinal_exclusive":3
+                }}}),
+            ],
+        );
+        let ordinary = archived.join("ordinary.jsonl");
+        write_jsonl(&ordinary, &image_records("ordinary"));
+        let store = SessionStore::new(codex.path().to_path_buf());
+        let warnings = store.preserve_images_before_restart().unwrap();
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("受保护") && w.contains("parent")));
+        assert_eq!(fs::read(parent).unwrap(), original_parent);
+        let repaired: Vec<Value> = fs::read_to_string(&ordinary)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let path = repaired[2]["payload"]["local_images"][0].as_str().unwrap();
+        assert!(Path::new(path).starts_with(codex.path().join("generated_images/ordinary")));
+        assert!(Path::new(path).is_file());
+    }
+
+    #[test]
+    fn model_switch_repairs_archives_and_ordinals_without_clearing_fork_history() {
+        let codex = tempdir().unwrap();
+        let archived = codex.path().join("archived_sessions");
+        let sessions = codex.path().join("sessions");
+        fs::create_dir_all(&archived).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        let parent = archived.join("parent.jsonl");
+        let prefix = concat!(
+            "{\"type\":\"session_meta\",\"ordinal\":0,\"payload\":{\"id\":\"parent\",\"model_provider\":\"api\"}}\n",
+            "{\"type\":\"event_msg\",\"ordinal\":1,\"payload\":{\"type\":\"task_started\",\"turn_id\":\"inherited\"}}\n",
+            "{\"type\":\"event_msg\",\"ordinal\":2,\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"inherited\"}}\n"
+        );
+        fs::write(&parent, format!("{prefix}{}\n{}\n",
+            json!({"type":"response_item","ordinal":3,"payload":{"type":"reasoning","id":"rs_old","encrypted_content":"old"}}),
+            json!({"type":"turn_context","ordinal":4,"payload":{"model":"api/gpt-5.6-sol"}})
+        )).unwrap();
+        write_jsonl(
+            &sessions.join("child.jsonl"),
+            &[
+                json!({"type":"session_meta","ordinal":3,"payload":{"id":"child","model_provider":"api","history_base":{"thread_id":"parent","end_byte_offset":prefix.len(),"end_ordinal_exclusive":3}}}),
+                json!({"type":"turn_context","ordinal":4,"payload":{"model":"api/gpt-5.6-sol"}}),
+            ],
+        );
+        let ordinary = archived.join("ordinary.jsonl");
+        write_jsonl(
+            &ordinary,
+            &[
+                json!({"type":"session_meta","ordinal":0,"payload":{"id":"ordinary","model_provider":"api"}}),
+                json!({"type":"response_item","ordinal":1,"payload":{"type":"reasoning","encrypted_content":"old"}}),
+                json!({"type":"turn_context","ordinal":2,"payload":{"model":"api/gpt-5.6-sol"}}),
+            ],
+        );
+        let history = rusqlite::Connection::open(codex.path().join("thread_history_1.sqlite")).unwrap();
+        history.execute_batch("
+            CREATE TABLE thread_items (thread_id TEXT, item_id TEXT);
+            CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT);
+            CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER);
+            INSERT INTO thread_items VALUES ('parent','inherited-image'), ('ordinary','stale');
+            INSERT INTO thread_turns VALUES ('parent','inherited');
+            INSERT INTO thread_history_projection_state VALUES ('parent',1,5), ('ordinary',1,3);
+        ").unwrap();
+        let store = SessionStore::new(codex.path().to_path_buf());
+        let summary = store.repair_model_compatibility("openai").unwrap();
+        assert_eq!(summary.repaired_rollout_file_count, 3);
+        assert!(summary.warnings.iter().any(|w| w.contains("保留祖先投影")));
+        let repaired_parent = fs::read_to_string(&parent).unwrap();
+        assert!(repaired_parent.starts_with(prefix));
+        let tail: Value = serde_json::from_str(repaired_parent[prefix.len()..].trim()).unwrap();
+        assert_eq!(tail["ordinal"], 3);
+        assert_eq!(tail["payload"]["model"], "gpt-5.6-sol");
+        let repaired: Vec<Value> = fs::read_to_string(&ordinary)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(repaired.len(), 2);
+        assert_eq!(repaired[0]["payload"]["model_provider"], "openai");
+        assert_eq!(repaired[1]["ordinal"], 1);
+        assert_eq!(repaired[1]["payload"]["model"], "gpt-5.6-sol");
+        let count = |id: &str| {
+            history
+                .query_row(
+                    "SELECT COUNT(*) FROM thread_items WHERE thread_id=?1",
+                    [id],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count("parent"), 1);
+        assert_eq!(count("ordinary"), 0);
+    }
+
+    #[test]
+    fn inline_image_recovery_distinguishes_equal_length_images_with_matching_headers() {
+        use super::rewrite_local_image_attachments;
+        use base64::{engine::general_purpose, Engine as _};
+        let codex = tempdir().unwrap();
+        let png = general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=").unwrap();
+        let first = [png.clone(), vec![1]].concat();
+        let second = [png, vec![2]].concat();
+        let encoded = [
+            general_purpose::STANDARD.encode(&first),
+            general_purpose::STANDARD.encode(&second),
+        ];
+        assert_eq!(encoded[0].len(), encoded[1].len());
+        assert_eq!(&encoded[0][..64], &encoded[1][..64]);
+        let mut values = Vec::new();
+        for (index, image) in encoded.iter().enumerate() {
+            values.push(
+                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[
+                    {"type":"input_image","image_url":format!("data:image/png;base64,{image}")}
+                ]}}),
+            );
+            values.push(json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[
+                {"type":"local_image","path":format!("/missing/image-{index}.png")}
+            ]}}}));
+        }
+        let content = values.iter().map(|v| format!("{v}\n")).collect::<String>();
+        let (rewritten, result) =
+            rewrite_local_image_attachments(&content, codex.path(), "images").unwrap();
+        assert_eq!(result.recreated, 2);
+        let repaired: Vec<Value> = rewritten
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let paths = [
+            repaired[1]["payload"]["item"]["content"][0]["path"]
+                .as_str()
+                .unwrap(),
+            repaired[3]["payload"]["item"]["content"][0]["path"]
+                .as_str()
+                .unwrap(),
+        ];
+        assert_ne!(paths[0], paths[1]);
+        assert_eq!(fs::read(paths[0]).unwrap(), first);
+        assert_eq!(fs::read(paths[1]).unwrap(), second);
     }
 
     #[test]

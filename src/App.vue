@@ -154,7 +154,9 @@ import {
   cancelAppUpdateDownload,
   downloadAppUpdate,
   fetchAppUpdateInfo,
+  installAppUpdateAndRestart,
   openAppUpdateInstaller,
+  takeAppUpdateInstallError,
   type AppUpdateDownloadProgress,
   type AppUpdateDownloadResult,
   type AppUpdateInfo,
@@ -2714,7 +2716,8 @@ async function performApiKeyAccountSync(
     currentAccount.value = summary.account;
     await Promise.all([loadAccounts(), loadCodexInstances()]);
     if (activeView.value === "sessions") void loadSessions({ silent: true });
-    Message.success(`${t("同步配置完成")}：${summary.message}`);
+    const notify = summary.warning ? Message.warning : Message.success;
+    notify(`${t("同步配置完成")}：${summary.message}`);
   } catch (error) {
     appBusy.value = null;
     await loadCodexInstances().catch(() => undefined);
@@ -3374,7 +3377,7 @@ function openReleasesPage(): void {
 
 function showUpdateDialog(info: AppUpdateInfo): void {
   const content = info.canDownload
-    ? `${t("当前版本")} v${info.currentVersion}，${t("最新版本")} v${info.latestVersion}。${t("可直接在应用内下载安装包。")}`
+    ? `${t("当前版本")} v${info.currentVersion}，${t("最新版本")} v${info.latestVersion}。${t(info.target.startsWith("macos-") ? "下载完成后将自动安装并重启应用。" : "可直接在应用内下载安装包。")}`
     : `${t("当前版本")} v${info.currentVersion}，${t("最新版本")} v${info.latestVersion}。${t("当前平台没有可用的在线安装包，请前往 GitHub Releases 下载。")}`;
   Modal.confirm({
     title: `${t("发现新版本")} v${info.latestVersion}`,
@@ -3418,7 +3421,7 @@ async function checkAppUpdate(options: { silent?: boolean } = {}): Promise<void>
 }
 
 async function startAppUpdateDownload(info: AppUpdateInfo | null = appUpdateInfo.value): Promise<void> {
-  if (!info || appUpdateDownloading.value) return;
+  if (!info || appUpdateDownloading.value || appUpdateOpening.value) return;
   appUpdateInfo.value = info;
   appUpdateProgress.value = {
     status: "checking",
@@ -3434,6 +3437,10 @@ async function startAppUpdateDownload(info: AppUpdateInfo | null = appUpdateInfo
   appUpdateDownloading.value = true;
   try {
     appUpdateResult.value = await downloadAppUpdate();
+    appUpdateDownloading.value = false;
+    if (info.target.startsWith("macos-")) {
+      await openDownloadedAppUpdate();
+    }
   } catch (error) {
     const message = errorText(error);
     if (message !== "下载已取消") {
@@ -3460,18 +3467,25 @@ async function openDownloadedAppUpdate(): Promise<void> {
   const result = appUpdateResult.value;
   if (!result || appUpdateOpening.value) return;
   appUpdateOpening.value = true;
+  appUpdateError.value = "";
+  const automaticInstall = appUpdateInfo.value?.target.startsWith("macos-");
   try {
+    if (automaticInstall) {
+      await installAppUpdateAndRestart(result.path);
+      // Keep the modal busy until the backend exits; do not permit a second install.
+      return;
+    }
     await openAppUpdateInstaller(result.path);
     Message.success(t("安装包已打开，请按安装程序完成更新。"));
+    appUpdateOpening.value = false;
   } catch (error) {
-    Message.error(`${t("打开安装包失败")}：${errorText(error)}`);
-  } finally {
+    appUpdateError.value = `${t(automaticInstall ? "更新安装失败" : "打开安装包失败")}：${errorText(error)}`;
     appUpdateOpening.value = false;
   }
 }
 
 function closeAppUpdateModal(): void {
-  if (appUpdateDownloading.value) return;
+  if (appUpdateDownloading.value || appUpdateOpening.value) return;
   appUpdateVisible.value = false;
 }
 
@@ -3755,11 +3769,14 @@ async function handleServiceBindingSave(target: ServiceOauthBindingRequest): Pro
     serviceBindingTarget.value = null;
     await Promise.all([loadAccounts(), loadCodexInstances()]);
     target.onUpdated?.(binding);
-    Message.success(
-      binding.boundAccountId
-        ? formatTranslatedText(t("已绑定 OAuth 账号「{account}」"), { account: binding.boundAccountLabel ?? binding.boundAccountId })
-        : t("已取消绑定 OAuth 账号"),
-    );
+    const message = binding.boundAccountId
+      ? formatTranslatedText(t("已绑定 OAuth 账号「{account}」"), { account: binding.boundAccountLabel ?? binding.boundAccountId })
+      : t("已取消绑定 OAuth 账号");
+    if (binding.warning) {
+      Message.warning(`${message}；${binding.warning}`);
+    } else {
+      Message.success(message);
+    }
   } catch (error) {
     Message.error(`${t("绑定失败")}：${errorText(error)}`);
   } finally {
@@ -4309,7 +4326,9 @@ function confirmRepairSessionModels(): void {
       sessionModelRepairing.value = true;
       try {
         const summary = await repairCodexSessionModelCompatibility(sessionInstanceId.value);
-        if (
+        if (summary.warnings?.length) {
+          Message.warning(summary.warnings.join("；"));
+        } else if (
           summary.repairedRolloutFileCount === 0 &&
           summary.repairedThreadCount === 0 &&
           summary.synchronizedCatalogRowCount === 0
@@ -4863,6 +4882,9 @@ watch(
 );
 
 onMounted(() => {
+  void takeAppUpdateInstallError().then((message) => {
+    if (message) Modal.error({ title: t("更新安装失败"), content: message });
+  }).catch((error) => console.error("读取更新安装结果失败", error));
   quotaCountdownTimer = window.setInterval(() => {
     nowMs.value = Date.now();
     refreshOverdueQuotaCountdowns();
@@ -4880,7 +4902,7 @@ onMounted(() => {
   void listen<AppUpdateDownloadProgress>(APP_UPDATE_DOWNLOAD_PROGRESS_EVENT, (event) => {
     appUpdateProgress.value = event.payload;
     if (event.payload.status === "completed") {
-      appUpdateDownloading.value = false;
+      // The command result owns the download-to-install transition.
       appUpdateCancelling.value = false;
     } else if (event.payload.status === "cancelled") {
       appUpdateDownloading.value = false;

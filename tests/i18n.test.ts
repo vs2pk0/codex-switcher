@@ -4,6 +4,15 @@ import { currentLanguage, formatTranslatedText, t } from "../src/i18n.ts";
 
 const originalLanguage = currentLanguage.value;
 
+test("应用内更新和重启提示支持全部界面语言", () => {
+  for (const language of ["en", "ru", "zh-TW"] as const) {
+    currentLanguage.value = language;
+    for (const text of ["下载完成后将自动安装并重启应用。", "正在安装更新", "正在校验并准备更新，完成后将自动重启", "安装并重启", "更新安装失败"]) {
+      assert.notEqual(t(text), text, `${language}: ${text}`);
+    }
+  }
+});
+
 test("下载完成弹窗和文件夹操作支持全部界面语言", () => {
   for (const language of ["en", "ru", "zh-TW"] as const) {
     currentLanguage.value = language;

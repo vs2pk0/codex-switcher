@@ -3798,6 +3798,7 @@ pub struct ApiServiceCodexSyncSummary {
     pub session_count: usize,
     pub repair_message: String,
     pub message: String,
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3807,6 +3808,7 @@ pub struct ApiServiceCodexRestoreSummary {
     pub instance_name: String,
     pub synchronized_session_provider_count: usize,
     pub message: String,
+    pub warning: Option<String>,
 }
 
 pub(crate) fn api_service_base_url(port: u16) -> String {
@@ -4031,17 +4033,17 @@ pub async fn api_service_sync_codex_instance(
                     &session_store,
                     &account_id,
                 )?;
-                // 切换时的会话 provider 同步告警无需中断：随后的一键修复会再次全量同步。
-                let _ = switched.warning;
                 let mut report = |step: u8| emit(step + 1);
-                let outcome = crate::one_click_repair_session_store(&session_store, &mut report)
+                let mut outcome = crate::one_click_repair_session_store(&session_store, &mut report)
                     .map_err(|error| format!("配置已同步，但一键修复会话失败：{error}"))?;
+                outcome.include_switch_warning(switched.warning);
                 emit(4);
                 Ok((instance.name.clone(), outcome, binding_message))
             })?,
             (),
         );
         let repair_message = crate::one_click_repair_message(&outcome);
+        let warning = (!outcome.warnings.is_empty()).then(|| outcome.warnings.join("；"));
         let message = format!(
             "实例“{instance_name}”已接入本地 API 服务（{base_url}）{}；{binding_message}；一键修复完成：{repair_message}；实例已重新打开",
             if service_started { "，并已顺带启动 API 服务" } else { "" }
@@ -4056,6 +4058,7 @@ pub async fn api_service_sync_codex_instance(
             session_count: outcome.session_count,
             repair_message,
             message,
+            warning,
         })
     })
     .await
@@ -4076,25 +4079,29 @@ pub async fn api_service_restore_codex_instance(
         };
         let instance_id = normalize_instance_id(instance_id.as_deref());
         emit(1);
-        let (instance_name, synchronized) =
+        let (instance_name, synchronized, warnings) =
             crate::instances::run_with_instance_opened_on_success(&instance_id, |instance| {
                 let codex_home = PathBuf::from(&instance.codex_home);
                 crate::reset_codex_config_for_instance(&instance.id)?;
                 let session_store = crate::session::SessionStore::new(codex_home);
-                let provider = session_store.read_target_provider()?;
-                let synchronized = session_store
-                    .synchronize_model_provider(&provider)
-                    .map_err(|error| format!("配置已恢复，但同步旧会话 provider 失败：{error}"))?;
+                let (synchronized, warnings) =
+                    crate::prepare_sessions_after_configuration_change(&session_store)?;
                 emit(4);
-                Ok((instance.name.clone(), synchronized))
+                Ok((instance.name.clone(), synchronized, warnings))
             })?;
+        let warning = (!warnings.is_empty()).then(|| warnings.join("；"));
+        let warning_note = warning
+            .as_ref()
+            .map(|value| format!("；注意：{value}"))
+            .unwrap_or_default();
         Ok(ApiServiceCodexRestoreSummary {
             instance_id,
             instance_name: instance_name.clone(),
             synchronized_session_provider_count: synchronized,
             message: format!(
-                "实例“{instance_name}”已恢复基础配置并重新打开，{synchronized} 条会话的 provider 已同步；如需回到 ChatGPT 账号，请在账号总览中切换"
+                "实例“{instance_name}”已恢复基础配置并重新打开，{synchronized} 条会话的 provider 已同步；如需回到 ChatGPT 账号，请在账号总览中切换{warning_note}"
             ),
+            warning,
         })
     })
     .await

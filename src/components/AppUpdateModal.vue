@@ -26,6 +26,9 @@ const emit = defineEmits<{
   (event: "open-releases"): void;
 }>();
 
+const automaticInstall = computed(() => props.info?.target.startsWith("macos-"));
+const busy = computed(() => props.downloading || props.opening);
+
 const totalBytes = computed(() => Number(props.progress?.totalBytes || props.info?.assetSize || 0));
 const downloadedBytes = computed(() =>
   Number(props.progress?.downloadedBytes || props.result?.sizeBytes || 0),
@@ -45,11 +48,13 @@ const progressStatus = computed(() => {
   return "normal";
 });
 const title = computed(() => {
+  if (props.opening && automaticInstall.value) return t("正在安装更新");
+  if (props.error) return t(props.result ? "更新安装失败" : "更新下载失败");
   if (props.result) return t("更新安装包下载完成");
-  if (props.error) return t("更新下载失败");
   return t("正在下载应用更新");
 });
 const detail = computed(() => {
+  if (props.opening && automaticInstall.value) return t("正在校验并准备更新，完成后将自动重启");
   if (props.result) return `${formatBytes(props.result.sizeBytes)} · ${t("等待安装")}`;
   if (props.progress?.status === "checking") return t("正在获取最新版本");
   if (props.progress?.status === "starting") return t("正在连接下载服务器");
@@ -70,7 +75,7 @@ function formatBytes(value: number): string {
 }
 
 function close(): void {
-  if (!props.downloading) emit("close");
+  if (!busy.value) emit("close");
 }
 </script>
 
@@ -80,9 +85,9 @@ function close(): void {
     :title="title"
     width="620px"
     :footer="false"
-    :closable="!downloading"
-    :mask-closable="!downloading"
-    :esc-to-close="!downloading"
+    :closable="!busy"
+    :mask-closable="!busy"
+    :esc-to-close="!busy"
     @cancel="close"
   >
     <div class="app-update-modal">
@@ -112,12 +117,18 @@ function close(): void {
       <a-alert v-if="error" type="error" show-icon>
         {{ error }}
       </a-alert>
+      <a-alert v-else-if="automaticInstall" type="info" show-icon>
+        {{ t("下载完成后将自动安装并重启应用。") }}
+      </a-alert>
       <a-alert v-else-if="result" type="success" show-icon>
         {{ t("安装包已保存，请打开安装包并按提示完成更新。") }}
       </a-alert>
 
       <div class="app-update-actions">
-        <a-button v-if="downloading" :loading="cancelling" @click="emit('cancel')">
+        <a-button v-if="opening" type="primary" loading>
+          {{ t(automaticInstall ? "正在安装更新" : "打开安装包") }}
+        </a-button>
+        <a-button v-else-if="downloading" :loading="cancelling" @click="emit('cancel')">
           {{ t("取消下载") }}
         </a-button>
         <template v-else>
@@ -125,13 +136,13 @@ function close(): void {
           <a-button v-if="error" @click="emit('open-releases')">
             {{ t("打开 Releases") }}
           </a-button>
-          <a-button v-if="error" type="primary" @click="emit('retry')">
+          <a-button v-if="error" :type="result ? 'secondary' : 'primary'" @click="emit('retry')">
             <template #icon><icon-refresh /></template>
             {{ t("重新下载") }}
           </a-button>
           <a-button v-if="result" type="primary" :loading="opening" @click="emit('open-installer')">
             <template #icon><icon-download /></template>
-            {{ t("打开安装包") }}
+            {{ t(automaticInstall ? "安装并重启" : "打开安装包") }}
           </a-button>
         </template>
       </div>

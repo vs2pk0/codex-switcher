@@ -10,6 +10,9 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 const LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/vs2pk0/codex-switcher/releases/latest";
 const GITHUB_USER_AGENT: &str = "Codex-Switcher-App-Updater";
@@ -24,6 +27,7 @@ pub struct AppUpdateDownloadState(Mutex<DownloadControl>);
 struct DownloadControl {
     active_id: Option<String>,
     cancel_requested: bool,
+    installing: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -151,15 +155,22 @@ pub fn app_update_open_installer(app: AppHandle, path: String) -> Result<(), Str
         .0
         .lock()
         .map_err(|_| "应用更新下载状态锁已损坏".to_string())?;
-    if update_guard.active_id.is_some() {
+    if update_guard.active_id.is_some() || update_guard.installing {
         return Err("应用更新仍在下载，请等待下载完成后再安装".to_string());
     }
 
-    let installer = PathBuf::from(path.trim());
+    let canonical_installer = validated_installer_path(&path, &updates_dir()?)?;
+    open_installer_with_system(&canonical_installer)?;
+    mark_updates_cleanup_pending(&updates_dir()?)?;
+    drop(update_guard);
+    Ok(())
+}
+
+fn validated_installer_path(path: &str, allowed_root: &Path) -> Result<PathBuf, String> {
+    let installer = PathBuf::from(path);
     if !installer.is_file() {
         return Err("更新安装包不存在，请重新下载".to_string());
     }
-    let allowed_root = updates_dir()?;
     let canonical_root = allowed_root
         .canonicalize()
         .map_err(|error| format!("读取更新目录失败: {error}"))?;
@@ -170,10 +181,73 @@ pub fn app_update_open_installer(app: AppHandle, path: String) -> Result<(), Str
         return Err("只能打开 Codex Switcher 更新目录中的安装包".to_string());
     }
 
-    open_installer_with_system(&canonical_installer)?;
-    mark_updates_cleanup_pending(&canonical_root)?;
-    drop(update_guard);
-    Ok(())
+    Ok(canonical_installer)
+}
+
+#[tauri::command]
+pub async fn app_update_install_and_restart(app: AppHandle, path: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        {
+            let state = app.state::<AppUpdateDownloadState>();
+            let mut guard = state
+                .0
+                .lock()
+                .map_err(|_| "应用更新状态锁已损坏".to_string())?;
+            if guard.active_id.is_some() || guard.installing {
+                return Err("已有应用更新正在进行".to_string());
+            }
+            guard.installing = true;
+        }
+        let worker_app = app.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let root = updates_dir()?;
+            let installer = validated_installer_path(&path, &root)?;
+            macos::prepare_install_and_restart(&worker_app, &installer, &root)
+        })
+        .await
+        .map_err(|error| format!("应用更新安装任务失败: {error}"))
+        .and_then(|result| result);
+        if result.is_ok() {
+            // The detached helper waits for this process to exit before touching the bundle.
+            crate::shutdown_background_services(&app);
+            app.exit(0);
+        } else if let Ok(mut guard) = app.state::<AppUpdateDownloadState>().0.lock() {
+            guard.installing = false;
+        }
+        result
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, path);
+        Err("当前平台暂不支持应用内安装并重启".to_string())
+    }
+}
+
+fn install_error_path() -> Result<PathBuf, String> {
+    Ok(updates_dir()?.with_file_name(".last-app-update-error"))
+}
+
+#[tauri::command]
+pub fn app_update_take_install_error() -> Result<Option<String>, String> {
+    let path = install_error_path()?;
+    match fs::read_to_string(&path) {
+        Ok(message) => {
+            fs::remove_file(path).map_err(|error| format!("清理更新错误提示失败: {error}"))?;
+            Ok(Some(message))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("读取更新错误提示失败: {error}")),
+    }
+}
+
+pub fn confirm_update_restart(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    if let Err(error) = macos::confirm_update_restart(app) {
+        eprintln!("App update restart confirmation failed: {error}");
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
 }
 
 pub fn shutdown_app_update(download: State<'_, AppUpdateDownloadState>) {
@@ -464,7 +538,7 @@ fn cleanup_updates_dir_contents_if_idle(app: &AppHandle, root: &Path) -> Result<
         .0
         .lock()
         .map_err(|_| "应用更新下载状态锁已损坏".to_string())?;
-    if guard.active_id.is_some() {
+    if guard.active_id.is_some() || guard.installing {
         return Ok(());
     }
     cleanup_pending_update_artifacts_at(root)
@@ -553,8 +627,8 @@ fn begin_download(download: &State<'_, AppUpdateDownloadState>) -> Result<String
         .0
         .lock()
         .map_err(|_| "应用更新下载状态锁已损坏".to_string())?;
-    if guard.active_id.is_some() {
-        return Err("已有应用更新正在下载".to_string());
+    if guard.active_id.is_some() || guard.installing {
+        return Err("已有应用更新正在进行".to_string());
     }
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -796,5 +870,27 @@ mod tests {
         cleanup_pending_update_artifacts_at(root).unwrap();
 
         assert!(root.join("installer.dmg").exists());
+    }
+
+    #[test]
+    fn installer_paths_cannot_escape_updates_directory_through_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("updates");
+        fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("other.dmg");
+        fs::write(&outside, b"dmg").unwrap();
+        let inside = root.join("app.dmg");
+        fs::write(&inside, b"dmg").unwrap();
+        assert_eq!(
+            validated_installer_path(inside.to_str().unwrap(), &root).unwrap(),
+            inside.canonicalize().unwrap()
+        );
+        assert!(validated_installer_path(outside.to_str().unwrap(), &root).is_err());
+        #[cfg(unix)]
+        {
+            let link = root.join("escape.dmg");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(validated_installer_path(link.to_str().unwrap(), &root).is_err());
+        }
     }
 }

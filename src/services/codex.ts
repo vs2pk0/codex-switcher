@@ -131,6 +131,7 @@ export interface CodexSessionModelCompatibilityRepairSummary {
   synchronizedCatalogRowCount: number;
   repairedDatabaseCount: number;
   backupDirs: string[];
+  warnings?: string[];
 }
 
 export async function reloadCodexAfterSessionVisibilityRepair(
@@ -353,6 +354,7 @@ export interface ApiKeyAccountSyncSummary {
   sessionCount: number;
   repairMessage: string;
   message: string;
+  warning?: string | null;
 }
 
 /** API Key 账号「启动」：停止实例 → 重置并写入 Provider 路由与模型目录 → 一键修复会话 → 重新打开实例。 */
@@ -400,6 +402,7 @@ export interface ServiceOauthBinding {
   instanceId: string;
   boundAccountId: string | null;
   boundAccountLabel: string | null;
+  warning?: string | null;
 }
 
 /** 面板向 App 发起「绑定 OAuth」的请求参数。 */

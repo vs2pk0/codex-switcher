@@ -39,6 +39,7 @@ pub struct ServiceOauthBinding {
     pub instance_id: String,
     pub bound_account_id: Option<String>,
     pub bound_account_label: Option<String>,
+    pub warning: Option<String>,
 }
 
 fn account_label(account: &CodexAccount) -> String {
@@ -143,6 +144,7 @@ pub(crate) fn read_service_oauth_binding(
         instance_id: instance_id.to_string(),
         bound_account_id,
         bound_account_label,
+        warning: None,
     })
 }
 
@@ -233,19 +235,32 @@ pub async fn codex_update_service_oauth_binding(
     }
     let task_instance_id = instance_id.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        instances::run_with_instance_restarted_if_running(&task_instance_id, |instance| {
-            let store = AccountStore::new_for_instance(
-                switcher_account_dir(),
-                PathBuf::from(&instance.codex_home),
-                &instance.id,
-            );
-            apply_service_oauth_binding(kind, &store, oauth_account_id.as_deref(), true)?;
-            Ok(())
-        })?;
-        read_service_oauth_binding(kind, &task_instance_id)
+        let warnings =
+            instances::run_with_instance_restarted_if_running(&task_instance_id, |instance| {
+                let store = AccountStore::new_for_instance(
+                    switcher_account_dir(),
+                    PathBuf::from(&instance.codex_home),
+                    &instance.id,
+                );
+                update_binding_and_prepare_sessions(kind, &store, oauth_account_id.as_deref())
+            })?;
+        let mut binding = read_service_oauth_binding(kind, &task_instance_id)?;
+        binding.warning = (!warnings.is_empty()).then(|| warnings.join("；"));
+        Ok(binding)
     })
     .await
     .map_err(|error| format!("更新服务 OAuth 绑定任务失败: {error}"))?
+}
+
+/// 调用方已停止实例；绑定变化后也要持久化图片并同步会话兼容状态。
+fn update_binding_and_prepare_sessions(
+    kind: ServiceKind,
+    store: &AccountStore,
+    oauth_account_id: Option<&str>,
+) -> Result<Vec<String>, String> {
+    apply_service_oauth_binding(kind, store, oauth_account_id, true)?;
+    let sessions = crate::session::SessionStore::new(store.codex_home().to_path_buf());
+    crate::prepare_sessions_after_configuration_change(&sessions).map(|(_, warnings)| warnings)
 }
 
 #[cfg(test)]
@@ -303,6 +318,50 @@ mod tests {
         assert_eq!(candidates, vec![first.id.clone(), second.id.clone()]);
         // OAuth 候选中不包含 API Key 账号自身
         assert!(!candidates.contains(&api.id));
+    }
+
+    #[test]
+    fn binding_changes_preserve_images_and_keep_service_routing() {
+        let (_storage, codex, store) = store();
+        let oauth = import_oauth(&store, "image@example.com", "refresh");
+        std::fs::write(
+            codex.path().join("config.toml"),
+            "model_provider = \"opencodex\"\n",
+        )
+        .unwrap();
+        let sessions = codex.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("binding.jsonl");
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        let values = [
+            json!({"type":"session_meta","payload":{"id":"binding","model_provider":"openai"}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":format!("data:image/png;base64,{png}")}]}}),
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"image","local_images":["/missing/clipboard.png"]}}),
+        ];
+        std::fs::write(
+            &path,
+            values.iter().map(|v| format!("{v}\n")).collect::<String>(),
+        )
+        .unwrap();
+        for binding in [Some(oauth.id.as_str()), None, Some(oauth.id.as_str())] {
+            let warnings =
+                update_binding_and_prepare_sessions(ServiceKind::OpenCodex, &store, binding)
+                    .unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            let updated: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(updated[0]["payload"]["model_provider"], "opencodex");
+            assert_eq!(updated[1], values[1]);
+            let image =
+                std::path::Path::new(updated[2]["payload"]["local_images"][0].as_str().unwrap());
+            assert!(image.starts_with(codex.path().join("generated_images/binding")));
+            assert_eq!(&std::fs::read(image).unwrap()[..8], b"\x89PNG\r\n\x1a\n");
+            let config = std::fs::read_to_string(codex.path().join("config.toml")).unwrap();
+            assert!(config.contains("model_provider = \"opencodex\""));
+        }
     }
 
     #[test]

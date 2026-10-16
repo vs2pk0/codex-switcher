@@ -1729,6 +1729,7 @@ pub(crate) struct ApiKeyAccountSyncSummary {
     pub session_count: usize,
     pub repair_message: String,
     pub message: String,
+    pub warning: Option<String>,
 }
 
 /// API Key 账号「启动」：与 OpenCodex / API 服务的「同步配置」保持同一套流程——
@@ -1798,14 +1799,15 @@ async fn sync_api_key_account_to_instance(
                 )?;
                 api_model_catalog::install(&codex_home, &account_id, &model_catalog)
                     .map_err(|error| format!("账号已切换，但模型目录写入失败，请重试：{error}"))?;
-                // 切换时的会话 provider 同步告警无需中断：随后的一键修复会再次全量同步。
                 let mut report = |step: u8| emit(step);
-                let outcome = one_click_repair_session_store(&session_store, &mut report)
+                let mut outcome = one_click_repair_session_store(&session_store, &mut report)
                     .map_err(|error| format!("配置已同步，但一键修复会话失败：{error}"))?;
+                outcome.include_switch_warning(switched.warning.clone());
                 emit(3);
                 Ok((instance.name.clone(), switched, outcome))
             })?;
         let repair_message = one_click_repair_message(&outcome);
+        let warning = (!outcome.warnings.is_empty()).then(|| outcome.warnings.join("；"));
         let message = format!(
             "实例“{instance_name}”已同步到 API Key 账号并重新打开；同步 {} 条已有会话；一键修复完成：{repair_message}",
             switched.synchronized_session_provider_count
@@ -1818,6 +1820,7 @@ async fn sync_api_key_account_to_instance(
             session_count: outcome.session_count,
             repair_message,
             message,
+            warning,
         })
     })
     .await
@@ -1854,23 +1857,43 @@ pub(crate) fn switch_account_and_sync_session_provider(
     account_id: &str,
 ) -> Result<CodexAccountSwitchResult, String> {
     let account = account_store.switch_account(account_id)?;
-    let provider = session_store.read_target_provider()?;
-    let (synchronized_session_provider_count, warning) =
-        match session_store.synchronize_model_provider(&provider) {
-            Ok(updated) => (updated, None),
-            Err(error) => (
-                0,
-                Some(format!(
-                "账号已切换，但同步已有会话 provider 失败：{}。请在会话页点击“修复可见性”后重试",
-                error
-            )),
-            ),
-        };
+    let (synchronized_session_provider_count, warnings) =
+        prepare_sessions_after_configuration_change(session_store)?;
     Ok(CodexAccountSwitchResult {
         account,
         synchronized_session_provider_count,
-        warning,
+        warning: (!warnings.is_empty()).then(|| warnings.join("；")),
     })
+}
+
+/// 调用方须已停止目标实例；统一修复会话路由、模型和图片，再允许重新打开实例。
+pub(crate) fn prepare_sessions_after_configuration_change(
+    session_store: &SessionStore,
+) -> Result<(usize, Vec<String>), String> {
+    let provider = session_store.read_target_provider()?;
+    let mut warnings = Vec::new();
+    let synchronized = match session_store.synchronize_model_provider(&provider) {
+        Ok(count) => count,
+        Err(error) => {
+            warnings.push(format!(
+                "配置已更新，但会话数据库 Provider 同步未完成：{error}"
+            ));
+            0
+        }
+    };
+    match session_store.repair_model_compatibility(&provider) {
+        Ok(summary) => warnings.extend(summary.warnings),
+        Err(error) => warnings.push(format!(
+            "配置已更新，但会话 Provider 或模型修复未完成：{error}。请在会话页点击“恢复完整会话”后重试"
+        )),
+    }
+    match session_store.preserve_images_before_restart() {
+        Ok(image_warnings) => warnings.extend(image_warnings),
+        Err(error) => warnings.push(format!(
+            "配置已更新，但历史图片恢复未完成：{error}。请在会话页点击“恢复完整会话”后重试"
+        )),
+    }
+    Ok((synchronized, warnings))
 }
 
 /// 启动实例的结果：附带本次为它顺带拉起的依赖服务名称。
@@ -1993,6 +2016,16 @@ pub(crate) struct OneClickStoreRepairOutcome {
     pub warnings: Vec<String>,
 }
 
+impl OneClickStoreRepairOutcome {
+    pub(crate) fn include_switch_warning(&mut self, warning: Option<String>) {
+        if let Some(warning) = warning {
+            if !self.warnings.contains(&warning) {
+                self.warnings.push(warning);
+            }
+        }
+    }
+}
+
 pub(crate) fn one_click_repair_session_store(
     session_store: &SessionStore,
     report_progress: &mut impl FnMut(u8),
@@ -2023,6 +2056,11 @@ pub(crate) fn one_click_repair_session_store(
             }
         }
     };
+    warnings.extend(model_compatibility.warnings.iter().cloned());
+    match session_store.preserve_images_before_restart() {
+        Ok(image_warnings) => warnings.extend(image_warnings),
+        Err(error) => warnings.push(format!("历史图片恢复未完成：{error}")),
+    }
     let session_ids = match session_store.list_sessions(None, None) {
         Ok(sessions) => sessions
             .into_iter()
@@ -4874,6 +4912,321 @@ mod tests {
     }
 
     #[test]
+    fn account_switch_recovers_images_and_resets_only_affected_projection() {
+        let storage = tempdir().unwrap();
+        let codex = tempdir().unwrap();
+        let directory = codex.path().join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("images.jsonl");
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        let values = [
+            json!({"type":"session_meta","ordinal":0,"payload":{"id":"images","history_mode":"paginated","model_provider":"openai"}}),
+            json!({"type":"event_msg","ordinal":1,"payload":{"type":"task_started","turn_id":"turn"}}),
+            json!({"type":"response_item","ordinal":2,"payload":{"type":"message","role":"user","id":"user-images","content":[
+                {"type":"input_text","text":"Keep this message"},
+                {"type":"input_image","image_url":format!("data:image/png;base64,{png}")},
+                {"type":"input_image","image_url":format!("data:image/png;base64,{png}")},
+                {"type":"input_image","image_url":format!("data:image/png;base64,{png}")},
+                {"type":"input_image","image_url":format!("data:image/png;base64,{png}")}
+            ]}}),
+            json!({"type":"event_msg","ordinal":3,"payload":{"type":"item_completed","item":{"type":"UserMessage","id":"user-images","content":[
+                {"type":"text","text":"Keep this message"},
+                {"type":"local_image","path":"/missing/codex-clipboard-1.png"},
+                {"type":"local_image","path":"/missing/codex-clipboard-2.png"},
+                {"type":"local_image","path":"/missing/codex-clipboard-3.png"},
+                {"type":"local_image","path":"/missing/codex-clipboard-4.png"}
+            ]}}}),
+            json!({"type":"turn_context","ordinal":4,"payload":{"model":"gpt-5.6-sol"}}),
+            json!({"type":"event_msg","ordinal":5,"payload":{"type":"task_complete","turn_id":"turn"}}),
+        ];
+        let original = values.iter().map(|v| format!("{v}\n")).collect::<String>();
+        std::fs::write(&path, &original).unwrap();
+        let history =
+            rusqlite::Connection::open(codex.path().join("thread_history_1.sqlite")).unwrap();
+        history.execute_batch("
+            CREATE TABLE thread_items (thread_id TEXT, item_id TEXT);
+            CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT);
+            CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER);
+            INSERT INTO thread_items VALUES ('images','stale-image'), ('untouched','keep');
+            INSERT INTO thread_turns VALUES ('images','turn'), ('untouched','keep');
+            INSERT INTO thread_history_projection_state VALUES ('untouched',123,456);
+        ").unwrap();
+        history
+            .execute(
+                "INSERT INTO thread_history_projection_state VALUES ('images',?1,6)",
+                [original.len() as i64],
+            )
+            .unwrap();
+        drop(history);
+        let accounts = AccountStore::new(storage.path().to_path_buf(), codex.path().to_path_buf());
+        let sessions = SessionStore::new(codex.path().to_path_buf());
+        let oauth = accounts.import_from_json(&json!({
+            "email":"fixture@example.com", "tokens":{"access_token":"fixture","id_token":"fixture","refresh_token":"fixture"}
+        }).to_string()).unwrap().remove(0);
+        let result =
+            switch_account_and_sync_session_provider(&accounts, &sessions, &oauth.id).unwrap();
+        assert!(result.warning.is_none(), "{:?}", result.warning);
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        let updated: Vec<serde_json::Value> = repaired
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(updated.len(), values.len());
+        for (index, value) in updated.iter().enumerate() {
+            assert_eq!(value["ordinal"], values[index]["ordinal"]);
+            if index != 3 {
+                assert_eq!(value, &values[index]);
+            }
+        }
+        for item in updated[3]["payload"]["item"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+        {
+            let image = std::path::Path::new(item["path"].as_str().unwrap());
+            assert!(image.starts_with(codex.path().join("generated_images/images")));
+            assert_eq!(&std::fs::read(image).unwrap()[..8], b"\x89PNG\r\n\x1a\n");
+        }
+        let history =
+            rusqlite::Connection::open(codex.path().join("thread_history_1.sqlite")).unwrap();
+        for table in [
+            "thread_items",
+            "thread_turns",
+            "thread_history_projection_state",
+        ] {
+            let count: i64 = history
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE thread_id='images'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0);
+            let count: i64 = history
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE thread_id='untouched'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+        drop(history);
+        let result =
+            switch_account_and_sync_session_provider(&accounts, &sessions, &oauth.id).unwrap();
+        assert!(result.warning.is_none());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), repaired);
+    }
+
+    #[test]
+    fn configuration_change_keeps_provider_sync_when_a_rollout_is_invalid() {
+        let codex = tempdir().unwrap();
+        let sessions = codex.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("broken.jsonl");
+        let content = concat!(
+            "{\"type\":\"session_meta\",\"ordinal\":0,\"payload\":{\"id\":\"broken\",\"model_provider\":\"api\"}}\n",
+            "invalid-json\n"
+        );
+        std::fs::write(&path, content).unwrap();
+        let state = rusqlite::Connection::open(codex.path().join("state_5.sqlite")).unwrap();
+        state.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT); INSERT INTO threads VALUES ('broken','api');").unwrap();
+        let (count, warnings) = super::prepare_sessions_after_configuration_change(
+            &SessionStore::new(codex.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("模型修复未完成")));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), content);
+        let provider: String = state
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id='broken'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider, "openai");
+    }
+
+    #[test]
+    fn api_repair_reports_archived_image_failures_and_retains_switch_warnings() {
+        let storage = tempdir().unwrap();
+        let codex = tempdir().unwrap();
+        let archived = codex.path().join("archived_sessions");
+        std::fs::create_dir_all(&archived).unwrap();
+        let values = [
+            json!({"type":"session_meta","payload":{"id":"broken-image","model_provider":"openai"}}),
+            json!({"type":"event_msg","payload":{"type":"image_generation_end","call_id":"broken","result":"not-base64"}}),
+        ];
+        std::fs::write(
+            archived.join("broken.jsonl"),
+            values.iter().map(|v| format!("{v}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let accounts = AccountStore::new(storage.path().to_path_buf(), codex.path().to_path_buf());
+        let sessions = SessionStore::new(codex.path().to_path_buf());
+        let api = accounts
+            .add_api_key_account(
+                "sk-fixture".into(),
+                Some("https://fixture.invalid/v1".into()),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let switched =
+            switch_account_and_sync_session_provider(&accounts, &sessions, &api.id).unwrap();
+        assert!(switched
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("生成图片无法"));
+        let mut outcome = super::one_click_repair_session_store(&sessions, &mut |_| {}).unwrap();
+        outcome.include_switch_warning(switched.warning);
+        assert_eq!(outcome.warnings.len(), 1, "duplicate image warning");
+        outcome.include_switch_warning(Some("切号时的独立修复告警".into()));
+        let message = super::one_click_repair_message(&outcome);
+        assert!(message.contains("生成图片无法"));
+        assert!(message.contains("切号时的独立修复告警"));
+    }
+
+    #[test]
+    fn oauth_api_round_trips_preserve_image_payloads_and_persistent_paths() {
+        let storage = tempdir().unwrap();
+        let codex = tempdir().unwrap();
+        let directory = codex.path().join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("round-trip.jsonl");
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        let image_url = format!("data:image/png;base64,{png}");
+        let values = [
+            json!({"type":"session_meta","ordinal":0,"payload":{"id":"round-trip","history_mode":"paginated","model_provider":"openai","cwd":codex.path(),"source":"cli"}}),
+            json!({"type":"event_msg","ordinal":1,"payload":{"type":"task_started","turn_id":"turn"}}),
+            json!({"type":"response_item","ordinal":2,"payload":{"type":"message","role":"user","id":"user-image","content":[
+                {"type":"input_text","text":"Keep this attachment"},
+                {"type":"input_image","image_url":image_url}
+            ]}}),
+            json!({"type":"event_msg","ordinal":3,"payload":{"type":"item_completed","item":{"type":"UserMessage","id":"user-image","content":[
+                {"type":"text","text":"Keep this attachment"},
+                {"type":"local_image","path":"/missing/codex-clipboard.png"}
+            ]}}}),
+            json!({"type":"turn_context","ordinal":4,"payload":{"model":"gpt-5.6-sol"}}),
+            json!({"type":"event_msg","ordinal":5,"payload":{"type":"task_complete","turn_id":"turn"}}),
+        ];
+        std::fs::write(
+            &path,
+            values
+                .iter()
+                .map(|value| format!("{value}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let accounts = AccountStore::new(storage.path().to_path_buf(), codex.path().to_path_buf());
+        let sessions = SessionStore::new(codex.path().to_path_buf());
+        let import_oauth = |email: &str| {
+            accounts.import_from_json(&json!({
+                "email":email, "tokens":{"access_token":format!("fixture-{email}"),"id_token":"fixture","refresh_token":"fixture"}
+            }).to_string()).unwrap().remove(0)
+        };
+        let first = import_oauth("first@example.com");
+        let second = import_oauth("second@example.com");
+        let api = accounts
+            .add_api_key_account(
+                "sk-fixture".to_string(),
+                Some("https://fixture.invalid/v1".to_string()),
+                Some("Fixture API".to_string()),
+                None,
+                None,
+            )
+            .unwrap();
+        let other_api = accounts
+            .add_api_key_account(
+                "sk-other-fixture".to_string(),
+                Some("https://other-fixture.invalid/v1".to_string()),
+                Some("Other Fixture API".to_string()),
+                None,
+                None,
+            )
+            .unwrap();
+        // 覆盖纯 API、绑定 OAuth 的 API，以及返回不同 OAuth 账号后的重复切换。
+        for round in 0..3 {
+            accounts
+                .update_api_key_bound_oauth_account(&api.id, None, false)
+                .unwrap();
+            for (account, binding) in [
+                (&first, None),
+                (&api, None),
+                (&other_api, None),
+                (&second, None),
+                (&api, Some(first.id.clone())),
+                (&first, None),
+            ] {
+                if let Some(bound_id) = binding {
+                    accounts
+                        .update_api_key_bound_oauth_account(&api.id, Some(bound_id), false)
+                        .unwrap();
+                }
+                if super::codex_home_needs_config_reset_before_switch(codex.path()) {
+                    reset_codex_config_toml_in(codex.path()).unwrap();
+                }
+                let switched =
+                    switch_account_and_sync_session_provider(&accounts, &sessions, &account.id)
+                        .unwrap();
+                assert!(switched.warning.is_none(), "{:?}", switched.warning);
+                if account.auth_mode.as_deref() == Some("apikey") {
+                    let outcome =
+                        super::one_click_repair_session_store(&sessions, &mut |_| {}).unwrap();
+                    assert_eq!(outcome.session_count, 1);
+                    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+                }
+                let updated: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(updated.len(), values.len(), "round {round}");
+                assert_eq!(updated[2], values[2], "inline image and user text");
+                let provider = sessions.read_target_provider().unwrap();
+                assert_eq!(updated[0]["payload"]["model_provider"], provider);
+                let model = updated[4]["payload"]["model"].as_str().unwrap();
+                if account.auth_mode.as_deref() == Some("apikey") {
+                    assert!(model.starts_with(&format!("{provider}/")));
+                } else {
+                    assert!(!model.contains('/'), "OAuth retains an API model: {model}");
+                }
+                assert_eq!(
+                    updated[3]["payload"]["item"]["content"][0],
+                    values[3]["payload"]["item"]["content"][0]
+                );
+                for (index, value) in updated.iter().enumerate() {
+                    assert_eq!(value["ordinal"], values[index]["ordinal"]);
+                }
+                let image = std::path::Path::new(
+                    updated[3]["payload"]["item"]["content"][1]["path"]
+                        .as_str()
+                        .unwrap(),
+                );
+                assert!(image.starts_with(codex.path().join("generated_images/round-trip")));
+                assert_eq!(
+                    std::fs::read(image).unwrap(),
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, png)
+                        .unwrap()
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_dir(codex.path().join("generated_images/round-trip"))
+                .unwrap()
+                .count(),
+            1,
+            "repeated switches reuse the persistent file"
+        );
+    }
+
+    #[test]
     fn account_switch_synchronizes_existing_session_provider_before_restart() {
         let storage = tempdir().expect("storage tempdir");
         let codex = tempdir().expect("codex tempdir");
@@ -5896,6 +6249,7 @@ pub fn run() {
             let opencodex_backend = opencodex::OpenCodexBackend::new(app.handle().clone())
                 .map_err(std::io::Error::other)?;
             app.manage(Arc::new(opencodex_backend));
+            app_update::confirm_update_restart(app.handle());
             start_startup_maintenance(app.handle().clone());
             push::start_push_scheduler(app.handle().clone());
             token_keeper::start_token_keeper(app.handle().clone());
@@ -5925,6 +6279,8 @@ pub fn run() {
             app_update::app_update_download,
             app_update::app_update_cancel_download,
             app_update::app_update_open_installer,
+            app_update::app_update_install_and_restart,
+            app_update::app_update_take_install_error,
             push::push_get_settings,
             push::push_update_settings,
             push::push_run_now,
@@ -6062,18 +6418,20 @@ pub fn run() {
             // 只有主窗口销毁才代表应用退出；OpenCodex Web 管理等子窗口关闭时不能停掉 API 服务，
             // 否则 shutting_down 标志会一直置位，后续所有 API 服务操作都会报"应用正在退出"。
             if matches!(event, tauri::WindowEvent::Destroyed) && window.label() == "main" {
-                let process = window.state::<api_service::ApiServiceProcessState>();
-                let download = window.state::<api_service::ApiServiceDownloadState>();
-                let operation = window.state::<api_service::ApiServiceOperationState>();
-                api_service::shutdown_api_service(process, download, operation);
-                let app_update_download = window.state::<app_update::AppUpdateDownloadState>();
-                app_update::shutdown_app_update(app_update_download);
-                let push_runtime = window.state::<push::PushRuntimeState>();
-                push::shutdown_push_scheduler(push_runtime);
+                shutdown_background_services(window.app_handle());
             }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn shutdown_background_services(app: &AppHandle) {
+    let process = app.state::<api_service::ApiServiceProcessState>();
+    let download = app.state::<api_service::ApiServiceDownloadState>();
+    let operation = app.state::<api_service::ApiServiceOperationState>();
+    api_service::shutdown_api_service(process, download, operation);
+    app_update::shutdown_app_update(app.state::<app_update::AppUpdateDownloadState>());
+    push::shutdown_push_scheduler(app.state::<push::PushRuntimeState>());
 }
 
 fn start_startup_maintenance(app: AppHandle) {

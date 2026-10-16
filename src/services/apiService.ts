@@ -213,6 +213,7 @@ export interface ApiServiceCodexSyncSummary {
   sessionCount: number;
   repairMessage: string;
   message: string;
+  warning?: string | null;
 }
 
 export interface ApiServiceCodexRestoreSummary {
@@ -220,6 +221,7 @@ export interface ApiServiceCodexRestoreSummary {
   instanceName: string;
   synchronizedSessionProviderCount: number;
   message: string;
+  warning?: string | null;
 }
 
 /** 同步配置：确保服务运行 → 停止实例 → 重置基础配置并写入 API 服务路由 → 一键修复会话 → 重新打开实例。 */

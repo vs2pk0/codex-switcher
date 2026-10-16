@@ -45,3 +45,11 @@ export function cancelAppUpdateDownload(): Promise<void> {
 export function openAppUpdateInstaller(path: string): Promise<void> {
   return invoke("app_update_open_installer", { path });
 }
+
+export function installAppUpdateAndRestart(path: string): Promise<void> {
+  return invoke("app_update_install_and_restart", { path });
+}
+
+export function takeAppUpdateInstallError(): Promise<string | null> {
+  return invoke("app_update_take_install_error");
+}

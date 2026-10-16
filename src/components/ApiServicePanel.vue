@@ -176,7 +176,8 @@ async function runCodexIntegration(mode: CodexIntegrationMode, instanceId: strin
     await refreshState(true, false);
     emit("instances-changed");
     emit("bound-accounts-changed");
-    Message.success(`${t(mode === "sync" ? "同步配置完成" : "恢复配置完成")}：${summary.message}`);
+    const notify = summary.warning ? Message.warning : Message.success;
+    notify(`${t(mode === "sync" ? "同步配置完成" : "恢复配置完成")}：${summary.message}`);
   } catch (error) {
     codexIntegrationBusy.value = null;
     emit("instances-changed");
