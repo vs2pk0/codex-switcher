@@ -28,6 +28,36 @@ export const languageOptions: Array<{ value: AppLanguage; label: string }> = [
 ];
 
 const en: Record<string, string> = {
+  "导出 MD": "Export MD",
+  "正在导出 Markdown 和附件…": "Exporting Markdown and attachments…",
+  "导出 Markdown 失败": "Markdown export failed",
+  "导出完整会话，图片和文件保存到同级 assets 目录": "Export the full conversation with images and files in the adjacent assets folder",
+  "Markdown 与 assets 附件目录请一起移动或分享。": "Move or share the Markdown document together with its assets folder.",
+  "部分附件无法读取，已在文档中注明": "Some attachments could not be read and are noted in the document",
+
+  "管理偏好、账号切换与本地数据": "Manage preferences, account switching and local data",
+  "控制切换账号时的行为，避免不必要的配置变更。": "Control account switching behavior and avoid unnecessary configuration changes.",
+  "默认关闭": "Off by default",
+  "关闭时保留现有配置，仅更新登录凭据与必要路由。": "When off, keep existing configuration and only update credentials and required routing.",
+  "关闭时保留会话文件和索引，需要时可手动修复。": "When off, keep session files and indexes. Repair manually when needed.",
+  "额度与刷新": "Usage and refresh",
+  "管理额度显示与账号数据刷新策略。": "Manage usage display and account refresh intervals.",
+  "保存刷新设置": "Save refresh settings",
+  "自定义界面显示与布局。": "Customize the interface and layout.",
+  "本地数据": "Local data",
+  "路径仅用于显示，点击文件夹按钮打开原始位置。": "Paths are for display. Use the folder buttons to open their actual locations.",
+  "收起目录": "Collapse directories",
+  "展开全部目录": "Show all directories",
+  "备份与恢复": "Backup and restore",
+  "收起备份列表": "Hide backups",
+  "查看备份": "View backups",
+
+  "切换时重置默认配置": "Reset configuration when switching",
+  "切换时自动修复会话": "Automatically repair sessions when switching",
+  "默认关闭。开启后，从 API 等配置切换账号前重置 config.toml；关闭时仅修改登录凭据和必要的路由配置。": "Off by default. Reset config.toml before switching from API configurations; otherwise only update credentials and necessary routing.",
+  "默认关闭。开启后，切换账号或 API Key 时自动修复会话；关闭时保留会话文件和索引，可按需手动修复。": "Off by default. Repair sessions when switching accounts or API keys; otherwise preserve session files and indexes. Manual repair remains available.",
+  "仅更新登录凭据和必要的 API 路由配置，保留现有会话，完成后重新打开 Codex。": "Update credentials and necessary API routing, preserve existing sessions, then reopen Codex.",
+
   "中文": "Chinese",
   "繁體中文（台灣）": "Traditional Chinese (Taiwan)",
   "English": "English",

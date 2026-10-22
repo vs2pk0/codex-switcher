@@ -5,6 +5,7 @@ const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
   plugins: [vue()],
+  worker: { format: "es" },
   clearScreen: false,
   server: {
     port: 5173,

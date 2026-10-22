@@ -3,6 +3,8 @@ use crate::system_command;
 
 /// 同一线程多段 rollout（history_base 续写链）的解析与合并。
 mod lineage;
+mod markdown;
+pub use markdown::MarkdownExportResult;
 use base64::{engine::general_purpose, Engine as _};
 use lineage::{
     lineage_projection_targets, materialize_lineage, physical_rollout_id, resolve_lineage,

@@ -4010,12 +4010,15 @@ pub async fn api_service_sync_codex_instance(
 
         let account_id = ensure_api_service_account(&api_key, &base_url)?;
 
+        let switch_settings = crate::read_switcher_settings()?;
         // 第二步：停止实例、重置并写入路由、绑定 OAuth 登录态、修复会话，成功后打开实例。
         emit(1);
         let ((instance_name, outcome, binding_message), _) = (
             crate::instances::run_with_instance_opened_on_success(&instance_id, |instance| {
                 let codex_home = PathBuf::from(&instance.codex_home);
-                crate::reset_codex_config_for_instance(&instance.id)?;
+                if switch_settings.reset_config_on_account_switch {
+                    crate::reset_codex_config_for_switch(&instance.id, switch_settings.repair_sessions_on_account_switch)?;
+                }
                 let account_store = AccountStore::new_for_instance(
                     crate::switcher_account_dir(),
                     codex_home.clone(),
@@ -4028,13 +4031,14 @@ pub async fn api_service_sync_codex_instance(
                     oauth_account_id.as_deref(),
                 )?;
                 let session_store = crate::session::SessionStore::new(codex_home);
-                let switched = crate::switch_account_and_sync_session_provider(
+                let switched = crate::switch_account_with_session_options(
                     &account_store,
                     &session_store,
                     &account_id,
+                    switch_settings.repair_sessions_on_account_switch,
                 )?;
                 let mut report = |step: u8| emit(step + 1);
-                let mut outcome = crate::one_click_repair_session_store_with_native_history(&session_store, &mut report)
+                let mut outcome = crate::repair_sessions_on_switch(&session_store, &mut report, switch_settings.repair_sessions_on_account_switch)
                     .map_err(|error| format!("配置已同步，但一键修复会话失败：{error}"))?;
                 outcome.include_switch_warning(switched.warning);
                 emit(4);
@@ -4042,10 +4046,12 @@ pub async fn api_service_sync_codex_instance(
             })?,
             (),
         );
-        let repair_message = crate::one_click_repair_message(&outcome);
+        let repair_message = if switch_settings.repair_sessions_on_account_switch {
+            crate::one_click_repair_message(&outcome)
+        } else { "已跳过自动会话修复，保留现有会话".to_string() };
         let warning = (!outcome.warnings.is_empty()).then(|| outcome.warnings.join("；"));
         let message = format!(
-            "实例“{instance_name}”已接入本地 API 服务（{base_url}）{}；{binding_message}；一键修复完成：{repair_message}；实例已重新打开",
+            "实例“{instance_name}”已接入本地 API 服务（{base_url}）{}；{binding_message}；{repair_message}；实例已重新打开",
             if service_started { "，并已顺带启动 API 服务" } else { "" }
         );
         Ok(ApiServiceCodexSyncSummary {

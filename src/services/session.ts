@@ -289,6 +289,21 @@ export function listSessionContent(
   return invoke("codex_list_session_content", { sessionId, cursor, limit, direction, instanceId });
 }
 
+export interface SessionMarkdownExportResult {
+  fileName: string;
+  path: string;
+  attachmentCount: number;
+  missingAttachmentCount: number;
+}
+
+export function exportSessionMarkdown(
+  sessionId: string,
+  title: string,
+  instanceId = "default",
+): Promise<SessionMarkdownExportResult> {
+  return invoke("codex_export_session_markdown", { sessionId, title, instanceId });
+}
+
 export function getSessionAsset(
   sessionId: string,
   assetId: string,

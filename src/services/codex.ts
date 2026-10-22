@@ -20,6 +20,8 @@ export interface CodexResetCreditConsumeResult {
 }
 
 export interface CodexSwitcherSettings {
+  resetConfigOnAccountSwitch: boolean;
+  repairSessionsOnAccountSwitch: boolean;
   monitorQuota: boolean;
   quotaRefreshMinutes: number;
   currentAccountRefreshMinutes: number;

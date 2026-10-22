@@ -4,12 +4,16 @@ import { Message, Modal } from "@arco-design/web-vue";
 import DOMPurify from "dompurify";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
+import { createPdfAssembler, pdfCaptureSlices, type PdfAssembler } from "../sessionPdfWorker";
 import { marked, Renderer } from "marked";
 import { t } from "../i18n";
+import ExportDownloadModal from "./ExportDownloadModal.vue";
 import {
   deleteSessionMessages,
   deleteSessionTurn,
   getSessionAsset,
+  exportSessionMarkdown,
+  type SessionMarkdownExportResult,
   listSessionContent,
   openPathInFileManager,
   restoreSessionTurnBackup,
@@ -38,6 +42,10 @@ const deletingTurnIds = ref<Set<string>>(new Set());
 const deletingMessageIds = ref<Set<string>>(new Set());
 const restoring = ref(false);
 const exportingPdf = ref(false);
+const exportingMd = ref(false);
+const exporting = computed(() => exportingPdf.value || exportingMd.value);
+const markdownResult = ref<SessionMarkdownExportResult | null>(null);
+const openingMarkdownFolder = ref(false);
 const exportProgress = ref("");
 const searchQuery = ref("");
 const sortDirection = ref<"asc" | "desc">("desc");
@@ -253,7 +261,7 @@ function handleMarkdownClick(event: MouseEvent): void {
 }
 
 function updateVisible(visible: boolean): void {
-  if (!deletingTurnIds.value.size && !deletingMessageIds.value.size && !restoring.value && !exportingPdf.value) {
+  if (!deletingTurnIds.value.size && !deletingMessageIds.value.size && !restoring.value && !exporting.value) {
     emit("update:visible", visible);
   }
 }
@@ -357,7 +365,7 @@ async function openAttachment(attachment: CodexSessionAttachment): Promise<void>
 
 function confirmDelete(turn: CodexSessionTurn): void {
   const session = props.session;
-  if (!session || deletingTurnIds.value.has(turn.id)) return;
+  if (!session || exporting.value || deletingTurnIds.value.has(turn.id)) return;
   Modal.confirm({
     title: t("删除这轮对话"),
     content: t("将删除这一轮中的用户消息、回复和附件引用。操作前会自动备份会话，可在本窗口撤销。"),
@@ -365,6 +373,7 @@ function confirmDelete(turn: CodexSessionTurn): void {
     cancelText: t("取消"),
     okButtonProps: { status: "danger" },
     async onOk() {
+      if (exporting.value) return;
       setInProgress(deletingTurnIds, turn.id, true);
       try {
         const result = await deleteSessionTurn(session.id, turn.id, props.instanceId);
@@ -411,7 +420,7 @@ async function copyMessage(entry: SessionMessageEntry): Promise<void> {
 
 function confirmDeleteMessages(turn: CodexSessionTurn, entry: SessionMessageEntry): void {
   const session = props.session;
-  if (!session || deletingMessageIds.value.has(entry.id)) return;
+  if (!session || exporting.value || deletingMessageIds.value.has(entry.id)) return;
   const groupedSkill = entry.messageIds.length > 1;
   Modal.confirm({
     title: groupedSkill ? t("删除技能调用") : t("删除这条消息"),
@@ -422,6 +431,7 @@ function confirmDeleteMessages(turn: CodexSessionTurn, entry: SessionMessageEntr
     cancelText: t("取消"),
     okButtonProps: { status: "danger" },
     async onOk() {
+      if (exporting.value) return;
       setInProgress(deletingMessageIds, entry.id, true);
       try {
         const result = await deleteSessionMessages(
@@ -450,13 +460,14 @@ function confirmDeleteMessages(turn: CodexSessionTurn, entry: SessionMessageEntr
 function confirmRestore(): void {
   const session = props.session;
   const backupId = lastBackupId.value;
-  if (!session || !backupId || restoring.value) return;
+  if (!session || !backupId || restoring.value || exporting.value) return;
   Modal.confirm({
     title: t("撤销上次删除"),
     content: t("将从自动备份恢复删除前的完整会话内容，当前文件也会先创建回滚备份。"),
     okText: t("确认恢复"),
     cancelText: t("取消"),
     async onOk() {
+      if (exporting.value) return;
       restoring.value = true;
       try {
         const result = await restoreSessionTurnBackup(
@@ -600,6 +611,7 @@ function appendCanvasToPdf(
   pdf: jsPDF,
   canvas: HTMLCanvasElement,
   state: { y: number },
+  gapAfter = true,
 ): void {
   const margin = 28;
   const gap = 8;
@@ -634,51 +646,128 @@ function appendCanvasToPdf(
       state.y = margin;
     }
   }
-  state.y += gap;
+  if (gapAfter) state.y += gap;
+}
+
+async function exportMarkdown(): Promise<void> {
+  const session = props.session;
+  if (!session || exporting.value) return;
+  exportingMd.value = true;
+  exportProgress.value = t("正在导出 Markdown 和附件…");
+  try {
+    markdownResult.value = await exportSessionMarkdown(session.id, session.title, props.instanceId);
+  } catch (error) {
+    Message.error(`${t("导出 Markdown 失败")}: ${error}`);
+  } finally {
+    exportingMd.value = false;
+  }
+}
+
+async function openMarkdownFolder(): Promise<void> {
+  if (!markdownResult.value || openingMarkdownFolder.value) return;
+  openingMarkdownFolder.value = true;
+  try {
+    await openPathInFileManager(markdownResult.value.path);
+  } catch (error) {
+    Message.error(`${t("打开文件夹失败")}: ${error}`);
+  } finally {
+    openingMarkdownFolder.value = false;
+  }
 }
 
 async function exportSessionPdf(): Promise<void> {
   const session = props.session;
-  if (!session || exportingPdf.value) return;
+  if (!session || exporting.value) return;
   exportingPdf.value = true;
   exportProgress.value = t("正在准备 PDF");
   const stage = document.createElement("div");
   stage.className = "session-pdf-stage";
   document.body.appendChild(stage);
+  let assembler: PdfAssembler | null = null;
+  let pendingAssembly: Promise<void> = Promise.resolve();
   try {
     const allTurns = await loadAllTurnsForPdf(session);
     if (!allTurns.length) throw new Error(t("此会话暂无可导出的内容"));
     await loadPdfImageAssets(allTurns, session.id);
     await document.fonts.ready;
 
-    const pdf = new jsPDF({ orientation: "portrait", unit: "pt", format: "a4", compress: true });
+    assembler = await createPdfAssembler();
+    const pdf = assembler ? null : new jsPDF({ orientation: "portrait", unit: "pt", format: "a4", compress: true });
     const pdfState = { y: 28 };
     const blocks: HTMLElement[] = [createPdfTitleBlock(session)];
     allTurns.forEach((turn, index) => {
       blocks.push(createPdfTurnHeader(turn, index + 1));
       blocks.push(...messageEntries(turn).map(createPdfMessageBlock));
     });
-    for (let index = 0; index < blocks.length; index += 1) {
-      exportProgress.value = `${t("正在生成 PDF")}（${index + 1}/${blocks.length}）`;
-      stage.replaceChildren(blocks[index]);
-      await waitForPdfBlock(blocks[index]);
-      const canvas = await html2canvas(blocks[index], {
-        backgroundColor: "#ffffff",
-        logging: false,
-        scale: 1.5,
-        useCORS: true,
-      });
-      appendCanvasToPdf(pdf, canvas, pdfState);
+    for (let index = 0; index < blocks.length;) {
+      // 合批减少 html2canvas 复制文档与解析样式的次数；限制高度和数量控制峰值内存。
+      const batch = document.createElement("div");
+      batch.style.width = "724px";
+      batch.style.display = "flex";
+      batch.style.flexDirection = "column";
+      batch.style.gap = "11px";
+      stage.replaceChildren(batch);
+      let count = 0;
+      while (index < blocks.length && count < 12) {
+        const block = blocks[index];
+        batch.appendChild(block);
+        await Promise.all([...block.querySelectorAll("img")].map(image => image.decode().catch(() => undefined)));
+        if (count > 0 && batch.offsetHeight > 1400) {
+          block.remove();
+          break;
+        }
+        index += 1;
+        count += 1;
+      }
+      exportProgress.value = `${t("正在生成 PDF")}（${index}/${blocks.length}）`;
+      await waitForPdfBlock(batch);
+      for (const slice of pdfCaptureSlices(batch.getBoundingClientRect().height)) {
+        const canvas = await html2canvas(batch, {
+          backgroundColor: "#ffffff",
+          logging: false,
+          scale: 1.5,
+          useCORS: true,
+          y: slice.y,
+          height: slice.height,
+        });
+        // 至多一张截图在后台编码，同时主线程渲染下一张，按原顺序写入。
+        try {
+          await pendingAssembly;
+          if (assembler) {
+            pendingAssembly = assembler.append(canvas, slice.last).finally(() => { canvas.width = canvas.height = 0; });
+            // 提前注册错误处理，避免渲染下一批期间产生未处理的 rejection。
+            void pendingAssembly.catch(() => undefined);
+          } else if (pdf) {
+            appendCanvasToPdf(pdf, canvas, pdfState, slice.last);
+            canvas.width = canvas.height = 0;
+          }
+        } catch (error) {
+          canvas.width = canvas.height = 0;
+          throw error;
+        }
+      }
     }
+    await pendingAssembly;
     exportProgress.value = t("正在保存 PDF");
     const fileName = `${session.title || t("未命名会话")}`
       .replace(/[\\/:*?"<>|]/g, "_")
       .slice(0, 80);
-    pdf.save(`${fileName}.pdf`);
+    if (assembler) {
+      const blob = new Blob([await assembler.finish()], { type: "application/pdf" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${fileName}.pdf`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } else {
+      pdf!.save(`${fileName}.pdf`);
+    }
     Message.success(t("PDF 导出成功"));
   } catch (error) {
     Message.error(`${t("PDF 导出失败")}：${String(error)}`);
   } finally {
+    assembler?.dispose();
     stage.remove();
     exportingPdf.value = false;
     exportProgress.value = "";
@@ -717,7 +806,7 @@ function formatTime(value?: string | number | null): string {
   <a-modal
     :visible="visible"
     :footer="false"
-    :closable="!deletingTurnIds.size && !deletingMessageIds.size && !restoring && !exportingPdf"
+    :closable="!deletingTurnIds.size && !deletingMessageIds.size && !restoring && !exporting"
     :mask-closable="false"
     width="min(1180px, calc(100vw - 32px))"
     modal-class="session-content-modal"
@@ -761,12 +850,21 @@ function formatTime(value?: string | number | null): string {
         <a-button
           type="primary"
           :loading="exportingPdf"
-          :disabled="loading || loadingMore || deletingTurnIds.size > 0 || deletingMessageIds.size > 0 || restoring"
+          :disabled="loading || loadingMore || deletingTurnIds.size > 0 || deletingMessageIds.size > 0 || restoring || exportingMd"
           @click="exportSessionPdf"
         >
           <template #icon><icon-download /></template>{{ t("导出 PDF") }}
         </a-button>
-        <a-button v-if="lastBackupId" status="warning" :loading="restoring" @click="confirmRestore">
+        <a-tooltip :content="t('导出完整会话，图片和文件保存到同级 assets 目录')">
+          <a-button
+            :loading="exportingMd"
+            :disabled="loading || loadingMore || deletingTurnIds.size > 0 || deletingMessageIds.size > 0 || restoring || exportingPdf"
+            @click="exportMarkdown"
+          >
+            <template #icon><icon-download /></template>{{ t("导出 MD") }}
+          </a-button>
+        </a-tooltip>
+        <a-button v-if="lastBackupId" status="warning" :loading="restoring" :disabled="exporting" @click="confirmRestore">
           <template #icon><icon-undo /></template>{{ t("撤销上次删除") }}
         </a-button>
       </div>
@@ -789,7 +887,7 @@ function formatTime(value?: string | number | null): string {
                   size="small"
                   status="danger"
                   :loading="deletingTurnIds.has(turn.id)"
-                  :disabled="!turn.canDelete || deletingTurnIds.size > 0 || deletingMessageIds.size > 0 || restoring"
+                  :disabled="!turn.canDelete || deletingTurnIds.size > 0 || deletingMessageIds.size > 0 || restoring || exporting"
                   @click="confirmDelete(turn)"
                 >
                   <template #icon><icon-delete /></template>{{ t("删除本轮") }}
@@ -823,7 +921,7 @@ function formatTime(value?: string | number | null): string {
                         status="danger"
                         :aria-label="t('删除这条消息')"
                         :loading="deletingMessageIds.has(entry.id)"
-                        :disabled="!turn.canDelete || deletingTurnIds.size > 0 || deletingMessageIds.size > 0 || restoring"
+                        :disabled="!turn.canDelete || deletingTurnIds.size > 0 || deletingMessageIds.size > 0 || restoring || exporting"
                         @click="confirmDeleteMessages(turn, entry)"
                       >
                         <template #icon><icon-delete /></template>
@@ -909,13 +1007,25 @@ function formatTime(value?: string | number | null): string {
           </a-button>
         </main>
       </a-spin>
-      <div v-if="exportingPdf" class="session-pdf-loading">
+      <div v-if="exporting" class="session-pdf-loading">
         <a-spin dot />
         <strong>{{ exportProgress }}</strong>
         <span>{{ t("会话较大或图片较多时可能需要较长时间，请勿关闭窗口") }}</span>
       </div>
     </div>
   </a-modal>
+
+  <ExportDownloadModal
+    :result="markdownResult"
+    :opening="openingMarkdownFolder"
+    @close="markdownResult = null"
+    @open-folder="openMarkdownFolder"
+  >
+    <p>{{ t("Markdown 与 assets 附件目录请一起移动或分享。") }}</p>
+    <a-alert v-if="markdownResult?.missingAttachmentCount" type="warning">
+      {{ t("部分附件无法读取，已在文档中注明") }}（{{ markdownResult.missingAttachmentCount }}）
+    </a-alert>
+  </ExportDownloadModal>
 
   <a-modal
     :visible="Boolean(skillDetail)"

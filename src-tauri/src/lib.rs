@@ -2,8 +2,8 @@ mod account;
 mod api_model_catalog;
 mod api_service;
 mod app_update;
-mod external_url;
 mod export_file;
+mod external_url;
 mod instances;
 mod oauth;
 mod opencodex;
@@ -105,6 +105,10 @@ struct CodexRelayBalanceEndpoints {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexSwitcherSettings {
+    #[serde(default)]
+    reset_config_on_account_switch: bool,
+    #[serde(default)]
+    repair_sessions_on_account_switch: bool,
     #[serde(default = "default_monitor_quota")]
     monitor_quota: bool,
     quota_refresh_minutes: u64,
@@ -149,6 +153,8 @@ static SWITCHER_SETTINGS_LOCK: Mutex<()> = Mutex::new(());
 impl Default for CodexSwitcherSettings {
     fn default() -> Self {
         Self {
+            reset_config_on_account_switch: false,
+            repair_sessions_on_account_switch: false,
             monitor_quota: true,
             quota_refresh_minutes: 10,
             current_account_refresh_minutes: 10,
@@ -1338,7 +1344,10 @@ tell application "System Events"
   end if
 end tell
 "#;
-    let _ = system_command::new("osascript").arg("-e").arg(script).status();
+    let _ = system_command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .status();
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1687,12 +1696,17 @@ async fn switch_codex_account(
         )
         .await?;
     }
+    let switch_settings = read_switcher_settings()?;
     instances::run_with_instance_restarted(&instance_id, |instance| {
         let codex_home = PathBuf::from(&instance.codex_home);
-        // 实例若已接入 API 服务 / OpenCodex / 第三方 API Key Provider，先重置 config.toml 再导入账号数据，
-        // 避免旧的代理路由残留在新账号配置里。
-        if codex_home_needs_config_reset_before_switch(&codex_home) {
-            reset_codex_config_for_instance(&instance.id)?;
+        // 仅在用户启用重置选项时清空旧配置；默认保留自定义配置。
+        if switch_settings.reset_config_on_account_switch
+            && codex_home_needs_config_reset_before_switch(&codex_home)
+        {
+            reset_codex_config_for_switch(
+                &instance.id,
+                switch_settings.repair_sessions_on_account_switch,
+            )?;
         }
         let account_store = AccountStore::new_for_instance(
             switcher_account_dir(),
@@ -1700,8 +1714,12 @@ async fn switch_codex_account(
             &instance.id,
         );
         let session_store = SessionStore::new(codex_home.clone());
-        let switched =
-            switch_account_and_sync_session_provider(&account_store, &session_store, &account_id)?;
+        let switched = switch_account_with_session_options(
+            &account_store,
+            &session_store,
+            &account_id,
+            switch_settings.repair_sessions_on_account_switch,
+        )?;
         if let Some(catalog) = &model_catalog {
             api_model_catalog::install(&codex_home, &account_id, catalog)
                 .map_err(|error| format!("账号已切换，但模型目录写入失败，请重试：{error}"))?;
@@ -1774,6 +1792,7 @@ async fn sync_api_key_account_to_instance(
         )
         .await?;
     }
+    let switch_settings = read_switcher_settings()?;
     tauri::async_runtime::spawn_blocking(move || {
         let emit = |step: u8| {
             let _ = app_handle.emit(
@@ -1785,8 +1804,9 @@ async fn sync_api_key_account_to_instance(
         let (instance_name, switched, outcome) =
             instances::run_with_instance_opened_on_success(&instance_id, |instance| {
                 let codex_home = PathBuf::from(&instance.codex_home);
-                if codex_home_needs_config_reset_before_switch(&codex_home) {
-                    reset_codex_config_for_instance(&instance.id)?;
+                if switch_settings.reset_config_on_account_switch
+            && codex_home_needs_config_reset_before_switch(&codex_home) {
+                    reset_codex_config_for_switch(&instance.id, switch_settings.repair_sessions_on_account_switch)?;
                 }
                 let account_store = AccountStore::new_for_instance(
                     switcher_account_dir(),
@@ -1794,26 +1814,36 @@ async fn sync_api_key_account_to_instance(
                     &instance.id,
                 );
                 let session_store = SessionStore::new(codex_home.clone());
-                let switched = switch_account_and_sync_session_provider(
+                let switched = switch_account_with_session_options(
                     &account_store,
                     &session_store,
                     &account_id,
+                    switch_settings.repair_sessions_on_account_switch,
                 )?;
                 api_model_catalog::install(&codex_home, &account_id, &model_catalog)
                     .map_err(|error| format!("账号已切换，但模型目录写入失败，请重试：{error}"))?;
                 let mut report = |step: u8| emit(step);
-                let mut outcome = one_click_repair_session_store_with_native_history(&session_store, &mut report)
-                    .map_err(|error| format!("配置已同步，但一键修复会话失败：{error}"))?;
+                let mut outcome = repair_sessions_on_switch(
+                    &session_store,
+                    &mut report,
+                    switch_settings.repair_sessions_on_account_switch,
+                ).map_err(|error| format!("配置已同步，但一键修复会话失败：{error}"))?;
                 outcome.include_switch_warning(switched.warning.clone());
                 emit(3);
                 Ok((instance.name.clone(), switched, outcome))
             })?;
-        let repair_message = one_click_repair_message(&outcome);
+        let repair_message = if switch_settings.repair_sessions_on_account_switch {
+            one_click_repair_message(&outcome)
+        } else { "已跳过自动会话修复，保留现有会话".to_string() };
         let warning = (!outcome.warnings.is_empty()).then(|| outcome.warnings.join("；"));
-        let message = format!(
-            "实例“{instance_name}”已同步到 API Key 账号并重新打开；同步 {} 条已有会话；一键修复完成：{repair_message}",
-            switched.synchronized_session_provider_count
-        );
+        let message = if switch_settings.repair_sessions_on_account_switch {
+            format!(
+                "实例“{instance_name}”已同步到 API Key 账号并重新打开；同步 {} 条已有会话；{repair_message}",
+                switched.synchronized_session_provider_count
+            )
+        } else {
+            format!("实例“{instance_name}”已同步到 API Key 账号并重新打开；{repair_message}")
+        };
         Ok(ApiKeyAccountSyncSummary {
             instance_id,
             instance_name,
@@ -1853,14 +1883,27 @@ fn codex_config_uses_custom_model_provider(config_path: &Path) -> bool {
         .is_some_and(|provider| !provider.is_empty() && provider != "openai")
 }
 
-pub(crate) fn switch_account_and_sync_session_provider(
+#[cfg(test)]
+fn switch_account_and_sync_session_provider(
     account_store: &AccountStore,
     session_store: &SessionStore,
     account_id: &str,
 ) -> Result<CodexAccountSwitchResult, String> {
+    switch_account_with_session_options(account_store, session_store, account_id, true)
+}
+
+pub(crate) fn switch_account_with_session_options(
+    account_store: &AccountStore,
+    session_store: &SessionStore,
+    account_id: &str,
+    repair_sessions: bool,
+) -> Result<CodexAccountSwitchResult, String> {
     let account = account_store.switch_account(account_id)?;
-    let (synchronized_session_provider_count, warnings) =
-        prepare_sessions_after_configuration_change(session_store)?;
+    let (synchronized_session_provider_count, warnings) = if repair_sessions {
+        prepare_sessions_after_configuration_change(session_store)?
+    } else {
+        (0, Vec::new())
+    };
     Ok(CodexAccountSwitchResult {
         account,
         synchronized_session_provider_count,
@@ -2028,6 +2071,24 @@ impl OneClickStoreRepairOutcome {
     }
 }
 
+/// 自动切换遵循用户设置；手动修复仍直接调用原来的修复函数。
+pub(crate) fn repair_sessions_on_switch(
+    session_store: &SessionStore,
+    report_progress: &mut impl FnMut(u8),
+    repair_sessions: bool,
+) -> Result<OneClickStoreRepairOutcome, String> {
+    if repair_sessions {
+        one_click_repair_session_store_with_native_history(session_store, report_progress)
+    } else {
+        Ok(OneClickStoreRepairOutcome {
+            session_count: 0,
+            model_compatibility: Default::default(),
+            visibility: Default::default(),
+            warnings: Vec::new(),
+        })
+    }
+}
+
 pub(crate) fn one_click_repair_session_store(
     session_store: &SessionStore,
     report_progress: &mut impl FnMut(u8),
@@ -2161,7 +2222,10 @@ pub(crate) fn one_click_repair_sessions_blocking(
     let ((instance_name, outcome), was_running) =
         instances::run_with_instance_stopped(&instance_id, |instance| {
             let session_store = SessionStore::new(PathBuf::from(&instance.codex_home));
-            let outcome = one_click_repair_session_store_with_native_history(&session_store, &mut report_progress)?;
+            let outcome = one_click_repair_session_store_with_native_history(
+                &session_store,
+                &mut report_progress,
+            )?;
             Ok((instance.name.clone(), outcome))
         })?;
     let message = format!("已完成一键修复：{}", one_click_repair_message(&outcome));
@@ -2490,6 +2554,13 @@ fn default_codex_config_content(codex_home: &Path) -> Result<String, String> {
 }
 
 fn reset_codex_config_toml_in(codex_home: &Path) -> Result<CodexConfigFileContent, String> {
+    reset_codex_config_toml_with_session_options(codex_home, true)
+}
+
+fn reset_codex_config_toml_with_session_options(
+    codex_home: &Path,
+    repair_sessions: bool,
+) -> Result<CodexConfigFileContent, String> {
     let content = default_codex_config_content(codex_home)?;
     // Keep old generated artifacts as backups, but do not allow an old Engine
     // restore journal/profile to resurrect the routing after this explicit reset.
@@ -2505,7 +2576,9 @@ fn reset_codex_config_toml_in(codex_home: &Path) -> Result<CodexConfigFileConten
     }
     let restored =
         write_codex_config_file_to(codex_home, CodexConfigFileKind::ConfigToml, &content)?;
-    session::SessionStore::new(codex_home.to_path_buf()).repair_missing_opencodex_provider()?;
+    if repair_sessions {
+        session::SessionStore::new(codex_home.to_path_buf()).repair_missing_opencodex_provider()?;
+    }
     Ok(restored)
 }
 
@@ -2596,10 +2669,17 @@ async fn delete_codex_instance(
 pub(crate) fn reset_codex_config_for_instance(
     instance_id: &str,
 ) -> Result<CodexConfigFileContent, String> {
+    reset_codex_config_for_switch(instance_id, true)
+}
+
+pub(crate) fn reset_codex_config_for_switch(
+    instance_id: &str,
+    repair_sessions: bool,
+) -> Result<CodexConfigFileContent, String> {
     let codex_home = instances::codex_home_for(Some(instance_id))?;
     let path = codex_home.join("config.toml");
     let snapshot = read_file_snapshot(&path)?;
-    let restored = reset_codex_config_toml_in(&codex_home)?;
+    let restored = reset_codex_config_toml_with_session_options(&codex_home, repair_sessions)?;
     rollback_file_on_error(
         AccountStore::new_for_instance(switcher_account_dir(), codex_home.clone(), instance_id)
             .release_current_api_key_default_model(),
@@ -3092,7 +3172,6 @@ fn restore_codex_switcher_session_backup_to(
     }
 }
 
-
 #[tauri::command]
 fn delete_codex_switcher_backup(backup_path: String) -> Result<(), String> {
     let path = validate_backup_zip_path(&backup_path)?;
@@ -3256,6 +3335,23 @@ fn codex_list_session_content(
         limit,
         direction.as_deref(),
     )
+}
+
+#[tauri::command]
+async fn codex_export_session_markdown(
+    session_id: String,
+    title: String,
+    instance_id: Option<String>,
+) -> Result<session::MarkdownExportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let directory = dirs::download_dir()
+            .or_else(|| dirs::home_dir().map(|home| home.join("Downloads")))
+            .ok_or_else(|| "无法确定下载目录".to_string())?;
+        session_store_for_instance(instance_id.as_deref())?
+            .export_markdown(&session_id, &title, &directory)
+    })
+    .await
+    .map_err(|error| format!("导出 Markdown 任务失败: {error}"))?
 }
 
 #[tauri::command]
@@ -4964,6 +5060,61 @@ mod tests {
     }
 
     #[test]
+    fn switching_without_repair_preserves_session_bytes_and_custom_config() {
+        let storage = tempdir().unwrap();
+        let codex = tempdir().unwrap();
+        let directory = codex.path().join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("unchanged.jsonl");
+        let original = b"unparseable session data preserved exactly\n";
+        std::fs::write(&path, original).unwrap();
+        std::fs::write(
+            codex.path().join("config.toml"),
+            "model_provider = \"old-api\"\nmodel_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+        let accounts = AccountStore::new(storage.path().to_path_buf(), codex.path().to_path_buf());
+        let oauth = accounts.import_from_json(&json!({
+            "email":"fixture@example.com", "tokens":{"access_token":"fixture","id_token":"fixture","refresh_token":"fixture"}
+        }).to_string()).unwrap().remove(0);
+        let result = super::switch_account_with_session_options(
+            &accounts,
+            &SessionStore::new(codex.path().to_path_buf()),
+            &oauth.id,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.synchronized_session_provider_count, 0);
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        let config = std::fs::read_to_string(codex.path().join("config.toml")).unwrap();
+        assert!(config.contains("model_reasoning_effort = \"high\""));
+        assert!(config.contains("model_provider = \"openai\""));
+        assert!(!codex.path().join("state_5.sqlite").exists());
+    }
+
+    #[test]
+    fn switch_options_default_off_for_existing_settings_and_round_trip() {
+        let mut value = serde_json::to_value(super::CodexSwitcherSettings::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("resetConfigOnAccountSwitch");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("repairSessionsOnAccountSwitch");
+        let mut settings: super::CodexSwitcherSettings = serde_json::from_value(value).unwrap();
+        assert!(!settings.reset_config_on_account_switch);
+        assert!(!settings.repair_sessions_on_account_switch);
+        settings.reset_config_on_account_switch = true;
+        settings.repair_sessions_on_account_switch = true;
+        let loaded: super::CodexSwitcherSettings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert!(loaded.reset_config_on_account_switch);
+        assert!(loaded.repair_sessions_on_account_switch);
+    }
+
+    #[test]
     fn account_switch_recovers_images_and_resets_only_affected_projection() {
         let storage = tempdir().unwrap();
         let codex = tempdir().unwrap();
@@ -5722,6 +5873,40 @@ mod tests {
     }
 
     #[test]
+    fn resetting_config_without_session_repair_keeps_rollouts_and_database_untouched() {
+        let home = tempdir().unwrap();
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let path = sessions.join("old.jsonl");
+        let original =
+            "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"opencodex\"}}\n";
+        std::fs::write(&path, original).unwrap();
+        let database = home.path().join("state_5.sqlite");
+        std::fs::write(&database, b"untouched database fixture").unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "model_provider = 'opencodex'\n",
+        )
+        .unwrap();
+        let reset =
+            super::reset_codex_config_toml_with_session_options(home.path(), false).unwrap();
+        assert!(!reset.content.contains("opencodex"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+        assert_eq!(
+            std::fs::read(database).unwrap(),
+            b"untouched database fixture"
+        );
+        let outcome = super::repair_sessions_on_switch(
+            &SessionStore::new(home.path().to_path_buf()),
+            &mut |_| panic!("disabled repair must not report repair progress"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(outcome.session_count, 0);
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[test]
     fn config_reset_removes_empty_catalog_and_stale_integration_artifacts() {
         let home = tempdir().unwrap();
         let other = tempdir().unwrap();
@@ -6425,6 +6610,7 @@ pub fn run() {
             codex_get_session_token_stats_across_instances,
             codex_list_session_content,
             codex_get_session_asset,
+            codex_export_session_markdown,
             codex_delete_session_turn,
             codex_delete_session_messages,
             codex_restore_session_turn_backup,

@@ -325,6 +325,8 @@ let windowResizeFrame: number | undefined;
 let viewLoadTimer: number | undefined;
 const EXPANDED_LAYOUT_MIN_WIDTH = 1260;
 const settings = reactive<CodexSwitcherSettings>({
+  resetConfigOnAccountSwitch: false,
+  repairSessionsOnAccountSwitch: false,
   monitorQuota: true,
   quotaRefreshMinutes: 10,
   currentAccountRefreshMinutes: 10,
@@ -2112,6 +2114,8 @@ async function loadSettings(options: { includeStorage?: boolean } = {}): Promise
     ]);
     Object.assign(settings, {
       ...nextSettings,
+      resetConfigOnAccountSwitch: nextSettings.resetConfigOnAccountSwitch ?? false,
+      repairSessionsOnAccountSwitch: nextSettings.repairSessionsOnAccountSwitch ?? false,
       monitorQuota: true,
       badgeStyles: {
         ...defaultBadgeStyles(),
@@ -2692,6 +2696,7 @@ async function performAccountSwitch(instanceId: string): Promise<void> {
 
 /** API Key 账号同步配置的阶段文案，顺序与 Rust 侧 `codex-api-key-account-sync-progress` 的 step 一致。 */
 function apiKeyAccountSyncSteps(): string[] {
+  if (!settings.repairSessionsOnAccountSwitch) return [t("关闭实例并同步配置"), t("重新打开 Codex 实例")];
   return [t("关闭实例并同步配置"), t("修复切号会话"), t("恢复全部会话的完整历史"), t("重新打开 Codex 实例")];
 }
 
@@ -2705,8 +2710,10 @@ async function performApiKeyAccountSync(
   instanceName: string,
 ): Promise<void> {
   appBusy.value = {
-    title: `${t("正在同步配置并一键修复")}「${instanceName}」`,
-    message: t("同步配置后会先对该实例执行一键修复（切号修复 + 恢复全部完整会话），修复完成后再重新打开 Codex。请勿关闭应用。"),
+    title: `${t(settings.repairSessionsOnAccountSwitch ? "正在同步配置并一键修复" : "正在同步配置")} 「${instanceName}」`,
+    message: settings.repairSessionsOnAccountSwitch
+      ? t("同步配置后会先对该实例执行一键修复（切号修复 + 恢复全部完整会话），修复完成后再重新打开 Codex。请勿关闭应用。")
+      : t("仅更新登录凭据和必要的 API 路由配置，保留现有会话，完成后重新打开 Codex。"),
     steps: apiKeyAccountSyncSteps(),
     activeStep: 0,
   };
@@ -4973,7 +4980,7 @@ onMounted(() => {
   });
   void listen<{ step: number }>(API_KEY_ACCOUNT_SYNC_PROGRESS_EVENT, (event) => {
     if (appBusy.value?.steps) {
-      appBusy.value = { ...appBusy.value, activeStep: event.payload.step };
+      appBusy.value = { ...appBusy.value, activeStep: settings.repairSessionsOnAccountSwitch ? event.payload.step : (event.payload.step >= 3 ? 1 : 0) };
     }
   }).then((unlisten) => {
     apiKeyAccountSyncProgressUnlisten = unlisten;

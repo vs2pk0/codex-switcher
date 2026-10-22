@@ -258,9 +258,27 @@ fn update_binding_and_prepare_sessions(
     store: &AccountStore,
     oauth_account_id: Option<&str>,
 ) -> Result<Vec<String>, String> {
+    update_binding_with_session_options(
+        kind,
+        store,
+        oauth_account_id,
+        crate::read_switcher_settings()?.repair_sessions_on_account_switch,
+    )
+}
+
+fn update_binding_with_session_options(
+    kind: ServiceKind,
+    store: &AccountStore,
+    oauth_account_id: Option<&str>,
+    repair_sessions: bool,
+) -> Result<Vec<String>, String> {
     apply_service_oauth_binding(kind, store, oauth_account_id, true)?;
     let sessions = crate::session::SessionStore::new(store.codex_home().to_path_buf());
-    crate::prepare_sessions_after_configuration_change(&sessions).map(|(_, warnings)| warnings)
+    if repair_sessions {
+        crate::prepare_sessions_after_configuration_change(&sessions).map(|(_, warnings)| warnings)
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]
@@ -345,7 +363,7 @@ mod tests {
         .unwrap();
         for binding in [Some(oauth.id.as_str()), None, Some(oauth.id.as_str())] {
             let warnings =
-                update_binding_and_prepare_sessions(ServiceKind::OpenCodex, &store, binding)
+                update_binding_with_session_options(ServiceKind::OpenCodex, &store, binding, true)
                     .unwrap();
             assert!(warnings.is_empty(), "{warnings:?}");
             let updated: Vec<serde_json::Value> = std::fs::read_to_string(&path)

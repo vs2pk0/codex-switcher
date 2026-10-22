@@ -17,7 +17,7 @@ defineEmits<{
   <a-modal
     :visible="Boolean(result)"
     :title="t('下载完成')"
-    :width="620"
+    width="min(620px, calc(100vw - 32px))"
     :footer="false"
     @cancel="$emit('close')"
   >
@@ -37,6 +37,7 @@ defineEmits<{
         <span>{{ t("保存位置") }}</span>
         <code>{{ result.path }}</code>
       </div>
+      <slot />
       <div class="download-actions">
         <a-button @click="$emit('close')">{{ t("关闭") }}</a-button>
         <a-button type="primary" :loading="opening" @click="$emit('open-folder')">

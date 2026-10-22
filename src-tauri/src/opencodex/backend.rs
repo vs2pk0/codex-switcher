@@ -1879,6 +1879,10 @@ impl Backend {
                             "预检通过，已停止实例，仅同步接口和模型配置…",
                         );
                         let message = self.run_instance_integration_helper(&action, port, home)?;
+                        if !crate::read_switcher_settings()?.repair_sessions_on_account_switch {
+                            self.emit_log(&operation_id, "system", "已跳过自动会话修复，正在重新打开实例…");
+                            return Ok(format!("{message}；保留现有会话，正在重新打开实例"));
+                        }
                         // 配置同步后、实例重开前执行一键修复（切号修复 + 恢复全部完整会话）：
                         // 修复只改会话文件并自动备份，不迁移账号；期间实例保持关闭。
                         self.emit_log(
