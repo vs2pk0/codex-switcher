@@ -19,6 +19,43 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+export interface CreditBalanceSnapshot {
+  balance?: number;
+  rawBalance?: string;
+  unlimited: boolean;
+}
+
+/** Credits balance is separate from rate_limit_reset_credits (limit reset vouchers). */
+export function creditBalance(quota: CodexQuota | null | undefined): CreditBalanceSnapshot | undefined {
+  if (!isRecord(quota?.raw_data)) return undefined;
+  const root = quota.raw_data;
+  const data = isRecord(root.data) ? root.data : undefined;
+  const credits = isRecord(root.credits) ? root.credits : isRecord(data?.credits) ? data.credits : undefined;
+  if (!credits) return undefined;
+  const raw = credits.balance;
+  const rawBalance = typeof raw === "number" || typeof raw === "string" ? String(raw).trim() : "";
+  // Null/blank/boolean balances are unknown, never a zero balance.
+  const balance = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(rawBalance)
+    ? Number(rawBalance) : NaN;
+  return {
+    unlimited: credits.unlimited === true,
+    ...(Number.isFinite(balance) ? { balance, rawBalance } : {}),
+  };
+}
+
+export function hasCreditBalance(quota: CodexQuota | null | undefined): boolean {
+  const credits = creditBalance(quota);
+  return Boolean(credits?.unlimited || (credits?.balance !== undefined && credits.balance !== 0));
+}
+
+export function formatCreditBalance(balance: number, locale: string): string {
+  const formatter = new Intl.NumberFormat(locale, { maximumFractionDigits: 2 });
+  if (balance !== 0 && Math.abs(balance) < 0.01) {
+    return `${balance > 0 ? "<" : ">"} ${formatter.format(balance > 0 ? 0.01 : -0.01)}`;
+  }
+  return formatter.format(balance);
+}
+
 function isPositiveNumber(value: unknown): boolean {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
 }

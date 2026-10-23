@@ -11,11 +11,13 @@ import { currentLocale, formatLocalizedDuration, formatTranslatedText, t } from 
 import {
   additionalQuotaWindows,
   hasAnyQuotaWindow,
+  hasCreditBalance,
   hasQuotaWindow,
   stackQuotaAccounts,
   type AdditionalQuotaWindowSnapshot,
 } from "../quota";
 import PlanBadge from "./PlanBadge.vue";
+import CreditBalance from "./CreditBalance.vue";
 
 const props = defineProps<{
   accounts: CodexAccount[];
@@ -100,7 +102,8 @@ const accountGridStyle = computed<Record<string, string>>(() => {
     0,
   );
   const extraRows = Math.max(0, maxQuotaRows - 2);
-  const style: Record<string, string> = { "--additional-quota-height": `${extraRows * 70}px` };
+  const creditHeight = props.accounts.some(shouldShowCredits) ? 46 : 0;
+  const style: Record<string, string> = { "--additional-quota-height": `${extraRows * 70 + creditHeight}px` };
   if (isAdaptiveColumns.value) {
     // 自适应模式下按窗口宽度直接写列数，覆盖固定列数的样式规则。
     style.gridTemplateColumns = `repeat(${accountColumns.value}, minmax(0, 1fr))`;
@@ -279,6 +282,10 @@ function visibleQuotaRowCount(account: CodexAccount): number {
   const weeklyRows =
     !isFreePlanAccount(account) && hasQuotaWindow(account.quota, "weekly") ? 1 : 0;
   return primaryRows + weeklyRows + visibleAdditionalQuotaWindows(account).length;
+}
+
+function shouldShowCredits(account: CodexAccount): boolean {
+  return canShowQuota(account) && hasCreditBalance(account.quota) && !shouldShowQuotaError(account);
 }
 
 function shouldShowQuotaError(account: CodexAccount): boolean {
@@ -1354,6 +1361,12 @@ function formatTime(value?: number | null): string {
             </a-button>
           </div>
 
+          <CreditBalance
+            v-if="shouldShowCredits(account)"
+            :quota="account.quota"
+            :privacy-masked="privacyMasked"
+          />
+
           <div v-if="!isBoundApiKeyAccount(account)" class="status-grid">
             <div
               class="status-card"
@@ -1551,7 +1564,7 @@ function formatTime(value?: number | null): string {
             <span class="source-status-mark open-codex-pill" :title="t('已导入 OpenCodex')">O</span>
           </a-tooltip>
         </div>
-        <span v-if="shouldShowQuota(account) && account.quota" class="compact-quota-pair">
+        <span v-if="(shouldShowQuota(account) || shouldShowCredits(account)) && account.quota" class="compact-quota-pair">
           <span v-if="hasQuotaWindow(account.quota, 'hourly')">
             <i :style="quotaDotStyle(account.quota.hourly_percentage)" />
             {{ quotaPercentLabel(account.quota.hourly_percentage) }}
@@ -1560,11 +1573,12 @@ function formatTime(value?: number | null): string {
             <i :style="quotaDotStyle(account.quota.weekly_percentage)" />
             {{ quotaPercentLabel(account.quota.weekly_percentage) }}
           </span>
+          <CreditBalance v-if="shouldShowCredits(account)" :quota="account.quota" :privacy-masked="privacyMasked" inline />
         </span>
         <span v-if="shouldShowQuotaError(account)" class="compact-quota-error">
           {{ t("异常") }}
         </span>
-        <span v-if="!shouldShowQuota(account) && !shouldShowQuotaError(account)" class="compact-quota-pair muted">
+        <span v-if="!shouldShowQuota(account) && !shouldShowQuotaError(account) && !shouldShowCredits(account)" class="compact-quota-pair muted">
           <span><i />--</span>
           <span><i />--</span>
         </span>
@@ -1764,7 +1778,8 @@ function formatTime(value?: number | null): string {
                   {{ t("重新授权") }}
                 </a-button>
               </div>
-              <span v-else class="table-muted">{{ t("未获得订阅信息") }}</span>
+              <span v-else-if="!shouldShowCredits(account)" class="table-muted">{{ t("未获得订阅信息") }}</span>
+              <CreditBalance v-if="shouldShowCredits(account)" :quota="account.quota" :privacy-masked="privacyMasked" inline />
             </td>
             <td>
               <div class="table-actions">

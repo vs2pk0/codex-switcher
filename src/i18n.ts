@@ -28,6 +28,11 @@ export const languageOptions: Array<{ value: AppLanguage; label: string }> = [
 ];
 
 const en: Record<string, string> = {
+  "积分余额": "Credit balance",
+  "无限额度": "Unlimited credits",
+  "积分余额已隐藏": "Credit balance hidden",
+  "未返回积分余额，可刷新额度重试": "Credit balance unavailable; refresh usage to retry",
+
   "导出 MD": "Export MD",
   "正在导出 Markdown 和附件…": "Exporting Markdown and attachments…",
   "导出 Markdown 失败": "Markdown export failed",
@@ -1192,6 +1197,11 @@ const en: Record<string, string> = {
 };
 
 const ru: Record<string, string> = {
+  "积分余额": "Остаток кредитов",
+  "无限额度": "Безлимитные кредиты",
+  "积分余额已隐藏": "Остаток кредитов скрыт",
+  "未返回积分余额，可刷新额度重试": "Остаток кредитов недоступен; обновите данные",
+
   "中文": "Китайский",
   "繁體中文（台灣）": "Традиционный китайский (Тайвань)",
   "English": "Английский",
@@ -3182,6 +3192,11 @@ const dictionary: Record<Exclude<AppLanguage, "zh-CN" | "zh-TW">, Record<string,
 let reverseDictionary: Map<string, string> | null = null;
 
 const simplifiedToTraditional: Record<string, string> = {
+  "积分余额": "積分餘額",
+  "无限额度": "無限額度",
+  "积分余额已隐藏": "積分餘額已隱藏",
+  "未返回积分余额，可刷新额度重试": "未回傳積分餘額，可重新整理額度重試",
+
   "下载完成后将自动安装并重启应用。": "下載完成後將自動安裝並重新啟動應用程式。",
   "正在安装更新": "正在安裝更新",
   "正在校验并准备更新，完成后将自动重启": "正在驗證並準備更新，完成後將自動重新啟動",
