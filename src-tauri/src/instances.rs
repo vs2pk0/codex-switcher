@@ -1179,9 +1179,24 @@ fn launch_stored(instance: &StoredCodexInstance) -> Result<CodexInstance, String
         }
         #[cfg(windows)]
         hide_command_window(&mut command);
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("启动 Codex 实例失败：{error}"))?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            #[cfg(windows)]
+            Err(error) if windows::can_activate_store_app(&executable, &error) => {
+                return windows::launch_store_instance(instance, &executable).map_err(|detail| {
+                    format!(
+                        "启动 Codex 实例失败：直接启动 {} 被拒绝（{error}）；商店应用激活失败：{detail}",
+                        executable.display()
+                    )
+                });
+            }
+            Err(error) => {
+                return Err(format!(
+                    "启动 Codex 实例失败（{}）：{error}",
+                    executable.display()
+                ));
+            }
+        };
         thread::sleep(Duration::from_millis(550));
         if let Some(status) = child
             .try_wait()

@@ -153,6 +153,178 @@ fn store_root(path: &str) -> Option<PathBuf> {
     package.parent().map(Path::to_path_buf)
 }
 
+pub(super) fn can_activate_store_app(executable: &Path, error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+        && store_root(&executable.to_string_lossy()).is_some()
+}
+
+fn validate_store_activation(instance: &StoredCodexInstance) -> Result<(), String> {
+    // Shell activation is brokered by Windows and cannot inherit our per-process
+    // CODEX_HOME / CODEX_ELECTRON_USER_DATA_PATH overrides. Never open a different
+    // profile while reporting that an isolated instance was launched.
+    if instance.id != DEFAULT_INSTANCE_ID {
+        return Err("商店激活只能打开系统默认实例，不能保留多开实例的独立启动环境".to_string());
+    }
+    let home = dirs::home_dir().ok_or_else(|| "无法确定用户主目录".to_string())?;
+    if normalized_path(&instance.codex_home)
+        != normalized_path(&home.join(".codex").to_string_lossy())
+        || normalized_path(&instance.electron_data)
+            != normalized_path(&default_electron_data().to_string_lossy())
+    {
+        return Err("商店激活不能保留自定义数据目录，请使用标准默认目录后重试".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoreApplication {
+    app_user_model_id: String,
+    executable_path: String,
+}
+
+fn store_app_id<'a>(
+    executable: &Path,
+    applications: &'a [StoreApplication],
+) -> Result<&'a str, String> {
+    let expected = normalized_path(&executable.to_string_lossy());
+    applications
+        .iter()
+        .find(|app| normalized_path(&app.executable_path) == expected)
+        .map(|app| app.app_user_model_id.as_str())
+        .ok_or_else(|| {
+            format!(
+                "未找到此桌面程序对应的已注册商店入口：{}",
+                executable.display()
+            )
+        })
+}
+
+fn registered_store_apps() -> Result<Vec<StoreApplication>, String> {
+    // Read Application.Id from the registered manifest instead of assuming
+    // "!App" or a display name, which can change between Codex/ChatGPT releases.
+    let output = powershell(
+        r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$apps = @(Get-AppxPackage -Name 'OpenAI.Codex' | ForEach-Object {
+    $pkg = $_
+    $manifest = Get-AppxPackageManifest -Package $pkg.PackageFullName
+    foreach ($app in $manifest.Package.Applications.Application) {
+        if ($app.Id -and $app.Executable) {
+            [PSCustomObject]@{
+                appUserModelId = $pkg.PackageFamilyName + '!' + $app.Id
+                executablePath = Join-Path $pkg.InstallLocation $app.Executable
+            }
+        }
+    }
+})
+ConvertTo-Json -InputObject $apps -Compress
+"#,
+    )?;
+    serde_json::from_str(&output).map_err(|error| format!("解析商店应用入口失败：{error}"))
+}
+
+fn quote_workspace_argument(workspace: &str) -> String {
+    // Always quote the one workspace argument, including trailing backslashes
+    // and embedded quotes, using the CommandLineToArgvW escaping rules.
+    let mut result = String::from("\"");
+    let mut backslashes = 0;
+    for ch in workspace.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if ch == '"' {
+            result.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+        } else {
+            result.extend(std::iter::repeat_n('\\', backslashes));
+        }
+        result.push(ch);
+        backslashes = 0;
+    }
+    result.extend(std::iter::repeat_n('\\', backslashes * 2));
+    result.push('"');
+    result
+}
+
+fn activate_store_app(app_id: &str, workspace: Option<&str>) -> Result<(), String> {
+    let target = format!(r"shell:AppsFolder\{app_id}");
+    let parameters = workspace.map(|path| quote_workspace_argument(&application_path(path)));
+    // Shell extensions can require STA COM. Use a fresh thread so a Tauri
+    // worker's existing COM apartment does not change the activation behavior.
+    thread::spawn(move || {
+        use windows_sys::Win32::{
+            System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED},
+            UI::Shell::{
+                ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+            },
+        };
+        let initialized =
+            unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+        if initialized < 0 {
+            return Err(format!(
+                "初始化商店激活组件失败（HRESULT 0x{initialized:08X}）"
+            ));
+        }
+        let operation: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+        let target: Vec<u16> = target.encode_utf16().chain(Some(0)).collect();
+        let parameters: Option<Vec<u16>> =
+            parameters.map(|value| value.encode_utf16().chain(Some(0)).collect());
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+            lpVerb: operation.as_ptr(),
+            lpFile: target.as_ptr(),
+            lpParameters: parameters
+                .as_ref()
+                .map_or(std::ptr::null(), |value| value.as_ptr()),
+            nShow: 1,
+            ..Default::default()
+        };
+        // Let Windows activate the registered app, as the Start menu does.
+        // No PowerShell/cmd interpolation, elevation or package ACL changes.
+        let result = if unsafe { ShellExecuteExW(&mut info) } != 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "系统商店入口启动失败：{}",
+                std::io::Error::last_os_error()
+            ))
+        };
+        unsafe { CoUninitialize() };
+        result
+    })
+    .join()
+    .map_err(|_| "商店应用激活线程异常退出".to_string())?
+}
+
+pub(super) fn launch_store_instance(
+    instance: &StoredCodexInstance,
+    executable: &Path,
+) -> Result<CodexInstance, String> {
+    validate_store_activation(instance)?;
+    let applications = registered_store_apps()?;
+    let app_id = store_app_id(executable, &applications)?;
+    activate_store_app(app_id, instance.workspace.as_deref())?;
+    // Shell success means the activation request was accepted, not that the
+    // desktop is ready. Check the actual instance instead of the shell process.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let launched = checked_public_instance(instance.clone())?;
+        if launched.running {
+            return Ok(launched);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "商店启动请求已发送，但未检测到实例“{}”运行，请从开始菜单检查应用能否打开",
+                instance.name
+            ));
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn executable_matches(expected: &Path, actual: &str) -> bool {
     let expected = normalized_path(&expected.to_string_lossy());
     let actual = normalized_path(actual);
@@ -252,6 +424,100 @@ pub(super) fn list(instances: Vec<StoredCodexInstance>) -> Result<Vec<CodexInsta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn store_activation_fallback_only_handles_denied_desktop_package_launches() {
+        let desktop = Path::new("C:/Program Files/WindowsApps/OpenAI.Codex_2/app/ChatGPT.exe");
+        let denied = std::io::Error::from_raw_os_error(5);
+        assert!(can_activate_store_app(desktop, &denied));
+        assert!(!can_activate_store_app(
+            desktop,
+            &std::io::Error::from_raw_os_error(2)
+        ));
+        for other in [
+            "C:/Program Files/Codex/ChatGPT.exe",
+            "C:/Program Files/WindowsApps/OpenAI.Codex_2/app/resources/codex.exe",
+            "C:/Program Files/WindowsApps/Other.App_2/app/ChatGPT.exe",
+        ] {
+            assert!(!can_activate_store_app(Path::new(other), &denied));
+        }
+    }
+
+    #[test]
+    fn store_activation_cannot_redirect_an_isolated_or_custom_home_instance() {
+        let mut instance = default_instance();
+        instance.codex_home = dirs::home_dir()
+            .unwrap()
+            .join(".codex")
+            .to_string_lossy()
+            .into();
+        assert!(validate_store_activation(&instance).is_ok());
+        instance.id = "work".into();
+        assert!(validate_store_activation(&instance)
+            .unwrap_err()
+            .contains("多开实例"));
+        instance.id = DEFAULT_INSTANCE_ID.into();
+        instance.codex_home.push_str("-custom");
+        assert!(validate_store_activation(&instance).is_err());
+        instance.codex_home.truncate(instance.codex_home.len() - 7);
+        instance.electron_data.push_str("-custom");
+        assert!(validate_store_activation(&instance).is_err());
+    }
+
+    #[test]
+    fn store_activation_uses_the_registered_id_for_the_exact_desktop_executable() {
+        let apps: Vec<StoreApplication> = serde_json::from_value(serde_json::json!([
+            {
+                "appUserModelId": "OpenAI.Codex_publisher!Helper",
+                "executablePath": "C:/Program Files/WindowsApps/OpenAI.Codex_2/app/resources/codex.exe"
+            },
+            {
+                "appUserModelId": "OpenAI.Codex_publisher!ChatGPT",
+                "executablePath": "C:/Program Files/WindowsApps/OpenAI.Codex_2/app/ChatGPT.exe"
+            },
+            {
+                "appUserModelId": "OpenAI.Codex_publisher!App",
+                "executablePath": "D:/WindowsApps/OpenAI.Codex_1/app/Codex.exe"
+            }
+        ])).unwrap();
+        assert_eq!(
+            store_app_id(
+                Path::new(r"\\?\C:\Program Files\WindowsApps\OpenAI.Codex_2\app\ChatGPT.exe"),
+                &apps
+            )
+            .unwrap(),
+            "OpenAI.Codex_publisher!ChatGPT"
+        );
+        assert_eq!(
+            store_app_id(
+                Path::new("d:/windowsapps/openai.codex_1/app/codex.exe"),
+                &apps
+            )
+            .unwrap(),
+            "OpenAI.Codex_publisher!App"
+        );
+        assert!(store_app_id(
+            Path::new("C:/Program Files/WindowsApps/OpenAI.Codex_1/app/ChatGPT.exe"),
+            &apps
+        )
+        .is_err());
+        assert!(store_app_id(Path::new("C:/Codex/ChatGPT.exe"), &[]).is_err());
+    }
+
+    #[test]
+    fn store_workspace_arguments_round_trip_without_shell_interpolation() {
+        for workspace in [
+            r"C:\用户\工作 A",
+            r"C:\",
+            r"C:\Work Space\",
+            r"\\server\share\工作\",
+            r#"C:\work\a\"quoted"#,
+            r"C:\work\$(& other);'project",
+        ] {
+            let command = format!("ChatGPT.exe {}", quote_workspace_argument(workspace));
+            assert_eq!(arguments(&command), vec!["ChatGPT.exe", workspace]);
+        }
+    }
 
     #[test]
     fn process_identity_excludes_helpers_cli_and_neighbor_profiles() {
