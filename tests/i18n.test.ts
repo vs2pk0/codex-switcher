@@ -4,6 +4,30 @@ import { currentLanguage, formatTranslatedText, t } from "../src/i18n.ts";
 
 const originalLanguage = currentLanguage.value;
 
+test("Fast 设置说明支持全部界面语言", () => {
+  const description = "开启后默认使用 Fast 档位；需 API 和模型支持，费用以服务商为准。关闭后恢复原有配置。";
+  for (const language of ["en", "ru", "zh-TW"] as const) {
+    currentLanguage.value = language;
+    assert.notEqual(t(description), description);
+  }
+});
+
+test("API 账号偏好支持全部界面语言", () => {
+  for (const language of ["en", "ru", "zh-TW"] as const) {
+    currentLanguage.value = language;
+    for (const text of ["API 账号偏好", "自定义上下文压缩阈值", "自动压缩阈值", "思考强度调节", "支持的思考档位", "默认思考强度", "禁用内置联网搜索", "API 不支持 web_search 工具时开启，避免请求因工具类型不受支持而失败。", "自动压缩阈值必须为 1 到 2147483647 之间的整数", "请选择有效且不重复的思考档位，并将默认强度设为其中一档"])
+      assert.notEqual(t(text), text, `${language}: ${text}`);
+  }
+});
+
+test("全局时区设置支持全部界面语言", () => {
+  for (const language of ["en", "ru", "zh-TW"] as const) {
+    currentLanguage.value = language;
+    for (const text of ["时区", "跟随系统时区", "使用时区", "当前时间", "开始时间", "结束时间", "所有页面的时间显示、日期筛选、统计和预约均使用此时区。"])
+      assert.notEqual(t(text), text, `${language}: ${text}`);
+  }
+});
+
 test("应用内更新和重启提示支持全部界面语言", () => {
   for (const language of ["en", "ru", "zh-TW"] as const) {
     currentLanguage.value = language;

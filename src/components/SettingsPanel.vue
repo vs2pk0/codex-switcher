@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import ApiModelSettingsPanel from "./ApiModelSettingsPanel.vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import type {
   CodexConfigFileKind,
   CodexSwitcherBackupFile,
@@ -9,6 +10,7 @@ import type {
 import type { CodexInstance } from "../services/instances";
 import { instanceDisplayName } from "../services/instances";
 import { languageOptions, setLanguage, t } from "../i18n";
+import { effectiveTimeZone, formatAppDateTime, supportedTimeZones, systemTimeZone, timeZoneOffsetLabel } from "../timeZone";
 
 const props = defineProps<{
   settings: CodexSwitcherSettings;
@@ -64,6 +66,29 @@ function changeLanguage(value: unknown): void {
   if (typeof value !== "string") return;
   props.settings.language = value;
   setLanguage(value);
+  emit("save");
+}
+
+const clock = ref(Date.now());
+const offsetClock = computed(() => Math.floor(clock.value / 60_000) * 60_000);
+let clockTimer: ReturnType<typeof setInterval> | undefined;
+onMounted(() => { clockTimer = setInterval(() => { clock.value = Date.now(); }, 1000); });
+onBeforeUnmount(() => { if (clockTimer) clearInterval(clockTimer); });
+const zoneCities: Record<string, string> = {
+  "Asia/Shanghai": "北京", "Asia/Hong_Kong": "香港", "Asia/Taipei": "台北", "Asia/Singapore": "新加坡",
+  "Asia/Tokyo": "东京", "Asia/Seoul": "首尔", "Asia/Bangkok": "曼谷", "Asia/Calcutta": "新德里", "Asia/Kolkata": "新德里",
+  "Asia/Katmandu": "加德满都", "Asia/Kathmandu": "加德满都", "Asia/Dubai": "迪拜", "Europe/Moscow": "莫斯科",
+  "Europe/Berlin": "柏林", "Europe/Paris": "巴黎", "Europe/London": "伦敦", "America/Los_Angeles": "洛杉矶",
+  "America/New_York": "纽约", "Australia/Sydney": "悉尼", "Pacific/Auckland": "奥克兰",
+};
+function zoneLabel(zone: string): string {
+  return `(${timeZoneOffsetLabel(zone, offsetClock.value)}) ${zoneCities[zone] ? `${t(zoneCities[zone])} · ` : ""}${zone}`;
+}
+const zoneOptions = computed(() => [...new Set([...supportedTimeZones(), ...(props.settings.timeZone && props.settings.timeZone !== "system" ? [props.settings.timeZone] : [])])]
+  .map(value => ({ value, label: zoneLabel(value) })));
+function changeTimeZone(value: unknown): void {
+  if (typeof value !== "string") return;
+  props.settings.timeZone = value;
   emit("save");
 }
 
@@ -139,6 +164,19 @@ function displayPath(path?: string): string {
           </a-card>
         </div>
       </div>
+      <ApiModelSettingsPanel :settings="settings.apiModelSettings" :saving="saving" @save="emit('save')" />
+      <a-card :bordered="false" class="settings-card settings-time-zone">
+        <div class="section-heading"><div><h2>{{ t("时区") }}</h2><p>{{ t("所有页面的时间显示、日期筛选、统计和预约均使用此时区。") }}</p></div></div>
+        <div class="time-zone-system"><strong>{{ t("系统时区") }}</strong><span>{{ zoneLabel(systemTimeZone) }}</span></div>
+        <div class="preference-row">
+          <div class="preference-copy"><strong>{{ t("使用时区") }}</strong><p>{{ t("默认跟随系统，手动选择后立即生效并自动保存。") }}</p></div>
+          <div class="preference-control time-zone-control"><a-select :aria-label="t('使用时区')" :model-value="settings.timeZone || 'system'" :disabled="saving" allow-search popup-container="body" @change="changeTimeZone">
+            <a-option value="system">{{ t("跟随系统时区") }}</a-option>
+            <a-option v-for="zone in zoneOptions" :key="zone.value" :value="zone.value" :label="zone.label" />
+          </a-select></div>
+        </div>
+        <p class="time-zone-current">{{ t("当前时间") }}：{{ formatAppDateTime(clock, { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) }} · {{ effectiveTimeZone }}</p>
+      </a-card>
       <div class="settings-utilities">
         <a-card :title="t('配置')" :bordered="false" class="settings-card settings-config">
           <p class="settings-hint">
@@ -192,7 +230,7 @@ function displayPath(path?: string): string {
                 <div class="backup-main">
                   <div class="backup-name">{{ backup.name }}</div>
                   <div class="backup-meta">
-                    <span>{{ backup.createdAt }}</span>
+                    <span>{{ formatAppDateTime(backup.createdAt) }}</span>
                     <span>{{ formatFileSize(backup.sizeBytes) }}</span>
                   </div>
                 </div>
@@ -265,6 +303,12 @@ function displayPath(path?: string): string {
 .instance-status i { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
 .instance-status.running { color: #21a65d; }
 .settings-main-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); align-items: stretch; gap: 20px; }
+.settings-time-zone { margin-top: 20px; }
+.time-zone-system { display: flex; flex-wrap: wrap; gap: 12px; padding: 14px 16px; border-radius: 8px; background: #f5f7fa; color: #7a879c; }
+.time-zone-system strong { color: #28364b; }
+.time-zone-control { flex: 0 1 440px; min-width: 180px; }
+.preference-control.time-zone-control :deep(.arco-select) { width: 100%; }
+.time-zone-current { color: #7a879c; font-size: 13px; overflow-wrap: anywhere; }
 .settings-column { display: contents; }
 /* 两列共享网格行，让对应卡片随最高内容自然等高。 */
 .settings-main-grid .settings-switching { grid-area: 1 / 1; }

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatAppDateTime } from "../timeZone";
 import type { CodexSwitcherBackupFile } from "../services/codex";
 import { t } from "../i18n";
 
@@ -34,7 +35,7 @@ defineEmits<{
           <div class="session-restore-main">
             <strong>{{ backup.name }}</strong>
             <span>
-              {{ backup.createdAt }} · {{ t("来源实例") }}：{{ backup.sourceInstanceName || t("旧版/未知") }}
+              {{ formatAppDateTime(backup.createdAt) }} · {{ t("来源实例") }}：{{ backup.sourceInstanceName || t("旧版/未知") }}
             </span>
           </div>
           <a-button type="primary" :disabled="backupWorking" @click="$emit('restore', backup)">

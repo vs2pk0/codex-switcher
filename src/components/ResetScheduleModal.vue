@@ -2,6 +2,8 @@
 import { ref, watch } from "vue";
 import { Message } from "@arco-design/web-vue";
 import { t } from "../i18n";
+import { effectiveTimeZone, parseWallTime } from "../timeZone";
+import TimeZoneDateTimeInput from "./TimeZoneDateTimeInput.vue";
 import {
   formatLocalScheduleInput,
   parseLocalScheduleInput,
@@ -31,6 +33,12 @@ watch(
       : "";
   },
 );
+
+watch(effectiveTimeZone, (_zone, previous) => {
+  if (!props.visible || !scheduledAtInput.value) return;
+  const timestamp = parseWallTime(scheduledAtInput.value, previous);
+  if (timestamp !== null) scheduledAtInput.value = formatLocalScheduleInput(timestamp);
+});
 
 function updateVisible(visible: boolean): void {
   if (props.saving) return;
@@ -68,15 +76,13 @@ function submitSchedule(): void {
         {{ t(mode === "edit" ? "修改以下账号的预约时间" : "将为以下账号预约一次重置") }}
       </p>
       <strong class="reset-schedule-account">{{ accountLabel }}</strong>
-      <a-date-picker
+      <TimeZoneDateTimeInput
         v-model="scheduledAtInput"
-        show-time
-        format="YYYY-MM-DD HH:mm"
-        value-format="YYYY-MM-DD HH:mm"
-        :placeholder="t('选择重置时间')"
+        :label="t('选择重置时间')"
         :disabled="saving"
         class="reset-schedule-date-picker"
       />
+      <small>{{ t("时区") }}：{{ effectiveTimeZone }}</small>
       <div class="reset-schedule-modal-actions">
         <a-button :disabled="saving" @click="updateVisible(false)">
           {{ t("取消") }}

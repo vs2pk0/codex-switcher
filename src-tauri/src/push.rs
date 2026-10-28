@@ -1,9 +1,10 @@
+use crate::app_time::AppTimeZone;
 use crate::{
     account::{write_bytes_atomic, AccountStore, CodexAccount, CodexQuota},
     fetch_codex_quota_for_account, switcher_config_data_dir,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
 use hmac::{Hmac, Mac};
 use reqwest::{Client, Url};
@@ -1445,8 +1446,8 @@ fn format_expiry_line(label: &str, expiry: Option<DateTime<Utc>>, now: DateTime<
     let Some(expiry) = expiry else {
         return format!("- **{label}**：未知");
     };
-    let time = expiry
-        .with_timezone(&Local)
+    let time = AppTimeZone::current()
+        .convert(expiry)
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
     let remaining_seconds = (expiry.timestamp() - now.timestamp()).max(0) as u64;
@@ -1747,7 +1748,7 @@ fn format_reset_time(timestamp: Option<i64>) -> String {
         .map(|value| {
             format!(
                 " · {} 重置",
-                value.with_timezone(&Local).format("%m-%d %H:%M")
+                AppTimeZone::current().convert(value).format("%m-%d %H:%M")
             )
         })
         .unwrap_or_default()
@@ -1781,7 +1782,8 @@ fn format_timestamp(value: i64) -> String {
     normalize_unix_seconds(value)
         .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
         .map(|date| {
-            date.with_timezone(&Local)
+            AppTimeZone::current()
+                .convert(date)
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string()
         })

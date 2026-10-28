@@ -1,3 +1,5 @@
+import { formatAppDateTime } from "../timeZone.ts";
+
 export function hasAvailableResetCredit<T>(
   records: readonly T[],
   isAvailable: (record: T) => boolean,
@@ -9,13 +11,13 @@ export function formatResetDateTime(timestamp: number, locale: string): string {
   if (!Number.isFinite(timestamp)) return "—";
   const date = new Date(timestamp);
   if (Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat(locale, {
+  return formatAppDateTime(date, {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-  }).format(date);
+  }, locale);
 }
 
 export interface ResetCreditRowActionState {

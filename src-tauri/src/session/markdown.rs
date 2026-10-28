@@ -53,6 +53,7 @@ fn export_snapshot(
     writeln!(output, "# {}\n", label(title)).map_err(|e| e.to_string())?;
     let mut cursor = 0;
     let mut sequence = 0;
+    let zone = crate::app_time::AppTimeZone::current();
     loop {
         let (turns, next) = read_session_turn_page(source, cursor, 50)?;
         for turn in turns {
@@ -64,8 +65,14 @@ fn export_snapshot(
                 } else {
                     "助手"
                 };
-                writeln!(output, "### {role} · {}\n", label(&message.timestamp))
-                    .map_err(|e| e.to_string())?;
+                let time = chrono::DateTime::parse_from_rfc3339(&message.timestamp)
+                    .map(|value| {
+                        zone.convert(value.with_timezone(&chrono::Utc))
+                            .format("%Y-%m-%d %H:%M:%S %:z")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|_| message.timestamp.clone());
+                writeln!(output, "### {role} · {}\n", label(&time)).map_err(|e| e.to_string())?;
                 // Resolve attachments first so recovered inline images also fix body links.
                 let attachments = message
                     .attachments

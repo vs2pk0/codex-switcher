@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { currentTimeZone, formatAppDateTime, formatWallTime, setTimeZone, trackSystemTimeZone } from "./timeZone";
+import { defaultApiModelSettings, normalizeApiModelSettings, validateApiModelSettings } from "./services/apiModelSettings";
 import {
   computed,
   defineAsyncComponent,
@@ -290,6 +292,7 @@ const savingApiKey = ref(false);
 const refreshingAllQuotas = ref(false);
 const settingsLoading = ref(false);
 const savingSettings = ref(false);
+const savedApiFastMode = ref(false);
 const configEditorVisible = ref(false);
 const configEditorKind = ref<CodexConfigFileKind>("auth");
 const configEditorFile = ref<CodexConfigFileContent | null>(null);
@@ -325,6 +328,7 @@ let windowResizeFrame: number | undefined;
 let viewLoadTimer: number | undefined;
 const EXPANDED_LAYOUT_MIN_WIDTH = 1260;
 const settings = reactive<CodexSwitcherSettings>({
+  apiModelSettings: defaultApiModelSettings(),
   resetConfigOnAccountSwitch: false,
   repairSessionsOnAccountSwitch: false,
   monitorQuota: true,
@@ -347,6 +351,7 @@ const settings = reactive<CodexSwitcherSettings>({
   badgeStyles: defaultBadgeStyles(),
   maxColumns: ADAPTIVE_COLUMNS,
   language: "zh-CN",
+  timeZone: currentTimeZone.value,
 });
 
 const oauthLoginId = ref("");
@@ -1216,13 +1221,13 @@ function maskSensitiveJson(value: unknown): unknown {
 
 function formatTime(timestamp: number): string {
   if (!Number.isFinite(timestamp) || timestamp <= 0) return "--";
-  return new Intl.DateTimeFormat("zh-CN", {
+  return formatAppDateTime(timestamp * 1000, {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-  }).format(new Date(timestamp * 1000));
+  });
 }
 
 function parseFlexibleDate(value?: string): Date | null {
@@ -1240,13 +1245,13 @@ function parseFlexibleDate(value?: string): Date | null {
 function formatDateTime(value?: string): string {
   const date = parseFlexibleDate(value);
   if (!date) return "--";
-  return new Intl.DateTimeFormat("zh-CN", {
+  return formatAppDateTime(date, {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-  }).format(date);
+  });
 }
 
 function expiryDaysLabel(value?: string): string {
@@ -2114,6 +2119,7 @@ async function loadSettings(options: { includeStorage?: boolean } = {}): Promise
     ]);
     Object.assign(settings, {
       ...nextSettings,
+      apiModelSettings: normalizeApiModelSettings(nextSettings.apiModelSettings),
       resetConfigOnAccountSwitch: nextSettings.resetConfigOnAccountSwitch ?? false,
       repairSessionsOnAccountSwitch: nextSettings.repairSessionsOnAccountSwitch ?? false,
       monitorQuota: true,
@@ -2136,8 +2142,11 @@ async function loadSettings(options: { includeStorage?: boolean } = {}): Promise
       tokenKeeperEnabled: nextSettings.tokenKeeperEnabled ?? true,
       maxColumns: normalizeMaxColumns(nextSettings.maxColumns),
       language: nextSettings.language || "zh-CN",
+      timeZone: nextSettings.timeZone || "system",
     });
+    savedApiFastMode.value = settings.apiModelSettings.fastMode;
     setLanguage(settings.language);
+    setTimeZone(settings.timeZone);
     if (nextPaths) appPaths.value = nextPaths;
     if (nextBackups) backupFiles.value = nextBackups;
     resetQuotaTimer();
@@ -2172,6 +2181,12 @@ async function loadSessionBackups(options: { silent?: boolean } = {}): Promise<v
 }
 
 async function saveSettings(): Promise<void> {
+  const apiSettingsError = validateApiModelSettings(settings.apiModelSettings);
+  if (apiSettingsError) {
+    settings.apiModelSettings.fastMode = savedApiFastMode.value;
+    Message.warning(apiSettingsError);
+    return;
+  }
   savingSettings.value = true;
   try {
     const saved = await updateCodexSwitcherSettings({
@@ -2198,13 +2213,18 @@ async function saveSettings(): Promise<void> {
       tokenKeeperEnabled: settings.tokenKeeperEnabled ?? true,
       maxColumns: normalizeMaxColumns(settings.maxColumns),
       language: settings.language || "zh-CN",
+      timeZone: settings.timeZone || "system",
     });
     Object.assign(settings, saved);
+    savedApiFastMode.value = settings.apiModelSettings.fastMode;
     setLanguage(settings.language);
+    setTimeZone(settings.timeZone);
     resetQuotaTimer();
     resetCurrentAccountQuotaTimer();
     Message.success("设置已保存");
   } catch (error) {
+    settings.apiModelSettings.fastMode = savedApiFastMode.value;
+    settings.timeZone = currentTimeZone.value;
     Message.error(`保存设置失败：${errorText(error)}`);
   } finally {
     savingSettings.value = false;
@@ -3068,7 +3088,7 @@ async function openExportDownloadFolder(): Promise<void> {
 
 function downloadBatchExportText(): void {
   const suffix = exportFormat.value === "switcher_json" ? "" : `_${exportFormat.value}`;
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const timestamp = formatWallTime(Date.now(), true, "-").replace(/[ :]/g, "-");
   void downloadJsonText(batchExportText.value, `codex-switcher-batch${suffix}_${timestamp}.json`);
 }
 
@@ -4889,7 +4909,9 @@ watch(
   },
 );
 
+let stopTrackingSystemTimeZone: (() => void) | undefined;
 onMounted(() => {
+  stopTrackingSystemTimeZone = trackSystemTimeZone();
   void takeAppUpdateInstallError().then((message) => {
     if (message) Modal.error({ title: t("更新安装失败"), content: message });
   }).catch((error) => console.error("读取更新安装结果失败", error));
@@ -4988,6 +5010,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  stopTrackingSystemTimeZone?.();
   oauthUnlisten?.();
   appUpdateUnlisten?.();
   apiServiceAutoUpdateUnlisten?.();

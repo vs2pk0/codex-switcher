@@ -1,3 +1,4 @@
+use crate::app_time::AppTimeZone;
 use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime, TimeZone,
     Timelike,
@@ -408,7 +409,9 @@ pub fn get_codex_usage_activity(
 ) -> Result<CodexUsageActivity, String> {
     let _data_guard = lock_usage_data()?;
     let targets = resolve_usage_targets(instance_id.as_deref(), all_instances.unwrap_or(false))?;
-    let start = local_day_start_timestamp(usage_activity_start_date(Local::now().date_naive()));
+    let zone = AppTimeZone::current();
+    let now = zone.now();
+    let start = zone.day_start(usage_activity_start_date(now.date_naive()));
     let mut logs_by_instance = Vec::new();
     for target in &targets {
         let (conn, _) = ensure_usage_cache_db(target, refresh.unwrap_or(false))?;
@@ -418,7 +421,7 @@ pub fn get_codex_usage_activity(
         ));
     }
     let logs = aggregate_instance_usage_logs(logs_by_instance);
-    Ok(build_usage_activity(&logs))
+    Ok(build_usage_activity_in_zone(&logs, zone, now.timestamp()))
 }
 
 pub fn list_model_pricing() -> Result<Vec<CodexUsagePricing>, String> {
@@ -1614,8 +1617,12 @@ fn summarize_logs(
     summary
 }
 
-fn build_usage_activity(logs: &[ParsedUsageLog]) -> CodexUsageActivity {
-    let today = Local::now().date_naive();
+fn build_usage_activity_in_zone(
+    logs: &[ParsedUsageLog],
+    zone: AppTimeZone,
+    now: i64,
+) -> CodexUsageActivity {
+    let today = zone.at(now).unwrap_or_else(|| zone.now()).date_naive();
     let start_date = usage_activity_start_date(today);
     let day_count = 53 * 7;
     let mut day_tokens: HashMap<NaiveDate, (u64, usize)> = HashMap::new();
@@ -1623,10 +1630,9 @@ fn build_usage_activity(logs: &[ParsedUsageLog]) -> CodexUsageActivity {
     let mut session_ranges: HashMap<String, (i64, i64)> = HashMap::new();
 
     for log in logs {
-        let local_time = Local
-            .timestamp_opt(log.created_at, 0)
-            .single()
-            .unwrap_or_else(Local::now);
+        let Some(local_time) = zone.at(log.created_at) else {
+            continue;
+        };
         let date = local_time.date_naive();
         let entry = day_tokens.entry(date).or_default();
         entry.0 += log_total_tokens(log);
@@ -1650,11 +1656,11 @@ fn build_usage_activity(logs: &[ParsedUsageLog]) -> CodexUsageActivity {
     let mut hours = Vec::with_capacity(24);
     for hour in 0..24 {
         let (tokens, requests) = hour_tokens.get(&hour).copied().unwrap_or_default();
-        let timestamp = Local
-            .with_ymd_and_hms(today.year(), today.month(), today.day(), hour, 0, 0)
-            .earliest()
+        let timestamp = today
+            .and_hms_opt(hour, 0, 0)
+            .and_then(|naive| zone.from_local(&naive))
             .map(|date_time| date_time.timestamp())
-            .unwrap_or_else(|| Local::now().timestamp());
+            .unwrap_or_else(|| zone.day_start(today));
         hours.push(CodexUsageActivityHour {
             hour,
             label: format!("{:02}:00", hour),
@@ -1670,7 +1676,7 @@ fn build_usage_activity(logs: &[ParsedUsageLog]) -> CodexUsageActivity {
         let (tokens, requests) = day_tokens.get(&date).copied().unwrap_or_default();
         days.push(CodexUsageActivityDay {
             date: date.format("%Y-%m-%d").to_string(),
-            timestamp: local_day_start_timestamp(date),
+            timestamp: zone.day_start(date),
             tokens,
             requests,
         });
@@ -1707,15 +1713,9 @@ fn usage_activity_start_date(today: NaiveDate) -> NaiveDate {
     current_week_start - ChronoDuration::weeks(52)
 }
 
+#[cfg(test)]
 fn local_day_start_timestamp(date: NaiveDate) -> i64 {
-    let Some(naive) = date.and_hms_opt(0, 0, 0) else {
-        return Local::now().timestamp();
-    };
-    Local
-        .from_local_datetime(&naive)
-        .earliest()
-        .map(|date_time| date_time.timestamp())
-        .unwrap_or_else(|| Local::now().timestamp())
+    AppTimeZone::current().day_start(date)
 }
 
 fn legacy_session_id_from_request_id(request_id: &str) -> Option<&str> {
@@ -1764,17 +1764,17 @@ fn build_trends(
     pricing: &[CodexUsagePricing],
     cost_multiplier: f64,
 ) -> Vec<CodexUsageTrendPoint> {
-    let now = Local::now().timestamp();
+    let zone = AppTimeZone::current();
+    let now = zone.now().timestamp();
     let end = end_date.unwrap_or(now);
     let start = start_date.unwrap_or(end - 24 * 60 * 60);
-    let same_local_day = Local
-        .timestamp_opt(start, 0)
-        .single()
-        .zip(Local.timestamp_opt(end, 0).single())
+    let same_local_day = zone
+        .at(start)
+        .zip(zone.at(end))
         .is_some_and(|(start, end)| start.date_naive() == end.date_naive());
     let hourly = same_local_day || end.saturating_sub(start) <= 24 * 60 * 60;
     if !hourly {
-        return build_daily_trends(logs, start, end, pricing, cost_multiplier);
+        return build_daily_trends_in_zone(logs, start, end, pricing, cost_multiplier, zone);
     }
     let bucket_seconds = 60 * 60;
     let bucket_count = (end.saturating_sub(start) / bucket_seconds + 1).clamp(1, 60) as usize;
@@ -1783,7 +1783,7 @@ fn build_trends(
         let timestamp = start + index as i64 * bucket_seconds;
         buckets.push(CodexUsageTrendPoint {
             timestamp,
-            label: format_trend_label(timestamp, hourly),
+            label: format_trend_label(timestamp, hourly, zone),
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
@@ -1809,21 +1809,20 @@ fn build_trends(
     buckets
 }
 
-fn build_daily_trends(
+fn build_daily_trends_in_zone(
     logs: &[ParsedUsageLog],
     start: i64,
     end: i64,
     pricing: &[CodexUsagePricing],
     cost_multiplier: f64,
+    zone: AppTimeZone,
 ) -> Vec<CodexUsageTrendPoint> {
-    let start_day = Local
-        .timestamp_opt(start, 0)
-        .single()
+    let start_day = zone
+        .at(start)
         .map(|datetime| datetime.date_naive())
-        .unwrap_or_else(|| Local::now().date_naive());
-    let end_day = Local
-        .timestamp_opt(end, 0)
-        .single()
+        .unwrap_or_else(|| zone.now().date_naive());
+    let end_day = zone
+        .at(end)
         .map(|datetime| datetime.date_naive())
         .unwrap_or(start_day);
     let bucket_count = (end_day
@@ -1834,7 +1833,7 @@ fn build_daily_trends(
     let mut buckets = Vec::with_capacity(bucket_count);
     for index in 0..bucket_count {
         let date = start_day + ChronoDuration::days(index as i64);
-        let timestamp = local_day_start_timestamp(date);
+        let timestamp = zone.day_start(date);
         buckets.push(CodexUsageTrendPoint {
             timestamp,
             label: date.format("%m/%d").to_string(),
@@ -1850,9 +1849,8 @@ fn build_daily_trends(
         if log.created_at < start || log.created_at > end {
             continue;
         }
-        let Some(log_day) = Local
-            .timestamp_opt(log.created_at, 0)
-            .single()
+        let Some(log_day) = zone
+            .at(log.created_at)
             .map(|datetime| datetime.date_naive())
         else {
             continue;
@@ -3291,8 +3289,8 @@ fn rollout_filename_timestamp_in_timezone<Tz: TimeZone>(path: &Path, timezone: &
         .map(|datetime| datetime.timestamp())
 }
 
-fn format_trend_label(timestamp: i64, hourly: bool) -> String {
-    let Some(datetime) = Local.timestamp_opt(timestamp, 0).single() else {
+fn format_trend_label(timestamp: i64, hourly: bool, zone: AppTimeZone) -> String {
+    let Some(datetime) = zone.at(timestamp) else {
         return "--".to_string();
     };
     if hourly {
@@ -4773,6 +4771,62 @@ mod tests {
             &HashSet::from(["root".to_string()]),
         );
         assert_eq!(logs, vec![root]);
+    }
+
+    #[test]
+    fn selected_time_zone_controls_activity_dates_hours_and_daily_trends() {
+        let zone = AppTimeZone::new("Asia/Shanghai");
+        let mut first = sample_log("one", "s", "r", UsageLogSourceKind::CanonicalRoot, 100);
+        first.created_at = parse_rfc3339_timestamp("2026-10-25T15:30:00Z").unwrap();
+        let mut second = first.clone();
+        second.request_id = "two".to_string();
+        second.created_at = parse_rfc3339_timestamp("2026-10-25T16:30:00Z").unwrap();
+        let logs = [first, second];
+        let now = parse_rfc3339_timestamp("2026-10-26T00:00:00Z").unwrap();
+        let activity = build_usage_activity_in_zone(&logs, zone, now);
+        assert_eq!(activity.hours[0].requests, 1);
+        assert_eq!(
+            activity
+                .days
+                .iter()
+                .find(|day| day.date == "2026-10-25")
+                .unwrap()
+                .requests,
+            1
+        );
+        assert_eq!(
+            activity
+                .days
+                .iter()
+                .find(|day| day.date == "2026-10-26")
+                .unwrap()
+                .requests,
+            1
+        );
+        let other =
+            build_usage_activity_in_zone(&logs, AppTimeZone::new("America/Los_Angeles"), now);
+        assert_eq!(
+            other
+                .days
+                .iter()
+                .find(|day| day.date == "2026-10-25")
+                .unwrap()
+                .requests,
+            2
+        );
+        assert_eq!(other.hours[8].requests, 1);
+        assert_eq!(other.hours[9].requests, 1);
+        let start = zone.day_start(NaiveDate::from_ymd_opt(2026, 10, 25).unwrap());
+        let end = zone.day_start(NaiveDate::from_ymd_opt(2026, 10, 27).unwrap()) - 1;
+        let trends = build_daily_trends_in_zone(&logs, start, end, &[], 1.0, zone);
+        assert_eq!(trends.len(), 2);
+        assert_eq!(trends[0].input_tokens, 80);
+        assert_eq!(trends[1].input_tokens, 80);
+        assert_eq!(trends[0].timestamp, start);
+        assert_eq!(
+            format_trend_label(logs[1].created_at, true, zone),
+            "10/26 00:30"
+        );
     }
 
     #[test]

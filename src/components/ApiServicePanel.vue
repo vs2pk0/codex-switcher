@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatAppDateTime, formatWallTime } from "../timeZone";
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -588,10 +589,7 @@ function quotaResetLeftLabel(value?: string | number): string {
 function quotaResetDateLabel(value?: string | number): string {
   const date = normalizeDate(value);
   if (!date) return t("等待刷新");
-  const pad = (input: number) => String(input).padStart(2, "0");
-  return t(`更新 ${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(
-    date.getHours(),
-  )}:${pad(date.getMinutes())}`);
+  return t(`更新 ${formatWallTime(date)}`);
 }
 
 async function openBindAccounts(): Promise<void> {
@@ -1007,13 +1005,13 @@ function formatBytes(bytes?: number | null): string {
 
 function formatTime(seconds?: number | null): string {
   if (!seconds) return t("未检测");
-  return new Intl.DateTimeFormat("zh-CN", {
+  return formatAppDateTime(seconds * 1000, {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-  }).format(new Date(seconds * 1000));
+  });
 }
 
 function formatCountdown(totalSeconds: number): string {

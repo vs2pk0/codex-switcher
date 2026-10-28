@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatAppDateTime } from "../timeZone";
 import { computed, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import DOMPurify from "dompurify";
@@ -791,14 +792,14 @@ function formatTime(value?: string | number | null): string {
   if (!value) return "--";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
-  return new Intl.DateTimeFormat(undefined, {
+  return formatAppDateTime(date, {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
-  }).format(date);
+  });
 }
 </script>
 

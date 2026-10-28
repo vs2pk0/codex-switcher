@@ -1,4 +1,5 @@
 import type { AccountColumnsSetting } from "./accountLayout";
+import type { ApiModelSettings } from "./apiModelSettings";
 import { invoke } from "@tauri-apps/api/core";
 import type { CodexAccount } from "../types/codex";
 import type { CodexSessionVisibilityRepairSummary } from "./session";
@@ -20,6 +21,7 @@ export interface CodexResetCreditConsumeResult {
 }
 
 export interface CodexSwitcherSettings {
+  apiModelSettings: ApiModelSettings;
   resetConfigOnAccountSwitch: boolean;
   repairSessionsOnAccountSwitch: boolean;
   monitorQuota: boolean;
@@ -42,6 +44,7 @@ export interface CodexSwitcherSettings {
   badgeStyles: Record<string, string>;
   maxColumns: AccountColumnsSetting;
   language: string;
+  timeZone: string;
 }
 
 export interface CodexSwitcherPaths {

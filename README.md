@@ -37,6 +37,8 @@ Codex Switcher keeps multiple Codex sign-in profiles in one desktop app. It can 
 - **Independent Codex instances (macOS)**: launch official desktop instances with separate `CODEX_HOME` and Electron data, then target account switching, sessions, settings, and OpenCodex actions to a selected instance.
 - **OpenCodex Manager**: initialize and control the proxy, manage Engine versions, open the Web dashboard, synchronize models, configure image-input compatibility, import Switcher accounts, inspect logs, and restore native Codex.
 - **Usage analytics**: aggregate local tokens, cache activity, model and source distribution, estimated cost, and configurable pricing rules.
+- **Global time zone**: follow the system by default or search for a time zone in **Settings → Time zone**. The saved preference applies to time displays, date filters, statistics, scheduled resets, notifications, and session exports, including daylight saving time.
+- **API account preferences**: configure context auto-compaction, reasoning slider levels and default effort, enable Fast mode (requires API and model support; provider pricing applies), or disable built-in `web_search` for unsupported APIs. Preferences apply when switching or starting an API account; turning them off or returning to an official account restores the previous configuration.
 - **CLIProxyAPI integration**: install, update, run, configure, version, and bind selected accounts to the bundled CPA API service.
 - **Configuration and backups**: edit `auth.json` and `config.toml` with validation and automatic backups, create ZIP backups, and restore saved data.
 - **Local-first privacy**: mask account identifiers, redact credentials from OpenCodex logs, and keep application data on the local machine.

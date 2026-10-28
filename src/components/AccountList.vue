@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatAppDateTime, formatWallTime } from "../timeZone";
 import { Message } from "@arco-design/web-vue";
 import { computed, ref } from "vue";
 import { accountProPlan, proPlanLabel } from "../accountPlan";
@@ -553,12 +554,12 @@ function apiKeyBalanceTooltip(account: CodexAccount): string {
     .map((value) => value?.trim())
     .filter(Boolean);
   if (state.fetchedAt > 0) {
-    const updatedAt = new Intl.DateTimeFormat(currentLocale(), {
+    const updatedAt = formatAppDateTime(state.fetchedAt, {
       month: "2-digit",
       day: "2-digit",
       hour: "2-digit",
       minute: "2-digit",
-    }).format(state.fetchedAt);
+    });
     details.push(`${t("更新于")} ${updatedAt}`);
   }
   if (state.status === "consent_required") details.push(t("HTTP 地址需点击确认后查询余额"));
@@ -977,10 +978,7 @@ function normalizeDate(value?: string | number | null): Date | undefined {
 function formatDateTime(value?: string | number | null): string {
   const date = normalizeDate(value);
   if (!date) return "";
-  const pad = (input: number) => String(input).padStart(2, "0");
-  return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(
-    date.getHours(),
-  )}:${pad(date.getMinutes())}`;
+  return formatWallTime(date);
 }
 
 function formatTime(value?: number | null): string {

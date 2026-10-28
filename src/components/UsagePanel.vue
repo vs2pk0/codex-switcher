@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { calendarDateKey, calendarParts, effectiveTimeZone, formatAppDateTime, formatWallTime, nextCalendarDayStart, parseWallTime, usageCalendarRange } from "../timeZone";
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
 import { Message } from "@arco-design/web-vue";
 import type { ECharts, EChartsCoreOption } from "echarts/core";
@@ -215,7 +216,7 @@ const activityLabels = computed(() => {
     if (currentMonth !== previousMonth) {
       const nextLabel = {
         key: day.date,
-        label: new Intl.DateTimeFormat(currentLocale(), { month: "short" }).format(new Date(day.timestamp * 1000)),
+        label: formatAppDateTime(day.timestamp * 1000, { month: "short" }),
         column: Math.floor(index / 7) + 1,
       };
       const previous = labels[labels.length - 1];
@@ -337,32 +338,12 @@ function errorText(error: unknown): string {
   return String(error instanceof Error ? error.message : error).replace(/^Error:\s*/, "");
 }
 
-function pad(value: number): string {
-  return String(value).padStart(2, "0");
-}
-
 function formatPickerValue(date: Date): string {
-  return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return formatWallTime(date, true);
 }
 
 function localDayKey(date: Date): string {
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-}
-
-function startOfDay(date: Date): Date {
-  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0);
-}
-
-function endOfDay(date: Date): Date {
-  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 59, 999);
-}
-
-function startOfMonth(date: Date): Date {
-  return new Date(date.getFullYear(), date.getMonth(), 1, 0, 0, 0, 0);
-}
-
-function endOfMonth(date: Date): Date {
-  return new Date(date.getFullYear(), date.getMonth() + 1, 0, 23, 59, 59, 999);
+  return calendarDateKey(date);
 }
 
 function seconds(date: Date): number {
@@ -370,25 +351,7 @@ function seconds(date: Date): number {
 }
 
 function presetDates(preset: UsageRange): { start: Date; end: Date } {
-  const now = new Date();
-  if (preset === "yesterday") {
-    const date = new Date(now);
-    date.setDate(date.getDate() - 1);
-    return { start: startOfDay(date), end: endOfDay(date) };
-  }
-  if (preset === "beforeYesterday") {
-    const date = new Date(now);
-    date.setDate(date.getDate() - 2);
-    return { start: startOfDay(date), end: endOfDay(date) };
-  }
-  if (preset === "thisMonth") {
-    return { start: startOfMonth(now), end: now };
-  }
-  if (preset === "lastMonth") {
-    const date = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-    return { start: startOfMonth(date), end: endOfMonth(date) };
-  }
-  return { start: startOfDay(now), end: now };
+  return usageCalendarRange(preset);
 }
 
 function syncPickerToPreset(preset: UsageRange): void {
@@ -405,39 +368,8 @@ function parsePickerDate(value: unknown): Date | null {
     return Number.isNaN(parsed.getTime()) ? null : parsed;
   }
   if (typeof value === "string" && value.trim()) {
-    const match = value.trim().match(
-      /^(\d{4})[-/](\d{2})[-/](\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/,
-    );
-    if (!match) return null;
-    const [, yearText, monthText, dayText, hourText, minuteText, secondText] = match;
-    const year = Number(yearText);
-    const month = Number(monthText);
-    const day = Number(dayText);
-    const hour = Number(hourText);
-    const minute = Number(minuteText);
-    const second = Number(secondText);
-    if (
-      month < 1 || month > 12
-      || day < 1 || day > 31
-      || hour < 0 || hour > 23
-      || minute < 0 || minute > 59
-      || second < 0 || second > 59
-    ) {
-      return null;
-    }
-    const parsed = new Date(year, month - 1, day, hour, minute, second, 0);
-    // 组件以本地时间工作；回读所有字段可以同时拒绝 2 月 30 日和 DST gap 的自动归一化。
-    if (
-      parsed.getFullYear() !== year
-      || parsed.getMonth() !== month - 1
-      || parsed.getDate() !== day
-      || parsed.getHours() !== hour
-      || parsed.getMinutes() !== minute
-      || parsed.getSeconds() !== second
-    ) {
-      return null;
-    }
-    return parsed;
+    const timestamp = parseWallTime(value.trim());
+    return timestamp === null ? null : new Date(timestamp);
   }
   return null;
 }
@@ -668,21 +600,13 @@ function refreshPresetAtBoundary(): boolean {
 
 function schedulePresetBoundaryRefresh(): void {
   if (presetBoundaryTimer) window.clearTimeout(presetBoundaryTimer);
-  const now = new Date();
-  const nextMidnight = new Date(
-    now.getFullYear(),
-    now.getMonth(),
-    now.getDate() + 1,
-    0,
-    0,
-    0,
-    150,
-  );
+  const now = Date.now();
+  const nextMidnight = nextCalendarDayStart(now) + 150;
   presetBoundaryTimer = window.setTimeout(() => {
     presetBoundaryTimer = undefined;
     refreshPresetAtBoundary();
     schedulePresetBoundaryRefresh();
-  }, Math.max(250, nextMidnight.getTime() - now.getTime()));
+  }, Math.max(250, nextMidnight - now));
 }
 
 function scheduleActivationRefresh(delay = 280): void {
@@ -836,8 +760,9 @@ function activityDayToCellSource(day: CodexUsageActivityDay): ActivityCell {
 
 function activityWeekdayLabel(day: CodexUsageActivityDay): string {
   const date = new Date(day.timestamp * 1000);
-  const weekday = new Intl.DateTimeFormat(currentLocale(), { weekday: "short" }).format(date);
-  return `${date.getMonth() + 1}/${date.getDate()} ${weekday}`;
+  const weekday = formatAppDateTime(date, { weekday: "short" });
+  const parts = calendarParts(date);
+  return `${parts.month}/${parts.day} ${weekday}`;
 }
 
 function activityLevel(value: number, max: number): number {
@@ -857,12 +782,12 @@ function activityCellTitle(cell: ActivityCell): string {
 
 function formatTime(timestamp: number): string {
   if (!timestamp) return "--";
-  return new Intl.DateTimeFormat(currentLocale(), {
+  return formatAppDateTime(timestamp * 1000, {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-  }).format(new Date(timestamp * 1000));
+  });
 }
 
 function compactAxisNumber(value: number): string {
@@ -1120,7 +1045,22 @@ onMounted(() => {
   document.addEventListener("visibilitychange", handleVisibilityChange);
 });
 
-watch([trends, isHourlyTrend, currentLanguage], renderUsageChart, { deep: true });
+watch([trends, isHourlyTrend, currentLanguage, effectiveTimeZone], renderUsageChart, { deep: true });
+
+watch(effectiveTimeZone, (_next, previous) => {
+  if (range.value === "custom" && dateRange.value) {
+    // Keep the selected instants when only their display zone changes.
+    const start = parseWallTime(dateRange.value[0], previous);
+    const end = parseWallTime(dateRange.value[1], previous);
+    if (start !== null && end !== null) dateRange.value = [formatPickerValue(new Date(start)), formatPickerValue(new Date(end))];
+  } else {
+    syncPickerToPreset(range.value);
+  }
+  presetBoundaryKey = localDayKey(new Date());
+  schedulePresetBoundaryRefresh();
+  page.value = 1;
+  void loadUsage(false, { notify: false });
+});
 
 watch(
   () => props.instances.map((instance) => instance.id).join("\u0000"),
@@ -1194,6 +1134,8 @@ onBeforeUnmount(() => {
         </a-radio-group>
         <a-range-picker
           :model-value="dateRange"
+          :allow-clear="false"
+          :placeholder="[t('开始时间'), t('结束时间')]"
           show-time
           format="YYYY/MM/DD HH:mm:ss"
           value-format="YYYY/MM/DD HH:mm:ss"

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
+import { calendarDateKey, calendarDayStart, effectiveTimeZone, formatAppDateTime } from "../timeZone";
 import { Message } from "@arco-design/web-vue";
 import { t } from "../i18n";
 import { hasAnyQuotaWindow, hasQuotaWindow } from "../quota";
@@ -274,7 +275,7 @@ function hoursLabel(hours: number): string {
 
 function formatTime(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "--";
-  return new Date(value).toLocaleString();
+  return formatAppDateTime(value, { dateStyle: "short", timeStyle: "medium" });
 }
 
 async function load(): Promise<void> {
@@ -627,11 +628,10 @@ async function testChannel(channel: PushChannelConfig): Promise<void> {
 async function loadLogs(): Promise<void> {
   logsLoading.value = true;
   try {
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
+    const start = calendarDayStart(calendarDateKey(Date.now()));
     const [nextLogs, successfulCount] = await Promise.all([
       listPushLogs(),
-      countSuccessfulPushLogsSince(start.getTime()),
+      countSuccessfulPushLogsSince(start),
     ]);
     logs.value = nextLogs;
     todayDeliveryCount.value = successfulCount;
@@ -641,6 +641,8 @@ async function loadLogs(): Promise<void> {
     logsLoading.value = false;
   }
 }
+
+watch(effectiveTimeZone, () => { void loadLogs(); });
 
 async function clearLogs(): Promise<void> {
   try {

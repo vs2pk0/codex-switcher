@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatAppDateTime } from "../timeZone";
 import { computed, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import {
@@ -54,7 +55,7 @@ function formatFileSize(bytes?: number | null): string {
 function formatTime(value: string | null): string {
   if (!value) return "-";
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "-" : date.toLocaleString();
+  return Number.isNaN(date.getTime()) ? "-" : formatAppDateTime(date);
 }
 
 function operationLabel(operation: string): string {

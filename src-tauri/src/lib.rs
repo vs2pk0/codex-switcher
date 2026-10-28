@@ -1,7 +1,9 @@
 mod account;
 mod api_model_catalog;
+mod api_model_settings;
 mod api_service;
 mod app_update;
+mod app_time;
 mod export_file;
 mod external_url;
 mod instances;
@@ -71,6 +73,8 @@ pub(crate) struct CodexApiKeyModel {
     pub(crate) owned_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) input_modalities: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning: Option<api_model_catalog::ApiModelReasoning>,
 }
 
 const MAX_API_MODEL_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -105,6 +109,8 @@ struct CodexRelayBalanceEndpoints {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexSwitcherSettings {
+    #[serde(default)]
+    api_model_settings: api_model_settings::ApiModelSettings,
     #[serde(default)]
     reset_config_on_account_switch: bool,
     #[serde(default)]
@@ -145,6 +151,8 @@ struct CodexSwitcherSettings {
     max_columns: u64,
     #[serde(default = "default_language")]
     language: String,
+    #[serde(default = "default_time_zone")]
+    time_zone: String,
 }
 
 const MAX_REFRESH_MINUTES: u64 = 518400;
@@ -153,6 +161,7 @@ static SWITCHER_SETTINGS_LOCK: Mutex<()> = Mutex::new(());
 impl Default for CodexSwitcherSettings {
     fn default() -> Self {
         Self {
+            api_model_settings: api_model_settings::ApiModelSettings::default(),
             reset_config_on_account_switch: false,
             repair_sessions_on_account_switch: false,
             monitor_quota: true,
@@ -175,6 +184,7 @@ impl Default for CodexSwitcherSettings {
             badge_styles: default_badge_styles(),
             max_columns: default_max_columns(),
             language: default_language(),
+            time_zone: default_time_zone(),
         }
     }
 }
@@ -193,8 +203,13 @@ impl CodexSwitcherSettings {
         );
         self.account_view_mode = normalize_account_view_mode(&self.account_view_mode);
         self.language = normalize_language(&self.language);
+        self.time_zone = app_time::normalize_time_zone(&self.time_zone);
         self
     }
+}
+
+fn default_time_zone() -> String {
+    app_time::SYSTEM_TIME_ZONE.to_string()
 }
 
 fn default_monitor_quota() -> bool {
@@ -519,6 +534,7 @@ fn parse_codex_api_key_models(body: &str) -> Result<Vec<CodexApiKeyModel>, Strin
             id: id.to_string(),
             owned_by,
             input_modalities: api_model_catalog::parse_input_modalities(item),
+            reasoning: api_model_catalog::parse_reasoning(item),
         });
         if models.len() >= MAX_API_MODELS {
             break;
@@ -1679,12 +1695,16 @@ async fn switch_codex_account(
     } else {
         Some(target.id.clone())
     };
+    let switch_settings = read_switcher_settings()?;
     // Discover before stopping the instance or replacing its working configuration.
     let model_catalog = if target.auth_mode.as_deref() == Some("apikey") {
         let models = fetch_codex_api_key_models_for_account(target)
             .await
             .map_err(|error| format!("获取模型列表失败，未切换账号：{error}"))?;
-        Some(api_model_catalog::encode(&models)?)
+        Some(api_model_catalog::encode_with_settings(
+            &models,
+            &switch_settings.api_model_settings,
+        )?)
     } else {
         None
     };
@@ -1696,7 +1716,6 @@ async fn switch_codex_account(
         )
         .await?;
     }
-    let switch_settings = read_switcher_settings()?;
     instances::run_with_instance_restarted(&instance_id, |instance| {
         let codex_home = PathBuf::from(&instance.codex_home);
         // 仅在用户启用重置选项时清空旧配置；默认保留自定义配置。
@@ -1721,8 +1740,9 @@ async fn switch_codex_account(
             switch_settings.repair_sessions_on_account_switch,
         )?;
         if let Some(catalog) = &model_catalog {
-            api_model_catalog::install(&codex_home, &account_id, catalog)
-                .map_err(|error| format!("账号已切换，但模型目录写入失败，请重试：{error}"))?;
+            api_model_catalog::install_with_settings(
+                &codex_home, &account_id, catalog, &switch_settings.api_model_settings,
+            ).map_err(|error| format!("账号已切换，但模型目录或 API 偏好写入失败，请重试：{error}"))?;
         }
         Ok(switched)
     })
@@ -1783,7 +1803,11 @@ async fn sync_api_key_account_to_instance(
     let models = fetch_codex_api_key_models_for_account(target)
         .await
         .map_err(|error| format!("获取模型列表失败，未同步配置：{error}"))?;
-    let model_catalog = api_model_catalog::encode(&models)?;
+    let switch_settings = read_switcher_settings()?;
+    let model_catalog = api_model_catalog::encode_with_settings(
+        &models,
+        &switch_settings.api_model_settings,
+    )?;
     if let Some(oauth_account_id) = target.bound_oauth_account_id.clone() {
         token_keeper::ensure_fresh_access_token_for_store(
             &selected_account_store,
@@ -1792,7 +1816,6 @@ async fn sync_api_key_account_to_instance(
         )
         .await?;
     }
-    let switch_settings = read_switcher_settings()?;
     tauri::async_runtime::spawn_blocking(move || {
         let emit = |step: u8| {
             let _ = app_handle.emit(
@@ -1820,8 +1843,9 @@ async fn sync_api_key_account_to_instance(
                     &account_id,
                     switch_settings.repair_sessions_on_account_switch,
                 )?;
-                api_model_catalog::install(&codex_home, &account_id, &model_catalog)
-                    .map_err(|error| format!("账号已切换，但模型目录写入失败，请重试：{error}"))?;
+                api_model_catalog::install_with_settings(
+                    &codex_home, &account_id, &model_catalog, &switch_settings.api_model_settings,
+                ).map_err(|error| format!("账号已切换，但模型目录或 API 偏好写入失败，请重试：{error}"))?;
                 let mut report = |step: u8| emit(step);
                 let mut outcome = repair_sessions_on_switch(
                     &session_store,
@@ -2307,6 +2331,7 @@ fn update_codex_switcher_settings(
     settings: CodexSwitcherSettings,
 ) -> Result<CodexSwitcherSettings, String> {
     let _settings_guard = lock_switcher_settings()?;
+    settings.api_model_settings.validate()?;
     let settings = settings.normalized();
     write_switcher_settings(&settings)?;
     Ok(settings)
@@ -2976,7 +3001,7 @@ where
             .map_err(|error| format!("创建备份目录失败: {}", error))?;
         let filename = format!(
             "codex-switcher-backup-{}.zip",
-            chrono::Local::now().format("%Y%m%d-%H%M%S-%3f")
+            app_time::AppTimeZone::current().now().format("%Y%m%d-%H%M%S-%3f")
         );
         let backup_path = backup_dir.join(filename);
         write_switcher_backup_zip(&backup_path, &content, &mut progress)?;
@@ -3016,7 +3041,7 @@ where
     let filename = format!(
         "codex-session-backup-{}-{}.zip",
         source_instance.id,
-        chrono::Local::now().format("%Y%m%d-%H%M%S-%3f")
+        app_time::AppTimeZone::current().now().format("%Y%m%d-%H%M%S-%3f")
     );
     let backup_path = backup_dir.join(filename);
     write_session_backup_zip(&backup_path, &content, codex_home, &mut progress)?;
@@ -4356,9 +4381,8 @@ fn backup_file_info(path: &Path) -> Result<CodexSwitcherBackupFile, String> {
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| {
-            chrono::DateTime::<chrono::Local>::from(std::time::UNIX_EPOCH + duration)
-                .format("%Y/%m/%d %H:%M:%S")
-                .to_string()
+            chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH + duration)
+                .to_rfc3339()
         })
         .unwrap_or_else(|| "未知时间".to_string());
     Ok(CodexSwitcherBackupFile {
@@ -5095,6 +5119,7 @@ mod tests {
     #[test]
     fn switch_options_default_off_for_existing_settings_and_round_trip() {
         let mut value = serde_json::to_value(super::CodexSwitcherSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("apiModelSettings");
         value
             .as_object_mut()
             .unwrap()
@@ -5106,12 +5131,19 @@ mod tests {
         let mut settings: super::CodexSwitcherSettings = serde_json::from_value(value).unwrap();
         assert!(!settings.reset_config_on_account_switch);
         assert!(!settings.repair_sessions_on_account_switch);
+        assert!(!settings.api_model_settings.reasoning_enabled);
+        assert!(!settings.api_model_settings.disable_web_search);
+        assert!(!settings.api_model_settings.fast_mode);
         settings.reset_config_on_account_switch = true;
         settings.repair_sessions_on_account_switch = true;
+        settings.api_model_settings.disable_web_search = true;
+        settings.api_model_settings.fast_mode = true;
         let loaded: super::CodexSwitcherSettings =
             serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
         assert!(loaded.reset_config_on_account_switch);
         assert!(loaded.repair_sessions_on_account_switch);
+        assert!(loaded.api_model_settings.disable_web_search);
+        assert!(loaded.api_model_settings.fast_mode);
     }
 
     #[test]
@@ -5539,11 +5571,13 @@ mod tests {
                     id: "gpt-5.5".to_string(),
                     owned_by: None,
                     input_modalities: None,
+                    reasoning: None,
                 },
                 CodexApiKeyModel {
                     id: "gpt-5.6-sol".to_string(),
                     owned_by: Some("custom".to_string()),
                     input_modalities: None,
+                    reasoning: None,
                 },
             ]
         );

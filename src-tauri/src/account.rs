@@ -866,7 +866,8 @@ impl AccountStore {
         let config_path = self.codex_home.join("config.toml");
         let config_before_update = fs::read_to_string(&config_path)
             .map_err(|error| format!("读取 config.toml 失败: {}", error))?;
-        let config_document = read_toml_document(&config_path)?;
+        let mut config_document = read_toml_document(&config_path)?;
+        crate::api_model_settings::restore_document(&self.codex_home, &mut config_document)?;
         if previous_model
             .as_deref()
             .is_some_and(|model| config_document.get("model").and_then(Item::as_str) != Some(model))
@@ -1194,7 +1195,8 @@ impl AccountStore {
             {
                 database.managed_model_config_backup = None;
             }
-            let config_document = read_toml_document(&self.codex_home.join("config.toml"))?;
+            let mut config_document = read_toml_document(&self.codex_home.join("config.toml"))?;
+            crate::api_model_settings::restore_document(&self.codex_home, &mut config_document)?;
             let mut previous_default_model = (old_account.auth_mode.as_deref() == Some("apikey"))
                 .then(|| {
                     old_account
@@ -1536,7 +1538,8 @@ impl AccountStore {
     pub fn switch_account(&self, account_id: &str) -> Result<CodexAccount, String> {
         let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
-        let config_document = read_toml_document(&self.codex_home.join("config.toml"))?;
+        let mut config_document = read_toml_document(&self.codex_home.join("config.toml"))?;
+        crate::api_model_settings::restore_document(&self.codex_home, &mut config_document)?;
         let stored_current_account_id = self.current_account_id(&database).map(str::to_string);
         let current_config = self.read_current_codex_config()?;
         let inferred_current_account_id =
@@ -3277,10 +3280,12 @@ fn write_official_provider_config(
 ) -> Result<(), String> {
     let config_path = codex_home.join("config.toml");
     let mut document = read_toml_document(&config_path)?;
+    crate::api_model_settings::restore_document(codex_home, &mut document)?;
     apply_managed_model_transition(&mut document, &model_transition)?;
     document["model_provider"] = value("openai");
     crate::api_model_catalog::detach_other_catalog(&mut document, codex_home, None);
-    write_string_atomic(&config_path, &document.to_string())
+    write_string_atomic(&config_path, &document.to_string())?;
+    crate::api_model_settings::clear_state(codex_home)
 }
 
 fn write_managed_model_transition_only(

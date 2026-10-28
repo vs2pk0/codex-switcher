@@ -87,7 +87,11 @@ async fn fetch_subscription_status(account: &CodexAccount) -> Result<Subscriptio
     let payload = request_json(
         client.get(ACCOUNTS_CHECK_URL).query(&[(
             "timezone_offset_min",
-            chrono::Local::now().offset().local_minus_utc() / 60,
+            crate::app_time::AppTimeZone::current()
+                .now()
+                .offset()
+                .local_minus_utc()
+                / 60,
         )]),
         account,
         "/backend-api/accounts/check/v4-2023-04-27",

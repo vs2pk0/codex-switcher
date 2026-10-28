@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatAppDateTime } from "../timeZone";
 import InstanceTransfer from "./InstanceTransfer.vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openExternalUrl } from "../services/codex";
@@ -173,7 +174,7 @@ watch(selectedInstanceId, async () => {
   await refreshSnapshot();
   const persisted = await readOpenCodexLogs(300,id).catch(() => []);
   if (id !== selectedInstanceId.value) return;
-  logs.value = persisted.map(line => ({ operationId: "history", stream: "system", line, timestamp: new Date().toISOString() }));
+  logs.value = persisted.map(persistedLogEntry);
   if (page.value === "versions") await checkVersions();
   if (page.value === "vision") await loadVisionModels();
 });
@@ -285,7 +286,7 @@ const imageGenRecentRequests = computed(() => imageGen.value?.recentRequests ?? 
 const imageGenLatestFailed = computed(() => (imageGenRecentRequests.value[0]?.status ?? 0) >= 400);
 
 function formatImageGenTime(timestamp: number): string {
-  return new Date(timestamp).toLocaleString(undefined, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  return formatAppDateTime(timestamp, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 
 function applyImageGenerationSettings(settings: OpenCodexImageGenerationSettings): void {
@@ -963,7 +964,17 @@ function confirmDeleteMigratedAccount(
 function formatLogTime(value: string): string {
   const date = new Date(value);
   const locale = currentLanguage.value === "ru" ? "ru-RU" : currentLanguage.value === "en" ? "en-US" : currentLanguage.value === "zh-TW" ? "zh-TW" : "zh-CN";
-  return Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString(locale, { hour12: false });
+  return Number.isNaN(date.getTime()) ? "" : formatAppDateTime(date, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }, locale);
+}
+
+function persistedLogEntry(line: string): OpenCodexCommandLogEvent {
+  const match = /^\[([^\]]+)\] \[(stdout|stderr|system)\] ?(.*)$/.exec(line);
+  return {
+    operationId: "history",
+    stream: match?.[2] || "system",
+    line: match?.[3] ?? line,
+    timestamp: match?.[1] && Number.isFinite(Date.parse(match[1])) ? match[1] : "",
+  };
 }
 
 function accountStatusLabel(status: string): string {
@@ -1014,12 +1025,7 @@ onMounted(async () => {
   void scanAccounts();
   try {
     const persisted = await readOpenCodexLogs(300, selectedInstanceId.value);
-    logs.value = persisted.map((line, index) => ({
-      operationId: "history",
-      stream: line.includes("stderr") ? "stderr" : "system",
-      line,
-      timestamp: new Date(Date.now() - (persisted.length - index) * 10).toISOString(),
-    }));
+    logs.value = persisted.map(persistedLogEntry);
     unlistenEvents = await subscribeOpenCodexEvents(
       appendLog,
       (event) => {
@@ -1227,7 +1233,7 @@ onUnmounted(() => { disposed = true; unlistenEvents?.(); unlistenEngine?.(); });
               <a-card :title="`${t('用户密钥')}（${connectionInfo?.userKeys.length ?? 0}）`" :bordered="true" style="margin-top: 12px">
                 <a-empty v-if="!connectionInfo?.userKeys.length" :description="t('暂无用户密钥')" />
                 <div v-for="key in connectionInfo?.userKeys" :key="key.id" class="connection-key-row">
-                  <div class="connection-key-main"><a-input v-if="editingConnectionKeyId === key.id" v-model="editingConnectionKeyName" size="small" @keyup.enter="saveEditedUserKey(key)" @keyup.esc="cancelEditUserKey" /><strong v-else>{{ key.name }}</strong><small>{{ key.createdAt ? new Date(key.createdAt).toLocaleString() : t("未记录创建时间") }}</small></div>
+                  <div class="connection-key-main"><a-input v-if="editingConnectionKeyId === key.id" v-model="editingConnectionKeyName" size="small" @keyup.enter="saveEditedUserKey(key)" @keyup.esc="cancelEditUserKey" /><strong v-else>{{ key.name }}</strong><small>{{ key.createdAt ? formatAppDateTime(key.createdAt) : t("未记录创建时间") }}</small></div>
                   <a-input-password :model-value="key.key" readonly hide-button class="connection-key-value" />
                   <a-button type="text" @click="copyConnectionValue(key.key)"><template #icon><icon-copy /></template></a-button>
                   <a-button v-if="editingConnectionKeyId === key.id" type="text" status="success" :loading="connectionKeyBusy" @click="saveEditedUserKey(key)"><template #icon><icon-check /></template></a-button>
