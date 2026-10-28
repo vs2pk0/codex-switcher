@@ -9,11 +9,13 @@ import { createPdfAssembler, pdfCaptureSlices, type PdfAssembler } from "../sess
 import { marked, Renderer } from "marked";
 import { t } from "../i18n";
 import ExportDownloadModal from "./ExportDownloadModal.vue";
+import type { ExportDownloadResult } from "../services/codex";
 import {
   deleteSessionMessages,
   deleteSessionTurn,
   getSessionAsset,
   exportSessionMarkdown,
+  saveSessionPdf,
   type SessionMarkdownExportResult,
   listSessionContent,
   openPathInFileManager,
@@ -45,8 +47,12 @@ const restoring = ref(false);
 const exportingPdf = ref(false);
 const exportingMd = ref(false);
 const exporting = computed(() => exportingPdf.value || exportingMd.value);
-const markdownResult = ref<SessionMarkdownExportResult | null>(null);
-const openingMarkdownFolder = ref(false);
+const exportResult = ref<
+  | { format: "pdf"; file: ExportDownloadResult }
+  | { format: "md"; file: SessionMarkdownExportResult }
+  | null
+>(null);
+const openingExportFolder = ref(false);
 const exportProgress = ref("");
 const searchQuery = ref("");
 const sortDirection = ref<"asc" | "desc">("desc");
@@ -656,7 +662,8 @@ async function exportMarkdown(): Promise<void> {
   exportingMd.value = true;
   exportProgress.value = t("正在导出 Markdown 和附件…");
   try {
-    markdownResult.value = await exportSessionMarkdown(session.id, session.title, props.instanceId);
+    const file = await exportSessionMarkdown(session.id, session.title, props.instanceId);
+    exportResult.value = { format: "md", file };
   } catch (error) {
     Message.error(`${t("导出 Markdown 失败")}: ${error}`);
   } finally {
@@ -664,15 +671,15 @@ async function exportMarkdown(): Promise<void> {
   }
 }
 
-async function openMarkdownFolder(): Promise<void> {
-  if (!markdownResult.value || openingMarkdownFolder.value) return;
-  openingMarkdownFolder.value = true;
+async function openExportFolder(): Promise<void> {
+  if (!exportResult.value || openingExportFolder.value) return;
+  openingExportFolder.value = true;
   try {
-    await openPathInFileManager(markdownResult.value.path);
+    await openPathInFileManager(exportResult.value.file.path);
   } catch (error) {
     Message.error(`${t("打开文件夹失败")}: ${error}`);
   } finally {
-    openingMarkdownFolder.value = false;
+    openingExportFolder.value = false;
   }
 }
 
@@ -750,21 +757,9 @@ async function exportSessionPdf(): Promise<void> {
     }
     await pendingAssembly;
     exportProgress.value = t("正在保存 PDF");
-    const fileName = `${session.title || t("未命名会话")}`
-      .replace(/[\\/:*?"<>|]/g, "_")
-      .slice(0, 80);
-    if (assembler) {
-      const blob = new Blob([await assembler.finish()], { type: "application/pdf" });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `${fileName}.pdf`;
-      link.click();
-      setTimeout(() => URL.revokeObjectURL(url), 60000);
-    } else {
-      pdf!.save(`${fileName}.pdf`);
-    }
-    Message.success(t("PDF 导出成功"));
+    const content = assembler ? await assembler.finish() : pdf!.output("arraybuffer");
+    const file = await saveSessionPdf(content, session.title || t("未命名会话"));
+    exportResult.value = { format: "pdf", file };
   } catch (error) {
     Message.error(`${t("PDF 导出失败")}：${String(error)}`);
   } finally {
@@ -1017,15 +1012,17 @@ function formatTime(value?: string | number | null): string {
   </a-modal>
 
   <ExportDownloadModal
-    :result="markdownResult"
-    :opening="openingMarkdownFolder"
-    @close="markdownResult = null"
-    @open-folder="openMarkdownFolder"
+    :result="exportResult?.file ?? null"
+    :opening="openingExportFolder"
+    @close="exportResult = null"
+    @open-folder="openExportFolder"
   >
-    <p>{{ t("Markdown 与 assets 附件目录请一起移动或分享。") }}</p>
-    <a-alert v-if="markdownResult?.missingAttachmentCount" type="warning">
-      {{ t("部分附件无法读取，已在文档中注明") }}（{{ markdownResult.missingAttachmentCount }}）
-    </a-alert>
+    <template v-if="exportResult?.format === 'md'">
+      <p>{{ t("Markdown 与 assets 附件目录请一起移动或分享。") }}</p>
+      <a-alert v-if="exportResult.file.missingAttachmentCount" type="warning">
+        {{ t("部分附件无法读取，已在文档中注明") }}（{{ exportResult.file.missingAttachmentCount }}）
+      </a-alert>
+    </template>
   </ExportDownloadModal>
 
   <a-modal

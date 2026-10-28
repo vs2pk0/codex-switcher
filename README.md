@@ -34,6 +34,7 @@ Codex Switcher keeps multiple Codex sign-in profiles in one desktop app. It can 
 - **OAuth and API Key accounts**: add, edit, import, export, filter, sort, refresh, and switch between multiple accounts.
 - **Quota monitoring and resets**: inspect availability, subscription periods, quota windows, GPT 5.3 Codex Spark quotas, reset history, and scheduled resets.
 - **Session management and repair**: search projects and message content, preview Markdown and attachments, delete individual messages or turns, back up and restore sessions, repair visibility, and recover truncated sessions.
+- **Session exports**: PDF and Markdown documents are saved under `Downloads/Codex Account Switcher/`, created automatically on the first export. Markdown exports include their attachments in a separate session folder; repeated exports keep previous files.
 - **Independent Codex instances (macOS)**: launch official desktop instances with separate `CODEX_HOME` and Electron data, then target account switching, sessions, settings, and OpenCodex actions to a selected instance.
 - **OpenCodex Manager**: initialize and control the proxy, manage Engine versions, open the Web dashboard, synchronize models, configure image-input compatibility, import Switcher accounts, inspect logs, and restore native Codex.
 - **Usage analytics**: aggregate local tokens, cache activity, model and source distribution, estimated cost, and configurable pricing rules.

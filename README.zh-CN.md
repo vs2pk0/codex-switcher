@@ -34,6 +34,7 @@ Codex Switcher 将多个 Codex 登录配置集中在一个桌面应用中。它�
 - **OAuth 与 API Key 账号**：添加、编辑、导入、导出、筛选、排序、刷新和切换多个账号。
 - **额度监控与重置**：查看可用状态、订阅有效期、额度窗口、GPT 5.3 Codex Spark 额度、重置记录和预约重置。
 - **会话管理与修复**：搜索项目和消息内容，预览 Markdown 与附件，删除单条消息或完整轮次，备份、恢复、修复可见性并恢复被截断的会话。
+- **会话导出**：PDF 和 Markdown 统一保存到系统“下载”目录下的 `Codex Account Switcher` 文件夹，首次导出时自动创建。Markdown 与附件保存在独立的会话子目录中，重复导出不会覆盖已有文件。
 - **Codex 桌面多开（macOS / Windows）**：为官方桌面 App 隔离 `CODEX_HOME` 和 Electron 数据，并将账号切换、会话、设置及 OpenCodex 操作定向到所选实例。
 - **OpenCodex Manager**：初始化和控制代理、管理 Engine 版本、打开 Web Dashboard、同步模型、配置图片输入兼容、导入 Switcher 账号、查看日志并恢复原生 Codex。
 - **使用统计**：汇总本地 Token、缓存、模型和来源分布、预估费用，并支持自定义模型计价规则。

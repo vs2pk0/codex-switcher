@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { ExportDownloadResult } from "./codex";
 
 export interface CodexSessionRecord {
   id: string;
@@ -289,9 +290,7 @@ export function listSessionContent(
   return invoke("codex_list_session_content", { sessionId, cursor, limit, direction, instanceId });
 }
 
-export interface SessionMarkdownExportResult {
-  fileName: string;
-  path: string;
+export interface SessionMarkdownExportResult extends ExportDownloadResult {
   attachmentCount: number;
   missingAttachmentCount: number;
 }
@@ -302,6 +301,12 @@ export function exportSessionMarkdown(
   instanceId = "default",
 ): Promise<SessionMarkdownExportResult> {
   return invoke("codex_export_session_markdown", { sessionId, title, instanceId });
+}
+
+export function saveSessionPdf(content: ArrayBuffer, title: string): Promise<ExportDownloadResult> {
+  return invoke("save_codex_session_pdf", content, {
+    headers: { "x-session-title": encodeURIComponent(title) },
+  });
 }
 
 export function getSessionAsset(

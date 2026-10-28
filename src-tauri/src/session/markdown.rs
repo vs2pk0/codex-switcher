@@ -1,4 +1,5 @@
 use super::*;
+use crate::export_file::session_file_stem;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
@@ -36,10 +37,10 @@ fn export_snapshot(
     // A unique directory keeps repeated/concurrent exports from overwriting previous documents.
     // It is automatically cleaned up if writing the document fails.
     let staging = tempfile::Builder::new()
-        .prefix(&format!("codex-session-{}-", safe_name(title)))
+        .prefix(&format!("codex-session-{}-", session_file_stem(title)))
         .tempdir_in(directory)
         .map_err(|e| format!("创建导出目录失败: {e}"))?;
-    let file_name = format!("{}.md", safe_name(title));
+    let file_name = format!("{}.md", session_file_stem(title));
     let path = staging.path().join(&file_name);
     let file = fs::File::create(&path).map_err(|e| e.to_string())?;
     let mut output = BufWriter::new(file);
@@ -128,30 +129,6 @@ fn export_snapshot(
     };
     let _ = staging.keep();
     Ok(result)
-}
-
-fn safe_name(value: &str) -> String {
-    let name: String = value
-        .chars()
-        .take(60)
-        .scan(0, |bytes, ch| {
-            *bytes += ch.len_utf8();
-            (*bytes <= 160).then_some(ch)
-        })
-        .map(|ch| {
-            if ch.is_control() || "/\\:*?\"<>|".contains(ch) {
-                '_'
-            } else {
-                ch
-            }
-        })
-        .collect();
-    let name = name.trim().trim_matches('.').trim();
-    if name.is_empty() {
-        "session".into()
-    } else {
-        format!("session-{name}")
-    }
 }
 
 fn label(value: &str) -> String {

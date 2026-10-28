@@ -3369,9 +3369,7 @@ async fn codex_export_session_markdown(
     instance_id: Option<String>,
 ) -> Result<session::MarkdownExportResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let directory = dirs::download_dir()
-            .or_else(|| dirs::home_dir().map(|home| home.join("Downloads")))
-            .ok_or_else(|| "无法确定下载目录".to_string())?;
+        let directory = export_file::session_export_directory()?;
         session_store_for_instance(instance_id.as_deref())?
             .export_markdown(&session_id, &title, &directory)
     })
@@ -6578,6 +6576,7 @@ pub fn run() {
             update_codex_account_phone,
             export_codex_accounts,
             export_file::download_codex_export,
+            export_file::save_codex_session_pdf,
             codex_oauth_login_start,
             codex_oauth_submit_callback_url,
             codex_oauth_login_completed,
