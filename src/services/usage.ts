@@ -75,6 +75,8 @@ export interface CodexUsageLog {
   statusCode: number;
   createdAt: number;
   dataSource: string;
+  latencyMs: number;
+  firstTokenMs: number | null;
 }
 
 export interface CodexUsageModelStat {
@@ -83,6 +85,8 @@ export interface CodexUsageModelStat {
   totalTokens: number;
   totalCost: string;
   avgCostPerRequest: string;
+  estSpeedOutputTokens: number;
+  estSpeedDurationMs: number;
 }
 
 export interface CodexUsageProviderStat {
@@ -93,6 +97,8 @@ export interface CodexUsageProviderStat {
   totalCost: string;
   successRate: number;
   avgLatencyMs: number;
+  estSpeedOutputTokens: number;
+  estSpeedDurationMs: number;
 }
 
 export interface CodexUsageQuery {

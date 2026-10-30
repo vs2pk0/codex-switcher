@@ -9,6 +9,7 @@ mod external_url;
 mod instances;
 mod oauth;
 mod opencodex;
+mod pricing_sync;
 mod push;
 mod quota_list;
 mod reset;
@@ -18,6 +19,7 @@ mod subscription;
 mod system_command;
 mod token_keeper;
 mod usage;
+mod usage_timing;
 
 use account::{
     write_bytes_atomic, write_reader_atomic, AccountStore, ApiKeyAccountBindingInput,
@@ -6634,6 +6636,11 @@ pub fn run() {
             codex_get_usage_dashboard,
             codex_get_usage_activity,
             codex_list_model_pricing,
+            usage::codex_update_model_pricing_batch,
+            pricing_sync::codex_get_models_dev_sync_config,
+            pricing_sync::codex_update_models_dev_sync_config,
+            pricing_sync::codex_record_models_dev_sync_result,
+            pricing_sync::codex_fetch_models_dev,
             codex_update_model_pricing,
             codex_delete_model_pricing,
             codex_reset_model_pricing,

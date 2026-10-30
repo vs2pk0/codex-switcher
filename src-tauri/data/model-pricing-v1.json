@@ -1,0 +1,442 @@
+[
+  {
+    "modelId": "gpt-5.5",
+    "displayName": "GPT-5.5",
+    "inputCostPerMillion": "5",
+    "outputCostPerMillion": "30",
+    "cacheReadCostPerMillion": "0.50",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.5-low",
+    "displayName": "GPT-5.5",
+    "inputCostPerMillion": "5",
+    "outputCostPerMillion": "30",
+    "cacheReadCostPerMillion": "0.50",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.5-medium",
+    "displayName": "GPT-5.5",
+    "inputCostPerMillion": "5",
+    "outputCostPerMillion": "30",
+    "cacheReadCostPerMillion": "0.50",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.5-high",
+    "displayName": "GPT-5.5",
+    "inputCostPerMillion": "5",
+    "outputCostPerMillion": "30",
+    "cacheReadCostPerMillion": "0.50",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.5-xhigh",
+    "displayName": "GPT-5.5",
+    "inputCostPerMillion": "5",
+    "outputCostPerMillion": "30",
+    "cacheReadCostPerMillion": "0.50",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.5-minimal",
+    "displayName": "GPT-5.5",
+    "inputCostPerMillion": "5",
+    "outputCostPerMillion": "30",
+    "cacheReadCostPerMillion": "0.50",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.6-sol",
+    "displayName": "GPT-5.6 Sol",
+    "inputCostPerMillion": "5",
+    "outputCostPerMillion": "30",
+    "cacheReadCostPerMillion": "0.50",
+    "cacheCreationCostPerMillion": "6.25"
+  },
+  {
+    "modelId": "gpt-5.6-terra",
+    "displayName": "GPT-5.6 Terra",
+    "inputCostPerMillion": "2.50",
+    "outputCostPerMillion": "15",
+    "cacheReadCostPerMillion": "0.25",
+    "cacheCreationCostPerMillion": "3.125"
+  },
+  {
+    "modelId": "gpt-5.6-luna",
+    "displayName": "GPT-5.6 Luna",
+    "inputCostPerMillion": "1",
+    "outputCostPerMillion": "6",
+    "cacheReadCostPerMillion": "0.10",
+    "cacheCreationCostPerMillion": "1.25"
+  },
+  {
+    "modelId": "gpt-5.4",
+    "displayName": "GPT-5.4",
+    "inputCostPerMillion": "2.50",
+    "outputCostPerMillion": "15",
+    "cacheReadCostPerMillion": "0.25",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.4-mini",
+    "displayName": "GPT-5.4 Mini",
+    "inputCostPerMillion": "0.75",
+    "outputCostPerMillion": "4.50",
+    "cacheReadCostPerMillion": "0.075",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.4-nano",
+    "displayName": "GPT-5.4 Nano",
+    "inputCostPerMillion": "0.20",
+    "outputCostPerMillion": "1.25",
+    "cacheReadCostPerMillion": "0.02",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.2",
+    "displayName": "GPT-5.2",
+    "inputCostPerMillion": "1.75",
+    "outputCostPerMillion": "14",
+    "cacheReadCostPerMillion": "0.175",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.2-low",
+    "displayName": "GPT-5.2",
+    "inputCostPerMillion": "1.75",
+    "outputCostPerMillion": "14",
+    "cacheReadCostPerMillion": "0.175",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.2-medium",
+    "displayName": "GPT-5.2",
+    "inputCostPerMillion": "1.75",
+    "outputCostPerMillion": "14",
+    "cacheReadCostPerMillion": "0.175",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.2-high",
+    "displayName": "GPT-5.2",
+    "inputCostPerMillion": "1.75",
+    "outputCostPerMillion": "14",
+    "cacheReadCostPerMillion": "0.175",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.2-xhigh",
+    "displayName": "GPT-5.2",
+    "inputCostPerMillion": "1.75",
+    "outputCostPerMillion": "14",
+    "cacheReadCostPerMillion": "0.175",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.2-codex",
+    "displayName": "GPT-5.2 Codex",
+    "inputCostPerMillion": "1.75",
+    "outputCostPerMillion": "14",
+    "cacheReadCostPerMillion": "0.175",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.2-codex-low",
+    "displayName": "GPT-5.2 Codex",
+    "inputCostPerMillion": "1.75",
+    "outputCostPerMillion": "14",
+    "cacheReadCostPerMillion": "0.175",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.2-codex-medium",
+    "displayName": "GPT-5.2 Codex",
+    "inputCostPerMillion": "1.75",
+    "outputCostPerMillion": "14",
+    "cacheReadCostPerMillion": "0.175",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.2-codex-high",
+    "displayName": "GPT-5.2 Codex",
+    "inputCostPerMillion": "1.75",
+    "outputCostPerMillion": "14",
+    "cacheReadCostPerMillion": "0.175",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.2-codex-xhigh",
+    "displayName": "GPT-5.2 Codex",
+    "inputCostPerMillion": "1.75",
+    "outputCostPerMillion": "14",
+    "cacheReadCostPerMillion": "0.175",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.3-codex",
+    "displayName": "GPT-5.3 Codex",
+    "inputCostPerMillion": "1.75",
+    "outputCostPerMillion": "14",
+    "cacheReadCostPerMillion": "0.175",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.3-codex-low",
+    "displayName": "GPT-5.3 Codex",
+    "inputCostPerMillion": "1.75",
+    "outputCostPerMillion": "14",
+    "cacheReadCostPerMillion": "0.175",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.3-codex-medium",
+    "displayName": "GPT-5.3 Codex",
+    "inputCostPerMillion": "1.75",
+    "outputCostPerMillion": "14",
+    "cacheReadCostPerMillion": "0.175",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.3-codex-high",
+    "displayName": "GPT-5.3 Codex",
+    "inputCostPerMillion": "1.75",
+    "outputCostPerMillion": "14",
+    "cacheReadCostPerMillion": "0.175",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.3-codex-xhigh",
+    "displayName": "GPT-5.3 Codex",
+    "inputCostPerMillion": "1.75",
+    "outputCostPerMillion": "14",
+    "cacheReadCostPerMillion": "0.175",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.1",
+    "displayName": "GPT-5.1",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.1-low",
+    "displayName": "GPT-5.1",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.1-medium",
+    "displayName": "GPT-5.1",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.1-high",
+    "displayName": "GPT-5.1",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.1-minimal",
+    "displayName": "GPT-5.1",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.1-codex",
+    "displayName": "GPT-5.1 Codex",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.1-codex-mini",
+    "displayName": "GPT-5.1 Codex",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.1-codex-max",
+    "displayName": "GPT-5.1 Codex",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.1-codex-max-high",
+    "displayName": "GPT-5.1 Codex",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5.1-codex-max-xhigh",
+    "displayName": "GPT-5.1 Codex",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5",
+    "displayName": "GPT-5",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5-low",
+    "displayName": "GPT-5",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5-medium",
+    "displayName": "GPT-5",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5-high",
+    "displayName": "GPT-5",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5-minimal",
+    "displayName": "GPT-5",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5-codex",
+    "displayName": "GPT-5 Codex",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5-codex-low",
+    "displayName": "GPT-5 Codex",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5-codex-medium",
+    "displayName": "GPT-5 Codex",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5-codex-high",
+    "displayName": "GPT-5 Codex",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5-codex-mini",
+    "displayName": "GPT-5 Codex",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5-codex-mini-medium",
+    "displayName": "GPT-5 Codex",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5-codex-mini-high",
+    "displayName": "GPT-5 Codex",
+    "inputCostPerMillion": "1.25",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.125",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-4.1",
+    "displayName": "GPT-4.1",
+    "inputCostPerMillion": "2",
+    "outputCostPerMillion": "8",
+    "cacheReadCostPerMillion": "0.50",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-4.1-mini",
+    "displayName": "GPT-4.1 Mini",
+    "inputCostPerMillion": "0.40",
+    "outputCostPerMillion": "1.60",
+    "cacheReadCostPerMillion": "0.10",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-4.1-nano",
+    "displayName": "GPT-4.1 Nano",
+    "inputCostPerMillion": "0.10",
+    "outputCostPerMillion": "0.40",
+    "cacheReadCostPerMillion": "0.025",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "codex-mini",
+    "displayName": "Codex Mini",
+    "inputCostPerMillion": "0.75",
+    "outputCostPerMillion": "3",
+    "cacheReadCostPerMillion": "0.025",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5-mini",
+    "displayName": "GPT-5 Mini",
+    "inputCostPerMillion": "0.25",
+    "outputCostPerMillion": "2",
+    "cacheReadCostPerMillion": "0.025",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-5-nano",
+    "displayName": "GPT-5 Nano",
+    "inputCostPerMillion": "0.05",
+    "outputCostPerMillion": "0.40",
+    "cacheReadCostPerMillion": "0.005",
+    "cacheCreationCostPerMillion": "0"
+  }
+]

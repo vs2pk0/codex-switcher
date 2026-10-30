@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { startModelsDevAutoSync } from "./services/modelsDev";
 import { currentTimeZone, formatAppDateTime, formatWallTime, setTimeZone, trackSystemTimeZone } from "./timeZone";
 import { defaultApiModelSettings, normalizeApiModelSettings, validateApiModelSettings } from "./services/apiModelSettings";
 import {
@@ -4909,8 +4910,10 @@ watch(
   },
 );
 
+let stopModelsDevAutoSync: (() => void) | undefined;
 let stopTrackingSystemTimeZone: (() => void) | undefined;
 onMounted(() => {
+  stopModelsDevAutoSync = startModelsDevAutoSync();
   stopTrackingSystemTimeZone = trackSystemTimeZone();
   void takeAppUpdateInstallError().then((message) => {
     if (message) Modal.error({ title: t("更新安装失败"), content: message });
@@ -5010,6 +5013,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  stopModelsDevAutoSync?.();
   stopTrackingSystemTimeZone?.();
   oauthUnlisten?.();
   appUpdateUnlisten?.();

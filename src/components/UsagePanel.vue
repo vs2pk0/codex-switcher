@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import UsagePricingSync from "./UsagePricingSync.vue";
+import OpenAiIcon from "./OpenAiIcon.vue";
+import { modelsDevPricingRevision } from "../services/modelsDev";
 import { calendarDateKey, calendarParts, effectiveTimeZone, formatAppDateTime, formatWallTime, nextCalendarDayStart, parseWallTime, usageCalendarRange } from "../timeZone";
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
 import { Message } from "@arco-design/web-vue";
@@ -22,11 +25,11 @@ import {
 import {
   currentLanguage,
   currentLocale,
-  formatCompactTokens,
   formatLocalizedCount,
   formatLocalizedNumber,
   t,
 } from "../i18n";
+import { formatUsageSpeed, usageRequestSpeed, formatUnitPrice, formatUsageTokens, normalizeTokenDisplayUnit, tokenDisplayStorageKey } from "../usageDisplay";
 import {
   DEFAULT_CODEX_INSTANCE_ID,
   instanceDisplayName,
@@ -70,15 +73,16 @@ const props = withDefaults(defineProps<{
   currentInstanceId: DEFAULT_CODEX_INSTANCE_ID,
 });
 
-const pageSize = 20;
+const pageSize = ref(20);
+const tokenDisplayUnit = ref(readTokenDisplayUnit());
 const loading = ref(false);
 const pricingLoading = ref(false);
 const savingPricing = ref(false);
 const savingPricingConfig = ref(false);
-const pricingCollapsed = ref(true);
 const pricingLoaded = ref(false);
 const pricingModalVisible = ref(false);
-const activeUsageTab = ref<"logs" | "providers" | "models">("logs");
+const activeUsageTab = ref("logs");
+const pricingSearch = ref("");
 const range = ref<UsageRange>("today");
 const page = ref(1);
 const chartContainer = ref<HTMLDivElement | null>(null);
@@ -88,6 +92,10 @@ const dashboard = ref<CodexUsageDashboard | null>(null);
 const activity = ref<CodexUsageActivity | null>(null);
 const activityMode = ref<ActivityMode>("daily");
 const pricingList = ref<CodexUsagePricing[]>([]);
+const filteredPricing = computed(() => {
+  const query = pricingSearch.value.trim().toLowerCase();
+  return pricingList.value.filter((item) => !query || `${item.modelId} ${item.displayName}`.toLowerCase().includes(query));
+});
 const editingModelId = ref<string | null>(null);
 const pricingConfigs = ref<CodexUsagePricingConfig[]>([]);
 const originalPricingConfigs = ref<CodexUsagePricingConfig[]>([]);
@@ -152,7 +160,6 @@ const codexPricingConfig = computed(
       pricingModelSource: "response",
     },
 );
-const totalPages = computed(() => Math.max(1, Math.ceil(totalLogs.value / pageSize)));
 const pricingConfigDirty = computed(
   () => JSON.stringify(pricingConfigs.value) !== JSON.stringify(originalPricingConfigs.value),
 );
@@ -412,7 +419,7 @@ async function loadUsage(
       ...resolveRange(),
       ...usageInstanceQuery(),
       page: page.value,
-      pageSize,
+      pageSize: pageSize.value,
       refresh,
     });
     let activityError: unknown;
@@ -462,13 +469,15 @@ async function loadUsage(
   }
 }
 
-async function loadPricing(): Promise<void> {
+async function loadPricing(preserveConfigDraft = false): Promise<void> {
   pricingLoading.value = true;
   try {
     const [pricing, config] = await Promise.all([listModelPricing(), getPricingConfig()]);
     pricingList.value = pricing;
-    pricingConfigs.value = config;
-    originalPricingConfigs.value = config.map((item) => ({ ...item }));
+    if (!preserveConfigDraft || !pricingConfigDirty.value) {
+      pricingConfigs.value = config;
+      originalPricingConfigs.value = config.map((item) => ({ ...item }));
+    }
     pricingLoaded.value = true;
   } catch (error) {
     Message.error(`加载费用规则失败：${errorText(error)}`);
@@ -477,12 +486,14 @@ async function loadPricing(): Promise<void> {
   }
 }
 
-function togglePricing(): void {
-  pricingCollapsed.value = !pricingCollapsed.value;
-  if (!pricingCollapsed.value && !pricingLoaded.value) {
-    void loadPricing();
-  }
-}
+watch(modelsDevPricingRevision, () => {
+  if (pricingLoaded.value) void loadPricing(true);
+  void loadUsage(false);
+});
+
+watch(activeUsageTab, (tab) => {
+  if (tab === "pricing" && !pricingLoaded.value) void loadPricing();
+});
 
 async function savePricingConfig(): Promise<void> {
   if (!pricingConfigs.value.every((item) => isValidCost(item.multiplier))) {
@@ -557,7 +568,13 @@ function changeAutoRefreshInterval(value: unknown): void {
 }
 
 function changePage(next: number): void {
-  page.value = Math.min(Math.max(1, next), totalPages.value);
+  page.value = Math.min(Math.max(1, next), Math.max(1, Math.ceil(totalLogs.value / pageSize.value)));
+  void loadUsage(false);
+}
+
+function changePageSize(size: number): void {
+  pageSize.value = size;
+  page.value = 1;
   void loadUsage(false);
 }
 
@@ -717,8 +734,24 @@ async function restoreDefaultPricing(): Promise<void> {
   }
 }
 
+function readTokenDisplayUnit() {
+  try {
+    return normalizeTokenDisplayUnit(window.localStorage.getItem(tokenDisplayStorageKey));
+  } catch {
+    return normalizeTokenDisplayUnit(null);
+  }
+}
+
+watch(tokenDisplayUnit, (unit) => {
+  try {
+    window.localStorage.setItem(tokenDisplayStorageKey, unit);
+  } catch {
+    // Display selection still works when local storage is unavailable.
+  }
+});
+
 function formatTokens(value?: number): string {
-  return formatCompactTokens(value);
+  return formatUsageTokens(value, tokenDisplayUnit.value, currentLocale());
 }
 
 function formatFullNumber(value?: number): string {
@@ -782,18 +815,20 @@ function activityCellTitle(cell: ActivityCell): string {
 
 function formatTime(timestamp: number): string {
   if (!timestamp) return "--";
-  return formatAppDateTime(timestamp * 1000, {
-    month: "2-digit",
-    day: "2-digit",
+  const date = new Date(timestamp * 1000);
+  const today = calendarDateKey(date) === calendarDateKey(new Date());
+  return formatAppDateTime(date, {
+    month: today ? undefined : "2-digit",
+    day: today ? undefined : "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+    second: today ? "2-digit" : undefined,
+    hour12: false,
   });
 }
 
 function compactAxisNumber(value: number): string {
-  if (value >= 1_000_000) return `${Math.round(value / 1_000)}k`;
-  if (value >= 1_000) return `${Math.round(value / 1_000)}k`;
-  return String(Math.round(value));
+  return formatTokens(value);
 }
 
 function tooltipParams(value: unknown): UsageTooltipParam[] {
@@ -1006,18 +1041,24 @@ function usageChartOption(core: EChartsCoreApi): EChartsCoreOption {
 }
 
 async function ensureUsageChart(): Promise<ECharts | null> {
-  if (!chartContainer.value) return null;
+  if (disposed || !props.active || !chartContainer.value) return null;
   const core = await loadEchartsApi();
+  const container = chartContainer.value;
+  // A hidden panel has no usable dimensions. Initialize only after it is shown.
+  if (disposed || !props.active || !container?.clientWidth || !container.clientHeight) return null;
   if (!usageChart.value) {
-    usageChart.value = core.init(chartContainer.value, undefined, { renderer: "canvas" });
-    chartResizeObserver = new ResizeObserver(() => usageChart.value?.resize());
-    chartResizeObserver.observe(chartContainer.value);
+    usageChart.value = core.init(container, undefined, { renderer: "canvas" });
+    chartResizeObserver = new ResizeObserver(() => {
+      if (props.active && container.clientWidth && container.clientHeight) usageChart.value?.resize();
+    });
+    chartResizeObserver.observe(container);
   }
   return usageChart.value;
 }
 
 function renderUsageChart(): void {
   void nextTick(async () => {
+    if (disposed) return;
     if (!trends.value.length) {
       chartResizeObserver?.disconnect();
       chartResizeObserver = null;
@@ -1025,9 +1066,11 @@ function renderUsageChart(): void {
       usageChart.value = null;
       return;
     }
+    if (!props.active) return;
     const core = await loadEchartsApi();
     if (!trends.value.length) return;
     const chart = await ensureUsageChart();
+    chart?.resize();
     chart?.setOption(usageChartOption(core), true);
   });
 }
@@ -1045,7 +1088,7 @@ onMounted(() => {
   document.addEventListener("visibilitychange", handleVisibilityChange);
 });
 
-watch([trends, isHourlyTrend, currentLanguage, effectiveTimeZone], renderUsageChart, { deep: true });
+watch([trends, isHourlyTrend, currentLanguage, effectiveTimeZone, tokenDisplayUnit], renderUsageChart, { deep: true });
 
 watch(effectiveTimeZone, (_next, previous) => {
   if (range.value === "custom" && dateRange.value) {
@@ -1082,6 +1125,7 @@ watch(
   () => props.active,
   (active) => {
     if (active) {
+      renderUsageChart();
       scheduleActivationRefresh();
     } else if (activationRefreshTimer) {
       window.clearTimeout(activationRefreshTimer);
@@ -1114,10 +1158,16 @@ onBeforeUnmount(() => {
         <p>{{ t("从本机会话记录汇总 Tokens、缓存复用和预估费用") }}</p>
       </div>
       <div class="usage-controls">
+        <a-select v-model="tokenDisplayUnit" size="mini" class="usage-token-unit" :aria-label="t('Token 显示单位')">
+          <a-option value="compact">K / M / B</a-option>
+          <a-option value="localized">{{ t("万 / 亿") }}</a-option>
+          <a-option value="full">{{ t("完整数字") }}</a-option>
+        </a-select>
         <a-select
           v-if="hasManagedInstances"
           :model-value="selectedUsageInstanceId"
           class="usage-instance-select"
+          size="mini"
           :placeholder="t('统计范围')"
           @change="changeUsageInstance"
         >
@@ -1127,7 +1177,7 @@ onBeforeUnmount(() => {
             {{ instanceDisplayName(instance) }}
           </a-option>
         </a-select>
-        <a-radio-group :model-value="range" type="button" @change="changeRange">
+        <a-radio-group :model-value="range" type="button" size="mini" @change="changeRange">
           <a-radio v-for="item in rangeOptions" :key="item.value" :value="item.value">
             {{ t(item.label) }}
           </a-radio>
@@ -1140,11 +1190,13 @@ onBeforeUnmount(() => {
           format="YYYY/MM/DD HH:mm:ss"
           value-format="YYYY/MM/DD HH:mm:ss"
           class="usage-range-picker"
+          size="mini"
           @change="changeCustomRange"
         />
         <a-select
           :model-value="autoRefreshIntervalMs"
           class="usage-auto-refresh-select"
+          size="mini"
           @change="changeAutoRefreshInterval"
         >
           <template #prefix><icon-refresh /></template>
@@ -1152,23 +1204,24 @@ onBeforeUnmount(() => {
             {{ t(item.label) }}
           </a-option>
         </a-select>
-        <a-button :loading="loading" @click="refreshUsage">
+        <a-button size="mini" :loading="loading" @click="refreshUsage">
           <template #icon><icon-refresh /></template>
           {{ t("刷新") }}
         </a-button>
       </div>
     </div>
 
-    <a-spin :loading="loading" dot>
+    <a-spin :loading="loading" dot class="usage-dashboard-spin">
       <div class="usage-dashboard-grid">
         <div class="usage-main-column">
           <div class="usage-hero">
             <div class="usage-hero-main">
-              <div class="usage-app-mark"><icon-robot /></div>
+              <div class="usage-app-mark"><OpenAiIcon /></div>
               <div>
-                <span>{{ t("本地 Codex 消耗") }}</span>
-                <strong>{{ formatFullNumber(summary?.realTotalTokens) }}</strong>
-                <small>≈ {{ formatTokens(summary?.realTotalTokens) }}</small>
+                <div class="usage-token-heading">
+                  <span>{{ t("真实消耗 Tokens") }}</span>
+                </div>
+                <strong :title="formatFullNumber(summary?.realTotalTokens)">{{ formatTokens(summary?.realTotalTokens) }}</strong>
               </div>
             </div>
             <div class="usage-hero-side">
@@ -1217,380 +1270,6 @@ onBeforeUnmount(() => {
               <div ref="chartContainer" class="usage-echart" />
             </div>
             <a-empty v-else :description="t('暂无趋势数据')" />
-          </div>
-
-          <div class="usage-activity-card">
-            <div class="usage-activity-summary">
-              <article>
-                <strong>{{ formatTokens(activitySummary?.totalTokens) }}</strong>
-                <span>{{ t("累计 Token 数") }}</span>
-              </article>
-              <article>
-                <strong>{{ formatTokens(activitySummary?.peakDayTokens) }}</strong>
-                <span>{{ t("峰值 Token 数") }}</span>
-              </article>
-              <article>
-                <strong>{{ formatLocalizedCount(activitySummary?.currentStreakDays ?? 0, "天") }}</strong>
-                <span>{{ t("当前连续天数") }}</span>
-              </article>
-              <article>
-                <strong>{{ formatLocalizedCount(activitySummary?.longestStreakDays ?? 0, "天") }}</strong>
-                <span>{{ t("最长连续天数") }}</span>
-              </article>
-            </div>
-
-            <div class="usage-card-title usage-activity-title">
-              <strong>{{ t("Token 活动") }}</strong>
-              <div class="usage-activity-mode">
-                <button
-                  v-for="item in activityModeOptions"
-                  :key="item.value"
-                  :class="{ active: activityMode === item.value }"
-                  type="button"
-                  @click="activityMode = item.value"
-                >
-                  {{ t(item.label) }}
-                </button>
-              </div>
-            </div>
-            <div v-if="activityMode === 'daily'" class="usage-activity-bars daily">
-              <article
-                v-for="block in dailyActivityBlocks"
-                :key="block.key"
-                class="usage-activity-block"
-                :class="`level-${block.level}`"
-                :title="activityCellTitle(block)"
-              >
-                <div class="usage-activity-block-head">
-                  <strong>{{ block.label }}</strong>
-                  <span>{{ block.subtitle }}</span>
-                </div>
-                <div class="usage-activity-track">
-                  <i :style="{ width: `${block.percent}%` }" />
-                </div>
-                <div class="usage-activity-block-foot">
-                  <span>{{ formatTokens(block.value) }}</span>
-                  <em>{{ formatLocalizedCount(block.requests, "次") }}</em>
-                </div>
-              </article>
-            </div>
-            <div v-else-if="activityMode === 'weekly'" class="usage-activity-bars weekly">
-              <article
-                v-for="block in weeklyActivityBlocks"
-                :key="block.key"
-                class="usage-activity-block"
-                :class="`level-${block.level}`"
-                :title="activityCellTitle(block)"
-              >
-                <div class="usage-activity-block-head">
-                  <strong>{{ block.label }}</strong>
-                  <span>{{ block.subtitle }}</span>
-                </div>
-                <div class="usage-activity-track">
-                  <i :style="{ width: `${block.percent}%` }" />
-                </div>
-                <div class="usage-activity-block-foot">
-                  <span>{{ formatTokens(block.value) }}</span>
-                  <em>{{ formatLocalizedCount(block.requests, "次") }}</em>
-                </div>
-              </article>
-            </div>
-            <div v-else-if="activityCells.length" class="usage-activity-map">
-              <div
-                class="usage-activity-grid"
-                :style="{ '--activity-columns': activityColumnCount, '--activity-rows': activityRowCount }"
-              >
-                <a-tooltip
-                  v-for="cell in activityCells"
-                  :key="cell.key"
-                  position="top"
-                  :mouse-enter-delay="100"
-                >
-                  <template #content>
-                    <div class="usage-activity-tooltip">
-                      <strong>{{ cell.label }}</strong>
-                      <span>{{ t("当日") }} Token <b>{{ formatFullNumber(cell.tokens) }}</b></span>
-                      <span>{{ t("累计") }} Token <b>{{ formatFullNumber(cell.value) }}</b></span>
-                      <span>{{ t("请求次数") }} <b>{{ formatLocalizedCount(cell.requests, "次") }}</b></span>
-                    </div>
-                  </template>
-                  <i
-                    class="usage-activity-cell"
-                    :class="`level-${cell.level}`"
-                    :aria-label="`${cell.label}: ${t('当日')} ${formatFullNumber(cell.tokens)} Tokens, ${activityCellTitle(cell)}`"
-                  />
-                </a-tooltip>
-              </div>
-              <div
-                class="usage-activity-months"
-                :style="{ '--activity-columns': activityColumnCount }"
-              >
-                <span
-                  v-for="item in activityLabels"
-                  :key="item.key"
-                  :style="{ gridColumn: item.column }"
-                >
-                  {{ item.label }}
-                </span>
-              </div>
-            </div>
-            <a-empty v-else :description="t('暂无活动数据')" />
-          </div>
-
-          <div class="usage-table-card">
-            <div class="usage-tabs">
-              <button :class="{ active: activeUsageTab === 'logs' }" type="button" @click="activeUsageTab = 'logs'">
-                <icon-list /> {{ t("调用流水") }}
-              </button>
-              <button :class="{ active: activeUsageTab === 'providers' }" type="button" @click="activeUsageTab = 'providers'">
-                <icon-thunderbolt /> {{ t("来源汇总") }}
-              </button>
-              <button :class="{ active: activeUsageTab === 'models' }" type="button" @click="activeUsageTab = 'models'">
-                <icon-bar-chart /> {{ t("模型用量") }}
-              </button>
-            </div>
-
-            <div v-if="activeUsageTab === 'logs'">
-              <div class="usage-card-title">
-                <strong>{{ t("调用记录") }}</strong>
-                <span>{{ formatLocalizedCount(totalLogs, "条记录") }}</span>
-              </div>
-              <div class="usage-log-table">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>{{ t("时间") }}</th>
-                      <th>{{ t("来源") }}</th>
-                      <th>{{ t("计费模型") }}</th>
-                      <th>{{ t("输入") }}</th>
-                      <th>{{ t("输出") }}</th>
-                      <th>{{ t("费用") }}</th>
-                      <th>{{ t("状态") }}</th>
-                      <th>{{ t("来源") }}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="log in logs" :key="log.requestId">
-                      <td>{{ formatTime(log.createdAt) }}</td>
-                      <td>{{ log.providerName }}</td>
-                      <td><code>{{ log.model }}</code></td>
-                      <td>
-                        {{ formatFullNumber(log.inputTokens) }}
-                        <small v-if="log.cacheReadTokens">R{{ formatFullNumber(log.cacheReadTokens) }}</small>
-                      </td>
-                      <td>{{ formatFullNumber(log.outputTokens) }}</td>
-                      <td>{{ formatUsd(log.totalCost) }}</td>
-                      <td><span class="usage-status">{{ log.statusCode }}</span></td>
-                      <td><code>{{ log.dataSource }}</code></td>
-                    </tr>
-                    <tr v-if="!logs.length">
-                      <td colspan="8">
-                        <a-empty :description="t('暂无使用记录')" />
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-              <div class="usage-pagination">
-                <span>{{ t(`第 ${page} / ${totalPages} 页`) }}</span>
-                <a-button size="small" :disabled="page <= 1" @click="changePage(page - 1)">
-                  <template #icon><icon-left /></template>
-                </a-button>
-                <a-button size="small" :disabled="page >= totalPages" @click="changePage(page + 1)">
-                  <template #icon><icon-right /></template>
-                </a-button>
-              </div>
-            </div>
-
-            <div v-else-if="activeUsageTab === 'providers'" class="usage-stat-table">
-              <table>
-                <thead>
-                  <tr>
-                    <th>{{ t("来源") }}</th>
-                    <th>{{ t("请求数") }}</th>
-                    <th>Tokens</th>
-                    <th>{{ t("费用") }}</th>
-                    <th>{{ t("成功率") }}</th>
-                    <th>{{ t("平均延迟") }}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="item in providerStats" :key="item.providerId">
-                    <td>{{ item.providerName }}</td>
-                    <td>{{ formatFullNumber(item.requestCount) }}</td>
-                    <td>{{ formatFullNumber(item.totalTokens) }}</td>
-                    <td>{{ formatUsd(item.totalCost) }}</td>
-                    <td>{{ item.successRate.toFixed(1) }}%</td>
-                    <td>{{ item.avgLatencyMs }}ms</td>
-                  </tr>
-                  <tr v-if="!providerStats.length">
-                    <td colspan="6"><a-empty :description="t('暂无来源数据')" /></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-
-            <div v-else class="usage-stat-table">
-              <table>
-                <thead>
-                  <tr>
-                    <th>{{ t("模型") }}</th>
-                    <th>{{ t("请求数") }}</th>
-                    <th>Tokens</th>
-                    <th>{{ t("费用") }}</th>
-                    <th>{{ t("单次均价") }}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="item in modelStats" :key="item.model">
-                    <td><code>{{ item.model }}</code></td>
-                    <td>{{ formatFullNumber(item.requestCount) }}</td>
-                    <td>{{ formatFullNumber(item.totalTokens) }}</td>
-                    <td>{{ formatUsd(item.totalCost) }}</td>
-                    <td>{{ formatUsd(item.avgCostPerRequest) }}</td>
-                  </tr>
-                  <tr v-if="!modelStats.length">
-                    <td colspan="5"><a-empty :description="t('暂无模型用量')" /></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          <div class="usage-pricing-card">
-        <button class="usage-pricing-head" type="button" @click="togglePricing">
-          <span>
-            <icon-settings />
-            <strong>{{ t("费用规则") }}</strong>
-            <small>{{ t("维护 Codex 统计使用的模型单价和倍率") }}</small>
-          </span>
-          <icon-down :class="{ rotated: !pricingCollapsed }" />
-        </button>
-
-        <div v-show="!pricingCollapsed" class="usage-pricing-body">
-          <div class="usage-pricing-section">
-            <div class="usage-card-title">
-              <div>
-                <strong>{{ t("Codex 计费口径") }}</strong>
-                <span>{{ t("设置统计倍率与模型识别来源") }}</span>
-              </div>
-              <a-button
-                type="primary"
-                :disabled="!pricingConfigDirty"
-                :loading="savingPricingConfig"
-                @click="savePricingConfig"
-              >
-                {{ t("保存") }}
-              </a-button>
-            </div>
-            <div class="usage-pricing-defaults">
-              <table>
-                <thead>
-                  <tr>
-                    <th>{{ t("应用") }}</th>
-                    <th>{{ t("默认倍率") }}</th>
-                    <th>{{ t("计费模式") }}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="item in pricingConfigs" :key="item.app">
-                    <td>{{ item.app }}</td>
-                    <td>
-                      <a-input
-                        v-model="item.multiplier"
-                        inputmode="decimal"
-                        class="usage-config-input"
-                        placeholder="1"
-                      />
-                    </td>
-                    <td>
-                      <a-select v-model="item.pricingModelSource" class="usage-config-select">
-                        <a-option value="response">{{ t("返回模型") }}</a-option>
-                        <a-option value="request">{{ t("请求模型") }}</a-option>
-                      </a-select>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          <div class="usage-pricing-section">
-            <div class="usage-card-title">
-              <div>
-                <strong>{{ t("模型单价（每百万 Tokens）") }}</strong>
-                <span>{{ formatLocalizedCount(pricingList.length, "条规则") }}</span>
-              </div>
-              <div class="usage-pricing-actions">
-                <a-popconfirm
-                  :content="t('恢复内置 GPT/Codex 单价会覆盖当前 pricing.json，确定继续？')"
-                  :ok-text="t('确认')"
-                  :cancel-text="t('取消')"
-                  @ok="restoreDefaultPricing"
-                >
-                  <a-button :loading="pricingLoading">
-                    <template #icon><icon-refresh /></template>
-                    {{ t("恢复默认") }}
-                  </a-button>
-                </a-popconfirm>
-                <a-button type="primary" @click="openAddPricing">
-                  <template #icon><icon-plus /></template>
-                  {{ t("添加") }}
-                </a-button>
-              </div>
-            </div>
-
-            <a-spin :loading="pricingLoading" dot>
-              <div class="usage-pricing-table">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>{{ t("模型") }}</th>
-                      <th>{{ t("显示名称") }}</th>
-                      <th>{{ t("输入单价") }}</th>
-                      <th>{{ t("输出单价") }}</th>
-                      <th>{{ t("缓存复用") }}</th>
-                      <th>{{ t("缓存写入") }}</th>
-                      <th>{{ t("操作") }}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="item in pricingList" :key="item.modelId">
-                      <td><code>{{ item.modelId }}</code></td>
-                      <td>{{ item.displayName }}</td>
-                      <td>${{ item.inputCostPerMillion }}</td>
-                      <td>${{ item.outputCostPerMillion }}</td>
-                      <td>${{ item.cacheReadCostPerMillion }}</td>
-                      <td>${{ item.cacheCreationCostPerMillion }}</td>
-                      <td>
-                        <a-space>
-                          <a-button size="mini" @click="openEditPricing(item)">
-                            <template #icon><icon-edit /></template>
-                          </a-button>
-                          <a-popconfirm
-                            :content="t('确定删除这条模型单价？')"
-                            :ok-text="t('确认')"
-                            :cancel-text="t('取消')"
-                            @ok="removePricing(item.modelId)"
-                          >
-                            <a-button size="mini" status="danger">
-                              <template #icon><icon-delete /></template>
-                            </a-button>
-                          </a-popconfirm>
-                        </a-space>
-                      </td>
-                    </tr>
-                    <tr v-if="!pricingList.length">
-                      <td colspan="7">
-                        <a-empty :description="t('暂无模型单价')" />
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </a-spin>
-          </div>
-        </div>
           </div>
         </div>
 
@@ -1647,6 +1326,310 @@ onBeforeUnmount(() => {
             <a-empty v-if="!modelStats.length" :description="t('暂无模型用量')" />
           </section>
         </aside>
+
+        <div class="usage-activity-card">
+          <div class="usage-activity-summary">
+            <article>
+              <strong>{{ formatTokens(activitySummary?.totalTokens) }}</strong>
+              <span>{{ t("累计 Token 数") }}</span>
+            </article>
+            <article>
+              <strong>{{ formatTokens(activitySummary?.peakDayTokens) }}</strong>
+              <span>{{ t("峰值 Token 数") }}</span>
+            </article>
+            <article>
+              <strong>{{ formatLocalizedCount(activitySummary?.currentStreakDays ?? 0, "天") }}</strong>
+              <span>{{ t("当前连续天数") }}</span>
+            </article>
+            <article>
+              <strong>{{ formatLocalizedCount(activitySummary?.longestStreakDays ?? 0, "天") }}</strong>
+              <span>{{ t("最长连续天数") }}</span>
+            </article>
+          </div>
+
+          <div class="usage-card-title usage-activity-title">
+            <strong>{{ t("Token 活动") }}</strong>
+            <div class="usage-activity-mode">
+              <button
+                v-for="item in activityModeOptions"
+                :key="item.value"
+                :class="{ active: activityMode === item.value }"
+                type="button"
+                @click="activityMode = item.value"
+              >
+                {{ t(item.label) }}
+              </button>
+            </div>
+          </div>
+          <div v-if="activityMode === 'daily'" class="usage-activity-bars daily">
+            <article
+              v-for="block in dailyActivityBlocks"
+              :key="block.key"
+              class="usage-activity-block"
+              :class="`level-${block.level}`"
+              :title="activityCellTitle(block)"
+            >
+              <div class="usage-activity-block-head">
+                <strong>{{ block.label }}</strong>
+                <span>{{ block.subtitle }}</span>
+              </div>
+              <div class="usage-activity-track">
+                <i :style="{ width: `${block.percent}%` }" />
+              </div>
+              <div class="usage-activity-block-foot">
+                <span>{{ formatTokens(block.value) }}</span>
+                <em>{{ formatLocalizedCount(block.requests, "次") }}</em>
+              </div>
+            </article>
+          </div>
+          <div v-else-if="activityMode === 'weekly'" class="usage-activity-bars weekly">
+            <article
+              v-for="block in weeklyActivityBlocks"
+              :key="block.key"
+              class="usage-activity-block"
+              :class="`level-${block.level}`"
+              :title="activityCellTitle(block)"
+            >
+              <div class="usage-activity-block-head">
+                <strong>{{ block.label }}</strong>
+                <span>{{ block.subtitle }}</span>
+              </div>
+              <div class="usage-activity-track">
+                <i :style="{ width: `${block.percent}%` }" />
+              </div>
+              <div class="usage-activity-block-foot">
+                <span>{{ formatTokens(block.value) }}</span>
+                <em>{{ formatLocalizedCount(block.requests, "次") }}</em>
+              </div>
+            </article>
+          </div>
+          <div v-else-if="activityCells.length" class="usage-activity-map">
+            <div
+              class="usage-activity-grid"
+              :style="{ '--activity-columns': activityColumnCount, '--activity-rows': activityRowCount }"
+            >
+              <a-tooltip
+                v-for="cell in activityCells"
+                :key="cell.key"
+                position="top"
+                :mouse-enter-delay="100"
+              >
+                <template #content>
+                  <div class="usage-activity-tooltip">
+                    <strong>{{ cell.label }}</strong>
+                    <span>{{ t("当日") }} Token <b>{{ formatFullNumber(cell.tokens) }}</b></span>
+                    <span>{{ t("累计") }} Token <b>{{ formatFullNumber(cell.value) }}</b></span>
+                    <span>{{ t("请求次数") }} <b>{{ formatLocalizedCount(cell.requests, "次") }}</b></span>
+                  </div>
+                </template>
+                <i
+                  class="usage-activity-cell"
+                  :class="`level-${cell.level}`"
+                  :aria-label="`${cell.label}: ${t('当日')} ${formatFullNumber(cell.tokens)} Tokens, ${activityCellTitle(cell)}`"
+                />
+              </a-tooltip>
+            </div>
+            <div
+              class="usage-activity-months"
+              :style="{ '--activity-columns': activityColumnCount }"
+            >
+              <span
+                v-for="item in activityLabels"
+                :key="item.key"
+                :style="{ gridColumn: item.column }"
+              >
+                {{ item.label }}
+              </span>
+            </div>
+          </div>
+          <a-empty v-else :description="t('暂无活动数据')" />
+        </div>
+
+        <section class="usage-table-card">
+          <a-tabs v-model:active-key="activeUsageTab" class="usage-record-tabs" :lazy-load="true">
+            <a-tab-pane key="logs" :title="t('请求日志')">
+              <div class="usage-card-title">
+                <span>{{ formatLocalizedCount(totalLogs, "条记录") }}</span>
+                <span>{{ t("本机会话用量记录") }}</span>
+              </div>
+              <a-table :data="logs" row-key="requestId" :pagination="false" :bordered="false" :scroll="{ x: 1200 }" class="usage-data-table">
+                <template #columns>
+                  <a-table-column :title="t('时间')" :width="120">
+                    <template #cell="{ record }"><span :title="formatWallTime(record.createdAt * 1000, true)">{{ formatTime(record.createdAt) }}</span></template>
+                  </a-table-column>
+                  <a-table-column :title="t('应用')" :width="100">
+                    <template #cell><span class="usage-app-cell"><OpenAiIcon /> Codex</span></template>
+                  </a-table-column>
+                  <a-table-column :title="t('来源')" :width="130">
+                    <template #cell="{ record }"><span :title="record.dataSource">{{ t('会话日志') }}</span></template>
+                  </a-table-column>
+                  <a-table-column :title="t('模型')" :width="250">
+                    <template #cell="{ record }"><code class="usage-model-id" :title="record.model">{{ record.model }}</code></template>
+                  </a-table-column>
+                  <a-table-column :title="t('新增输入')" align="right" :width="120">
+                    <template #cell="{ record }"><span :title="formatFullNumber(record.inputTokens)">{{ formatTokens(record.inputTokens) }}</span></template>
+                  </a-table-column>
+                  <a-table-column :title="t('输出')" align="right" :width="110">
+                    <template #cell="{ record }"><span :title="formatFullNumber(record.outputTokens)">{{ formatTokens(record.outputTokens) }}</span></template>
+                  </a-table-column>
+                  <a-table-column :title="t('缓存命中')" align="right" :width="130">
+                    <template #cell="{ record }"><span :title="formatFullNumber(record.cacheReadTokens)">{{ formatTokens(record.cacheReadTokens) }}</span></template>
+                  </a-table-column>
+                  <a-table-column :title="t('预估费用')" align="right" :width="120">
+                    <template #cell="{ record }"><strong class="usage-cost">{{ formatUsd(record.totalCost) }}</strong></template>
+                  </a-table-column>
+                  <a-table-column align="right" :width="120">
+                    <template #title><span class="usage-speed-title">{{ t('速度') }}<a-tooltip :content="t('会话日志按请求事件时间戳估算，含首字等待；输出不少于 200 Tokens 且耗时不少于 1 秒时显示 ≈ tok/s。缺少可靠时间戳时显示 —。')"><icon-question-circle /></a-tooltip></span></template>
+                    <template #cell="{record}"><span class="usage-speed" :title="record.latencyMs ? `${t('估算耗时')} ${(record.latencyMs / 1000).toFixed(2)}s` : undefined">{{ usageRequestSpeed(record) }}</span></template>
+                  </a-table-column>
+                </template>
+                <template #empty><a-empty :description="t('暂无使用记录')" /></template>
+              </a-table>
+              <a-pagination
+                class="usage-pagination"
+                :current="page"
+                :page-size="pageSize"
+                :total="totalLogs"
+                :page-size-options="[20, 50, 100, 200]"
+                show-total
+                show-page-size
+                @change="changePage"
+                @page-size-change="changePageSize"
+              />
+            </a-tab-pane>
+            <a-tab-pane key="providers" :title="t('来源汇总')">
+              <a-table :data="providerStats" row-key="providerId" :pagination="false" :bordered="false" :scroll="{ x: 960 }" class="usage-data-table">
+                <template #columns>
+                  <a-table-column :title="t('来源')" data-index="providerName" :width="220" />
+                  <a-table-column :title="t('请求数')" align="right">
+                    <template #cell="{ record }">{{ formatFullNumber(record.requestCount) }}</template>
+                  </a-table-column>
+                  <a-table-column title="Tokens" align="right">
+                    <template #cell="{ record }"><span :title="formatFullNumber(record.totalTokens)">{{ formatTokens(record.totalTokens) }}</span></template>
+                  </a-table-column>
+                  <a-table-column :title="t('预估费用')" align="right">
+                    <template #cell="{ record }">{{ formatUsd(record.totalCost) }}</template>
+                  </a-table-column>
+                  <a-table-column align="right" :width="110">
+                    <template #title><span class="usage-speed-title">{{ t('成功率') }}<a-tooltip :content="t('会话日志仅记录有用量的成功请求，不包含失败请求。')"><icon-question-circle /></a-tooltip></span></template>
+                    <template #cell>100%</template>
+                  </a-table-column>
+                  <a-table-column align="right" :width="140">
+                    <template #title><span class="usage-speed-title">{{ t('速度') }}<a-tooltip :content="t('汇总速度为符合条件请求的总输出除以总耗时，不是逐条平均。会话日志估算含首字等待，仅统计输出不少于 200 Tokens、耗时不少于 1 秒的请求。')"><icon-question-circle /></a-tooltip></span></template>
+                    <template #cell="{record}"><span class="usage-speed">{{ formatUsageSpeed(record.estSpeedOutputTokens, record.estSpeedDurationMs) }}</span></template>
+                  </a-table-column>
+                </template>
+                <template #empty><a-empty :description="t('暂无来源数据')" /></template>
+              </a-table>
+            </a-tab-pane>
+            <a-tab-pane key="models" :title="t('模型用量')">
+              <a-table :data="modelStats" row-key="model" :pagination="{ pageSize: 20, showTotal: true }" :bordered="false" :scroll="{ x: 1080 }" class="usage-data-table">
+                <template #columns>
+                  <a-table-column :title="t('模型')" :width="280">
+                    <template #cell="{ record }"><code class="usage-model-id" :title="record.model">{{ record.model }}</code></template>
+                  </a-table-column>
+                  <a-table-column :title="t('请求数')" align="right">
+                    <template #cell="{ record }">{{ formatFullNumber(record.requestCount) }}</template>
+                  </a-table-column>
+                  <a-table-column title="Tokens" align="right">
+                    <template #cell="{ record }"><span :title="formatFullNumber(record.totalTokens)">{{ formatTokens(record.totalTokens) }}</span></template>
+                  </a-table-column>
+                  <a-table-column :title="t('预估费用')" align="right">
+                    <template #cell="{ record }">{{ formatUsd(record.totalCost) }}</template>
+                  </a-table-column>
+                  <a-table-column :title="t('单次均价')" align="right">
+                    <template #cell="{ record }">{{ formatUsd(record.avgCostPerRequest) }}</template>
+                  </a-table-column>
+                  <a-table-column align="right" :width="110">
+                    <template #title><span class="usage-speed-title">{{ t('成功率') }}<a-tooltip :content="t('会话日志仅记录有用量的成功请求，不包含失败请求。')"><icon-question-circle /></a-tooltip></span></template>
+                    <template #cell>100%</template>
+                  </a-table-column>
+                  <a-table-column align="right" :width="140">
+                    <template #title><span class="usage-speed-title">{{ t('速度') }}<a-tooltip :content="t('汇总速度为符合条件请求的总输出除以总耗时，不是逐条平均。会话日志估算含首字等待，仅统计输出不少于 200 Tokens、耗时不少于 1 秒的请求。')"><icon-question-circle /></a-tooltip></span></template>
+                    <template #cell="{record}"><span class="usage-speed">{{ formatUsageSpeed(record.estSpeedOutputTokens, record.estSpeedDurationMs) }}</span></template>
+                  </a-table-column>
+                </template>
+                <template #empty><a-empty :description="t('暂无模型用量')" /></template>
+              </a-table>
+            </a-tab-pane>
+            <a-tab-pane key="pricing" :title="t('定价')">
+              <a-spin :loading="pricingLoading" dot class="usage-pricing-spin">
+                <div class="usage-pricing-overview">
+                  <UsagePricingSync />
+                  <section class="usage-pricing-settings usage-pricing-card">
+                    <div class="usage-pricing-card-head">
+                      <div class="usage-pricing-card-heading">
+                        <span class="usage-pricing-card-icon"><icon-settings /></span>
+                        <strong>{{ t("计费设置") }}</strong>
+                        <span class="usage-pricing-badge">Codex</span>
+                      </div>
+                      <span v-if="pricingConfigDirty" class="usage-pricing-draft">{{ t("未保存") }}</span>
+                    </div>
+                    <p class="usage-pricing-description">{{ t("设置统计倍率与模型识别来源") }}</p>
+                    <div v-for="item in pricingConfigs" :key="item.app" class="usage-billing-fields">
+                      <div class="usage-billing-field">
+                        <span>{{ t("默认倍率") }}</span>
+                        <a-input v-model="item.multiplier" inputmode="decimal" placeholder="1" :aria-label="t('默认倍率')">
+                          <template #suffix>×</template>
+                        </a-input>
+                      </div>
+                      <div class="usage-billing-field">
+                        <span>{{ t("计费模式") }}</span>
+                        <a-select v-model="item.pricingModelSource" :aria-label="t('计费模式')">
+                          <a-option value="response">{{ t("返回模型") }}</a-option>
+                          <a-option value="request">{{ t("请求模型") }}</a-option>
+                        </a-select>
+                      </div>
+                    </div>
+                    <div class="usage-pricing-card-footer">
+                      <span class="usage-pricing-hint">{{ t("按模型单价 × 倍率估算费用") }}</span>
+                      <a-button size="small" type="primary" :disabled="!pricingConfigDirty" :loading="savingPricingConfig" @click="savePricingConfig">{{ t("保存") }}</a-button>
+                    </div>
+                  </section>
+                </div>
+                <section class="usage-pricing-catalog usage-pricing-card">
+                  <div class="usage-card-title usage-pricing-toolbar">
+                    <div class="usage-pricing-catalog-heading">
+                      <div><strong>{{ t("模型价格库") }}</strong><span class="usage-pricing-count">{{ formatLocalizedCount(pricingList.length, "条规则") }}</span></div>
+                      <span>{{ t("USD / 每百万 Tokens") }}</span>
+                    </div>
+                    <div class="usage-pricing-actions">
+                      <a-input-search v-model="pricingSearch" size="small" :placeholder="t('搜索模型 ID 或名称')" allow-clear class="usage-pricing-search" />
+                      <a-popconfirm :content="t('恢复内置模型单价会覆盖当前自定义价格，确定继续？')" :ok-text="t('确认')" :cancel-text="t('取消')" @ok="restoreDefaultPricing">
+                        <a-button size="small" :loading="pricingLoading"><template #icon><icon-refresh /></template>{{ t("恢复默认") }}</a-button>
+                      </a-popconfirm>
+                      <a-button size="small" type="primary" @click="openAddPricing"><template #icon><icon-plus /></template>{{ t("添加") }}</a-button>
+                    </div>
+                  </div>
+                  <a-table :data="filteredPricing" row-key="modelId" :pagination="{ pageSize: 20, showPageSize: true, showTotal: true }" :bordered="false" :scroll="{ x: 1080 }" class="usage-data-table usage-pricing-table">
+                    <template #columns>
+                      <a-table-column :title="t('模型')" :width="330">
+                        <template #cell="{ record }"><div class="usage-price-model"><strong :title="record.displayName || record.modelId">{{ record.displayName || record.modelId }}</strong><code class="usage-model-id" :title="record.modelId">{{ record.modelId }}</code></div></template>
+                      </a-table-column>
+                      <a-table-column :title="t('输入单价')" align="right"><template #cell="{ record }">{{ formatUnitPrice(record.inputCostPerMillion) }}</template></a-table-column>
+                      <a-table-column :title="t('输出单价')" align="right"><template #cell="{ record }">{{ formatUnitPrice(record.outputCostPerMillion) }}</template></a-table-column>
+                      <a-table-column :title="t('缓存命中')" align="right"><template #cell="{ record }">{{ formatUnitPrice(record.cacheReadCostPerMillion) }}</template></a-table-column>
+                      <a-table-column :title="t('缓存写入')" align="right"><template #cell="{ record }">{{ formatUnitPrice(record.cacheCreationCostPerMillion) }}</template></a-table-column>
+                      <a-table-column :title="t('操作')" :width="100" align="right">
+                        <template #cell="{ record }">
+                          <a-space>
+                            <a-button size="mini" :aria-label="t('编辑')" @click="openEditPricing(record)"><template #icon><icon-edit /></template></a-button>
+                            <a-popconfirm :content="t('确定删除这条模型单价？')" :ok-text="t('确认')" :cancel-text="t('取消')" @ok="removePricing(record.modelId)">
+                              <a-button size="mini" status="danger" :aria-label="t('删除')"><template #icon><icon-delete /></template></a-button>
+                            </a-popconfirm>
+                          </a-space>
+                        </template>
+                      </a-table-column>
+                    </template>
+                    <template #empty><a-empty :description="t('暂无模型单价')" /></template>
+                  </a-table>
+                  <p class="usage-pricing-source"><icon-info-circle /> {{ t("预置价格参考 CC Switch，实际费用以服务商账单为准。") }}</p>
+                </section>
+              </a-spin>
+            </a-tab-pane>
+          </a-tabs>
+        </section>
+
       </div>
     </a-spin>
 

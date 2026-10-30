@@ -37,7 +37,9 @@
       "signingIdentity": "-"
     },
     "resources": {
-      "../opencodex-engine": "opencodex-engine"
+      "../opencodex-engine": "opencodex-engine",
+      "data/README.md": "third-party/cc-switch-pricing.md",
+      "data/openai-icon-license.txt": "third-party/openai-icon-license.txt"
     },
     "icon": [
       "icons/16x16.png",

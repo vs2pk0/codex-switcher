@@ -104,6 +104,8 @@ pub struct CodexUsageLog {
     pub status_code: u16,
     pub created_at: i64,
     pub data_source: String,
+    pub latency_ms: u64,
+    pub first_token_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +116,8 @@ pub struct CodexUsageModelStat {
     pub total_tokens: u64,
     pub total_cost: String,
     pub avg_cost_per_request: String,
+    pub est_speed_output_tokens: u64,
+    pub est_speed_duration_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -126,9 +130,11 @@ pub struct CodexUsageProviderStat {
     pub total_cost: String,
     pub success_rate: f64,
     pub avg_latency_ms: u64,
+    pub est_speed_output_tokens: u64,
+    pub est_speed_duration_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexUsagePricing {
     pub model_id: String,
@@ -182,6 +188,12 @@ struct ParsedUsageLog {
     created_at: i64,
     #[serde(default)]
     source_kind: UsageLogSourceKind,
+    #[serde(default)]
+    latency_ms: u64,
+    #[serde(default)]
+    first_token_ms: Option<u64>,
+    #[serde(default)]
+    request_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,9 +318,8 @@ struct UsageEventIdentity {
 }
 
 const PROVENANCE_USAGE_CACHE_VERSION: u32 = 4;
-const USAGE_CACHE_VERSION: u32 = 8;
-const PRICING_DEFAULTS_VERSION: u32 = 1;
-const GPT_56_DEFAULT_MODEL_IDS: [&str; 3] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+const USAGE_CACHE_VERSION: u32 = 9;
+const PRICING_DEFAULTS_VERSION: u32 = 2;
 static USAGE_DATA_LOCK: Mutex<()> = Mutex::new(());
 
 pub(super) fn lock_usage_data() -> Result<MutexGuard<'static, ()>, String> {
@@ -375,6 +386,7 @@ pub fn get_codex_usage_dashboard(
         ));
     }
     let mut logs = aggregate_instance_usage_logs(logs_by_instance);
+    apply_pricing_model_source(&mut logs, &pricing_configs);
     logs.sort_by_key(|log| std::cmp::Reverse(log.created_at));
 
     let total_logs = logs.len();
@@ -445,6 +457,37 @@ pub fn update_model_pricing(input: CodexUsagePricing) -> Result<(), String> {
     write_pricing(&pricing)
 }
 
+#[tauri::command]
+pub fn codex_update_model_pricing_batch(prices: Vec<CodexUsagePricing>) -> Result<usize, String> {
+    let _data_guard = lock_usage_data()?;
+    // Validate every entry before writing, so a bad import cannot partially apply.
+    for price in &prices {
+        validate_pricing(price)?;
+    }
+    let mut pricing = load_pricing()?;
+    let mut changed = 0;
+    for mut price in prices {
+        price.model_id = clean_model_id_for_pricing(&price.model_id);
+        price.display_name = price.display_name.trim().to_string();
+        if let Some(existing) = pricing
+            .iter_mut()
+            .find(|row| row.model_id == price.model_id)
+        {
+            if *existing != price {
+                *existing = price;
+                changed += 1;
+            }
+        } else {
+            pricing.push(price);
+            changed += 1;
+        }
+    }
+    if changed > 0 {
+        write_pricing(&pricing)?;
+    }
+    Ok(changed)
+}
+
 pub fn delete_model_pricing(model_id: &str) -> Result<(), String> {
     let _data_guard = lock_usage_data()?;
     let model_id = clean_model_id_for_pricing(model_id);
@@ -499,6 +542,8 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
         event_index: 0,
     };
     let mut events = Vec::new();
+    let mut timer = crate::usage_timing::RequestTimer::default();
+    let mut request_model = None;
 
     for line in reader.lines() {
         let line = match line {
@@ -508,20 +553,11 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
         if line.trim().is_empty() {
             continue;
         }
-        let is_event_msg = line.contains("\"event_msg\"");
-        let is_turn_context = line.contains("\"turn_context\"");
-        let is_session_meta = line.contains("\"session_meta\"");
-        if !is_event_msg && !is_turn_context && !is_session_meta {
-            continue;
-        }
-        if is_event_msg && !line.contains("\"token_count\"") && !line.contains("\"task_started\"") {
-            continue;
-        }
-
         let value: Value = match serde_json::from_str(&line) {
             Ok(value) => value,
             Err(_) => continue,
         };
+        timer.observe(&value);
         match value.get("type").and_then(Value::as_str) {
             Some("session_meta") if state.session_id.is_none() => {
                 let payload = value.get("payload");
@@ -576,6 +612,7 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
                     .and_then(Value::as_str)
                 {
                     state.current_model = normalize_codex_model(model);
+                    request_model = Some(state.current_model.clone());
                 }
             }
             Some("event_msg") => {
@@ -636,6 +673,10 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
                         (Some(total), Some(last)) if total == last
                     ));
                 }
+                let (latency_ms, first_token_ms) = timer.finish(
+                    crate::usage_timing::timestamp_ms(&value),
+                    info.get("last_token_usage"),
+                );
                 let delta = if let Some(total) = total {
                     // Fork/replay rollouts start with the parent's cumulative total.  Only
                     // those rollouts use last_token_usage for their first event; a canonical
@@ -696,6 +737,9 @@ fn parse_codex_usage_file(path: &Path) -> Result<ParsedUsageFile, String> {
                         .or(filename_timestamp)
                         .unwrap_or_default(),
                     source_kind,
+                    latency_ms,
+                    first_token_ms,
+                    request_model: request_model.clone(),
                 });
                 events.push(ParsedUsageEvent {
                     fingerprint,
@@ -1089,6 +1133,18 @@ fn init_usage_db(conn: &Connection) -> Result<(), String> {
             "source_kind",
             "ALTER TABLE usage_logs ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'legacy'",
         ),
+        (
+            "latency_ms",
+            "ALTER TABLE usage_logs ADD COLUMN latency_ms INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "first_token_ms",
+            "ALTER TABLE usage_logs ADD COLUMN first_token_ms INTEGER",
+        ),
+        (
+            "request_model",
+            "ALTER TABLE usage_logs ADD COLUMN request_model TEXT",
+        ),
     ] {
         if !columns.contains(name) {
             conn.execute(statement, [])
@@ -1170,7 +1226,7 @@ fn read_usage_logs_db(conn: &Connection) -> Result<Vec<ParsedUsageLog>, String> 
     let mut stmt = conn
         .prepare(
             "SELECT request_id, session_id, rollout_id, model, input_tokens, output_tokens, \
-             cache_read_tokens, created_at, source_kind \
+             cache_read_tokens, created_at, source_kind, latency_ms, first_token_ms, request_model \
              FROM usage_logs ORDER BY created_at ASC, request_id ASC",
         )
         .map_err(|error| format!("读取统计日志失败: {}", error))?;
@@ -1195,6 +1251,12 @@ fn read_usage_logs_db(conn: &Connection) -> Result<Vec<ParsedUsageLog>, String> 
                 cache_read_tokens: row.get::<_, i64>(6)?.max(0) as u64,
                 created_at: row.get(7)?,
                 source_kind: UsageLogSourceKind::from_db_value(&row.get::<_, String>(8)?),
+                latency_ms: row.get::<_, i64>(9)?.max(0) as u64,
+                first_token_ms: row
+                    .get::<_, Option<i64>>(10)?
+                    .filter(|ms| *ms >= 0)
+                    .map(|ms| ms as u64),
+                request_model: row.get(11)?,
             })
         })
         .map_err(|error| format!("读取统计日志失败: {}", error))?;
@@ -1209,7 +1271,7 @@ fn read_usage_logs_db_range(
     let mut stmt = conn
         .prepare(
             "SELECT request_id, session_id, rollout_id, model, input_tokens, output_tokens, \
-             cache_read_tokens, created_at, source_kind \
+             cache_read_tokens, created_at, source_kind, latency_ms, first_token_ms, request_model \
              FROM usage_logs WHERE created_at >= ?1 AND created_at <= ?2 \
              ORDER BY created_at ASC, request_id ASC",
         )
@@ -1235,6 +1297,12 @@ fn read_usage_logs_db_range(
                 cache_read_tokens: row.get::<_, i64>(6)?.max(0) as u64,
                 created_at: row.get(7)?,
                 source_kind: UsageLogSourceKind::from_db_value(&row.get::<_, String>(8)?),
+                latency_ms: row.get::<_, i64>(9)?.max(0) as u64,
+                first_token_ms: row
+                    .get::<_, Option<i64>>(10)?
+                    .filter(|ms| *ms >= 0)
+                    .map(|ms| ms as u64),
+                request_model: row.get(11)?,
             })
         })
         .map_err(|error| format!("读取统计日志失败: {}", error))?;
@@ -1310,8 +1378,8 @@ fn write_usage_cache_db(conn: &mut Connection, cache: &UsageCache) -> Result<(),
             .prepare(
                 "INSERT OR IGNORE INTO usage_logs \
                  (request_id, session_id, rollout_id, model, input_tokens, output_tokens, \
-                  cache_read_tokens, created_at, source_kind) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  cache_read_tokens, created_at, source_kind, latency_ms, first_token_ms, request_model) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )
             .map_err(|error| format!("写入统计日志失败: {}", error))?;
         for log in &cache.logs {
@@ -1325,6 +1393,9 @@ fn write_usage_cache_db(conn: &mut Connection, cache: &UsageCache) -> Result<(),
                 log.cache_read_tokens as i64,
                 log.created_at,
                 log.source_kind.as_db_value(),
+                log.latency_ms as i64,
+                log.first_token_ms.map(|ms| ms as i64),
+                log.request_model,
             ])
             .map_err(|error| format!("写入统计日志失败: {}", error))?;
         }
@@ -1439,8 +1510,8 @@ fn import_usage_cache_into_db(conn: &mut Connection, cache: &UsageCache) -> Resu
             .prepare(
                 "INSERT OR IGNORE INTO usage_logs \
                  (request_id, session_id, rollout_id, model, input_tokens, output_tokens, \
-                  cache_read_tokens, created_at, source_kind) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  cache_read_tokens, created_at, source_kind, latency_ms, first_token_ms, request_model) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )
             .map_err(|error| format!("迁移统计日志失败: {}", error))?;
         for log in &cache.logs {
@@ -1454,6 +1525,9 @@ fn import_usage_cache_into_db(conn: &mut Connection, cache: &UsageCache) -> Resu
                 log.cache_read_tokens as i64,
                 log.created_at,
                 log.source_kind.as_db_value(),
+                log.latency_ms as i64,
+                log.first_token_ms.map(|ms| ms as i64),
+                log.request_model,
             ])
             .map_err(|error| format!("迁移统计日志失败: {}", error))?;
         }
@@ -1887,6 +1961,7 @@ fn build_provider_stats(
     if logs.is_empty() {
         return Vec::new();
     }
+    let (est_speed_output_tokens, est_speed_duration_ms) = estimated_speed_totals(logs);
     vec![CodexUsageProviderStat {
         provider_id: "codex_session".to_string(),
         provider_name: "Codex (Session)".to_string(),
@@ -1895,6 +1970,8 @@ fn build_provider_stats(
         total_cost: format_cost(total_cost),
         success_rate: 100.0,
         avg_latency_ms: 0,
+        est_speed_output_tokens,
+        est_speed_duration_ms,
     }]
 }
 
@@ -1903,21 +1980,30 @@ fn build_model_stats(
     pricing: &[CodexUsagePricing],
     cost_multiplier: f64,
 ) -> Vec<CodexUsageModelStat> {
-    let mut grouped: HashMap<String, (usize, u64, f64)> = HashMap::new();
+    let mut grouped: HashMap<String, (usize, u64, f64, u64, u64)> = HashMap::new();
     for log in logs {
         let entry = grouped.entry(log.model.clone()).or_default();
         entry.0 += 1;
         entry.1 += fresh_input_tokens(log) + log.output_tokens + log.cache_read_tokens;
         entry.2 += calculate_cost(log, pricing, cost_multiplier);
+        if speed_eligible(log) {
+            entry.3 += log.output_tokens;
+            entry.4 += log.latency_ms;
+        }
     }
     let mut stats = grouped
         .into_iter()
         .map(
-            |(model, (request_count, total_tokens, cost))| CodexUsageModelStat {
+            |(
+                model,
+                (request_count, total_tokens, cost, est_speed_output_tokens, est_speed_duration_ms),
+            )| CodexUsageModelStat {
                 model,
                 request_count,
                 total_tokens,
                 total_cost: format_cost(cost),
+                est_speed_output_tokens,
+                est_speed_duration_ms,
                 avg_cost_per_request: format_cost(if request_count > 0 {
                     cost / request_count as f64
                 } else {
@@ -1947,7 +2033,21 @@ fn to_usage_log(
         status_code: 200,
         created_at: log.created_at,
         data_source: "codex_session".to_string(),
+        latency_ms: log.latency_ms,
+        first_token_ms: log.first_token_ms,
     }
+}
+
+fn speed_eligible(log: &ParsedUsageLog) -> bool {
+    log.output_tokens >= 200 && log.latency_ms >= 1000
+}
+
+fn estimated_speed_totals(logs: &[ParsedUsageLog]) -> (u64, u64) {
+    logs.iter()
+        .filter(|log| speed_eligible(log))
+        .fold((0, 0), |(tokens, ms), log| {
+            (tokens + log.output_tokens, ms + log.latency_ms)
+        })
 }
 
 fn calculate_cost(
@@ -1997,8 +2097,7 @@ fn load_pricing() -> Result<Vec<CodexUsagePricing>, String> {
         let pricing: Vec<CodexUsagePricing> = serde_json::from_str(&content)
             .map_err(|error| format!("解析成本定价失败: {}", error))?;
         let applied_version = read_pricing_defaults_version()?;
-        let (pricing, migrated) = migrate_pricing_defaults(pricing, applied_version);
-        let mut pricing = filter_supported_pricing(pricing);
+        let (mut pricing, migrated) = migrate_pricing_defaults(pricing, applied_version);
         pricing.sort_by(|left, right| left.model_id.cmp(&right.model_id));
         write_pricing(&pricing)?;
         if migrated {
@@ -2020,11 +2119,19 @@ fn migrate_pricing_defaults(
         return (pricing, false);
     }
 
-    for default in default_pricing()
-        .into_iter()
-        .filter(|item| GPT_56_DEFAULT_MODEL_IDS.contains(&item.model_id.as_str()))
-    {
-        if !pricing.iter().any(|item| item.model_id == default.model_id) {
+    let previous: Vec<CodexUsagePricing> =
+        serde_json::from_str(include_str!("../data/model-pricing-v1.json"))
+            .expect("valid version 1 pricing snapshot");
+    for default in default_pricing() {
+        if let Some(existing) = pricing
+            .iter_mut()
+            .find(|item| item.model_id == default.model_id)
+        {
+            // Only replace unchanged built-in rows. User prices and display names win.
+            if previous.iter().any(|old| old == existing) {
+                *existing = default;
+            }
+        } else {
             pricing.push(default);
         }
     }
@@ -2055,20 +2162,17 @@ fn write_pricing_defaults_version() -> Result<(), String> {
 
 fn write_pricing(pricing: &[CodexUsagePricing]) -> Result<(), String> {
     fs::create_dir_all(statistics_dir()).map_err(|error| format!("创建统计目录失败: {}", error))?;
-    let mut next = filter_supported_pricing(pricing.to_vec());
+    let mut next = pricing.to_vec();
     next.sort_by(|left, right| left.model_id.cmp(&right.model_id));
     let content = serde_json::to_string_pretty(&next)
         .map_err(|error| format!("序列化成本定价失败: {}", error))?;
-    fs::write(pricing_path(), content).map_err(|error| format!("写入成本定价失败: {}", error))
+    crate::account::write_bytes_atomic(&pricing_path(), content.as_bytes())
 }
 
 fn validate_pricing(pricing: &CodexUsagePricing) -> Result<(), String> {
     let model_id = clean_model_id_for_pricing(&pricing.model_id);
     if model_id.is_empty() {
         return Err("模型 ID 不能为空".to_string());
-    }
-    if !is_supported_pricing_model(&model_id) {
-        return Err("当前只支持配置 GPT/Codex 相关模型".to_string());
     }
     if pricing.display_name.trim().is_empty() {
         return Err("显示名称不能为空".to_string());
@@ -2100,19 +2204,6 @@ fn pricing_to_numbers(pricing: &CodexUsagePricing) -> ModelPricing {
             .parse()
             .unwrap_or(0.0),
     }
-}
-
-fn filter_supported_pricing(pricing: Vec<CodexUsagePricing>) -> Vec<CodexUsagePricing> {
-    pricing
-        .into_iter()
-        .filter(|item| is_supported_pricing_model(&item.model_id))
-        .collect()
-}
-
-fn is_supported_pricing_model(model_id: &str) -> bool {
-    let cleaned = clean_model_id_for_pricing(model_id);
-    let normalized = strip_known_model_namespace(&cleaned).unwrap_or(cleaned);
-    normalized.starts_with("gpt-") || normalized.starts_with("codex-")
 }
 
 fn load_pricing_configs() -> Result<Vec<CodexUsagePricingConfig>, String> {
@@ -2208,817 +2299,23 @@ fn pricing_config_multiplier(configs: &[CodexUsagePricingConfig]) -> f64 {
         .max(0.0)
 }
 
+fn apply_pricing_model_source(logs: &mut [ParsedUsageLog], configs: &[CodexUsagePricingConfig]) {
+    if configs
+        .iter()
+        .any(|config| config.app == "Codex" && config.pricing_model_source == "request")
+    {
+        for log in logs {
+            if let Some(model) = &log.request_model {
+                log.model = model.clone();
+            }
+        }
+    }
+}
+
 fn default_pricing() -> Vec<CodexUsagePricing> {
-    [
-        (
-            "claude-fable-5",
-            "Claude Fable 5",
-            "10",
-            "50",
-            "1.00",
-            "12.50",
-        ),
-        (
-            "claude-mythos-5",
-            "Claude Mythos 5",
-            "10",
-            "50",
-            "1.00",
-            "12.50",
-        ),
-        (
-            "claude-opus-4-8",
-            "Claude Opus 4.8",
-            "5",
-            "25",
-            "0.50",
-            "6.25",
-        ),
-        (
-            "claude-opus-4-7",
-            "Claude Opus 4.7",
-            "5",
-            "25",
-            "0.50",
-            "6.25",
-        ),
-        (
-            "claude-opus-4-6-20260206",
-            "Claude Opus 4.6",
-            "5",
-            "25",
-            "0.50",
-            "6.25",
-        ),
-        (
-            "claude-sonnet-4-6-20260217",
-            "Claude Sonnet 4.6",
-            "3",
-            "15",
-            "0.30",
-            "3.75",
-        ),
-        (
-            "claude-opus-4-5-20251101",
-            "Claude Opus 4.5",
-            "5",
-            "25",
-            "0.50",
-            "6.25",
-        ),
-        (
-            "claude-sonnet-4-5-20250929",
-            "Claude Sonnet 4.5",
-            "3",
-            "15",
-            "0.30",
-            "3.75",
-        ),
-        (
-            "claude-haiku-4-5-20251001",
-            "Claude Haiku 4.5",
-            "1",
-            "5",
-            "0.10",
-            "1.25",
-        ),
-        (
-            "claude-opus-4-20250514",
-            "Claude Opus 4",
-            "15",
-            "75",
-            "1.50",
-            "18.75",
-        ),
-        (
-            "claude-opus-4-1-20250805",
-            "Claude Opus 4.1",
-            "15",
-            "75",
-            "1.50",
-            "18.75",
-        ),
-        (
-            "claude-sonnet-4-20250514",
-            "Claude Sonnet 4",
-            "3",
-            "15",
-            "0.30",
-            "3.75",
-        ),
-        (
-            "claude-3-5-haiku-20241022",
-            "Claude 3.5 Haiku",
-            "0.80",
-            "4",
-            "0.08",
-            "1",
-        ),
-        (
-            "claude-3-5-sonnet-20241022",
-            "Claude 3.5 Sonnet",
-            "3",
-            "15",
-            "0.30",
-            "3.75",
-        ),
-        ("gpt-5.5", "GPT-5.5", "5", "30", "0.50", "0"),
-        ("gpt-5.5-low", "GPT-5.5", "5", "30", "0.50", "0"),
-        ("gpt-5.5-medium", "GPT-5.5", "5", "30", "0.50", "0"),
-        ("gpt-5.5-high", "GPT-5.5", "5", "30", "0.50", "0"),
-        ("gpt-5.5-xhigh", "GPT-5.5", "5", "30", "0.50", "0"),
-        ("gpt-5.5-minimal", "GPT-5.5", "5", "30", "0.50", "0"),
-        ("gpt-5.6-sol", "GPT-5.6 Sol", "5", "30", "0.50", "6.25"),
-        (
-            "gpt-5.6-terra",
-            "GPT-5.6 Terra",
-            "2.50",
-            "15",
-            "0.25",
-            "3.125",
-        ),
-        ("gpt-5.6-luna", "GPT-5.6 Luna", "1", "6", "0.10", "1.25"),
-        ("gpt-5.4", "GPT-5.4", "2.50", "15", "0.25", "0"),
-        ("gpt-5.4-mini", "GPT-5.4 Mini", "0.75", "4.50", "0.075", "0"),
-        ("gpt-5.4-nano", "GPT-5.4 Nano", "0.20", "1.25", "0.02", "0"),
-        ("gpt-5.2", "GPT-5.2", "1.75", "14", "0.175", "0"),
-        ("gpt-5.2-low", "GPT-5.2", "1.75", "14", "0.175", "0"),
-        ("gpt-5.2-medium", "GPT-5.2", "1.75", "14", "0.175", "0"),
-        ("gpt-5.2-high", "GPT-5.2", "1.75", "14", "0.175", "0"),
-        ("gpt-5.2-xhigh", "GPT-5.2", "1.75", "14", "0.175", "0"),
-        ("gpt-5.2-codex", "GPT-5.2 Codex", "1.75", "14", "0.175", "0"),
-        (
-            "gpt-5.2-codex-low",
-            "GPT-5.2 Codex",
-            "1.75",
-            "14",
-            "0.175",
-            "0",
-        ),
-        (
-            "gpt-5.2-codex-medium",
-            "GPT-5.2 Codex",
-            "1.75",
-            "14",
-            "0.175",
-            "0",
-        ),
-        (
-            "gpt-5.2-codex-high",
-            "GPT-5.2 Codex",
-            "1.75",
-            "14",
-            "0.175",
-            "0",
-        ),
-        (
-            "gpt-5.2-codex-xhigh",
-            "GPT-5.2 Codex",
-            "1.75",
-            "14",
-            "0.175",
-            "0",
-        ),
-        ("gpt-5.3-codex", "GPT-5.3 Codex", "1.75", "14", "0.175", "0"),
-        (
-            "gpt-5.3-codex-low",
-            "GPT-5.3 Codex",
-            "1.75",
-            "14",
-            "0.175",
-            "0",
-        ),
-        (
-            "gpt-5.3-codex-medium",
-            "GPT-5.3 Codex",
-            "1.75",
-            "14",
-            "0.175",
-            "0",
-        ),
-        (
-            "gpt-5.3-codex-high",
-            "GPT-5.3 Codex",
-            "1.75",
-            "14",
-            "0.175",
-            "0",
-        ),
-        (
-            "gpt-5.3-codex-xhigh",
-            "GPT-5.3 Codex",
-            "1.75",
-            "14",
-            "0.175",
-            "0",
-        ),
-        ("gpt-5.1", "GPT-5.1", "1.25", "10", "0.125", "0"),
-        ("gpt-5.1-low", "GPT-5.1", "1.25", "10", "0.125", "0"),
-        ("gpt-5.1-medium", "GPT-5.1", "1.25", "10", "0.125", "0"),
-        ("gpt-5.1-high", "GPT-5.1", "1.25", "10", "0.125", "0"),
-        ("gpt-5.1-minimal", "GPT-5.1", "1.25", "10", "0.125", "0"),
-        ("gpt-5.1-codex", "GPT-5.1 Codex", "1.25", "10", "0.125", "0"),
-        (
-            "gpt-5.1-codex-mini",
-            "GPT-5.1 Codex",
-            "1.25",
-            "10",
-            "0.125",
-            "0",
-        ),
-        (
-            "gpt-5.1-codex-max",
-            "GPT-5.1 Codex",
-            "1.25",
-            "10",
-            "0.125",
-            "0",
-        ),
-        (
-            "gpt-5.1-codex-max-high",
-            "GPT-5.1 Codex",
-            "1.25",
-            "10",
-            "0.125",
-            "0",
-        ),
-        (
-            "gpt-5.1-codex-max-xhigh",
-            "GPT-5.1 Codex",
-            "1.25",
-            "10",
-            "0.125",
-            "0",
-        ),
-        ("gpt-5", "GPT-5", "1.25", "10", "0.125", "0"),
-        ("gpt-5-low", "GPT-5", "1.25", "10", "0.125", "0"),
-        ("gpt-5-medium", "GPT-5", "1.25", "10", "0.125", "0"),
-        ("gpt-5-high", "GPT-5", "1.25", "10", "0.125", "0"),
-        ("gpt-5-minimal", "GPT-5", "1.25", "10", "0.125", "0"),
-        ("gpt-5-codex", "GPT-5 Codex", "1.25", "10", "0.125", "0"),
-        ("gpt-5-codex-low", "GPT-5 Codex", "1.25", "10", "0.125", "0"),
-        (
-            "gpt-5-codex-medium",
-            "GPT-5 Codex",
-            "1.25",
-            "10",
-            "0.125",
-            "0",
-        ),
-        (
-            "gpt-5-codex-high",
-            "GPT-5 Codex",
-            "1.25",
-            "10",
-            "0.125",
-            "0",
-        ),
-        (
-            "gpt-5-codex-mini",
-            "GPT-5 Codex",
-            "1.25",
-            "10",
-            "0.125",
-            "0",
-        ),
-        (
-            "gpt-5-codex-mini-medium",
-            "GPT-5 Codex",
-            "1.25",
-            "10",
-            "0.125",
-            "0",
-        ),
-        (
-            "gpt-5-codex-mini-high",
-            "GPT-5 Codex",
-            "1.25",
-            "10",
-            "0.125",
-            "0",
-        ),
-        ("o3", "OpenAI o3", "2", "8", "0.50", "0"),
-        ("o4-mini", "OpenAI o4-mini", "1.10", "4.40", "0.275", "0"),
-        ("gpt-4.1", "GPT-4.1", "2", "8", "0.50", "0"),
-        ("gpt-4.1-mini", "GPT-4.1 Mini", "0.40", "1.60", "0.10", "0"),
-        ("gpt-4.1-nano", "GPT-4.1 Nano", "0.10", "0.40", "0.025", "0"),
-        (
-            "gemini-3.5-flash",
-            "Gemini 3.5 Flash",
-            "1.50",
-            "9.00",
-            "0.15",
-            "0",
-        ),
-        (
-            "gemini-3.1-pro-preview",
-            "Gemini 3.1 Pro Preview",
-            "2",
-            "12",
-            "0.20",
-            "0",
-        ),
-        (
-            "gemini-3.1-flash-lite",
-            "Gemini 3.1 Flash Lite",
-            "0.25",
-            "1.50",
-            "0.025",
-            "0",
-        ),
-        (
-            "gemini-3.1-flash-lite-preview",
-            "Gemini 3.1 Flash Lite Preview",
-            "0.25",
-            "1.50",
-            "0.025",
-            "0",
-        ),
-        (
-            "gemini-3-pro-preview",
-            "Gemini 3 Pro Preview",
-            "2",
-            "12",
-            "0.2",
-            "0",
-        ),
-        (
-            "gemini-3-flash-preview",
-            "Gemini 3 Flash Preview",
-            "0.5",
-            "3",
-            "0.05",
-            "0",
-        ),
-        (
-            "gemini-2.5-pro",
-            "Gemini 2.5 Pro",
-            "1.25",
-            "10",
-            "0.125",
-            "0",
-        ),
-        (
-            "gemini-2.5-flash",
-            "Gemini 2.5 Flash",
-            "0.3",
-            "2.5",
-            "0.03",
-            "0",
-        ),
-        (
-            "gemini-2.5-flash-lite",
-            "Gemini 2.5 Flash Lite",
-            "0.10",
-            "0.40",
-            "0.01",
-            "0",
-        ),
-        (
-            "gemini-2.0-flash",
-            "Gemini 2.0 Flash",
-            "0.10",
-            "0.40",
-            "0.025",
-            "0",
-        ),
-        (
-            "step-3.7-flash",
-            "Step 3.7 Flash",
-            "0.19",
-            "1.13",
-            "0.04",
-            "0",
-        ),
-        (
-            "step-3.5-flash",
-            "Step 3.5 Flash",
-            "0.10",
-            "0.30",
-            "0.02",
-            "0",
-        ),
-        (
-            "step-3.5-flash-2603",
-            "Step 3.5 Flash 2603",
-            "0.10",
-            "0.30",
-            "0.02",
-            "0",
-        ),
-        (
-            "doubao-seed-2-1-pro",
-            "Doubao Seed 2.1 Pro",
-            "0.84",
-            "4.2",
-            "0.17",
-            "0",
-        ),
-        (
-            "doubao-seed-2-1-turbo",
-            "Doubao Seed 2.1 Turbo",
-            "0.42",
-            "2.1",
-            "0.08",
-            "0",
-        ),
-        (
-            "doubao-seed-code",
-            "Doubao Seed Code",
-            "0.17",
-            "1.11",
-            "0.02",
-            "0",
-        ),
-        (
-            "doubao-seed-2-0-pro",
-            "Doubao Seed 2.0 Pro",
-            "0.47",
-            "2.37",
-            "0.09",
-            "0",
-        ),
-        (
-            "doubao-seed-2-0-code",
-            "Doubao Seed 2.0 Code",
-            "0.47",
-            "2.37",
-            "0.09",
-            "0",
-        ),
-        (
-            "doubao-seed-2-0-code-preview-latest",
-            "Doubao Seed 2.0 Code Preview",
-            "0.47",
-            "2.37",
-            "0.09",
-            "0",
-        ),
-        (
-            "doubao-seed-2-0-lite",
-            "Doubao Seed 2.0 Lite",
-            "0.08",
-            "0.50",
-            "0.017",
-            "0",
-        ),
-        (
-            "doubao-seed-2-0-mini",
-            "Doubao Seed 2.0 Mini",
-            "0.03",
-            "0.31",
-            "0.0056",
-            "0",
-        ),
-        (
-            "deepseek-v3.2",
-            "DeepSeek V3.2",
-            "0.28",
-            "0.42",
-            "0.028",
-            "0",
-        ),
-        (
-            "deepseek-v3.1",
-            "DeepSeek V3.1",
-            "0.55",
-            "1.67",
-            "0.055",
-            "0",
-        ),
-        ("deepseek-v3", "DeepSeek V3", "0.28", "1.11", "0.028", "0"),
-        (
-            "deepseek-chat",
-            "DeepSeek Chat",
-            "0.27",
-            "1.10",
-            "0.07",
-            "0",
-        ),
-        (
-            "deepseek-reasoner",
-            "DeepSeek Reasoner",
-            "0.55",
-            "2.19",
-            "0.14",
-            "0",
-        ),
-        (
-            "deepseek-v4-flash",
-            "DeepSeek V4 Flash",
-            "0.14",
-            "0.28",
-            "0.0028",
-            "0",
-        ),
-        (
-            "deepseek-v4-pro",
-            "DeepSeek V4 Pro",
-            "0.435",
-            "0.87",
-            "0.003625",
-            "0",
-        ),
-        (
-            "kimi-k2-thinking",
-            "Kimi K2 Thinking",
-            "0.55",
-            "2.20",
-            "0.10",
-            "0",
-        ),
-        ("kimi-k2-0905", "Kimi K2", "0.55", "2.20", "0.10", "0"),
-        (
-            "kimi-k2-turbo",
-            "Kimi K2 Turbo",
-            "1.11",
-            "8.06",
-            "0.14",
-            "0",
-        ),
-        ("kimi-k2.5", "Kimi K2.5", "0.60", "3.00", "0.10", "0"),
-        ("kimi-k2.6", "Kimi K2.6", "0.95", "4.00", "0.16", "0"),
-        (
-            "kimi-k2.7-code",
-            "Kimi K2.7 Code",
-            "0.95",
-            "4.00",
-            "0.19",
-            "0",
-        ),
-        ("minimax-m2.1", "MiniMax M2.1", "0.27", "0.95", "0.03", "0"),
-        (
-            "minimax-m2.1-lightning",
-            "MiniMax M2.1 Lightning",
-            "0.27",
-            "2.33",
-            "0.03",
-            "0",
-        ),
-        ("minimax-m2", "MiniMax M2", "0.27", "0.95", "0.03", "0"),
-        ("minimax-m2.5", "MiniMax M2.5", "0.15", "0.95", "0.03", "0"),
-        (
-            "minimax-m2.5-lightning",
-            "MiniMax M2.5 Lightning",
-            "0.30",
-            "2.40",
-            "0.03",
-            "0",
-        ),
-        (
-            "minimax-m2.7",
-            "MiniMax M2.7",
-            "0.30",
-            "1.20",
-            "0.06",
-            "0.375",
-        ),
-        (
-            "minimax-m2.7-highspeed",
-            "MiniMax M2.7 Highspeed",
-            "0.60",
-            "2.40",
-            "0.06",
-            "0.375",
-        ),
-        ("minimax-m3", "MiniMax M3", "0.60", "2.40", "0.12", "0"),
-        ("glm-4.7", "GLM-4.7", "0.6", "2.2", "0.11", "0"),
-        ("glm-4.6", "GLM-4.6", "0.6", "2.2", "0.11", "0"),
-        ("glm-5", "GLM-5", "1", "3.2", "0.2", "0"),
-        ("glm-5.1", "GLM-5.1", "1.4", "4.4", "0.26", "0"),
-        ("glm-5.2", "GLM-5.2", "1.4", "4.4", "0.26", "0"),
-        (
-            "mimo-v2-flash",
-            "MiMo V2 Flash",
-            "0.09",
-            "0.29",
-            "0.009",
-            "0",
-        ),
-        ("mimo-v2-pro", "MiMo V2 Pro", "0.435", "0.87", "0.0036", "0"),
-        ("mimo-v2.5", "MiMo V2.5", "0.14", "0.29", "0.0028", "0"),
-        (
-            "mimo-v2.5-pro",
-            "MiMo V2.5 Pro",
-            "0.435",
-            "0.87",
-            "0.0036",
-            "0",
-        ),
-        ("qwen3.7-max", "Qwen3.7 Max", "2.50", "7.50", "0.25", "0"),
-        ("qwen3.7-plus", "Qwen3.7 Plus", "0.40", "1.60", "0.08", "0"),
-        (
-            "qwen3.6-plus",
-            "Qwen3.6 Plus",
-            "0.325",
-            "1.95",
-            "0.065",
-            "0",
-        ),
-        ("qwen3.5-plus", "Qwen3.5 Plus", "0.26", "1.56", "0.052", "0"),
-        ("qwen3-max", "Qwen3 Max", "0.78", "3.90", "0", "0"),
-        (
-            "qwen3-235b-a22b",
-            "Qwen3 235B-A22B",
-            "0.70",
-            "8.40",
-            "0",
-            "0",
-        ),
-        (
-            "qwen3-coder-plus",
-            "Qwen3 Coder Plus",
-            "0.65",
-            "3.25",
-            "0.13",
-            "0",
-        ),
-        (
-            "qwen3-coder-480b",
-            "Qwen3 Coder 480B",
-            "0.65",
-            "3.25",
-            "0",
-            "0",
-        ),
-        (
-            "qwen3-coder-480b-a35b-instruct",
-            "Qwen3 Coder 480B-A35B Instruct",
-            "0.65",
-            "3.25",
-            "0",
-            "0",
-        ),
-        (
-            "qwen3-coder-flash",
-            "Qwen3 Coder Flash",
-            "0.195",
-            "0.975",
-            "0.039",
-            "0",
-        ),
-        (
-            "qwen3-coder-next",
-            "Qwen3 Coder Next",
-            "0.12",
-            "0.75",
-            "0",
-            "0",
-        ),
-        ("qwq-plus", "QwQ Plus", "0.80", "2.40", "0", "0"),
-        ("qwq-32b", "QwQ 32B", "0.20", "0.60", "0", "0"),
-        ("qwen3-32b", "Qwen3 32B", "0.16", "0.64", "0", "0"),
-        ("grok-4.3", "Grok 4.3", "1.25", "2.50", "0.20", "0"),
-        (
-            "grok-4.20-0309-reasoning",
-            "Grok 4.20 Reasoning",
-            "1.25",
-            "2.50",
-            "0.20",
-            "0",
-        ),
-        (
-            "grok-4.20-0309-non-reasoning",
-            "Grok 4.20",
-            "1.25",
-            "2.50",
-            "0.20",
-            "0",
-        ),
-        (
-            "grok-4-1-fast-reasoning",
-            "Grok 4.1 Fast Reasoning",
-            "0.20",
-            "0.50",
-            "0.05",
-            "0",
-        ),
-        (
-            "grok-4-1-fast-non-reasoning",
-            "Grok 4.1 Fast",
-            "0.20",
-            "0.50",
-            "0.05",
-            "0",
-        ),
-        ("grok-4", "Grok 4", "3", "15", "0.75", "0"),
-        (
-            "grok-code-fast-1",
-            "Grok Build 0.1 (Code Fast Alias)",
-            "1",
-            "2",
-            "0.20",
-            "0",
-        ),
-        ("grok-build-0.1", "Grok Build 0.1", "1", "2", "0.20", "0"),
-        ("grok-3", "Grok 3", "3", "15", "0.75", "0"),
-        ("grok-3-mini", "Grok 3 Mini", "0.25", "0.50", "0.075", "0"),
-        (
-            "mistral-medium-3.5",
-            "Mistral Medium 3.5",
-            "1.50",
-            "7.50",
-            "0",
-            "0",
-        ),
-        (
-            "mistral-small-4",
-            "Mistral Small 4",
-            "0.10",
-            "0.30",
-            "0.01",
-            "0",
-        ),
-        (
-            "devstral-small-2-2512",
-            "Devstral Small 2",
-            "0.10",
-            "0.30",
-            "0.01",
-            "0",
-        ),
-        (
-            "magistral-small",
-            "Magistral Small",
-            "0.50",
-            "1.50",
-            "0",
-            "0",
-        ),
-        ("codestral-2508", "Codestral", "0.30", "0.90", "0.03", "0"),
-        (
-            "devstral-small-1.1",
-            "Devstral Small 1.1",
-            "0.07",
-            "0.28",
-            "0.01",
-            "0",
-        ),
-        ("devstral-2-2512", "Devstral 2", "0.40", "2", "0.04", "0"),
-        (
-            "devstral-medium",
-            "Devstral Medium",
-            "0.40",
-            "2",
-            "0.04",
-            "0",
-        ),
-        (
-            "mistral-large-3-2512",
-            "Mistral Large 3",
-            "0.50",
-            "1.50",
-            "0.05",
-            "0",
-        ),
-        (
-            "mistral-medium-3.1",
-            "Mistral Medium 3.1",
-            "0.40",
-            "2",
-            "0.04",
-            "0",
-        ),
-        (
-            "mistral-small-3.2-24b",
-            "Mistral Small 3.2",
-            "0.075",
-            "0.20",
-            "0.01",
-            "0",
-        ),
-        ("magistral-medium", "Magistral Medium", "2", "5", "0", "0"),
-        ("command-a", "Cohere Command A", "2.50", "10", "0", "0"),
-        (
-            "command-r-plus",
-            "Cohere Command R+",
-            "2.50",
-            "10",
-            "0",
-            "0",
-        ),
-        ("command-r", "Cohere Command R", "0.15", "0.60", "0", "0"),
-        ("o3-pro", "OpenAI o3-pro", "20", "80", "0", "0"),
-        ("o3-mini", "OpenAI o3-mini", "0.55", "2.20", "0.55", "0"),
-        ("o1", "OpenAI o1", "15", "60", "7.50", "0"),
-        ("o1-mini", "OpenAI o1-mini", "0.55", "2.20", "0.55", "0"),
-        ("codex-mini", "Codex Mini", "0.75", "3", "0.025", "0"),
-        ("gpt-5-mini", "GPT-5 Mini", "0.25", "2", "0.025", "0"),
-        ("gpt-5-nano", "GPT-5 Nano", "0.05", "0.40", "0.005", "0"),
-    ]
-    .into_iter()
-    .map(
-        |(model_id, display_name, input, output, cache_read, cache_creation)| CodexUsagePricing {
-            model_id: model_id.to_string(),
-            display_name: display_name.to_string(),
-            input_cost_per_million: input.to_string(),
-            output_cost_per_million: output.to_string(),
-            cache_read_cost_per_million: cache_read.to_string(),
-            cache_creation_cost_per_million: cache_creation.to_string(),
-        },
-    )
-    .filter(|item| is_supported_pricing_model(&item.model_id))
-    .collect()
+    // Source and license: ../data/README.md. Bundle the full catalog for offline use.
+    serde_json::from_str(include_str!("../data/model-pricing.json"))
+        .expect("valid bundled model pricing")
 }
 
 fn model_pricing_candidates(model_id: &str) -> Vec<String> {
@@ -3121,7 +2418,14 @@ fn strip_model_date_suffix(model_id: &str) -> Option<String> {
 }
 
 fn strip_reasoning_effort_suffix(model_id: &str) -> Option<String> {
-    for suffix in ["-minimal", "-low", "-medium", "-high", "-xhigh"] {
+    for suffix in [
+        "-minimal",
+        "-low",
+        "-medium",
+        "-high",
+        "-xhigh",
+        "-thinking",
+    ] {
         if let Some(stripped) = model_id.strip_suffix(suffix) {
             if !stripped.is_empty() {
                 return Some(stripped.to_string());
@@ -3509,6 +2813,9 @@ mod tests {
             cache_read_tokens: 20,
             created_at: 1_782_662_400,
             source_kind,
+            latency_ms: 0,
+            first_token_ms: None,
+            request_model: None,
         }
     }
 
@@ -5111,6 +4418,9 @@ mod tests {
                 cache_read_tokens: 4,
                 created_at: 1_782_880_001,
                 source_kind: UsageLogSourceKind::Fork,
+                latency_ms: 0,
+                first_token_ms: None,
+                request_model: None,
             }],
             errors: vec!["sample error".to_string()],
         };
@@ -5139,26 +4449,94 @@ mod tests {
     }
 
     #[test]
-    fn supported_pricing_only_keeps_gpt_and_codex_models() {
-        let pricing = default_pricing();
+    fn timing_survives_parser_and_sqlite_cache_and_aggregate_speed_is_weighted() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("timed.jsonl");
+        let rows = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"timed"}}),
+            serde_json::json!({"type":"turn_context","timestamp":"2026-10-30T00:00:00Z","payload":{"model":"gpt-6-astra"}}),
+            serde_json::json!({"type":"response_item","timestamp":"2026-10-30T00:00:10Z","payload":{"type":"message","role":"assistant"}}),
+            serde_json::json!({"type":"event_msg","timestamp":"2026-10-30T00:00:10Z","payload":{"type":"token_count","info":{"model":"gpt-6.1-sol","total_token_usage":{"input_tokens":100,"output_tokens":300},"last_token_usage":{"input_tokens":100,"output_tokens":300}}}}),
+        ];
+        fs::write(
+            &file,
+            rows.iter()
+                .map(|row| row.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let logs = file_logs(&parse_codex_usage_file(&file).unwrap());
+        assert_eq!(logs[0].latency_ms, 10_000);
+        assert_eq!(logs[0].request_model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(logs[0].model, "gpt-6.1-sol");
+        let mut billing_logs = logs.clone();
+        let mut configs = default_pricing_configs();
+        apply_pricing_model_source(&mut billing_logs, &configs);
+        assert_eq!(billing_logs[0].model, "gpt-6.1-sol");
+        configs[0].pricing_model_source = "request".into();
+        apply_pricing_model_source(&mut billing_logs, &configs);
+        assert_eq!(billing_logs[0].model, "gpt-6-astra");
+        assert_ne!(
+            calculate_cost(&billing_logs[0], &default_pricing(), 1.0),
+            calculate_cost(&logs[0], &default_pricing(), 1.0)
+        );
+        let mut legacy_log = logs[0].clone();
+        legacy_log.request_model = None;
+        apply_pricing_model_source(std::slice::from_mut(&mut legacy_log), &configs);
+        assert_eq!(legacy_log.model, "gpt-6.1-sol");
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_usage_db(&conn).unwrap();
+        let cache = UsageCache {
+            version: USAGE_CACHE_VERSION,
+            updated_at: 1,
+            files: vec![],
+            logs: logs.clone(),
+            errors: vec![],
+        };
+        write_usage_cache_db(&mut conn, &cache).unwrap();
+        assert_eq!(read_usage_logs_db(&conn).unwrap(), logs);
+        let mut slow = logs[0].clone();
+        slow.output_tokens = 1000;
+        slow.latency_ms = 100_000;
+        let mut short = slow.clone();
+        short.output_tokens = 100;
+        let all = vec![logs[0].clone(), slow, short];
+        assert_eq!(estimated_speed_totals(&all), (1300, 110_000));
+        let stats = build_model_stats(&all, &default_pricing(), 1.0);
+        assert_eq!(stats[0].est_speed_output_tokens, 1300);
+        assert_eq!(stats[0].est_speed_duration_ms, 110_000);
+    }
 
-        assert!(!pricing.is_empty());
-        assert!(pricing
-            .iter()
-            .all(|item| is_supported_pricing_model(&item.model_id)));
-        assert!(pricing.iter().any(|item| item.model_id == "gpt-5.5"));
-        assert!(pricing.iter().any(|item| item.model_id == "gpt-5.6-sol"));
-        assert!(pricing.iter().any(|item| item.model_id == "gpt-5.6-terra"));
-        assert!(pricing.iter().any(|item| item.model_id == "gpt-5.6-luna"));
-        assert!(!pricing
-            .iter()
-            .any(|item| item.model_id.starts_with("claude-")));
-        assert!(!pricing
-            .iter()
-            .any(|item| item.model_id.starts_with("gemini-")));
-        assert!(!pricing
-            .iter()
-            .any(|item| item.model_id.starts_with("doubao-")));
+    #[test]
+    fn bundled_pricing_contains_all_cc_switch_presets_and_valid_prices() {
+        let pricing = default_pricing();
+        assert_eq!(pricing.len(), 232);
+        let mut ids = HashSet::new();
+        for entry in &pricing {
+            assert!(ids.insert(entry.model_id.clone()), "duplicate pricing ID");
+            validate_pricing(entry).expect("valid bundled price");
+            assert_eq!(clean_model_id_for_pricing(&entry.model_id), entry.model_id);
+        }
+        for model in [
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "claude-opus-5-5",
+            "gemini-4-argon",
+            "deepseek-v4.1-flash",
+            "qwen3.8-max",
+            "kimi-k3",
+            "o3-mini",
+        ] {
+            assert!(ids.contains(model), "missing {model}");
+        }
+        let pricing = model_pricing("gpt-6-astra-high", &pricing);
+        assert_eq!(pricing.input_per_million, 10.0);
+        assert_eq!(pricing.output_per_million, 50.0);
+        assert_eq!(pricing.cache_read_per_million, 1.0);
+        let pricing = model_pricing("claude-opus-4-6-thinking", &default_pricing());
+        assert_eq!(pricing.input_per_million, 5.0);
+        assert_eq!(pricing.output_per_million, 25.0);
     }
 
     #[test]
@@ -5174,14 +4552,17 @@ mod tests {
             cache_read_tokens: 200_000,
             created_at: 1_782_880_001,
             source_kind: UsageLogSourceKind::CanonicalRoot,
+            latency_ms: 0,
+            first_token_ms: None,
+            request_model: None,
         };
 
         assert_eq!(log.model, "gpt-5.6-terra");
-        assert_eq!(format_cost(calculate_cost(&log, &pricing, 1.0)), "4.050000");
+        assert_eq!(format_cost(calculate_cost(&log, &pricing, 1.0)), "3.240000");
     }
 
     #[test]
-    fn pricing_defaults_migration_adds_gpt_56_once_and_preserves_custom_prices() {
+    fn pricing_defaults_migration_adds_full_catalog_once_and_preserves_custom_prices() {
         let custom_sol = CodexUsagePricing {
             model_id: "gpt-5.6-sol".to_string(),
             display_name: "Custom Sol".to_string(),
@@ -5235,27 +4616,38 @@ mod tests {
     }
 
     #[test]
-    fn filter_supported_pricing_removes_non_gpt_entries() {
-        let pricing = filter_supported_pricing(vec![
-            CodexUsagePricing {
-                model_id: "gpt-5.5".to_string(),
-                display_name: "GPT-5.5".to_string(),
-                input_cost_per_million: "1".to_string(),
-                output_cost_per_million: "1".to_string(),
-                cache_read_cost_per_million: "0".to_string(),
-                cache_creation_cost_per_million: "0".to_string(),
-            },
-            CodexUsagePricing {
-                model_id: "gemini-2.5-pro".to_string(),
-                display_name: "Gemini 2.5 Pro".to_string(),
-                input_cost_per_million: "1".to_string(),
-                output_cost_per_million: "1".to_string(),
-                cache_read_cost_per_million: "0".to_string(),
-                cache_creation_cost_per_million: "0".to_string(),
-            },
-        ]);
-
-        assert_eq!(pricing.len(), 1);
-        assert_eq!(pricing[0].model_id, "gpt-5.5");
+    fn catalog_upgrade_updates_old_defaults_but_preserves_custom_models_and_prices() {
+        let previous: Vec<CodexUsagePricing> =
+            serde_json::from_str(include_str!("../data/model-pricing-v1.json")).unwrap();
+        let mut custom = default_pricing()
+            .into_iter()
+            .find(|entry| entry.model_id == "claude-opus-5-5")
+            .unwrap();
+        custom.model_id = "my-api-model".to_string();
+        custom.input_cost_per_million = "99".to_string();
+        validate_pricing(&custom).expect("custom model accepted");
+        let mut existing = previous;
+        existing.push(custom.clone());
+        let (migrated, changed) = migrate_pricing_defaults(existing, 1);
+        assert!(changed);
+        assert_eq!(migrated.len(), 233);
+        assert!(migrated.contains(&custom));
+        let terra = migrated
+            .iter()
+            .find(|row| row.model_id == "gpt-5.6-terra")
+            .unwrap();
+        assert_eq!(terra.input_cost_per_million, "2");
+        let astra = migrated
+            .iter()
+            .find(|row| row.model_id == "gpt-6-astra")
+            .unwrap();
+        assert_eq!(astra.input_cost_per_million, "10");
+        let after_delete: Vec<_> = migrated
+            .into_iter()
+            .filter(|row| row.model_id != "claude-opus-5-5")
+            .collect();
+        let (second, changed) = migrate_pricing_defaults(after_delete, PRICING_DEFAULTS_VERSION);
+        assert!(!changed);
+        assert!(!second.iter().any(|row| row.model_id == "claude-opus-5-5"));
     }
 }

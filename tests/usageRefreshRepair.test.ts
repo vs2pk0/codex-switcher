@@ -28,5 +28,6 @@ test("刷新时自动归属子代理线程与独立计数 fork 的用量", () =>
     /if lcp > 0 \{\s*Some\(lcp\)\s*\} else if file\.owns_all_events_without_replay \{/,
   );
   // 缓存版本提升，旧缓存会在下次打开统计时自动重建
-  assert.match(usageBackend, /const USAGE_CACHE_VERSION: u32 = 8;/);
+  const version = usageBackend.match(/const USAGE_CACHE_VERSION: u32 = (\d+);/);
+  assert.ok(version && Number(version[1]) >= 8);
 });
