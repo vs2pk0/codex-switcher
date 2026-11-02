@@ -33,6 +33,7 @@ export interface CodexAccount {
   bound_oauth_use_local_gateway?: boolean;
   bound_phone?: string;
   subscription_active_until?: string;
+  subscription_is_active?: boolean;
   access_token_expires_at?: string;
   token_updated_at?: number;
   subscription_query_last_attempt_at?: number;

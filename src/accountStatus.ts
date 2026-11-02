@@ -1,3 +1,23 @@
+import type { CodexAccount } from "./types/codex";
+
+export function isAccountSubscriptionInactive(
+  account: CodexAccount,
+  referenceTime = Date.now(),
+): boolean {
+  return account.subscription_is_active === false
+    || isSubscriptionExpired(account.subscription_active_until, referenceTime);
+}
+
+export function subscriptionUntil(
+  account: CodexAccount,
+  tokenFallback?: string,
+): string | undefined {
+  if (account.subscription_is_active !== undefined) {
+    return account.subscription_is_active ? account.subscription_active_until : undefined;
+  }
+  return account.subscription_active_until || tokenFallback;
+}
+
 export function isSubscriptionExpired(
   value?: string | number | null,
   referenceTime = Date.now(),

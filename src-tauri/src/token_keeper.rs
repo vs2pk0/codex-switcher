@@ -175,7 +175,7 @@ async fn run_refresh_cycle(app: &AppHandle) {
                     updated.id, updated.email
                 );
                 if let Err(error) =
-                    crate::subscription::refresh_account_subscription(&updated.id, true).await
+                    crate::subscription::refresh_account_subscription(&updated.id, true, None).await
                 {
                     eprintln!(
                         "TokenKeeper 刷新 Codex 订阅状态失败: account_id={}, error={error}",
@@ -212,7 +212,7 @@ async fn run_refresh_cycle(app: &AppHandle) {
         if !allow_attempt(&account.id) {
             continue;
         }
-        match crate::subscription::refresh_account_subscription(&account.id, false).await {
+        match crate::subscription::refresh_account_subscription(&account.id, false, None).await {
             Ok(changed) => {
                 state_changed |= changed;
             }
@@ -376,6 +376,7 @@ mod tests {
             bound_oauth_use_local_gateway: false,
             bound_phone: None,
             subscription_active_until: None,
+            subscription_is_active: None,
             access_token_expires_at: Some("4102444800".to_string()),
             token_updated_at: Some(1_000_000),
             subscription_query_last_attempt_at: None,

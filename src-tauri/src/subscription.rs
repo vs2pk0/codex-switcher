@@ -1,5 +1,5 @@
 use crate::{
-    account::{chatgpt_account_id, AccountStore, CodexAccount},
+    account::{chatgpt_account_id, AccountStore, CodexAccount, CodexQuota},
     token_keeper,
 };
 use serde_json::{Map, Value};
@@ -11,6 +11,7 @@ const CHATGPT_REFERER: &str = "https://chatgpt.com/";
 const CHATGPT_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const SUBSCRIPTION_REFRESH_SECONDS: i64 = 30 * 60;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct SubscriptionSnapshot {
@@ -28,29 +29,48 @@ struct AccountRecord {
 pub(crate) async fn refresh_account_subscription(
     account_id: &str,
     force: bool,
+    quota: Option<&CodexQuota>,
 ) -> Result<bool, String> {
     let account =
         token_keeper::ensure_fresh_access_token(account_id, "订阅状态刷新前 Token 已过期").await?;
-    if !should_refresh(&account, force) {
+    let quota_plan = quota.and_then(|quota| plan_from_quota(quota, now_timestamp()));
+    let query_due = should_refresh(&account, force);
+    // Repeated quota polling must not postpone the periodic subscription query.
+    if !query_due
+        && (quota_plan.is_none()
+            || (quota_plan == account.plan_type
+                && !quota_plan.as_deref().is_some_and(is_free_plan)))
+    {
         return Ok(false);
     }
 
     let previous_plan = account.plan_type.clone();
     let previous_active_until = account.subscription_active_until.clone();
-    let snapshot = match fetch_subscription_status(&account).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            let _ = AccountStore::default().update_account_subscription_status(
-                account_id,
-                None,
-                None,
-                Some(error.clone()),
-            );
-            return Err(error);
+    let previous_is_active = account.subscription_is_active;
+    // The usage response describes the currently usable entitlement. Do not let an
+    // old JWT or a cached subscriptions response revive a free/monthly quota.
+    let mut snapshot = if quota_plan.as_deref().is_some_and(is_free_plan) {
+        SubscriptionSnapshot::default()
+    } else if query_due {
+        match fetch_subscription_status(&account).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = AccountStore::default().update_account_subscription_status(
+                    account_id,
+                    quota_plan,
+                    None,
+                    Some(error.clone()),
+                );
+                return Err(error);
+            }
         }
+    } else {
+        SubscriptionSnapshot::default()
     };
-    let retry_error = subscription_missing_or_expired(snapshot.active_until.as_deref())
-        .then(|| "订阅接口未返回有效订阅时间".to_string());
+    apply_quota_plan(&mut snapshot, quota_plan);
+    let retry_error = (!snapshot.plan_type.as_deref().is_some_and(is_free_plan)
+        && subscription_missing_or_expired(snapshot.active_until.as_deref()))
+    .then(|| "订阅接口未返回有效订阅时间".to_string());
     let updated = AccountStore::default().update_account_subscription_status(
         account_id,
         snapshot.plan_type,
@@ -58,7 +78,8 @@ pub(crate) async fn refresh_account_subscription(
         retry_error,
     )?;
     Ok(previous_plan != updated.plan_type
-        || previous_active_until != updated.subscription_active_until)
+        || previous_active_until != updated.subscription_active_until
+        || previous_is_active != updated.subscription_is_active)
 }
 
 pub(crate) fn subscription_refresh_due(account: &CodexAccount) -> bool {
@@ -66,16 +87,86 @@ pub(crate) fn subscription_refresh_due(account: &CodexAccount) -> bool {
 }
 
 fn should_refresh(account: &CodexAccount, force: bool) -> bool {
+    should_refresh_at(account, force, now_timestamp())
+}
+
+fn should_refresh_at(account: &CodexAccount, force: bool, now: i64) -> bool {
     if force {
         return true;
     }
-    if !subscription_missing_or_expired(account.subscription_active_until.as_deref()) {
+    if account
+        .subscription_query_next_retry_at
+        .is_some_and(|next| next > now)
+    {
         return false;
     }
     account
-        .subscription_query_next_retry_at
-        .map(|next_retry_at| next_retry_at <= now_timestamp())
+        .subscription_query_last_attempt_at
+        .map(|last| now.saturating_sub(last) >= SUBSCRIPTION_REFRESH_SECONDS)
         .unwrap_or(true)
+}
+
+pub(crate) fn normalize_plan_type(plan: &str) -> String {
+    let normalized = plan
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_', ' '], "");
+    normalized
+        .strip_prefix("chatgpt")
+        .or_else(|| normalized.strip_prefix("codex"))
+        .unwrap_or(&normalized)
+        .to_string()
+}
+
+pub(crate) fn is_free_plan(plan: &str) -> bool {
+    normalize_plan_type(plan) == "free"
+}
+
+fn apply_quota_plan(snapshot: &mut SubscriptionSnapshot, quota_plan: Option<String>) {
+    if let Some(plan) = quota_plan {
+        // A currently paid usage entitlement supersedes an expired date from
+        // subscription metadata. Its renewal date remains unknown until supplied.
+        if is_free_plan(&plan) || subscription_missing_or_expired(snapshot.active_until.as_deref())
+        {
+            snapshot.active_until = None;
+        }
+        snapshot.plan_type = Some(plan);
+    }
+}
+
+fn plan_from_quota(quota: &CodexQuota, now: i64) -> Option<String> {
+    let raw = quota.raw_data.as_ref();
+    let plan = raw
+        .and_then(|raw| {
+            raw.get("plan_type")
+                .or_else(|| raw.get("planType"))
+                .or_else(|| raw.pointer("/data/plan_type"))
+        })
+        .and_then(Value::as_str)
+        .and_then(normalize_string);
+    if plan.is_some() {
+        return plan;
+    }
+
+    // Monthly-only limits can reveal a downgrade before subscription metadata
+    // catches up. An explicit plan and any secondary window take precedence.
+    if quota.hourly_window_present == Some(false)
+        || quota.weekly_window_present == Some(true)
+        || quota
+            .weekly_window_minutes
+            .is_some_and(|minutes| minutes > 0)
+        || quota.weekly_reset_time.is_some()
+    {
+        return None;
+    }
+    let monthly_minutes = 28 * 24 * 60..=31 * 24 * 60;
+    let monthly = match quota.hourly_window_minutes {
+        Some(minutes) => monthly_minutes.contains(&minutes),
+        None => quota.hourly_reset_time.is_some_and(|reset| {
+            (28 * 24 * 60 * 60..=31 * 24 * 60 * 60).contains(&reset.saturating_sub(now))
+        }),
+    };
+    monthly.then(|| "free".to_string())
 }
 
 async fn fetch_subscription_status(account: &CodexAccount) -> Result<SubscriptionSnapshot, String> {
@@ -99,7 +190,9 @@ async fn fetch_subscription_status(account: &CodexAccount) -> Result<Subscriptio
     )
     .await?;
     let mut snapshot = parse_account_check_snapshot(&payload, account)?;
-    if !subscription_missing_or_expired(snapshot.active_until.as_deref()) {
+    if snapshot.plan_type.as_deref().is_some_and(is_free_plan)
+        || !subscription_missing_or_expired(snapshot.active_until.as_deref())
+    {
         return Ok(snapshot);
     }
 
@@ -175,37 +268,47 @@ fn parse_account_check_snapshot(
         .and_then(|items| items.first())
         .and_then(Value::as_str)
         .and_then(normalize_string);
-    let selected = records
-        .iter()
-        .find(|item| {
-            item.node.as_object().is_some_and(|record| {
-                let account_record = nested_account_record(record);
-                extract_record_field(
-                    account_record,
-                    &["account_id", "id", "chatgpt_account_id", "workspace_id"],
-                ) == preferred_account_id
+    let selected = if let Some(preferred_id) = preferred_account_id.as_deref() {
+        records
+            .iter()
+            .find(|item| {
+                item.key.as_deref() == Some(preferred_id)
+                    || item.node.as_object().is_some_and(|record| {
+                        extract_record_field(
+                            nested_account_record(record),
+                            &["account_id", "id", "chatgpt_account_id", "workspace_id"],
+                        )
+                        .as_deref()
+                            == Some(preferred_id)
+                    })
             })
-        })
-        .or_else(|| {
-            records
-                .iter()
-                .find(|item| item.key.as_deref().and_then(normalize_string) == ordering_first_key)
-        })
-        .unwrap_or(&records[0]);
+            .ok_or_else(|| "accounts/check 未返回当前账号，保留原订阅状态".to_string())?
+    } else {
+        records
+            .iter()
+            .find(|item| ordering_first_key.is_some() && item.key == ordering_first_key)
+            .unwrap_or(&records[0])
+    };
     let record = selected
         .node
         .as_object()
         .ok_or_else(|| "accounts/check 账号记录格式不正确".to_string())?;
     let account_record = nested_account_record(record);
     let entitlement = record.get("entitlement").and_then(Value::as_object);
+    let account_plan = extract_record_field(account_record, &["plan_type", "planType"]);
+    let plan_type = if account_plan.as_deref().is_some_and(is_free_plan) {
+        account_plan
+    } else {
+        entitlement
+            .and_then(|value| extract_record_field(value, &["subscription_plan"]))
+            .or(account_plan)
+    };
     Ok(SubscriptionSnapshot {
         account_id: extract_record_field(
             account_record,
             &["account_id", "id", "chatgpt_account_id", "workspace_id"],
         ),
-        plan_type: entitlement
-            .and_then(|value| extract_record_field(value, &["subscription_plan"]))
-            .or_else(|| extract_record_field(account_record, &["plan_type", "planType"])),
+        plan_type,
         active_until: entitlement
             .and_then(|value| extract_record_field(value, &["expires_at"]))
             .or_else(|| extract_record_field(account_record, &["expires_at"])),
@@ -323,7 +426,10 @@ fn now_timestamp() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_account_check_snapshot, parse_subscription_snapshot, SubscriptionSnapshot};
+    use super::{
+        apply_quota_plan, parse_account_check_snapshot, parse_subscription_snapshot,
+        plan_from_quota, should_refresh_at, SubscriptionSnapshot,
+    };
     use crate::account::{CodexAccount, CodexTokens};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use serde_json::json;
@@ -352,6 +458,7 @@ mod tests {
             bound_oauth_use_local_gateway: false,
             bound_phone: None,
             subscription_active_until: None,
+            subscription_is_active: None,
             access_token_expires_at: None,
             token_updated_at: None,
             subscription_query_last_attempt_at: None,
@@ -412,6 +519,112 @@ mod tests {
                 plan_type: Some("team".to_string()),
                 active_until: Some("1800000000".to_string()),
             }
+        );
+    }
+
+    #[test]
+    fn quota_plan_takes_priority_over_monthly_window_inference() {
+        for plan in ["pro", "prolite", "plus", "team", "enterprise", "free"] {
+            let quota = crate::parse_codex_quota(json!({
+                "plan_type": plan,
+                "rate_limit": {"primary_window": {"limit_window_seconds": 30 * 86400}}
+            }));
+            assert_eq!(plan_from_quota(&quota, 0).as_deref(), Some(plan));
+        }
+    }
+
+    #[test]
+    fn monthly_only_quota_can_detect_missing_plan_downgrade() {
+        let now = 1_800_000_000;
+        let mut quota = crate::parse_codex_quota(json!({
+            "rate_limit": {"primary_window": {
+                "limit_window_seconds": 30 * 86400,
+                "reset_at": now + 30 * 86400,
+                "used_percent": 0
+            }, "secondary_window": null}
+        }));
+        assert_eq!(plan_from_quota(&quota, now).as_deref(), Some("free"));
+
+        // A reset still thirty days away is useful if the duration is omitted.
+        quota.hourly_window_minutes = None;
+        assert_eq!(plan_from_quota(&quota, now).as_deref(), Some("free"));
+        quota.hourly_reset_time = Some(now + 7 * 86400);
+        assert_eq!(plan_from_quota(&quota, now), None);
+
+        // Near the end of a known monthly window, its reset countdown is short.
+        quota.hourly_window_minutes = Some(30 * 24 * 60);
+        assert_eq!(plan_from_quota(&quota, now).as_deref(), Some("free"));
+        quota.weekly_window_present = Some(true);
+        assert_eq!(plan_from_quota(&quota, now), None);
+    }
+
+    #[test]
+    fn standard_or_missing_quota_windows_do_not_infer_free() {
+        for raw in [
+            json!({}),
+            json!({"rate_limit": {"primary_window": {"limit_window_seconds": 18000}}}),
+            json!({"rate_limit": {"primary_window": null,
+                "secondary_window": {"limit_window_seconds": 30 * 86400}}}),
+            json!({"rate_limit": {"primary_window": {"limit_window_seconds": 30 * 86400},
+                "secondary_window": {"limit_window_seconds": 604800}}}),
+        ] {
+            assert_eq!(
+                plan_from_quota(&crate::parse_codex_quota(raw), 1_800_000_000),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn future_subscription_date_does_not_prevent_periodic_or_manual_refresh() {
+        let now = 1_800_000_000;
+        let mut account = account();
+        account.subscription_active_until = Some((now + 86400).to_string());
+        assert!(should_refresh_at(&account, false, now));
+        account.subscription_query_last_attempt_at = Some(now - 60);
+        assert!(!should_refresh_at(&account, false, now));
+        assert!(should_refresh_at(&account, true, now));
+        account.subscription_query_last_attempt_at = Some(now - 1800);
+        assert!(should_refresh_at(&account, false, now));
+        account.subscription_query_next_retry_at = Some(now + 1800);
+        assert!(!should_refresh_at(&account, false, now));
+        assert!(should_refresh_at(&account, true, now));
+    }
+
+    #[test]
+    fn free_account_does_not_reuse_old_paid_entitlement() {
+        let payload = json!({"accounts": {"account-b": {
+            "account": {"account_id": "account-b", "plan_type": "free"},
+            "entitlement": {"subscription_plan": "pro", "expires_at": "2099-01-01T00:00:00Z"}
+        }}});
+        let snapshot = parse_account_check_snapshot(&payload, &account()).unwrap();
+        assert_eq!(snapshot.plan_type.as_deref(), Some("free"));
+    }
+
+    #[test]
+    fn missing_current_workspace_does_not_use_another_accounts_plan() {
+        let payload = json!({"account_ordering": ["account-a"], "accounts": {"account-a": {
+            "account": {"account_id": "account-a", "plan_type": "free"}
+        }}});
+        assert!(parse_account_check_snapshot(&payload, &account()).is_err());
+    }
+
+    #[test]
+    fn renewed_quota_does_not_reuse_an_expired_subscription_date() {
+        let mut snapshot = SubscriptionSnapshot {
+            plan_type: Some("free".into()),
+            active_until: Some("2000-01-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        apply_quota_plan(&mut snapshot, Some("pro".into()));
+        assert_eq!(snapshot.plan_type.as_deref(), Some("pro"));
+        assert!(snapshot.active_until.is_none());
+
+        snapshot.active_until = Some("2099-01-01T00:00:00Z".into());
+        apply_quota_plan(&mut snapshot, Some("pro".into()));
+        assert_eq!(
+            snapshot.active_until.as_deref(),
+            Some("2099-01-01T00:00:00Z")
         );
     }
 }

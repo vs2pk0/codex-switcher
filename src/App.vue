@@ -16,7 +16,7 @@ import { Message, Modal } from "@arco-design/web-vue";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { accountProPlan, proPlanLabel } from "./accountPlan";
-import { isSubscriptionExpired } from "./accountStatus";
+import { isAccountSubscriptionInactive, isSubscriptionExpired, subscriptionUntil } from "./accountStatus";
 import AccountList from "./components/AccountList.vue";
 import AboutPanel from "./components/AboutPanel.vue";
 import AccountToolbar from "./components/AccountToolbar.vue";
@@ -1001,7 +1001,7 @@ function jwtAuthClaim(token: string | undefined, claim: string): string | undefi
 
 function accountStatusSource(account: CodexAccount): CodexAccount {
   if (isBoundApiKeyAccount(account)) return account;
-  return account.subscription_active_until ||
+  return account.subscription_is_active !== undefined || account.subscription_active_until ||
     account.access_token_expires_at ||
     jwtAuthClaim(account.tokens.id_token, "chatgpt_subscription_active_until") ||
     jwtClaim(account.tokens.access_token, "exp") ||
@@ -1012,8 +1012,7 @@ function accountStatusSource(account: CodexAccount): CodexAccount {
 
 function accountSubscriptionUntil(account: CodexAccount): string | undefined {
   const source = accountStatusSource(account);
-  return (
-    source.subscription_active_until ||
+  return subscriptionUntil(source,
     jwtAuthClaim(source.tokens.id_token, "chatgpt_subscription_active_until")
   );
 }
@@ -1103,7 +1102,8 @@ function normalizePlanKey(planType?: string): string {
 function effectivePlanKey(account: CodexAccount): string {
   if (
     !isApiKeyAccount(account) &&
-    isSubscriptionExpired(accountSubscriptionUntil(account), accountStatusClockMs.value)
+    (isAccountSubscriptionInactive(account, accountStatusClockMs.value)
+      || isSubscriptionExpired(accountSubscriptionUntil(account), accountStatusClockMs.value))
   ) {
     return "free";
   }
@@ -2399,7 +2399,7 @@ async function handleRefreshCurrentQuota(
 async function handleRefreshQuota(account: CodexAccount): Promise<void> {
   quotaRefreshingId.value = account.id;
   try {
-    await refreshCodexQuota(account.id);
+    await refreshCodexQuota(account.id, true);
     await loadAccounts();
     Message.success("额度已刷新");
   } catch (error) {

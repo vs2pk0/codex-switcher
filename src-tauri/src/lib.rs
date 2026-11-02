@@ -3226,8 +3226,11 @@ fn import_codex_switcher_backup(json_content: String) -> Result<Vec<CodexAccount
 }
 
 #[tauri::command]
-async fn refresh_codex_quota(account_id: String) -> Result<CodexAccount, String> {
-    match fetch_codex_quota_for_account(&account_id).await {
+async fn refresh_codex_quota(
+    account_id: String,
+    force_subscription_refresh: Option<bool>,
+) -> Result<CodexAccount, String> {
+    match fetch_codex_quota(&account_id, force_subscription_refresh.unwrap_or(false)).await {
         Ok(quota) => AccountStore::default().update_account_quota(&account_id, quota),
         Err(error) => {
             let _ = AccountStore::default().update_account_quota_error(&account_id, error.clone());
@@ -3249,7 +3252,7 @@ async fn refresh_all_codex_quotas() -> Result<i32, String> {
         {
             continue;
         }
-        match fetch_codex_quota_for_account(&account.id).await {
+        match fetch_codex_quota(&account.id, true).await {
             Ok(quota) => {
                 if AccountStore::default()
                     .update_account_quota(&account.id, quota)
@@ -3318,7 +3321,7 @@ async fn consume_codex_reset_credit(
         ));
     }
     Ok(reset_credit_consume_result(
-        refresh_codex_quota(account_id).await,
+        refresh_codex_quota(account_id, Some(false)).await,
     ))
 }
 
@@ -4515,6 +4518,13 @@ fn write_switcher_settings(settings: &CodexSwitcherSettings) -> Result<(), Strin
 }
 
 pub(crate) async fn fetch_codex_quota_for_account(account_id: &str) -> Result<CodexQuota, String> {
+    fetch_codex_quota(account_id, false).await
+}
+
+async fn fetch_codex_quota(
+    account_id: &str,
+    force_subscription_refresh: bool,
+) -> Result<CodexQuota, String> {
     let source = refreshed_quota_source_account(account_id).await?;
     let accounts = AccountStore::default().list_accounts()?;
     let target = accounts
@@ -4531,10 +4541,14 @@ pub(crate) async fn fetch_codex_quota_for_account(account_id: &str) -> Result<Co
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| format!("初始化额度请求失败: {}", error))?;
-    let response = client
+    let mut request = client
         .get("https://chatgpt.com/backend-api/wham/usage")
         .bearer_auth(access_token)
-        .header("OpenAI-Beta", "codex-1")
+        .header("OpenAI-Beta", "codex-1");
+    if let Some(remote_account_id) = account::chatgpt_account_id(&source) {
+        request = request.header("ChatGPT-Account-Id", remote_account_id);
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| format!("请求额度失败: {}", error))?;
@@ -4561,7 +4575,13 @@ pub(crate) async fn fetch_codex_quota_for_account(account_id: &str) -> Result<Co
         &mut quota,
     )
     .await;
-    if let Err(error) = subscription::refresh_account_subscription(&source.id, false).await {
+    if let Err(error) = subscription::refresh_account_subscription(
+        &source.id,
+        force_subscription_refresh,
+        Some(&quota),
+    )
+    .await
+    {
         eprintln!(
             "刷新 Codex 额度后同步订阅状态失败: account_id={}, error={error}",
             source.id

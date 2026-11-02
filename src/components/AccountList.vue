@@ -3,7 +3,7 @@ import { formatAppDateTime, formatWallTime } from "../timeZone";
 import { Message } from "@arco-design/web-vue";
 import { computed, ref } from "vue";
 import { accountProPlan, proPlanLabel } from "../accountPlan";
-import { isSubscriptionExpired } from "../accountStatus";
+import { isAccountSubscriptionInactive, isSubscriptionExpired, subscriptionUntil } from "../accountStatus";
 import { ADAPTIVE_COLUMNS, normalizeMaxColumns, resolveAccountColumns } from "../services/accountLayout";
 import type { CodexApiKeyBalanceState, CodexSwitcherSettings } from "../services/codex";
 import type { QuotaListAccount, QuotaListState, QuotaListWindow } from "../services/quotaList";
@@ -323,7 +323,7 @@ function jwtAuthClaim(token: string | undefined, claim: string): string | undefi
 
 function accountStatusSource(account: CodexAccount): CodexAccount {
   if (isBoundApiKeyAccount(account)) return account;
-  return account.subscription_active_until ||
+  return account.subscription_is_active !== undefined || account.subscription_active_until ||
     account.access_token_expires_at ||
     jwtAuthClaim(account.tokens.id_token, "chatgpt_subscription_active_until") ||
     jwtClaim(account.tokens.access_token, "exp") ||
@@ -334,10 +334,14 @@ function accountStatusSource(account: CodexAccount): CodexAccount {
 
 function accountSubscriptionUntil(account: CodexAccount): string | undefined {
   const source = accountStatusSource(account);
-  return (
-    source.subscription_active_until ||
+  return subscriptionUntil(source,
     jwtAuthClaim(source.tokens.id_token, "chatgpt_subscription_active_until")
   );
+}
+
+function hasSubscriptionStatus(account: CodexAccount): boolean {
+  return accountStatusSource(account).subscription_is_active === false
+    || Boolean(accountSubscriptionUntil(account));
 }
 
 function accountTokenExpiresAt(account: CodexAccount): string | undefined {
@@ -435,7 +439,8 @@ function accountAuthLine(account: CodexAccount): string {
 function effectivePlanKey(account: CodexAccount): string {
   if (
     !isApiKeyAccount(account) &&
-    isSubscriptionExpired(accountSubscriptionUntil(account), props.statusClockMs)
+    (isAccountSubscriptionInactive(account, props.statusClockMs)
+      || isSubscriptionExpired(accountSubscriptionUntil(account), props.statusClockMs))
   ) {
     return "free";
   }
@@ -892,6 +897,7 @@ function quotaProgressStyle(value?: number): Record<string, string> {
 }
 
 function accountSubscriptionClass(account: CodexAccount): string {
+  if (isAccountSubscriptionInactive(accountStatusSource(account), props.statusClockMs)) return "expired";
   const value = accountSubscriptionUntil(account);
   if (!value) return "unknown";
   const date = normalizeDate(value);
@@ -900,6 +906,8 @@ function accountSubscriptionClass(account: CodexAccount): string {
 }
 
 function accountSubscriptionBadge(account: CodexAccount): string {
+  if (accountStatusSource(account).subscription_is_active === false) return t("无有效订阅");
+  if (isAccountSubscriptionInactive(accountStatusSource(account), props.statusClockMs)) return t("已过期");
   const value = accountSubscriptionUntil(account);
   if (!value) return t("未获得订阅信息");
   const date = normalizeDate(value);
@@ -1368,18 +1376,18 @@ function formatTime(value?: number | null): string {
           <div v-if="!isBoundApiKeyAccount(account)" class="status-grid">
             <div
               class="status-card"
-              :class="accountSubscriptionUntil(account) ? 'status-valid' : 'status-placeholder'"
-              :aria-hidden="accountSubscriptionUntil(account) ? undefined : 'true'"
+              :class="hasSubscriptionStatus(account) ? 'status-valid' : 'status-placeholder'"
+              :aria-hidden="hasSubscriptionStatus(account) ? undefined : 'true'"
             >
-              <template v-if="accountSubscriptionUntil(account)">
+              <template v-if="hasSubscriptionStatus(account)">
                 <span>
                   <icon-calendar />
                   {{ statusTitle(account) }}
                   <b class="status-remaining-time">
-                    {{ expiryDaysLabel(accountSubscriptionUntil(account)) || t("已记录") }}
+                    {{ accountSubscriptionBadge(account) }}
                   </b>
                 </span>
-                <strong>{{ formatDateTime(accountSubscriptionUntil(account)) }}</strong>
+                <strong v-if="accountSubscriptionUntil(account)">{{ formatDateTime(accountSubscriptionUntil(account)) }}</strong>
               </template>
             </div>
 
@@ -1581,7 +1589,7 @@ function formatTime(value?: number | null): string {
           <span><i />--</span>
         </span>
         <span
-          v-if="accountSubscriptionUntil(account)"
+          v-if="hasSubscriptionStatus(account)"
           class="compact-subscription"
           :class="accountSubscriptionClass(account)"
         >

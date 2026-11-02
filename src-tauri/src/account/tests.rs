@@ -143,6 +143,230 @@ fn imports_token_json_and_persists_account() {
 }
 
 #[test]
+fn subscription_downgrade_clears_cached_pro_and_survives_token_refresh() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let (_storage, _codex, store) = test_store();
+    let stale_token = format!(
+        "e30.{}.fixture",
+        URL_SAFE_NO_PAD.encode(
+            json!({
+                "email": "owner@example.com",
+                "https://api.openai.com/auth": {
+                    "chatgpt_plan_type": "prolite",
+                    "chatgpt_subscription_active_until": "2099-01-01T00:00:00Z"
+                }
+            })
+            .to_string()
+        )
+    );
+    let account = store
+        .import_from_json(
+            &json!({
+                "email": "owner@example.com", "plan_type": "pro", "auth_file_plan_type": "prolite",
+                "subscription_active_until": "2099-01-01T00:00:00Z",
+                "tokens": {"id_token": stale_token, "access_token": stale_token}
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .remove(0);
+    let updated = store
+        .update_account_subscription_status(&account.id, Some("free".into()), None, None)
+        .unwrap();
+    assert_eq!(updated.plan_type.as_deref(), Some("free"));
+    assert_eq!(updated.subscription_is_active, Some(false));
+    assert!(updated.auth_file_plan_type.is_none());
+    assert!(updated.subscription_active_until.is_none());
+
+    let updated = store
+        .update_refreshed_oauth_tokens(&account.id, account.tokens.clone())
+        .unwrap();
+    assert_eq!(updated.plan_type.as_deref(), Some("free"));
+    assert_eq!(updated.subscription_is_active, Some(false));
+    assert!(super::resolve_subscription_expiry(&updated).is_none());
+    let persisted = store.list_accounts().unwrap().remove(0);
+    assert_eq!(persisted.subscription_is_active, Some(false));
+
+    let renewed = store
+        .update_account_subscription_status(
+            &account.id,
+            Some("pro".into()),
+            Some("2099-02-01T00:00:00Z".into()),
+            None,
+        )
+        .unwrap();
+    assert_eq!(renewed.subscription_is_active, Some(true));
+    assert_eq!(renewed.plan_type.as_deref(), Some("pro"));
+    assert_eq!(
+        renewed.subscription_active_until.as_deref(),
+        Some("2099-02-01T00:00:00Z")
+    );
+}
+
+#[test]
+fn failed_subscription_query_preserves_status_and_paid_refresh_preserves_pro_variant() {
+    let (_storage, _codex, store) = test_store();
+    let account = store
+        .import_from_json(
+            &json!({
+                "email": "owner@example.com", "plan_type": "pro", "auth_file_plan_type": "prolite",
+                "subscription_active_until": "2099-01-01T00:00:00Z",
+                "tokens": {"id_token": "id-token", "access_token": "access-token"}
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .remove(0);
+    let failed = store
+        .update_account_subscription_status(
+            &account.id,
+            None,
+            None,
+            Some("request timed out".into()),
+        )
+        .unwrap();
+    assert_eq!(failed.plan_type, account.plan_type);
+    assert_eq!(
+        failed.subscription_active_until,
+        account.subscription_active_until
+    );
+    assert_eq!(failed.subscription_is_active, None);
+    assert!(failed.subscription_query_next_retry_at.is_some());
+    let updated = store
+        .update_account_subscription_status(
+            &account.id,
+            Some("pro".into()),
+            Some("2099-02-01T00:00:00Z".into()),
+            None,
+        )
+        .unwrap();
+    assert_eq!(updated.auth_file_plan_type.as_deref(), Some("prolite"));
+    assert_eq!(updated.subscription_is_active, Some(true));
+    assert!(updated.subscription_query_next_retry_at.is_none());
+}
+
+#[test]
+fn generic_pro_refresh_preserves_a_variant_previously_read_from_jwt() {
+    let (_storage, _codex, store) = test_store();
+    let account = store
+        .import_from_json(
+            &json!({
+                "email": "owner@example.com", "plan_type": "prolite",
+                "tokens": {"id_token": "id-token", "access_token": "access-token"}
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .remove(0);
+    let updated = store
+        .update_account_subscription_status(
+            &account.id,
+            Some("pro".into()),
+            Some("2099-01-01T00:00:00Z".into()),
+            None,
+        )
+        .unwrap();
+    assert_eq!(updated.auth_file_plan_type.as_deref(), Some("prolite"));
+    let changed = store
+        .update_account_subscription_status(
+            &account.id,
+            Some("promax".into()),
+            Some("2099-01-01T00:00:00Z".into()),
+            None,
+        )
+        .unwrap();
+    assert_eq!(changed.auth_file_plan_type.as_deref(), Some("promax"));
+    let generic = store
+        .update_account_subscription_status(
+            &account.id,
+            Some("chatgpt_pro".into()),
+            Some("2099-01-01T00:00:00Z".into()),
+            None,
+        )
+        .unwrap();
+    assert_eq!(generic.auth_file_plan_type.as_deref(), Some("promax"));
+}
+
+#[test]
+fn paid_subscription_without_renewal_date_clears_a_stale_expired_date() {
+    let (_storage, _codex, store) = test_store();
+    let account = store
+        .import_from_json(
+            &json!({
+                "email": "owner@example.com", "plan_type": "pro",
+                "subscription_active_until": "2000-01-01T00:00:00Z",
+                "subscription_is_active": false,
+                "tokens": {"id_token": "id-token", "access_token": "access-token"}
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .remove(0);
+    let renewed = store
+        .update_account_subscription_status(
+            &account.id,
+            Some("pro".into()),
+            None,
+            Some("renewal date unavailable".into()),
+        )
+        .unwrap();
+    assert_eq!(renewed.subscription_is_active, Some(true));
+    assert!(renewed.subscription_active_until.is_none());
+    assert!(super::resolve_subscription_expiry(&renewed).is_none());
+}
+
+#[test]
+fn portable_token_export_retains_confirmed_subscription_status() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let (_storage, _codex, store) = test_store();
+    let stale_token = format!(
+        "e30.{}.fixture",
+        URL_SAFE_NO_PAD.encode(
+            json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_plan_type": "prolite",
+                    "chatgpt_subscription_active_until": "2099-02-01T00:00:00Z"
+                }
+            })
+            .to_string()
+        )
+    );
+    let account = store
+        .import_from_json(
+            &json!({
+                "email": "owner@example.com",
+                "tokens": {"id_token": stale_token, "access_token": "access-token"}
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .remove(0);
+    for (plan, expiry, is_active) in [
+        ("free", None, false),
+        ("pro", None, true),
+        ("pro", Some("2099-01-01T00:00:00Z".to_string()), true),
+    ] {
+        let account = store
+            .update_account_subscription_status(
+                &account.id,
+                Some(plan.into()),
+                expiry.clone(),
+                None,
+            )
+            .unwrap();
+        let exported = super::portable_token_storage(&account);
+        let (_import_storage, _import_codex, import_store) = test_store();
+        let imported = import_store
+            .import_from_json(&exported.to_string())
+            .unwrap()
+            .remove(0);
+        assert_eq!(imported.plan_type.as_deref(), Some(plan));
+        assert_eq!(imported.subscription_is_active, Some(is_active));
+        assert_eq!(imported.subscription_active_until, expiry);
+    }
+}
+
+#[test]
 fn clears_only_refresh_token_quota_errors() {
     let (_storage, _codex, store) = test_store();
     let input = json!({

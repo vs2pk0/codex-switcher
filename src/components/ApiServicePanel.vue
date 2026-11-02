@@ -5,7 +5,7 @@ import { Message, Modal } from "@arco-design/web-vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { accountProPlan, proPlanLabel } from "../accountPlan";
-import { isSubscriptionExpired } from "../accountStatus";
+import { isAccountSubscriptionInactive } from "../accountStatus";
 import {
   addCodexAccountWithApiKey,
   openExternalUrl,
@@ -516,7 +516,7 @@ function normalizedEmail(value?: string | null): string {
 function effectivePlanKey(account: CodexAccount): string {
   if (
     !isApiKeyAccount(account) &&
-    isSubscriptionExpired(account.subscription_active_until)
+    isAccountSubscriptionInactive(account)
   ) {
     return "free";
   }

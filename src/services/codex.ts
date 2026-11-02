@@ -513,8 +513,8 @@ export function importCodexSwitcherBackup(jsonContent: string): Promise<CodexAcc
   return invoke("import_codex_switcher_backup", { jsonContent });
 }
 
-export function refreshCodexQuota(accountId: string): Promise<CodexAccount> {
-  return invoke("refresh_codex_quota", { accountId });
+export function refreshCodexQuota(accountId: string, forceSubscriptionRefresh = false): Promise<CodexAccount> {
+  return invoke("refresh_codex_quota", { accountId, forceSubscriptionRefresh });
 }
 
 export function consumeCodexResetCredit(accountId: string): Promise<CodexResetCreditConsumeResult> {

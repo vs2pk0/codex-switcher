@@ -2671,6 +2671,7 @@ mod tests {
             bound_oauth_use_local_gateway: false,
             bound_phone: None,
             subscription_active_until: None,
+            subscription_is_active: None,
             access_token_expires_at: Some("2020-01-01T00:00:00Z".to_string()),
             token_updated_at: None,
             subscription_query_last_attempt_at: None,

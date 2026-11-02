@@ -113,6 +113,8 @@ pub struct CodexAccount {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_active_until: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_is_active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_token_expires_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_updated_at: Option<i64>,
@@ -719,11 +721,46 @@ impl AccountStore {
             .iter_mut()
             .find(|account| account.id == account_id)
             .ok_or_else(|| "账号不存在".to_string())?;
-        if let Some(plan_type) = normalize_optional(plan_type.as_deref()) {
+        let plan_type = normalize_optional(plan_type.as_deref());
+        let is_free = plan_type
+            .as_deref()
+            .is_some_and(crate::subscription::is_free_plan);
+        let has_plan = plan_type.is_some();
+        if let Some(plan_type) = plan_type {
+            let normalized = crate::subscription::normalize_plan_type(&plan_type);
+            if matches!(
+                normalized.as_str(),
+                "prolite" | "pro5x" | "promax" | "pro20x"
+            ) {
+                account.auth_file_plan_type = Some(plan_type.clone());
+            } else if normalized == "pro" {
+                if account.auth_file_plan_type.is_none() {
+                    account.auth_file_plan_type = account.plan_type.clone().filter(|previous| {
+                        matches!(
+                            crate::subscription::normalize_plan_type(previous).as_str(),
+                            "prolite" | "pro5x" | "promax" | "pro20x"
+                        )
+                    });
+                }
+            } else {
+                account.auth_file_plan_type = None;
+            }
+            account.subscription_is_active = Some(!is_free);
             account.plan_type = Some(plan_type);
         }
         if let Some(active_until) = normalize_optional(subscription_active_until.as_deref()) {
+            if let Some(expiry) = normalize_timestamp_to_iso(Some(&active_until))
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+            {
+                account.subscription_is_active = Some(expiry.timestamp() > now_timestamp());
+            }
             account.subscription_active_until = Some(active_until);
+        } else if has_plan {
+            account.subscription_active_until = None;
+        }
+        if is_free {
+            account.subscription_is_active = Some(false);
+            account.subscription_active_until = None;
         }
         let now = now_timestamp();
         account.subscription_query_last_attempt_at = Some(now);
@@ -1822,6 +1859,7 @@ impl AccountStore {
             bound_oauth_use_local_gateway: false,
             bound_phone: None,
             subscription_active_until: None,
+            subscription_is_active: None,
             access_token_expires_at: None,
             token_updated_at: read_token_updated_at(value).or(Some(now)),
             subscription_query_last_attempt_at: read_i64(
@@ -2040,11 +2078,15 @@ fn apply_refreshed_oauth_tokens(
     account.token_updated_at = Some(updated_at);
     account.access_token_expires_at =
         jwt_expiration_timestamp(&account.tokens.access_token).map(|value| value.to_string());
-    account.plan_type =
-        resolve_auth_field(account, "chatgpt_plan_type").or_else(|| account.plan_type.clone());
-    account.subscription_active_until =
-        resolve_auth_field(account, "chatgpt_subscription_active_until")
-            .or_else(|| account.subscription_active_until.clone());
+    // Live entitlement checks supersede JWT claims, which may retain the old
+    // subscription even after a token refresh.
+    if account.subscription_is_active.is_none() {
+        account.plan_type =
+            resolve_auth_field(account, "chatgpt_plan_type").or_else(|| account.plan_type.clone());
+        account.subscription_active_until =
+            resolve_auth_field(account, "chatgpt_subscription_active_until")
+                .or_else(|| account.subscription_active_until.clone());
+    }
     if account
         .quota_error
         .as_ref()
@@ -2375,6 +2417,7 @@ fn build_api_key_account_record(
         bound_oauth_use_local_gateway: false,
         bound_phone: None,
         subscription_active_until: None,
+        subscription_is_active: None,
         access_token_expires_at: None,
         token_updated_at: None,
         subscription_query_last_attempt_at: None,
@@ -2517,7 +2560,9 @@ fn apply_import_metadata(account: &mut CodexAccount, value: &Value) {
     .or_else(|| account.api_official_url.clone());
     account.default_model = read_string(value, &["default_model", "defaultModel", "model"])
         .or_else(|| account.default_model.clone());
-    account.subscription_active_until = read_scalar_string(
+    let subscription_is_active =
+        read_bool(value, &["subscription_is_active", "subscriptionIsActive"]);
+    let subscription_active_until = read_scalar_string(
         value,
         &[
             "subscription_active_until",
@@ -2528,14 +2573,26 @@ fn apply_import_metadata(account: &mut CodexAccount, value: &Value) {
             "valid_until",
             "validUntil",
         ],
-    )
-    .or_else(|| {
-        jwt_auth_claim_string(
-            &account.tokens.id_token,
-            "chatgpt_subscription_active_until",
-        )
-    })
-    .or_else(|| account.subscription_active_until.clone());
+    );
+    account.subscription_active_until = if let Some(is_active) = subscription_is_active {
+        subscription_active_until.filter(|_| is_active)
+    } else {
+        subscription_active_until
+            .or_else(|| {
+                account
+                    .subscription_is_active
+                    .is_none()
+                    .then(|| {
+                        jwt_auth_claim_string(
+                            &account.tokens.id_token,
+                            "chatgpt_subscription_active_until",
+                        )
+                    })
+                    .flatten()
+            })
+            .or_else(|| account.subscription_active_until.clone())
+    };
+    account.subscription_is_active = subscription_is_active.or(account.subscription_is_active);
     account.access_token_expires_at = read_scalar_string(
         value,
         &[
@@ -2672,7 +2729,10 @@ fn build_sub2api_credentials(account: &CodexAccount) -> Value {
     insert_optional(
         &mut credentials,
         "plan_type",
-        resolve_auth_field(account, "chatgpt_plan_type"),
+        account
+            .plan_type
+            .clone()
+            .or_else(|| resolve_auth_field(account, "chatgpt_plan_type")),
     );
     insert_optional(
         &mut credentials,
@@ -2719,6 +2779,15 @@ fn portable_token_storage(account: &CodexAccount) -> Value {
 }
 
 fn insert_account_metadata(payload: &mut serde_json::Map<String, Value>, account: &CodexAccount) {
+    if let Some(is_active) = account.subscription_is_active {
+        payload.insert("subscription_is_active".to_string(), Value::Bool(is_active));
+        insert_optional(payload, "plan_type", account.plan_type.clone());
+        insert_optional(
+            payload,
+            "subscription_active_until",
+            resolve_subscription_expiry(account),
+        );
+    }
     if account.is_hidden {
         payload.insert("is_hidden".to_string(), Value::Bool(true));
     }
@@ -2780,6 +2849,11 @@ fn insert_optional(payload: &mut serde_json::Map<String, Value>, key: &str, valu
 }
 
 fn resolve_subscription_expiry(account: &CodexAccount) -> Option<String> {
+    if let Some(is_active) = account.subscription_is_active {
+        return is_active
+            .then(|| normalize_timestamp_to_iso(account.subscription_active_until.as_deref()))
+            .flatten();
+    }
     normalize_timestamp_to_iso(account.subscription_active_until.as_deref()).or_else(|| {
         jwt_auth_claim_string(
             &account.tokens.id_token,
