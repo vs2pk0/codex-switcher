@@ -126,6 +126,7 @@ export interface CodexSessionVisibilityRepairSummary {
   verifiedGeneratedImageCount?: number;
   invalidGeneratedImageCount?: number;
   resetHistoryProjectionCount?: number;
+  recoveredContextCount?: number;
   desktopReloadRequired?: boolean;
   desktopReloadPerformed?: boolean;
   backupDirs?: string[];
@@ -133,7 +134,7 @@ export interface CodexSessionVisibilityRepairSummary {
   warnings?: string[];
 }
 
-export type CodexSessionVisibilityRepairMode = "quick" | "deep";
+export type CodexSessionVisibilityRepairMode = "quick" | "deep" | "context";
 
 export interface CodexSessionVisibilityRepairItem {
   instanceId: string;
@@ -184,13 +185,14 @@ export interface CodexSessionVisibilityRepairOptions {
 export function buildSingleSessionHistoryRepairOptions(
   sessionId: string,
   target: Pick<CodexSessionVisibilityRepairInstanceOption, "id" | "currentProvider">,
+  recoverContext = false,
 ): CodexSessionVisibilityRepairOptions {
   const normalizedSessionId = sessionId.trim();
   const normalizedInstanceId = target.id.trim();
   if (!normalizedSessionId) throw new Error("会话 ID 不能为空");
   if (!normalizedInstanceId) throw new Error("Codex 实例 ID 不能为空");
   return {
-    mode: "deep",
+    mode: recoverContext ? "context" : "deep",
     targetProvider: target.currentProvider,
     targetInstanceId: normalizedInstanceId,
     repairInstanceIds: [normalizedInstanceId],

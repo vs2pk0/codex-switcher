@@ -1,11 +1,17 @@
 use crate::account::{replace_file_atomic, write_bytes_atomic};
 use crate::system_command;
+mod item_ids;
+mod recovery_context;
+use recovery_context::{recover_rollout_context, LocalRecoveryContext};
+#[cfg(test)]
+use recovery_context::{LOCAL_RECOVERY_CONTEXT_MAX_BYTES, LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES};
 
 /// 同一线程多段 rollout（history_base 续写链）的解析与合并。
 mod lineage;
 mod markdown;
 pub use markdown::MarkdownExportResult;
 use base64::{engine::general_purpose, Engine as _};
+use item_ids::{repair_record_item_ids, rewrite_rollout_item_ids};
 use lineage::{
     lineage_projection_targets, materialize_lineage, physical_rollout_id, resolve_lineage,
     RolloutLineage, SegmentInput, SegmentProjectionTarget,
@@ -187,6 +193,8 @@ pub struct CodexSessionVisibilityRepairSummary {
     pub verified_generated_image_count: usize,
     pub invalid_generated_image_count: usize,
     pub reset_history_projection_count: usize,
+    #[serde(default)]
+    pub recovered_context_count: usize,
     pub desktop_reload_required: bool,
     pub desktop_reload_performed: bool,
     pub backup_dirs: Vec<String>,
@@ -205,6 +213,8 @@ pub struct CodexSessionModelCompatibilityRepairSummary {
     pub synchronized_rollout_provider_count: usize,
     pub removed_encrypted_reasoning_item_count: usize,
     pub removed_encrypted_compaction_item_count: usize,
+    #[serde(default)]
+    pub repaired_item_id_count: usize,
     pub repaired_thread_count: usize,
     pub synchronized_catalog_row_count: usize,
     pub repaired_database_count: usize,
@@ -315,6 +325,7 @@ struct LocalImageRepairResult {
 #[derive(Debug, Default)]
 struct RolloutRewriteOutcome {
     changed: usize,
+    recovered_contexts: usize,
     changed_session_ids: HashSet<String>,
     backup_dirs: Vec<String>,
     skipped_protected_ancestors: Vec<String>,
@@ -823,6 +834,7 @@ impl SessionStore {
             synchronized_rollout_provider_count: 0,
             removed_encrypted_reasoning_item_count: 0,
             removed_encrypted_compaction_item_count: 0,
+            repaired_item_id_count: 0,
             repaired_thread_count: 0,
             synchronized_catalog_row_count: 0,
             repaired_database_count: 0,
@@ -906,6 +918,7 @@ impl SessionStore {
                 rewrite_stats.removed_encrypted_reasoning_items;
             summary.removed_encrypted_compaction_item_count +=
                 rewrite_stats.removed_encrypted_compaction_items;
+            summary.repaired_item_id_count += rewrite_stats.repaired_item_ids;
             if let Some(id) = read_session_record_header(&path)?.id {
                 changed_ids.insert(id.clone());
                 changed_records.push(SessionRepairRecord {
@@ -2504,6 +2517,10 @@ impl SessionStore {
         repair_instance_ids: Option<Vec<String>>,
         session_ids: Option<Vec<String>>,
     ) -> Result<CodexSessionVisibilityRepairSummary, String> {
+        let recover_context = mode.is_some_and(|value| value.eq_ignore_ascii_case("context"));
+        if recover_context && normalized_id_set(session_ids.clone()).is_none_or(|ids| ids.len() != 1) {
+            return Err("恢复超限上下文必须明确选择一条会话".to_string());
+        }
         if !should_repair_default_instance(target_instance_id, repair_instance_ids) {
             return Ok(CodexSessionVisibilityRepairSummary {
                 scanned: 0,
@@ -2527,6 +2544,7 @@ impl SessionStore {
                 verified_generated_image_count: 0,
                 invalid_generated_image_count: 0,
                 reset_history_projection_count: 0,
+                recovered_context_count: 0,
                 desktop_reload_required: false,
                 desktop_reload_performed: false,
                 backup_dirs: Vec::new(),
@@ -2559,17 +2577,20 @@ impl SessionStore {
                 updated_at: session.updated_at,
             })
             .collect::<Vec<_>>();
-        let deep = mode
-            .map(|value| value.eq_ignore_ascii_case("deep"))
-            .unwrap_or(false);
+        let deep = recover_context
+            || mode
+                .map(|value| value.eq_ignore_ascii_case("deep"))
+                .unwrap_or(false);
         let protected_prefixes = self.protected_rollout_prefixes();
         self.preflight_visibility_databases()?;
-        let rollout_outcome = self.repair_rollout_visibility_guarded(
+        let rollout_outcome = self.repair_rollout_visibility_with_context(
             &target_provider,
             &repair_records,
             deep,
             &protected_prefixes,
+            recover_context,
         )?;
+        let recovered_context_count = rollout_outcome.recovered_contexts;
         let mut changed_rollout_files = rollout_outcome.changed;
         let mut rollout_backup_dirs = rollout_outcome.backup_dirs;
         let mut skipped_protected_ancestors = rollout_outcome.skipped_protected_ancestors;
@@ -2723,6 +2744,7 @@ impl SessionStore {
             verified_generated_image_count: generated_images.verified,
             invalid_generated_image_count: generated_images.invalid,
             reset_history_projection_count: reset_history_projections,
+            recovered_context_count,
             desktop_reload_required: !sessions.is_empty(),
             desktop_reload_performed: false,
             backup_dirs: all_backup_dirs.clone(),
@@ -4312,12 +4334,26 @@ impl SessionStore {
         Ok((outcome.changed, outcome.backup_dirs))
     }
 
+    #[cfg(test)]
     fn repair_rollout_visibility_guarded(
         &self,
         target_provider: &str,
         sessions: &[SessionRepairRecord],
         rewrite_all_meta: bool,
         protected: &ProtectedRolloutPrefixes,
+    ) -> Result<RolloutRewriteOutcome, String> {
+        self.repair_rollout_visibility_with_context(
+            target_provider, sessions, rewrite_all_meta, protected, false,
+        )
+    }
+
+    fn repair_rollout_visibility_with_context(
+        &self,
+        target_provider: &str,
+        sessions: &[SessionRepairRecord],
+        rewrite_all_meta: bool,
+        protected: &ProtectedRolloutPrefixes,
+        recover_context: bool,
     ) -> Result<RolloutRewriteOutcome, String> {
         let mut outcome = RolloutRewriteOutcome::default();
         if sessions.is_empty() {
@@ -4341,7 +4377,22 @@ impl SessionStore {
             };
             // Visibility repair must preserve the model and encrypted context.
             // Account/provider migration has a separate compatibility operation.
-            let base_content = &content;
+            let item_id_rewrite = match rewrite_rollout_item_ids(
+                &content,
+                protected_prefix_bytes(protected, &session.path, &session.id).unwrap_or(0),
+            ) {
+                Ok(rewrite) => rewrite,
+                Err(error) => {
+                    outcome.warnings.push(format!(
+                        "完整历史修复跳过会话 {} ({}): {}",
+                        session.id,
+                        session.path.display(),
+                        error
+                    ));
+                    continue;
+                }
+            };
+            let base_content = item_id_rewrite.as_deref().unwrap_or(&content);
             let provider_rewrite = match rewrite_session_meta_provider(
                 base_content,
                 target_provider,
@@ -4372,13 +4423,25 @@ impl SessionStore {
                     continue;
                 }
             };
-            let visibility_rewrite = ordinal_rewrite.or(provider_rewrite);
-            // Do not append a synthetic `compacted` record during visibility repair.
-            // Its replacement_history is sent back to the Responses API on the next
-            // turn, but locally reconstructed assistant messages are not valid input
-            // items for every Codex model (the API reports `content` max length 0).
-            // Visibility repair must preserve the rollout and only remove/normalize
-            // records that are known to be incompatible.
+            let visibility_rewrite = ordinal_rewrite.or(provider_rewrite).or(item_id_rewrite);
+            let visibility_rewrite = visibility_rewrite.filter(|next| {
+                !recover_context
+                    || protected_prefix_bytes(protected, &session.path, &session.id)
+                        .is_none_or(|bytes| rollout_prefix_preserved(&content, next, bytes))
+            });
+            // Ordinary history repair never reduces context. The explicitly selected
+            // recovery mode appends a bounded user-input snapshot, retaining originals.
+            let context_rewrite = if recover_context {
+                recover_rollout_context(
+                    &self.codex_home,
+                    &session.path,
+                    visibility_rewrite.as_deref().unwrap_or(&content),
+                )?
+            } else {
+                None
+            };
+            let recovered = context_rewrite.is_some();
+            let visibility_rewrite = context_rewrite.or(visibility_rewrite);
             let Some(next) = visibility_rewrite else {
                 continue;
             };
@@ -4419,7 +4482,7 @@ impl SessionStore {
                 ));
                 continue;
             }
-            if let Err(error) = fs::write(&session.path, next) {
+            if let Err(error) = write_bytes_atomic(&session.path, next.as_bytes()) {
                 outcome.warnings.push(format!(
                     "完整历史修复跳过会话 {} ({}): 写入失败：{}",
                     session.id,
@@ -4434,6 +4497,7 @@ impl SessionStore {
                 .arg(&session.path)
                 .output();
             changed += 1;
+            outcome.recovered_contexts += usize::from(recovered);
             outcome.changed_session_ids.insert(session.id.clone());
         }
         outcome.changed = changed;
@@ -5360,188 +5424,13 @@ fn should_repair_default_instance(
         .unwrap_or(true)
 }
 
-const LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES: usize = 1024 * 1024;
-const LOCAL_RECOVERY_CONTEXT_MAX_BYTES: usize = 384 * 1024;
-const LOCAL_RECOVERY_CONTEXT_MAX_MESSAGES: usize = 48;
-const LOCAL_RECOVERY_MESSAGE_MAX_CHARS: usize = 8 * 1024;
-const LOCAL_RECOVERY_SUMMARY_MAX_CHARS: usize = 16 * 1024;
-
-#[derive(Debug, Default)]
-struct LocalRecoveryContext {
-    active_response_bytes: usize,
-    messages: Vec<Value>,
-    latest_summary: String,
-    latest_timestamp: String,
-}
-
-impl LocalRecoveryContext {
-    fn observe(&mut self, value: &Value) {
-        if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
-            if !timestamp.trim().is_empty() {
-                self.latest_timestamp = timestamp.to_string();
-            }
-        }
-        match value.get("type").and_then(Value::as_str) {
-            Some("compacted") => {
-                let replacement_history = value
-                    .pointer("/payload/replacement_history")
-                    .and_then(Value::as_array);
-                self.active_response_bytes = replacement_history
-                    .and_then(|history| serde_json::to_vec(history).ok())
-                    .map(|serialized| serialized.len())
-                    .unwrap_or(0);
-                self.messages = replacement_history
-                    .into_iter()
-                    .flatten()
-                    .filter_map(portable_recovery_message)
-                    .collect();
-                if let Some(summary) = value
-                    .pointer("/payload/message")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|summary| !summary.is_empty())
-                {
-                    self.latest_summary = truncate_chars(summary, LOCAL_RECOVERY_SUMMARY_MAX_CHARS);
-                }
-            }
-            Some("response_item") => {
-                let Some(payload) = value.get("payload") else {
-                    return;
-                };
-                self.active_response_bytes = self.active_response_bytes.saturating_add(
-                    serde_json::to_vec(payload)
-                        .map(|serialized| serialized.len())
-                        .unwrap_or(0),
-                );
-                if let Some(message) = portable_recovery_message(payload) {
-                    self.messages.push(message);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn build_compaction(&self) -> Option<Value> {
-        if self.active_response_bytes <= LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES {
-            return None;
-        }
-
-        let mut replacement_history = Vec::new();
-        let mut serialized_bytes = 0usize;
-        for message in self.messages.iter().rev() {
-            if replacement_history.len() >= LOCAL_RECOVERY_CONTEXT_MAX_MESSAGES {
-                break;
-            }
-            let message_bytes = serde_json::to_vec(message).ok()?.len();
-            if serialized_bytes.saturating_add(message_bytes) > LOCAL_RECOVERY_CONTEXT_MAX_BYTES {
-                break;
-            }
-            serialized_bytes = serialized_bytes.saturating_add(message_bytes);
-            replacement_history.push(message.clone());
-        }
-        replacement_history.reverse();
-        if let Some(first_user) = replacement_history
-            .iter()
-            .position(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-        {
-            replacement_history.drain(..first_user);
-        }
-        if replacement_history.is_empty() {
-            replacement_history.push(serde_json::json!({
-                "type": "message",
-                "id": format!("{:032x}", rand::random::<u128>()),
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": "Continue this recovered conversation. Earlier history remains visible locally, but oversized model context was removed.",
-                }],
-            }));
-        }
-
-        let summary = if self.latest_summary.trim().is_empty() {
-            "Earlier messages and oversized tool outputs remain in the local rollout for display, but were compacted into a portable recent-message snapshot so this conversation can continue."
-                .to_string()
-        } else {
-            self.latest_summary.clone()
-        };
-        let timestamp = if self.latest_timestamp.trim().is_empty() {
-            chrono::Utc::now().to_rfc3339()
-        } else {
-            self.latest_timestamp.clone()
-        };
-        Some(json_value_with_type(
-            &timestamp,
-            "compacted",
-            serde_json::json!({
-                "message": summary,
-                "replacement_history": replacement_history,
-            }),
-        ))
-    }
-}
-
-fn portable_recovery_message(payload: &Value) -> Option<Value> {
-    if payload.get("type").and_then(Value::as_str) != Some("message") {
-        return None;
-    }
-    let role = payload.get("role").and_then(Value::as_str)?;
-    if role != "user" && role != "assistant" {
-        return None;
-    }
-    let mut text_parts = Vec::new();
-    let mut image_count = 0usize;
-    for content in payload.get("content").and_then(Value::as_array)? {
-        if let Some(text) = content.get("text").and_then(Value::as_str) {
-            if !text.trim().is_empty() {
-                text_parts.push(text.trim());
-            }
-        } else if content
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| kind.contains("image"))
-        {
-            image_count = image_count.saturating_add(1);
-        }
-    }
-    if image_count > 0 {
-        text_parts.push("[image attachment omitted from recovery context]");
-    }
-    let text = truncate_chars(&text_parts.join("\n\n"), LOCAL_RECOVERY_MESSAGE_MAX_CHARS);
-    if text.trim().is_empty() {
-        return None;
-    }
-    let content_type = if role == "user" {
-        "input_text"
-    } else {
-        "output_text"
-    };
-    Some(serde_json::json!({
-        "type": "message",
-        "id": format!("{:032x}", rand::random::<u128>()),
-        "role": role,
-        "content": [{
-            "type": content_type,
-            "text": text,
-        }],
-    }))
-}
-
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let truncated = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}\n[… truncated during local conversation recovery …]")
-    } else {
-        truncated
-    }
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct RolloutModelCompatibilityRewriteStats {
     rewritten_model_fields: usize,
     synchronized_providers: usize,
     removed_encrypted_reasoning_items: usize,
     removed_encrypted_compaction_items: usize,
+    repaired_item_ids: usize,
 }
 
 impl RolloutModelCompatibilityRewriteStats {
@@ -5550,6 +5439,7 @@ impl RolloutModelCompatibilityRewriteStats {
             || self.synchronized_providers > 0
             || self.removed_encrypted_reasoning_items > 0
             || self.removed_encrypted_compaction_items > 0
+            || self.repaired_item_ids > 0
     }
 
     fn add(&mut self, other: Self) {
@@ -5557,6 +5447,7 @@ impl RolloutModelCompatibilityRewriteStats {
         self.synchronized_providers += other.synchronized_providers;
         self.removed_encrypted_reasoning_items += other.removed_encrypted_reasoning_items;
         self.removed_encrypted_compaction_items += other.removed_encrypted_compaction_items;
+        self.repaired_item_ids += other.repaired_item_ids;
     }
 }
 
@@ -5638,6 +5529,9 @@ fn prepare_rollout_model_compatibility_rewrite_guarded(
             let may_contain_local_recovery_compaction = line
                 .windows(b"Earlier messages and oversized tool outputs".len())
                 .any(|window| window == b"Earlier messages and oversized tool outputs");
+            let may_contain_item_id = line
+                .windows(b"\"id\"".len())
+                .any(|window| window == b"\"id\"");
             if !may_contain_model
                 && !may_contain_provider
                 && !may_be_session_meta
@@ -5645,6 +5539,7 @@ fn prepare_rollout_model_compatibility_rewrite_guarded(
                 && !may_contain_remote_reasoning_id
                 && !may_contain_remote_compaction_id
                 && !may_contain_local_recovery_compaction
+                && !may_contain_item_id
             {
                 writer.write_all(&line).map_err(|error| {
                     format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
@@ -5739,6 +5634,7 @@ fn rewrite_rollout_model_compatibility_value(
         .unwrap_or_default()
         .to_string();
     let mut stats = RolloutModelCompatibilityRewriteStats::default();
+    stats.repaired_item_ids = repair_record_item_ids(value);
 
     if record_type == "response_item" {
         let should_remove = value
@@ -10298,7 +10194,7 @@ mod tests {
                 .as_array()
                 .expect("replacement history")
                 .len(),
-            2
+            1
         );
         let portable_context = compacted["payload"].to_string();
         assert!(portable_context.contains("保留最近问题"));

@@ -29,3 +29,14 @@ test("会话操作区提供恢复完整会话按钮", () => {
   assert.match(sessionPanelSource, /emit\('repair-session-history', session\)/);
   assert.match(sessionPanelSource, /repairingSessionId === session\.id/);
 });
+
+test("超限恢复必须显式启用并固定到一条会话", () => {
+  const target = { id: "instance-work", currentProvider: "openai" };
+  const options = buildSingleSessionHistoryRepairOptions(" target ", target, true);
+  assert.equal(options.mode, "context");
+  assert.deepEqual(options.sessionIds, ["target"]);
+  assert.deepEqual(options.repairInstanceIds, ["instance-work"]);
+  assert.equal(buildSingleSessionHistoryRepairOptions("target", target).mode, "deep");
+  assert.throws(() => buildSingleSessionHistoryRepairOptions(" ", target, true));
+  assert.throws(() => buildSingleSessionHistoryRepairOptions("target", { ...target, id: " " }, true));
+});

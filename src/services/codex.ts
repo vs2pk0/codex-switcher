@@ -132,6 +132,7 @@ export interface CodexSessionModelCompatibilityRepairSummary {
   synchronizedRolloutProviderCount: number;
   removedEncryptedReasoningItemCount: number;
   removedEncryptedCompactionItemCount: number;
+  repairedItemIdCount: number;
   repairedThreadCount: number;
   synchronizedCatalogRowCount: number;
   repairedDatabaseCount: number;

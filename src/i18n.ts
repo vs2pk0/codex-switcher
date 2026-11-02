@@ -451,8 +451,8 @@ const en: Record<string, string> = {
   "正在一键修复…": "Repairing…",
   "正在一键修复": "Repairing",
   "默认实例": "Default instance",
-  "将依次执行「一键修复切号会话」，并对当前实例下的所有会话执行「恢复完整会话」：修复 Provider 模型前缀、线程模型、消息序号、分页历史与本地索引，清理无法跨账号复用的加密记录。会话较多时耗时较长，期间请勿关闭应用。修复前会自动备份；修复期间对应 Codex 实例会先关闭，全部处理完后再询问是否重启。":
-    "This runs “Repair Switched-Account Sessions” and then “Restore Full Session” for every session in the current instance: provider model prefixes, thread models, message ordinals, paginated history and local indexes are repaired, and encrypted records that cannot be reused across accounts are removed. With many sessions this can take a while; keep the app open. Files are backed up first; the Codex instance is closed during the repair and you will be asked whether to restart it once everything is done.",
+  "将依次执行「一键修复切号会话」，并对当前实例下的所有会话执行「恢复完整会话」：修复 Provider 模型前缀、线程模型、消息序号、不兼容的消息与工具 ID、分页历史与本地索引，清理无法跨账号复用的加密记录。会话较多时耗时较长，期间请勿关闭应用。修复前会自动备份；修复期间对应 Codex 实例会先关闭，全部处理完后再询问是否重启。":
+    "This runs “Repair Switched-Account Sessions” and then “Restore Full Session” for every session in the current instance: provider model prefixes, thread models, message ordinals, incompatible message and tool item IDs, paginated history and local indexes are repaired, and encrypted records that cannot be reused across accounts are removed. With many sessions this can take a while; keep the app open. Files are backed up first; the Codex instance is closed during the repair and you will be asked whether to restart it once everything is done.",
   "一键修复完成": "Repair All completed",
   "一键修复失败": "Repair All failed",
   "是否重启 Codex？": "Restart Codex?",
@@ -510,9 +510,10 @@ const en: Record<string, string> = {
   "绑定失败": "Binding failed",
   "当前：{account}，点击更换或取消绑定": "Current: {account}. Click to change or unbind",
   "为所选实例写入 ChatGPT 登录态": "Write a ChatGPT login for the selected instance",
+  "修复消息与工具 ID": "repaired message and tool IDs",
   "清理加密引用": "removed encrypted references",
-  "无论从正常账号切到 API 服务账号，还是再切回来，都会按当前账号双向修复 Provider 模型前缀、线程模型与推理强度，并清理上一个账号遗留的 cmp/rs 加密引用。只移除无法跨账号复用的推理和压缩元数据，用户消息、助手回复与工具记录都会保留；修复前会自动备份，期间 ChatGPT/Codex 会自动重启。":
-    "Whether switching from an official account to an API service account or back again, repair provider-qualified model names in both directions, reset thread model and reasoning settings for the current account, and remove cmp/rs encrypted references left by the previous account. Only reasoning and compaction metadata that cannot be reused across accounts is removed; user messages, assistant replies, and tool records are preserved. A backup is created first, and ChatGPT/Codex restarts automatically.",
+  "无论从正常账号切到 API 服务账号，还是再切回来，都会按当前账号双向修复 Provider 模型前缀、线程模型与推理强度，修复不兼容的消息与工具 ID，并清理上一个账号遗留的 cmp/rs 加密引用。用户消息、助手回复与工具记录都会保留；修复前会自动备份，期间 ChatGPT/Codex 会自动重启。":
+    "Whether switching from an official account to an API service account or back again, repair provider-qualified model names in both directions, reset thread model and reasoning settings for the current account, repair incompatible message and tool item IDs, and remove cmp/rs encrypted references left by the previous account. User messages, assistant replies, and tool records are preserved. A backup is created first, and ChatGPT/Codex restarts automatically.",
   "将按当前账号清理本地会话中残留的旧 Provider 模型前缀，重置显式模型与推理强度，并同步 Provider。修复前会备份会话文件和数据库，不会删除会话内容。修复期间 ChatGPT/Codex 会自动重启。":
     "Remove stale provider prefixes from local session models, reset explicit model and reasoning selections, and synchronize the provider with the current account. Session files and databases are backed up first; session content is not deleted. ChatGPT/Codex restarts automatically during repair.",
   "开始修复": "Start Repair",
@@ -1258,8 +1259,12 @@ const en: Record<string, string> = {
   "修复可见性": "Repair Visibility",
   "历史投影": "History Projection",
   "恢复完整会话": "Restore Full Conversation",
-  "将修复该会话的分页历史、消息序号和本地索引，清理无法跨实例解密的记录；若上下文过大，会保留界面中的完整历史并生成仅含可读摘要和近期对话的本地压缩快照，然后将模型恢复为 gpt-5.5。原始文件会自动备份；修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。":
-    "Repairs this conversation's paginated history, message ordinals, and local indexes and removes records that cannot be decrypted across instances. If the context is oversized, the full visible history is retained while a local compacted snapshot containing readable summaries and recent messages is created, then the model is reset to gpt-5.5. The original file is backed up automatically. The corresponding Codex instance restarts during repair, so wait for active tasks to finish first.",
+  "恢复超限上下文": "Recover oversized context",
+  "适用于上下文超限且 /compact 失败的会话。保留完整原始记录和备份，仅将模型上下文替换为最近对话的有限文本摘录；这不是 AI 摘要，早期细节、图片和工具输出不会继续发送给模型，必要时请重新提供。": "For conversations that exceed the context window and cannot use /compact. Keeps the full original history and backup, replacing model context with bounded recent text excerpts. This is not an AI summary: older details, images and tool outputs are omitted. Provide them again when needed.",
+  "会话上下文已恢复，请重新打开会话后继续": "Conversation context recovered. Reopen the conversation to continue",
+  "本次未缩减上下文；可能已经恢复，或有记录需要处理，请查看修复提示。": "Context was not reduced this time. It may already be recovered, or some records need attention. Check the repair notices.",
+  "将修复该会话的分页历史、消息序号、不兼容的消息与工具 ID 和本地索引。原始文件会自动备份，消息正文、工具记录与模型设置会保留；修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。":
+    "Repairs this conversation's paginated history, message ordinals, incompatible message and tool item IDs, and local indexes. The original file is backed up automatically; message content, tool records, and model settings are preserved. The corresponding Codex instance restarts during repair, so wait for active tasks to finish first.",
   "未找到需要修复的 Codex 实例": "The Codex instance to repair was not found",
   "未找到需要修复的会话，请刷新后重试": "The conversation to repair was not found. Refresh and try again.",
   "完整会话已恢复": "Full conversation restored",
@@ -1680,8 +1685,8 @@ const ru: Record<string, string> = {
   "正在一键修复…": "Исправление…",
   "正在一键修复": "Исправление",
   "默认实例": "Экземпляр по умолчанию",
-  "将依次执行「一键修复切号会话」，并对当前实例下的所有会话执行「恢复完整会话」：修复 Provider 模型前缀、线程模型、消息序号、分页历史与本地索引，清理无法跨账号复用的加密记录。会话较多时耗时较长，期间请勿关闭应用。修复前会自动备份；修复期间对应 Codex 实例会先关闭，全部处理完后再询问是否重启。":
-    "Сначала выполняется «Исправить сессии после смены аккаунта», затем «Восстановить полную сессию» для всех сессий текущего экземпляра: исправляются префиксы моделей провайдера, модели тредов, порядковые номера сообщений, постраничная история и локальные индексы, удаляются зашифрованные записи, которые нельзя использовать в другом аккаунте. При большом числе сессий это займёт время; не закрывайте приложение. Перед исправлением создаётся резервная копия; экземпляр Codex будет закрыт на время исправления, а после завершения вам предложат перезапустить его.",
+  "将依次执行「一键修复切号会话」，并对当前实例下的所有会话执行「恢复完整会话」：修复 Provider 模型前缀、线程模型、消息序号、不兼容的消息与工具 ID、分页历史与本地索引，清理无法跨账号复用的加密记录。会话较多时耗时较长，期间请勿关闭应用。修复前会自动备份；修复期间对应 Codex 实例会先关闭，全部处理完后再询问是否重启。":
+    "Сначала выполняется «Исправить сессии после смены аккаунта», затем «Восстановить полную сессию» для всех сессий текущего экземпляра: исправляются префиксы моделей провайдера, модели тредов, порядковые номера сообщений, несовместимые ID сообщений и инструментов, постраничная история и локальные индексы, удаляются зашифрованные записи, которые нельзя использовать в другом аккаунте. При большом числе сессий это займёт время; не закрывайте приложение. Перед исправлением создаётся резервная копия; экземпляр Codex будет закрыт на время исправления, а после завершения вам предложат перезапустить его.",
   "一键修复完成": "Полное исправление завершено",
   "一键修复失败": "Полное исправление не удалось",
   "是否重启 Codex？": "Перезапустить Codex?",
@@ -1739,9 +1744,10 @@ const ru: Record<string, string> = {
   "绑定失败": "Ошибка привязки",
   "当前：{account}，点击更换或取消绑定": "Сейчас: {account}. Нажмите, чтобы сменить или отвязать",
   "为所选实例写入 ChatGPT 登录态": "Записать вход ChatGPT для выбранного экземпляра",
+  "修复消息与工具 ID": "исправлено ID сообщений и инструментов",
   "清理加密引用": "удалено зашифрованных ссылок",
-  "无论从正常账号切到 API 服务账号，还是再切回来，都会按当前账号双向修复 Provider 模型前缀、线程模型与推理强度，并清理上一个账号遗留的 cmp/rs 加密引用。只移除无法跨账号复用的推理和压缩元数据，用户消息、助手回复与工具记录都会保留；修复前会自动备份，期间 ChatGPT/Codex 会自动重启。":
-    "При переключении с официального аккаунта на аккаунт API-сервиса и обратно квалифицированные имена моделей исправляются в обоих направлениях, настройки модели и глубины рассуждений приводятся к текущему аккаунту, а зашифрованные ссылки cmp/rs от предыдущего аккаунта удаляются. Удаляются только метаданные рассуждений и сжатия, которые нельзя использовать с другим аккаунтом; сообщения пользователя, ответы помощника и записи инструментов сохраняются. Сначала создаётся резервная копия, затем ChatGPT/Codex автоматически перезапускается.",
+  "无论从正常账号切到 API 服务账号，还是再切回来，都会按当前账号双向修复 Provider 模型前缀、线程模型与推理强度，修复不兼容的消息与工具 ID，并清理上一个账号遗留的 cmp/rs 加密引用。用户消息、助手回复与工具记录都会保留；修复前会自动备份，期间 ChatGPT/Codex 会自动重启。":
+    "При переключении с официального аккаунта на аккаунт API-сервиса и обратно квалифицированные имена моделей исправляются в обоих направлениях, настройки модели и глубины рассуждений приводятся к текущему аккаунту, несовместимые ID сообщений и инструментов исправляются, а зашифрованные ссылки cmp/rs от предыдущего аккаунта удаляются. Сообщения пользователя, ответы помощника и записи инструментов сохраняются. Сначала создаётся резервная копия, затем ChatGPT/Codex автоматически перезапускается.",
   "将按当前账号清理本地会话中残留的旧 Provider 模型前缀，重置显式模型与推理强度，并同步 Provider。修复前会备份会话文件和数据库，不会删除会话内容。修复期间 ChatGPT/Codex 会自动重启。":
     "Устаревшие префиксы поставщика будут удалены из моделей локальных сессий, явные настройки модели и глубины рассуждений сброшены, а поставщик синхронизирован с текущим аккаунтом. Перед исправлением файлы и базы сессий будут сохранены; содержимое сессий не удаляется. ChatGPT/Codex автоматически перезапустится.",
   "开始修复": "Начать исправление",
@@ -2480,8 +2486,12 @@ const ru: Record<string, string> = {
   "修复可见性": "Восстановить видимость",
   "历史投影": "Проекция истории",
   "恢复完整会话": "Восстановить полную переписку",
-  "将修复该会话的分页历史、消息序号和本地索引，清理无法跨实例解密的记录；若上下文过大，会保留界面中的完整历史并生成仅含可读摘要和近期对话的本地压缩快照，然后将模型恢复为 gpt-5.5。原始文件会自动备份；修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。":
-    "Будут исправлены постраничная история, порядковые номера сообщений и локальные индексы, а также удалены записи, которые нельзя расшифровать в другом экземпляре. Если контекст слишком велик, полная видимая история сохранится, а для продолжения будет создан локальный сжатый снимок с читаемыми сводками и недавними сообщениями; модель будет сброшена на gpt-5.5. Исходный файл сохранится автоматически. Во время восстановления экземпляр Codex перезапустится — дождитесь завершения текущих задач.",
+  "恢复超限上下文": "Восстановить переполненный контекст",
+  "适用于上下文超限且 /compact 失败的会话。保留完整原始记录和备份，仅将模型上下文替换为最近对话的有限文本摘录；这不是 AI 摘要，早期细节、图片和工具输出不会继续发送给模型，必要时请重新提供。": "Для переполненного контекста, когда /compact не работает. Полная история и резервная копия сохраняются. Контекст модели заменяется ограниченными текстовыми выдержками из последних сообщений. Это не ИИ-сводка: ранние подробности, изображения и результаты инструментов нужно при необходимости предоставить заново.",
+  "会话上下文已恢复，请重新打开会话后继续": "Контекст восстановлен. Откройте переписку заново, чтобы продолжить",
+  "本次未缩减上下文；可能已经恢复，或有记录需要处理，请查看修复提示。": "Контекст не сокращён: возможно, он уже восстановлен или отдельные записи требуют внимания. Проверьте сообщения восстановления.",
+  "将修复该会话的分页历史、消息序号、不兼容的消息与工具 ID 和本地索引。原始文件会自动备份，消息正文、工具记录与模型设置会保留；修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。":
+    "Будут исправлены постраничная история, порядковые номера сообщений, несовместимые ID сообщений и инструментов и локальные индексы. Исходный файл сохранится автоматически; содержимое сообщений, записи инструментов и настройки модели будут сохранены. Во время восстановления экземпляр Codex перезапустится — дождитесь завершения текущих задач.",
   "未找到需要修复的 Codex 实例": "Экземпляр Codex для восстановления не найден",
   "未找到需要修复的会话，请刷新后重试": "Сессия для восстановления не найдена. Обновите список и повторите попытку.",
   "完整会话已恢复": "Полная переписка восстановлена",
@@ -3525,10 +3535,15 @@ const simplifiedToTraditional: Record<string, string> = {
   "全选回收站": "全選回收站",
   "修复可见性": "修復可見性",
   "历史投影": "歷史投影",
+  "修复消息与工具 ID": "修復訊息與工具 ID",
   "恢复完整会话": "還原完整會話",
+  "恢复超限上下文": "還原超限上下文",
+  "适用于上下文超限且 /compact 失败的会话。保留完整原始记录和备份，仅将模型上下文替换为最近对话的有限文本摘录；这不是 AI 摘要，早期细节、图片和工具输出不会继续发送给模型，必要时请重新提供。": "適用於上下文超限且 /compact 失敗的會話。保留完整原始記錄與備份，僅將模型上下文替換為近期對話的有限文字摘錄；這不是 AI 摘要，早期細節、圖片及工具輸出不再傳送給模型，必要時請重新提供。",
+  "会话上下文已恢复，请重新打开会话后继续": "會話上下文已還原，請重新開啟會話後繼續",
+  "本次未缩减上下文；可能已经恢复，或有记录需要处理，请查看修复提示。": "本次未縮減上下文；可能已經還原，或有記錄需要處理，請查看修復提示。",
   "开始修复": "開始修復",
-  "将修复该会话的分页历史、消息序号和本地索引，清理无法跨实例解密的记录；若上下文过大，会保留界面中的完整历史并生成仅含可读摘要和近期对话的本地压缩快照，然后将模型恢复为 gpt-5.5。原始文件会自动备份；修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。":
-    "將修復此會話的分頁歷史、訊息序號與本機索引，清理無法跨執行個體解密的記錄；若上下文過大，會保留介面中的完整歷史並產生僅含可讀摘要與近期對話的本機壓縮快照，然後將模型還原為 gpt-5.5。原始檔案會自動備份；修復期間對應的 Codex 執行個體會重新啟動，請先等待進行中的工作完成。",
+  "将修复该会话的分页历史、消息序号、不兼容的消息与工具 ID 和本地索引。原始文件会自动备份，消息正文、工具记录与模型设置会保留；修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。":
+    "將修復此會話的分頁歷史、訊息序號、不相容的訊息與工具 ID 與本機索引。原始檔案會自動備份，訊息正文、工具記錄與模型設定會保留；修復期間對應的 Codex 執行個體會重新啟動，請先等待進行中的工作完成。",
   "未找到需要修复的 Codex 实例": "找不到需要修復的 Codex 執行個體",
   "未找到需要修复的会话，请刷新后重试": "找不到需要修復的會話，請重新整理後再試一次",
   "完整会话已恢复": "完整會話已還原",

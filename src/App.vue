@@ -44,6 +44,7 @@ import SessionDirectoryModal from "./components/SessionDirectoryModal.vue";
 import SessionPanel from "./components/SessionPanel.vue";
 import SessionRepairModal from "./components/SessionRepairModal.vue";
 import SessionRenameModal from "./components/SessionRenameModal.vue";
+import SessionHistoryRepairModal from "./components/SessionHistoryRepairModal.vue";
 import SessionRestoreModal from "./components/SessionRestoreModal.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
 import InstancePickerModal from "./components/InstancePickerModal.vue";
@@ -481,6 +482,8 @@ const expandedSessionGroups = ref<Set<string>>(new Set());
 const sessionLoading = ref(false);
 const sessionRepairing = ref(false);
 const repairingSessionId = ref("");
+const sessionHistoryRepairVisible = ref(false);
+const sessionHistoryRepairTarget = ref<CodexSessionRecord | null>(null);
 const repairVisible = ref(false);
 const repairMode = ref<CodexSessionVisibilityRepairMode>("quick");
 const repairInstanceScope = ref<"target" | "all">("target");
@@ -2799,7 +2802,7 @@ async function handleSettingsInstanceChange(instanceId: string): Promise<void> {
 
 async function handleSessionInstanceChange(instanceId: string): Promise<void> {
   if (instanceId === sessionInstanceId.value) return;
-  if (backupWorking.value || sessionRepairing.value || sessionModelRepairing.value || sessionOneClickRepairing.value) {
+  if (backupWorking.value || sessionRepairing.value || sessionModelRepairing.value || sessionOneClickRepairing.value || repairingSessionId.value) {
     Message.warning(t("当前会话操作完成后再切换实例"));
     return;
   }
@@ -2809,6 +2812,8 @@ async function handleSessionInstanceChange(instanceId: string): Promise<void> {
   sessionCopySource.value = null;
   sessionRenameVisible.value = false;
   sessionRenameTarget.value = null;
+  sessionHistoryRepairVisible.value = false;
+  sessionHistoryRepairTarget.value = null;
   sessionDirectoryVisible.value = false;
   sessionDirectoryTarget.value = null;
   sessionRestoreVisible.value = false;
@@ -4220,42 +4225,41 @@ async function runRepairSessions(): Promise<void> {
 
 function confirmRepairSingleSessionHistory(session: CodexSessionRecord): void {
   if (repairingSessionId.value || sessionRepairing.value || sessionModelRepairing.value || sessionOneClickRepairing.value) return;
-  Modal.warning({
-    title: t("恢复完整会话"),
-    content: t(
-      "将修复该会话的分页历史、消息序号和本地索引，清理无法跨实例解密的记录；若上下文过大，会保留界面中的完整历史并生成仅含可读摘要和近期对话的本地压缩快照，然后将模型恢复为 gpt-5.5。原始文件会自动备份；修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。",
-    ),
-    okText: t("开始修复"),
-    cancelText: t("取消"),
-    hideCancel: false,
-    onOk: async () => {
-      repairingSessionId.value = session.id;
-      try {
-        const instanceList = await listSessionVisibilityRepairInstances();
-        const requestedInstanceId = sessionInstanceId.value === "default"
-          ? instanceList.defaultInstanceId
-          : sessionInstanceId.value;
-        const target = instanceList.instances.find(
-          (instance) => instance.id === requestedInstanceId,
-        );
-        if (!target) throw new Error(t("未找到需要修复的 Codex 实例"));
-        const summary = await repairSessionVisibilityAcrossInstances(
-          buildSingleSessionHistoryRepairOptions(session.id, target),
-        );
-        if (summary.scanned === 0) {
-          throw new Error(t("未找到需要修复的会话，请刷新后重试"));
-        }
-        await loadSessions({ silent: true });
-        Message.success(
-          `${t("完整会话已恢复")}：${session.title || t("未命名会话")}；${summary.message}`,
-        );
-      } catch (error) {
-        Message.error(`${t("恢复完整会话失败")}：${errorText(error)}`);
-      } finally {
-        repairingSessionId.value = "";
-      }
-    },
-  });
+  sessionHistoryRepairTarget.value = session;
+  sessionHistoryRepairVisible.value = true;
+}
+
+async function handleRepairSingleSessionHistory(recoverContext: boolean): Promise<void> {
+  const session = sessionHistoryRepairTarget.value;
+  if (!session || repairingSessionId.value || sessionRepairing.value || sessionModelRepairing.value || sessionOneClickRepairing.value) return;
+  repairingSessionId.value = session.id;
+  try {
+    const instanceList = await listSessionVisibilityRepairInstances();
+    const requestedInstanceId = sessionInstanceId.value === "default"
+      ? instanceList.defaultInstanceId
+      : sessionInstanceId.value;
+    const target = instanceList.instances.find((instance) => instance.id === requestedInstanceId);
+    if (!target) throw new Error(t("未找到需要修复的 Codex 实例"));
+    const summary = await repairSessionVisibilityAcrossInstances(
+      buildSingleSessionHistoryRepairOptions(session.id, target, recoverContext),
+    );
+    if (summary.scanned === 0) throw new Error(t("未找到需要修复的会话，请刷新后重试"));
+    await loadSessions({ silent: true });
+    if (summary.warnings?.length) {
+      Message.warning({ content: summary.warnings.join("；"), duration: 10000 });
+    }
+    if (recoverContext && !summary.recoveredContextCount) {
+      Message.info(t("本次未缩减上下文；可能已经恢复，或有记录需要处理，请查看修复提示。"));
+    } else {
+      Message.success(`${t(recoverContext ? "会话上下文已恢复，请重新打开会话后继续" : "完整会话已恢复")}：${session.title || t("未命名会话")}；${summary.message}`);
+    }
+    sessionHistoryRepairVisible.value = false;
+    sessionHistoryRepairTarget.value = null;
+  } catch (error) {
+    Message.error(`${t("恢复完整会话失败")}：${errorText(error)}`);
+  } finally {
+    repairingSessionId.value = "";
+  }
 }
 
 async function loadConfigEditorFile(): Promise<void> {
@@ -4345,7 +4349,7 @@ function confirmRepairSessionModels(): void {
   Modal.warning({
     title: t("一键修复切号会话"),
     content: t(
-      "无论从正常账号切到 API 服务账号，还是再切回来，都会按当前账号双向修复 Provider 模型前缀、线程模型与推理强度，并清理上一个账号遗留的 cmp/rs 加密引用。只移除无法跨账号复用的推理和压缩元数据，用户消息、助手回复与工具记录都会保留；修复前会自动备份，期间 ChatGPT/Codex 会自动重启。",
+      "无论从正常账号切到 API 服务账号，还是再切回来，都会按当前账号双向修复 Provider 模型前缀、线程模型与推理强度，修复不兼容的消息与工具 ID，并清理上一个账号遗留的 cmp/rs 加密引用。用户消息、助手回复与工具记录都会保留；修复前会自动备份，期间 ChatGPT/Codex 会自动重启。",
     ),
     okText: t("一键修复"),
     cancelText: t("取消"),
@@ -4367,7 +4371,7 @@ function confirmRepairSessionModels(): void {
             summary.removedEncryptedReasoningItemCount +
             summary.removedEncryptedCompactionItemCount;
           Message.success(
-            `${t("切号会话一键修复完成")}：${summary.repairedThreadCount} ${t("条会话")}，${summary.repairedRolloutFileCount} ${t("个会话文件")}，${t("清理加密引用")} ${removedEncryptedItems} ${t("个")}`,
+            `${t("切号会话一键修复完成")}：${summary.repairedThreadCount} ${t("条会话")}，${summary.repairedRolloutFileCount} ${t("个会话文件")}，${t("修复消息与工具 ID")} ${summary.repairedItemIdCount} ${t("个")}，${t("清理加密引用")} ${removedEncryptedItems} ${t("个")}`,
           );
         }
       } catch (error) {
@@ -4395,7 +4399,7 @@ function confirmOneClickRepairSessions(): void {
   Modal.warning({
     title: t("一键修复"),
     content: t(
-      "将依次执行「一键修复切号会话」，并对当前实例下的所有会话执行「恢复完整会话」：修复 Provider 模型前缀、线程模型、消息序号、分页历史与本地索引，清理无法跨账号复用的加密记录。会话较多时耗时较长，期间请勿关闭应用。修复前会自动备份；修复期间对应 Codex 实例会先关闭，全部处理完后再询问是否重启。",
+      "将依次执行「一键修复切号会话」，并对当前实例下的所有会话执行「恢复完整会话」：修复 Provider 模型前缀、线程模型、消息序号、不兼容的消息与工具 ID、分页历史与本地索引，清理无法跨账号复用的加密记录。会话较多时耗时较长，期间请勿关闭应用。修复前会自动备份；修复期间对应 Codex 实例会先关闭，全部处理完后再询问是否重启。",
     ),
     okText: t("开始修复"),
     cancelText: t("取消"),
@@ -5270,6 +5274,13 @@ onUnmounted(() => {
       :directories="sessionCopyDirectories"
       :saving="sessionCopySaving"
       @save="handleCopySession"
+    />
+
+    <SessionHistoryRepairModal
+      v-model:visible="sessionHistoryRepairVisible"
+      :session="sessionHistoryRepairTarget"
+      :repairing="Boolean(repairingSessionId)"
+      @repair="handleRepairSingleSessionHistory"
     />
 
     <SessionRenameModal

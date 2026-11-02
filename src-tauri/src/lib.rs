@@ -2207,9 +2207,10 @@ pub(crate) fn one_click_repair_session_store_with_native_history(
 /// 把一键修复结果压成一行人类可读的摘要。
 pub(crate) fn one_click_repair_message(outcome: &OneClickStoreRepairOutcome) -> String {
     let mut message = format!(
-        "切号修复 {} 条会话、{} 个会话文件，清理加密引用 {} 个；完整历史修复扫描 {} 条会话，校正 {} 个会话文件，重置 {} 条分页历史投影",
+        "切号修复 {} 条会话、{} 个会话文件，修复消息与工具 ID {} 个，清理加密引用 {} 个；完整历史修复扫描 {} 条会话，校正 {} 个会话文件，重置 {} 条分页历史投影",
         outcome.model_compatibility.repaired_thread_count,
         outcome.model_compatibility.repaired_rollout_file_count,
+        outcome.model_compatibility.repaired_item_id_count,
         outcome.model_compatibility.removed_encrypted_reasoning_item_count
             + outcome.model_compatibility.removed_encrypted_compaction_item_count,
         outcome.visibility.scanned,
@@ -3585,6 +3586,16 @@ fn repair_session_visibility_across_instances_impl(
     if requested_ids.is_empty() {
         return Err("没有选择需要修复的 Codex 实例".to_string());
     }
+    if mode
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("context"))
+        && (requested_ids.len() != 1
+            || session_ids
+                .as_ref()
+                .is_none_or(|ids| ids.len() != 1 || ids[0].trim().is_empty()))
+    {
+        return Err("恢复超限上下文必须明确选择一个实例中的一条会话".to_string());
+    }
 
     let mut combined: Option<CodexSessionVisibilityRepairSummary> = None;
     for instance_id in requested_ids {
@@ -3682,6 +3693,7 @@ fn merge_visibility_repair_summary(
     total.verified_generated_image_count += next.verified_generated_image_count;
     total.invalid_generated_image_count += next.invalid_generated_image_count;
     total.reset_history_projection_count += next.reset_history_projection_count;
+    total.recovered_context_count += next.recovered_context_count;
     total.desktop_reload_required |= next.desktop_reload_required;
     total.desktop_reload_performed |= next.desktop_reload_performed;
     total.backup_dirs.append(&mut next.backup_dirs);
