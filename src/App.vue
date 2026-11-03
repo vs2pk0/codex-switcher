@@ -4350,7 +4350,7 @@ function confirmRepairSessionModels(): void {
     title: t("一键修复切号会话"),
     content: t(
       "无论从正常账号切到 API 服务账号，还是再切回来，都会按当前账号双向修复 Provider 模型前缀、线程模型与推理强度，修复不兼容的消息与工具 ID，并清理上一个账号遗留的 cmp/rs 加密引用。用户消息、助手回复与工具记录都会保留；修复前会自动备份，期间 ChatGPT/Codex 会自动重启。",
-    ),
+    ) + "\n\n" + t("同时迁移整条分段历史与当前接口上下文，兼容绑定账号的 API 及编辑旧消息重发。API 使用完整工具定义，切回账号时恢复配置。原始文件会备份；不兼容的工具记录会转为历史文本，超限上下文会使用近期摘录，早期细节、图片和工具输出可能需要重新提供。"),
     okText: t("一键修复"),
     cancelText: t("取消"),
     hideCancel: false,
@@ -4371,7 +4371,7 @@ function confirmRepairSessionModels(): void {
             summary.removedEncryptedReasoningItemCount +
             summary.removedEncryptedCompactionItemCount;
           Message.success(
-            `${t("切号会话一键修复完成")}：${summary.repairedThreadCount} ${t("条会话")}，${summary.repairedRolloutFileCount} ${t("个会话文件")}，${t("修复消息与工具 ID")} ${summary.repairedItemIdCount} ${t("个")}，${t("清理加密引用")} ${removedEncryptedItems} ${t("个")}`,
+            `${t("切号会话一键修复完成")}：${summary.repairedThreadCount} ${t("条会话")}，${summary.repairedRolloutFileCount} ${t("个会话文件")}，${t("修复消息与工具 ID")} ${summary.repairedItemIdCount} ${t("个")}，${t("修复压缩元数据")} ${summary.repairedCompactionMetadataCount} ${t("个")}，${t("迁移协议上下文")} ${summary.rebuiltProtocolContextCount} ${t("条会话")}（${t("超限上下文摘录")} ${summary.reducedProtocolContextCount}），${t("清理加密引用")} ${removedEncryptedItems} ${t("个")}`,
           );
         }
       } catch (error) {
@@ -4400,7 +4400,7 @@ function confirmOneClickRepairSessions(): void {
     title: t("一键修复"),
     content: t(
       "将依次执行「一键修复切号会话」，并对当前实例下的所有会话执行「恢复完整会话」：修复 Provider 模型前缀、线程模型、消息序号、不兼容的消息与工具 ID、分页历史与本地索引，清理无法跨账号复用的加密记录。会话较多时耗时较长，期间请勿关闭应用。修复前会自动备份；修复期间对应 Codex 实例会先关闭，全部处理完后再询问是否重启。",
-    ),
+    ) + "\n\n" + t("同时迁移整条分段历史与当前接口上下文，兼容绑定账号的 API 及编辑旧消息重发。API 使用完整工具定义，切回账号时恢复配置。原始文件会备份；不兼容的工具记录会转为历史文本，超限上下文会使用近期摘录，早期细节、图片和工具输出可能需要重新提供。"),
     okText: t("开始修复"),
     cancelText: t("取消"),
     hideCancel: false,

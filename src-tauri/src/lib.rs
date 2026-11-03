@@ -1735,16 +1735,33 @@ async fn switch_codex_account(
             &instance.id,
         );
         let session_store = SessionStore::new(codex_home.clone());
-        let switched = switch_account_with_session_options(
-            &account_store,
-            &session_store,
-            &account_id,
-            switch_settings.repair_sessions_on_account_switch,
-        )?;
+        // Install the destination catalog before migrating saved thread models.
+        // Otherwise repair still sees the previous account's model defaults.
+        let account = account_store.switch_account(&account_id)?;
         if let Some(catalog) = &model_catalog {
             api_model_catalog::install_with_settings(
-                &codex_home, &account_id, catalog, &switch_settings.api_model_settings,
-            ).map_err(|error| format!("账号已切换，但模型目录或 API 偏好写入失败，请重试：{error}"))?;
+                &codex_home,
+                &account_id,
+                catalog,
+                &switch_settings.api_model_settings,
+            )
+            .map_err(|error| {
+                format!("账号已切换，但模型目录或 API 偏好写入失败，请重试：{error}")
+            })?;
+        }
+        let mut switched = account_switch_result_after_configuration(
+            &session_store,
+            account,
+            switch_settings.repair_sessions_on_account_switch,
+        )?;
+        if switch_settings.repair_sessions_on_account_switch {
+            if let Err(error) = session_store.hydrate_missing_history_projections(None) {
+                let warning = format!("配置已更新，但分页历史重建未完成：{error}");
+                switched.warning = Some(match switched.warning {
+                    Some(previous) => format!("{previous}；{warning}"),
+                    None => warning,
+                });
+            }
         }
         Ok(switched)
     })
@@ -1806,10 +1823,8 @@ async fn sync_api_key_account_to_instance(
         .await
         .map_err(|error| format!("获取模型列表失败，未同步配置：{error}"))?;
     let switch_settings = read_switcher_settings()?;
-    let model_catalog = api_model_catalog::encode_with_settings(
-        &models,
-        &switch_settings.api_model_settings,
-    )?;
+    let model_catalog =
+        api_model_catalog::encode_with_settings(&models, &switch_settings.api_model_settings)?;
     if let Some(oauth_account_id) = target.bound_oauth_account_id.clone() {
         token_keeper::ensure_fresh_access_token_for_store(
             &selected_account_store,
@@ -1839,15 +1854,11 @@ async fn sync_api_key_account_to_instance(
                     &instance.id,
                 );
                 let session_store = SessionStore::new(codex_home.clone());
-                let switched = switch_account_with_session_options(
-                    &account_store,
-                    &session_store,
-                    &account_id,
-                    switch_settings.repair_sessions_on_account_switch,
-                )?;
+                let account = account_store.switch_account(&account_id)?;
                 api_model_catalog::install_with_settings(
                     &codex_home, &account_id, &model_catalog, &switch_settings.api_model_settings,
                 ).map_err(|error| format!("账号已切换，但模型目录或 API 偏好写入失败，请重试：{error}"))?;
+                let switched = account_switch_result_after_configuration(&session_store, account, switch_settings.repair_sessions_on_account_switch)?;
                 let mut report = |step: u8| emit(step);
                 let mut outcome = repair_sessions_on_switch(
                     &session_store,
@@ -1925,6 +1936,14 @@ pub(crate) fn switch_account_with_session_options(
     repair_sessions: bool,
 ) -> Result<CodexAccountSwitchResult, String> {
     let account = account_store.switch_account(account_id)?;
+    account_switch_result_after_configuration(session_store, account, repair_sessions)
+}
+
+fn account_switch_result_after_configuration(
+    session_store: &SessionStore,
+    account: CodexAccount,
+    repair_sessions: bool,
+) -> Result<CodexAccountSwitchResult, String> {
     let (synchronized_session_provider_count, warnings) = if repair_sessions {
         prepare_sessions_after_configuration_change(session_store)?
     } else {
@@ -2027,7 +2046,13 @@ fn repair_codex_session_model_compatibility(
     instances::run_with_instance_restarted(&instance_id, |instance| {
         let session_store = SessionStore::new(PathBuf::from(&instance.codex_home));
         let target_provider = session_store.read_target_provider()?;
-        session_store.repair_model_compatibility(&target_provider)
+        let mut summary = session_store.repair_model_compatibility(&target_provider)?;
+        if let Err(error) = session_store.hydrate_missing_history_projections(None) {
+            summary
+                .warnings
+                .push(format!("分页历史重建未完成：{error}"));
+        }
+        Ok(summary)
     })
 }
 
@@ -2207,10 +2232,13 @@ pub(crate) fn one_click_repair_session_store_with_native_history(
 /// 把一键修复结果压成一行人类可读的摘要。
 pub(crate) fn one_click_repair_message(outcome: &OneClickStoreRepairOutcome) -> String {
     let mut message = format!(
-        "切号修复 {} 条会话、{} 个会话文件，修复消息与工具 ID {} 个，清理加密引用 {} 个；完整历史修复扫描 {} 条会话，校正 {} 个会话文件，重置 {} 条分页历史投影",
+        "切号修复 {} 条会话、{} 个会话文件，修复消息与工具 ID {} 个，修复压缩元数据 {} 处，迁移协议上下文 {} 条（超限上下文摘录 {} 条），清理加密引用 {} 个；完整历史修复扫描 {} 条会话，校正 {} 个会话文件，重置 {} 条分页历史投影",
         outcome.model_compatibility.repaired_thread_count,
         outcome.model_compatibility.repaired_rollout_file_count,
         outcome.model_compatibility.repaired_item_id_count,
+        outcome.model_compatibility.repaired_compaction_metadata_count,
+        outcome.model_compatibility.rebuilt_protocol_context_count,
+        outcome.model_compatibility.reduced_protocol_context_count,
         outcome.model_compatibility.removed_encrypted_reasoning_item_count
             + outcome.model_compatibility.removed_encrypted_compaction_item_count,
         outcome.visibility.scanned,

@@ -1,7 +1,11 @@
 use crate::account::{replace_file_atomic, write_bytes_atomic};
 use crate::system_command;
+mod compaction_metadata;
 mod item_ids;
+mod portable_history;
+mod portable_lineage;
 mod recovery_context;
+use compaction_metadata::{repair_compaction_metadata, retain_compacted_history};
 use recovery_context::{recover_rollout_context, LocalRecoveryContext};
 #[cfg(test)]
 use recovery_context::{LOCAL_RECOVERY_CONTEXT_MAX_BYTES, LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES};
@@ -9,13 +13,13 @@ use recovery_context::{LOCAL_RECOVERY_CONTEXT_MAX_BYTES, LOCAL_RECOVERY_CONTEXT_
 /// 同一线程多段 rollout（history_base 续写链）的解析与合并。
 mod lineage;
 mod markdown;
-pub use markdown::MarkdownExportResult;
 use base64::{engine::general_purpose, Engine as _};
 use item_ids::{repair_record_item_ids, rewrite_rollout_item_ids};
 use lineage::{
     lineage_projection_targets, materialize_lineage, physical_rollout_id, resolve_lineage,
     RolloutLineage, SegmentInput, SegmentProjectionTarget,
 };
+pub use markdown::MarkdownExportResult;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -215,6 +219,12 @@ pub struct CodexSessionModelCompatibilityRepairSummary {
     pub removed_encrypted_compaction_item_count: usize,
     #[serde(default)]
     pub repaired_item_id_count: usize,
+    #[serde(default)]
+    pub repaired_compaction_metadata_count: usize,
+    #[serde(default)]
+    pub rebuilt_protocol_context_count: usize,
+    #[serde(default)]
+    pub reduced_protocol_context_count: usize,
     pub repaired_thread_count: usize,
     pub synchronized_catalog_row_count: usize,
     pub repaired_database_count: usize,
@@ -827,6 +837,10 @@ impl SessionStore {
             return Err("Codex model_provider 不能为空".to_string());
         }
 
+        if target_provider != "openai" {
+            crate::api_model_settings::ensure_portable_tool_replay(&self.codex_home)?;
+        }
+
         let mut summary = CodexSessionModelCompatibilityRepairSummary {
             target_provider: target_provider.to_string(),
             repaired_rollout_file_count: 0,
@@ -835,6 +849,9 @@ impl SessionStore {
             removed_encrypted_reasoning_item_count: 0,
             removed_encrypted_compaction_item_count: 0,
             repaired_item_id_count: 0,
+            repaired_compaction_metadata_count: 0,
+            rebuilt_protocol_context_count: 0,
+            reduced_protocol_context_count: 0,
             repaired_thread_count: 0,
             synchronized_catalog_row_count: 0,
             repaired_database_count: 0,
@@ -843,10 +860,14 @@ impl SessionStore {
         };
 
         let protected = self.protected_rollout_prefixes();
+        let target_model = self.read_repair_model(target_provider)?;
         let mut changed_records = Vec::new();
         let mut changed_ids = HashSet::new();
         let mut paths = collect_jsonl_files(&self.sessions_dir())?;
-        paths.extend(collect_jsonl_files(&self.codex_home.join("archived_sessions"))?);
+        paths.extend(collect_jsonl_files(
+            &self.codex_home.join("archived_sessions"),
+        )?);
+        let protocol_records = self.session_lineage_entries_from_paths(paths.clone())?;
         for path in paths {
             // 被后继段引用的前缀必须保持字节级不变，只改写前缀之后的记录。
             let protected_prefix = if protected.is_empty() {
@@ -862,7 +883,7 @@ impl SessionStore {
                 prepare_rollout_model_compatibility_rewrite_guarded(
                     &path,
                     target_provider,
-                    None,
+                    target_model.as_deref(),
                     protected_prefix,
                 )?
             else {
@@ -919,6 +940,8 @@ impl SessionStore {
             summary.removed_encrypted_compaction_item_count +=
                 rewrite_stats.removed_encrypted_compaction_items;
             summary.repaired_item_id_count += rewrite_stats.repaired_item_ids;
+            summary.repaired_compaction_metadata_count +=
+                rewrite_stats.repaired_compaction_metadata;
             if let Some(id) = read_session_record_header(&path)?.id {
                 changed_ids.insert(id.clone());
                 changed_records.push(SessionRepairRecord {
@@ -927,6 +950,74 @@ impl SessionStore {
                     title: String::new(),
                     updated_at: 0,
                 });
+            }
+        }
+        // Protocol snapshots must be appended to the current lineage head. A
+        // snapshot appended to an ancestor after its retained cutoff is invisible
+        // to the running thread, even though it appears in the physical file.
+        for entry in protocol_records {
+            let session = entry.record;
+            let path = PathBuf::from(&session.path);
+            let result = (|| -> Result<Option<bool>, String> {
+                let content =
+                    fs::read_to_string(&path).map_err(|e| format!("读取会话失败：{e}"))?;
+                let Some((next, reduced)) = portable_history::migrate_protocol_context(
+                    &self.codex_home,
+                    &path,
+                    &content,
+                    target_provider,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let backup = self.backup_session_file(&path, "protocol-migration")?;
+                write_bytes_atomic(&path, next.as_bytes())?;
+                let _ = system_command::new("touch")
+                    .arg("-r")
+                    .arg(&backup)
+                    .arg(&path)
+                    .output();
+                if let Some(directory) = backup.parent() {
+                    let directory = directory.to_string_lossy().into_owned();
+                    if !summary.backup_dirs.contains(&directory) {
+                        summary.backup_dirs.push(directory);
+                    }
+                }
+                Ok(Some(reduced))
+            })();
+            match result {
+                Ok(Some(reduced)) => {
+                    summary.rebuilt_protocol_context_count += 1;
+                    summary.reduced_protocol_context_count += usize::from(reduced);
+                    changed_ids.insert(session.id.clone());
+                    if !changed_records.iter().any(|record| record.path == path) {
+                        summary.repaired_rollout_file_count += 1;
+                        changed_records.push(SessionRepairRecord {
+                            id: session.id,
+                            path,
+                            title: session.title,
+                            updated_at: session.updated_at,
+                        });
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => summary.warnings.push(format!(
+                    "会话 {} 的协议上下文迁移未完成：{error}",
+                    session.id
+                )),
+            }
+        }
+        let (lineage_records, lineage_backups) =
+            self.migrate_portable_lineage(target_provider, target_model.as_deref(), None)?;
+        summary.backup_dirs.extend(lineage_backups);
+        for record in lineage_records {
+            changed_ids.insert(record.id.clone());
+            if !changed_records
+                .iter()
+                .any(|existing| existing.path == record.path)
+            {
+                summary.repaired_rollout_file_count += 1;
+                changed_records.push(record);
             }
         }
         if !changed_records.is_empty() {
@@ -1133,9 +1224,16 @@ impl SessionStore {
     /// 按逻辑线程 id 归并 sessions 目录下的所有 rollout：同一线程被 Codex 切成多段时，
     /// 列表记录的路径是当前写入段，大小/Token 是各段有效字节的合计，标题取首段。
     fn session_lineage_entries(&self) -> Result<Vec<SessionLineageEntry>, String> {
+        self.session_lineage_entries_from_paths(collect_jsonl_files(&self.sessions_dir())?)
+    }
+
+    fn session_lineage_entries_from_paths(
+        &self,
+        paths: Vec<PathBuf>,
+    ) -> Result<Vec<SessionLineageEntry>, String> {
         let mut groups =
             HashMap::<String, Vec<(CodexSessionRecord, Option<RolloutHistoryBase>)>>::new();
-        for path in collect_jsonl_files(&self.sessions_dir())? {
+        for path in paths {
             let summary = build_session_record_summary(&path)?;
             let base = read_rollout_history_base(&path);
             groups
@@ -2518,7 +2616,9 @@ impl SessionStore {
         session_ids: Option<Vec<String>>,
     ) -> Result<CodexSessionVisibilityRepairSummary, String> {
         let recover_context = mode.is_some_and(|value| value.eq_ignore_ascii_case("context"));
-        if recover_context && normalized_id_set(session_ids.clone()).is_none_or(|ids| ids.len() != 1) {
+        if recover_context
+            && normalized_id_set(session_ids.clone()).is_none_or(|ids| ids.len() != 1)
+        {
             return Err("恢复超限上下文必须明确选择一条会话".to_string());
         }
         if !should_repair_default_instance(target_instance_id, repair_instance_ids) {
@@ -2568,6 +2668,9 @@ impl SessionStore {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or(self.read_target_provider()?);
+        if recover_context && target_provider != "openai" {
+            crate::api_model_settings::ensure_portable_tool_replay(&self.codex_home)?;
+        }
         let repair_records = sessions
             .iter()
             .map(|session| SessionRepairRecord {
@@ -2596,10 +2699,15 @@ impl SessionStore {
         let mut skipped_protected_ancestors = rollout_outcome.skipped_protected_ancestors;
         let mut repair_warnings = rollout_outcome.warnings;
         let rewritten_session_ids = rollout_outcome.changed_session_ids;
+        let recovery_model = if recover_context {
+            self.read_repair_model(&target_provider)?
+        } else {
+            None
+        };
         let (updated_rows, backup_dirs) = self.repair_sqlite_visibility(
             &target_provider,
             Some(&repair_records),
-            None,
+            recovery_model.as_deref(),
         )?;
         let added_index_entries = if deep {
             self.repair_session_index(&repair_records)?
@@ -2631,6 +2739,20 @@ impl SessionStore {
         // 游标就不再对应文件内容，必须重建；deep 模式额外校对所有目标会话的投影。
         let mut changed_session_ids = local_images.changed_session_ids.clone();
         changed_session_ids.extend(rewritten_session_ids);
+        if recover_context {
+            let lineage_ids = repair_records
+                .iter()
+                .map(|record| record.id.clone())
+                .collect();
+            let (lineage_records, lineage_backups) = self.migrate_portable_lineage(
+                &target_provider,
+                recovery_model.as_deref(),
+                Some(&lineage_ids),
+            )?;
+            changed_rollout_files += lineage_records.len();
+            changed_session_ids.extend(lineage_records.iter().map(|record| record.id.clone()));
+            rollout_backup_dirs.extend(lineage_backups);
+        }
         if deep && selected_ids.is_some() {
             // Native resume rebuilds the active segment only. Clearing an unchanged
             // ancestor's valid projection hides inherited turns from the desktop.
@@ -3956,25 +4078,61 @@ impl SessionStore {
         }
         let content = fs::read_to_string(&config_path)
             .map_err(|error| format!("读取 Codex config.toml 失败: {}", error))?;
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('#') || !trimmed.starts_with("model_provider") {
-                continue;
-            }
-            let Some((_, value)) = trimmed.split_once('=') else {
-                continue;
-            };
-            let provider = value
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'')
-                .trim()
-                .to_string();
-            if !provider.is_empty() {
-                return Ok(provider);
-            }
+        let document = content
+            .parse::<toml_edit::Document>()
+            .map_err(|e| format!("解析 Codex config.toml 失败：{e}"))?;
+        Ok(document
+            .get("model_provider")
+            .and_then(toml_edit::Item::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("openai")
+            .to_string())
+    }
+
+    /// Use the destination's configured/catalog model, never an API-only model
+    /// restored from an old thread. No hard-coded model names or network calls.
+    fn read_repair_model(&self, provider: &str) -> Result<Option<String>, String> {
+        let config = self.codex_home.join("config.toml");
+        if !config.exists() {
+            return Ok(None);
         }
-        Ok("openai".to_string())
+        let document = fs::read_to_string(config)
+            .map_err(|e| e.to_string())?
+            .parse::<toml_edit::Document>()
+            .map_err(|e| e.to_string())?;
+        let configured = document
+            .get("model")
+            .and_then(toml_edit::Item::as_str)
+            .filter(|s| !s.trim().is_empty());
+        let catalog_path = document
+            .get("model_catalog_json")
+            .and_then(toml_edit::Item::as_str)
+            .map(|path| self.codex_home.join(path))
+            .or_else(|| (provider == "openai").then(|| self.codex_home.join("models_cache.json")));
+        let catalog = catalog_path
+            .and_then(|path| fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        let models = catalog
+            .as_ref()
+            .and_then(|value| value.get("models"))
+            .and_then(Value::as_array);
+        let selected = models.and_then(|models| {
+            configured
+                .and_then(|name| {
+                    models
+                        .iter()
+                        .find(|model| model["slug"].as_str() == Some(name))
+                })
+                .or_else(|| {
+                    models
+                        .iter()
+                        .filter(|model| model["visibility"].as_str() != Some("hide"))
+                        .min_by_key(|model| model["priority"].as_i64().unwrap_or(i64::MAX))
+                })
+                .and_then(|model| model["slug"].as_str())
+        });
+        Ok(selected.or(configured).map(str::to_string))
     }
 
     fn repair_sqlite_visibility(
@@ -4343,7 +4501,11 @@ impl SessionStore {
         protected: &ProtectedRolloutPrefixes,
     ) -> Result<RolloutRewriteOutcome, String> {
         self.repair_rollout_visibility_with_context(
-            target_provider, sessions, rewrite_all_meta, protected, false,
+            target_provider,
+            sessions,
+            rewrite_all_meta,
+            protected,
+            false,
         )
     }
 
@@ -4362,6 +4524,11 @@ impl SessionStore {
         let backup_dir = visibility_backup_dir();
         let mut changed = 0usize;
         let mut backup_created = false;
+        let recovery_model = if recover_context {
+            self.read_repair_model(target_provider)?
+        } else {
+            None
+        };
         for session in sessions {
             let content = match fs::read_to_string(&session.path) {
                 Ok(content) => content,
@@ -4375,10 +4542,21 @@ impl SessionStore {
                     continue;
                 }
             };
-            // Visibility repair must preserve the model and encrypted context.
-            // Account/provider migration has a separate compatibility operation.
+            // Explicit context recovery also restores destination resume settings;
+            // ordinary visibility repair continues to preserve model settings.
+            let resume_rewrite = if recover_context {
+                rewrite_recovery_resume_settings(
+                    &content,
+                    target_provider,
+                    recovery_model.as_deref(),
+                    protected_prefix_bytes(protected, &session.path, &session.id).unwrap_or(0),
+                )?
+            } else {
+                None
+            };
+            let base_content = resume_rewrite.as_deref().unwrap_or(&content);
             let item_id_rewrite = match rewrite_rollout_item_ids(
-                &content,
+                base_content,
                 protected_prefix_bytes(protected, &session.path, &session.id).unwrap_or(0),
             ) {
                 Ok(rewrite) => rewrite,
@@ -4392,7 +4570,7 @@ impl SessionStore {
                     continue;
                 }
             };
-            let base_content = item_id_rewrite.as_deref().unwrap_or(&content);
+            let base_content = item_id_rewrite.as_deref().unwrap_or(base_content);
             let provider_rewrite = match rewrite_session_meta_provider(
                 base_content,
                 target_provider,
@@ -4423,7 +4601,10 @@ impl SessionStore {
                     continue;
                 }
             };
-            let visibility_rewrite = ordinal_rewrite.or(provider_rewrite).or(item_id_rewrite);
+            let visibility_rewrite = ordinal_rewrite
+                .or(provider_rewrite)
+                .or(item_id_rewrite)
+                .or(resume_rewrite);
             let visibility_rewrite = visibility_rewrite.filter(|next| {
                 !recover_context
                     || protected_prefix_bytes(protected, &session.path, &session.id)
@@ -5431,6 +5612,7 @@ struct RolloutModelCompatibilityRewriteStats {
     removed_encrypted_reasoning_items: usize,
     removed_encrypted_compaction_items: usize,
     repaired_item_ids: usize,
+    repaired_compaction_metadata: usize,
 }
 
 impl RolloutModelCompatibilityRewriteStats {
@@ -5440,6 +5622,7 @@ impl RolloutModelCompatibilityRewriteStats {
             || self.removed_encrypted_reasoning_items > 0
             || self.removed_encrypted_compaction_items > 0
             || self.repaired_item_ids > 0
+            || self.repaired_compaction_metadata > 0
     }
 
     fn add(&mut self, other: Self) {
@@ -5448,6 +5631,7 @@ impl RolloutModelCompatibilityRewriteStats {
         self.removed_encrypted_reasoning_items += other.removed_encrypted_reasoning_items;
         self.removed_encrypted_compaction_items += other.removed_encrypted_compaction_items;
         self.repaired_item_ids += other.repaired_item_ids;
+        self.repaired_compaction_metadata += other.repaired_compaction_metadata;
     }
 }
 
@@ -5532,6 +5716,9 @@ fn prepare_rollout_model_compatibility_rewrite_guarded(
             let may_contain_item_id = line
                 .windows(b"\"id\"".len())
                 .any(|window| window == b"\"id\"");
+            let may_contain_compaction_metadata = line
+                .windows(b"replacement_history_metadata".len())
+                .any(|window| window == b"replacement_history_metadata");
             if !may_contain_model
                 && !may_contain_provider
                 && !may_be_session_meta
@@ -5540,6 +5727,7 @@ fn prepare_rollout_model_compatibility_rewrite_guarded(
                 && !may_contain_remote_compaction_id
                 && !may_contain_local_recovery_compaction
                 && !may_contain_item_id
+                && !may_contain_compaction_metadata
             {
                 writer.write_all(&line).map_err(|error| {
                     format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
@@ -5623,6 +5811,38 @@ fn prepare_rollout_model_compatibility_rewrite_guarded(
     Ok(Some((tmp_path, rewrite_stats)))
 }
 
+fn rewrite_recovery_resume_settings(
+    content: &str,
+    target_provider: &str,
+    model: Option<&str>,
+    protected_prefix_bytes: u64,
+) -> Result<Option<String>, String> {
+    let mut next = String::with_capacity(content.len());
+    let mut offset = 0u64;
+    let mut changed = false;
+    for line in content.split_inclusive('\n') {
+        let protected = offset < protected_prefix_bytes;
+        offset = offset.saturating_add(line.len() as u64);
+        if protected || line.trim().is_empty() {
+            next.push_str(line);
+            continue;
+        }
+        let mut record = serde_json::from_str(line)
+            .map_err(|e| format!("会话续写设置无效，未重建上下文：{e}"))?;
+        if rewrite_rollout_model_compatibility_value(&mut record, target_provider, model).changed()
+        {
+            next.push_str(&serde_json::to_string(&record).map_err(|e| e.to_string())?);
+            if line.ends_with('\n') {
+                next.push('\n');
+            }
+            changed = true;
+        } else {
+            next.push_str(line);
+        }
+    }
+    Ok(changed.then_some(next))
+}
+
 fn rewrite_rollout_model_compatibility_value(
     value: &mut Value,
     target_provider: &str,
@@ -5635,6 +5855,7 @@ fn rewrite_rollout_model_compatibility_value(
         .to_string();
     let mut stats = RolloutModelCompatibilityRewriteStats::default();
     stats.repaired_item_ids = repair_record_item_ids(value);
+    stats.repaired_compaction_metadata = repair_compaction_metadata(value);
 
     if record_type == "response_item" {
         let should_remove = value
@@ -5648,15 +5869,9 @@ fn rewrite_rollout_model_compatibility_value(
     }
 
     if record_type == "compacted" {
-        if let Some(replacement_history) = value
-            .pointer_mut("/payload/replacement_history")
-            .and_then(Value::as_array_mut)
-        {
-            let previous_len = replacement_history.len();
-            replacement_history.retain(|item| !is_nonportable_encrypted_compaction_item(item));
-            stats.removed_encrypted_compaction_items =
-                previous_len.saturating_sub(replacement_history.len());
-        }
+        stats.removed_encrypted_compaction_items = retain_compacted_history(value, |item| {
+            !is_nonportable_encrypted_compaction_item(item)
+        });
     }
 
     if record_type == "session_meta" {
@@ -5693,6 +5908,11 @@ fn rewrite_rollout_model_compatibility_value(
             "/payload/state/collaboration_mode/settings/model",
             "/payload/state/personality/model",
         ],
+        "compacted" => &[
+            "/payload/resume_metadata/previous_turn_settings/model",
+            "/payload/resume_metadata/previous_turn_settings/collaboration_mode/model",
+            "/payload/resume_metadata/previous_turn_settings/collaboration_mode/settings/model",
+        ],
         _ => &[],
     };
     let forced_model = forced_model.map(|model| model_for_provider(model, target_provider));
@@ -5713,6 +5933,46 @@ fn rewrite_rollout_model_compatibility_value(
         };
         *model = Value::String(normalized);
         stats.rewritten_model_fields += 1;
+    }
+    let settings_paths: &[&str] = match record_type.as_str() {
+        "turn_context" => &["/payload", "/payload/collaboration_mode/settings"],
+        "event_msg" => &[
+            "/payload/thread_settings",
+            "/payload/thread_settings/collaboration_mode/settings",
+        ],
+        "world_state" => &[
+            "/payload/state",
+            "/payload/state/collaboration_mode/settings",
+        ],
+        "compacted" => &[
+            "/payload/resume_metadata/previous_turn_settings",
+            "/payload/resume_metadata/previous_turn_settings/collaboration_mode/settings",
+        ],
+        _ => &[],
+    };
+    for path in settings_paths {
+        let Some(settings) = value.pointer_mut(path).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for key in ["model_provider_id", "model_provider"] {
+            if let Some(provider) = settings.get_mut(key) {
+                if provider
+                    .as_str()
+                    .is_some_and(|provider| provider != target_provider)
+                {
+                    *provider = Value::String(target_provider.to_string());
+                    stats.synchronized_providers += 1;
+                }
+            }
+        }
+        if forced_model.is_some() {
+            for key in ["effort", "reasoning_effort", "model_reasoning_effort"] {
+                if let Some(effort) = settings.get_mut(key).filter(|effort| !effort.is_null()) {
+                    *effort = Value::Null;
+                    stats.rewritten_model_fields += 1;
+                }
+            }
+        }
     }
     stats
 }
@@ -7109,15 +7369,8 @@ fn scrub_compacted_line(
     if value.get("type").and_then(Value::as_str) != Some("compacted") {
         return Ok(line.to_vec());
     }
-    let Some(history) = value
-        .get_mut("payload")
-        .and_then(|payload| payload.get_mut("replacement_history"))
-        .and_then(Value::as_array_mut)
-    else {
-        return Ok(line.to_vec());
-    };
     let mut removed_by_fingerprint = HashMap::<String, usize>::new();
-    history.retain(|item| {
+    retain_compacted_history(&mut value, |item| {
         let id_matches = item
             .get("id")
             .and_then(Value::as_str)
@@ -9659,7 +9912,6 @@ fn now_timestamp() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::system_command;
     use super::{
         archive_staged_thread_row, copy_history_onto_target, create_staged_fork_rollout,
         extract_title, find_task_started_offsets_reverse, fork_history_modes_are_compatible,
@@ -9669,6 +9921,7 @@ mod tests {
         sql_quote, SessionRepairRecord, SessionStore, LOCAL_RECOVERY_CONTEXT_MAX_BYTES,
         LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES,
     };
+    use crate::system_command;
     use serde_json::{json, Value};
     use std::collections::{HashMap, HashSet};
     use std::fs;
@@ -13311,7 +13564,8 @@ mod tests {
                 json!({"type":"turn_context","ordinal":2,"payload":{"model":"api/gpt-5.6-sol"}}),
             ],
         );
-        let history = rusqlite::Connection::open(codex.path().join("thread_history_1.sqlite")).unwrap();
+        let history =
+            rusqlite::Connection::open(codex.path().join("thread_history_1.sqlite")).unwrap();
         history.execute_batch("
             CREATE TABLE thread_items (thread_id TEXT, item_id TEXT);
             CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT);

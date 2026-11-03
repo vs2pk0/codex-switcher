@@ -1,3 +1,4 @@
+use super::repair_compaction_metadata;
 use serde_json::Value;
 
 /// Third-party APIs can confuse response IDs and tool call IDs with item IDs.
@@ -53,7 +54,9 @@ pub(super) fn rewrite_rollout_item_ids(
     for segment in content.split_inclusive('\n') {
         let protected = offset < protected_prefix_bytes;
         offset += segment.len() as u64;
-        if protected || !segment.contains("\"id\"") {
+        if protected
+            || (!segment.contains("\"id\"") && !segment.contains("replacement_history_metadata"))
+        {
             output.push_str(segment);
             continue;
         }
@@ -61,7 +64,9 @@ pub(super) fn rewrite_rollout_item_ids(
             output.push_str(segment);
             continue;
         };
-        if repair_record_item_ids(&mut record) == 0 {
+        let repaired_ids = repair_record_item_ids(&mut record);
+        let repaired_metadata = repair_compaction_metadata(&mut record);
+        if repaired_ids + repaired_metadata == 0 {
             output.push_str(segment);
             continue;
         }
@@ -444,7 +449,20 @@ mod tests {
                     .lines()
                     .map(|line| serde_json::from_str(line).unwrap())
                     .collect();
-                assert_eq!(&actual, expected, "{mode}: {}", record.id);
+                if mode == "switch" {
+                    assert_eq!(&actual[..expected.len()], expected, "{}", record.id);
+                    assert_eq!(actual.len(), expected.len() + 1);
+                    let snapshot = actual.last().unwrap();
+                    assert_eq!(snapshot["type"], "compacted");
+                    let mut portable =
+                        expected.last().unwrap()["payload"]["replacement_history"].clone();
+                    for item in portable.as_array_mut().unwrap() {
+                        item.as_object_mut().unwrap().remove("id");
+                    }
+                    assert_eq!(snapshot["payload"]["replacement_history"], portable);
+                } else {
+                    assert_eq!(&actual, expected, "{mode}: {}", record.id);
+                }
                 assert!(
                     backup_dirs
                         .iter()
@@ -503,8 +521,17 @@ mod tests {
                 let store = SessionStore::new(home.path().to_path_buf());
                 if mode == "switch" {
                     let summary = store.repair_model_compatibility("openai").unwrap();
-                    assert_eq!(summary.repaired_rollout_file_count, 1);
+                    // Both the parent tail and the child's retained context need repair.
+                    assert_eq!(summary.repaired_rollout_file_count, 2);
                     assert_eq!(summary.repaired_item_id_count, 1);
+                    let child = fs::read_to_string(sessions.join("child.jsonl")).unwrap();
+                    let snapshot: Value =
+                        serde_json::from_str(child.lines().last().unwrap()).unwrap();
+                    let items = snapshot["payload"]["replacement_history"]
+                        .as_array()
+                        .unwrap();
+                    assert_eq!(items[0]["content"][0]["text"], "保留分支历史");
+                    assert!(items.iter().all(|item| item.get("id").is_none()));
                 } else {
                     let records = [SessionRepairRecord {
                         id: "parent".into(),
@@ -525,14 +552,30 @@ mod tests {
                 }
                 let repaired = fs::read_to_string(&parent).unwrap();
                 assert!(repaired.starts_with(prefix), "{mode}: fork prefix changed");
-                let repaired_tail: Value = serde_json::from_str(&repaired[prefix.len()..]).unwrap();
+                let tail_records: Vec<Value> = repaired[prefix.len()..]
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                let repaired_tail = &tail_records[0];
                 assert!(repaired_tail["payload"].get("id").is_none());
                 let mut expected_tail = tail;
                 expected_tail["payload"]
                     .as_object_mut()
                     .unwrap()
                     .remove("id");
-                assert_eq!(repaired_tail, expected_tail);
+                assert_eq!(repaired_tail, &expected_tail);
+                if mode == "switch" {
+                    assert_eq!(tail_records.len(), 2);
+                    let snapshot = tail_records.last().unwrap();
+                    assert_eq!(snapshot["type"], "compacted");
+                    assert!(snapshot["payload"]["replacement_history"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|item| item.get("id").is_none()));
+                } else {
+                    assert_eq!(tail_records.len(), 1);
+                }
             }
         }
     }

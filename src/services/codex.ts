@@ -133,6 +133,9 @@ export interface CodexSessionModelCompatibilityRepairSummary {
   removedEncryptedReasoningItemCount: number;
   removedEncryptedCompactionItemCount: number;
   repairedItemIdCount: number;
+  repairedCompactionMetadataCount: number;
+  rebuiltProtocolContextCount: number;
+  reducedProtocolContextCount: number;
   repairedThreadCount: number;
   synchronizedCatalogRowCount: number;
   repairedDatabaseCount: number;

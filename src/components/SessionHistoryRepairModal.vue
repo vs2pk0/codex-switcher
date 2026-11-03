@@ -34,10 +34,11 @@ function updateVisible(visible: boolean): void {
       <strong>{{ session?.title || t("未命名会话") }}</strong>
       <p>{{ t("将修复该会话的分页历史、消息序号、不兼容的消息与工具 ID 和本地索引。原始文件会自动备份，消息正文、工具记录与模型设置会保留；修复期间对应 Codex 实例会重启，请先等待正在运行的任务结束。") }}</p>
       <a-checkbox v-model="recoverContext" :disabled="repairing">
-        {{ t("恢复超限上下文") }}
+        {{ t("重建模型上下文（超限／接口不兼容）") }}
       </a-checkbox>
       <a-alert v-if="recoverContext" type="warning">
-        {{ t("适用于上下文超限且 /compact 失败的会话。保留完整原始记录和备份，仅将模型上下文替换为最近对话的有限文本摘录；这不是 AI 摘要，早期细节、图片和工具输出不会继续发送给模型，必要时请重新提供。") }}
+        {{ t("适用于上下文超限且压缩失败，或切换 API 后提示不支持 Responses 引用项或服务端工具项的会话。保留完整原始记录和备份，仅将模型上下文替换为最近对话的有限文本摘录；这不是 AI 摘要，早期细节、图片和工具输出不会继续发送给模型，必要时请重新提供。") }}
+        {{ t("同时按当前账号恢复续写模型与接口配置。") }}
       </a-alert>
       <div class="session-mutation-actions">
         <a-button :disabled="repairing" @click="updateVisible(false)">{{ t("取消") }}</a-button>

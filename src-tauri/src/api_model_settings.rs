@@ -5,12 +5,14 @@ use std::{collections::BTreeMap, path::Path};
 use toml_edit::{value, Document, Item};
 
 const STATE_FILE: &str = "switcher-api-settings.json";
-const KEYS: [&str; 5] = [
+const KEYS: [&str; 7] = [
+    "model",
     "model_auto_compact_token_limit",
     "model_reasoning_effort",
     "web_search",
     "service_tier",
     "features.fast_mode",
+    "features.incremental_tools",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,10 +99,10 @@ fn read_state(home: &Path) -> Result<OverrideState, String> {
 }
 
 fn raw(document: &Document, key: &str) -> Option<String> {
-    if key == "features.fast_mode" {
+    if let Some(feature) = key.strip_prefix("features.") {
         document
             .get("features")?
-            .get("fast_mode")
+            .get(feature)
             .map(ToString::to_string)
     } else {
         document.get(key).map(ToString::to_string)
@@ -108,13 +110,13 @@ fn raw(document: &Document, key: &str) -> Option<String> {
 }
 
 fn set_item(document: &mut Document, key: &str, next: Item) -> Result<(), String> {
-    if key == "features.fast_mode" {
+    if let Some(feature) = key.strip_prefix("features.") {
         if next.is_none() {
             if let Some(features) = document
                 .get_mut("features")
                 .and_then(Item::as_table_like_mut)
             {
-                features.remove("fast_mode");
+                features.remove(feature);
             }
         } else {
             document
@@ -122,8 +124,8 @@ fn set_item(document: &mut Document, key: &str, next: Item) -> Result<(), String
                 .entry("features")
                 .or_insert(Item::Table(toml_edit::Table::new()))
                 .as_table_like_mut()
-                .ok_or("无法启用 Fast：config.toml 中的 features 必须为 TOML 表")?
-                .insert("fast_mode", next);
+                .ok_or("无法设置 API 功能：config.toml 中的 features 必须为 TOML 表")?
+                .insert(feature, next);
         }
     } else if next.is_none() {
         document.remove(key);
@@ -171,6 +173,7 @@ pub(crate) fn write_config(
     document: &mut Document,
     settings: &ApiModelSettings,
     effort: Option<&str>,
+    model: Option<&str>,
 ) -> Result<(), String> {
     settings.validate()?;
     let mut state = OverrideState::default();
@@ -186,6 +189,13 @@ pub(crate) fn write_config(
         );
         Ok(())
     };
+    if let Some(model) = model {
+        apply("model", value(model))?;
+    }
+    // Incremental definitions produce additional_tools input items even after
+    // the historical context has been rebuilt. Generic Responses adapters need
+    // the complete client function definitions on every request instead.
+    apply("features.incremental_tools", value(false))?;
     if settings.auto_compact_enabled {
         apply(
             "model_auto_compact_token_limit",
@@ -222,6 +232,51 @@ pub(crate) fn write_config(
             if let Err(rollback) = write_bytes_atomic(&path, &bytes) {
                 return Err(format!("{error}；恢复 API 设置备份失败：{rollback}"));
             }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Upgrade an already-configured API account during manual one-click repair.
+/// Merge ownership with existing API preferences so switching back restores it.
+pub(crate) fn ensure_portable_tool_replay(home: &Path) -> Result<(), String> {
+    let path = home.join("config.toml");
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut document = std::fs::read_to_string(&path)
+        .map_err(|e| e.to_string())?
+        .parse::<Document>()
+        .map_err(|e| e.to_string())?;
+    let key = "features.incremental_tools";
+    if document
+        .get("features")
+        .and_then(|features| features.get("incremental_tools"))
+        .and_then(Item::as_bool)
+        == Some(false)
+    {
+        return Ok(());
+    }
+    let mut state = read_state(home)?;
+    let old_state = serde_json::to_vec(&state).map_err(|e| e.to_string())?;
+    let previous = raw(&document, key);
+    set_item(&mut document, key, value(false))?;
+    state.0.insert(
+        key.into(),
+        OverrideValue {
+            previous,
+            applied: raw(&document, key),
+        },
+    );
+    let state_path = home.join(STATE_FILE);
+    write_bytes_atomic(
+        &state_path,
+        &serde_json::to_vec_pretty(&state).map_err(|e| e.to_string())?,
+    )?;
+    if let Err(error) = write_bytes_atomic(&path, document.to_string().as_bytes()) {
+        if let Err(rollback) = write_bytes_atomic(&state_path, &old_state) {
+            return Err(format!("{error}；恢复 API 设置备份失败：{rollback}"));
         }
         return Err(error);
     }
@@ -376,7 +431,7 @@ mod tests {
             fast_mode: true,
             ..Default::default()
         };
-        assert!(write_config(home.path(), &mut document, &settings, None).is_err());
+        assert!(write_config(home.path(), &mut document, &settings, None, None).is_err());
         assert_eq!(
             std::fs::read_to_string(home.path().join("config.toml")).unwrap(),
             original
@@ -429,6 +484,7 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(doc["model_reasoning_effort"].as_str(), Some("medium"));
+        assert_eq!(doc["model"].as_str(), Some("original"));
         assert_eq!(doc["web_search"].as_str(), Some("live"));
         assert!(doc.get("model_auto_compact_token_limit").is_none());
         assert!(doc.get("model_catalog_json").is_none());
@@ -438,5 +494,41 @@ mod tests {
             .and_then(|f| f.get("fast_mode"))
             .is_none());
         assert!(read_state(home.path()).unwrap().0.is_empty());
+        assert!(doc
+            .get("features")
+            .and_then(|features| features.get("incremental_tools"))
+            .is_none());
+    }
+
+    #[test]
+    fn manual_repair_preserves_tool_mode_ownership_and_other_api_preferences() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "model = 'official-model'\n[features]\nincremental_tools = true\n",
+        )
+        .unwrap();
+        let mut doc = install(home.path(), "api", &enabled());
+        assert_eq!(doc["features"]["incremental_tools"].as_bool(), Some(false));
+        // Simulate an older installation that never recorded tool-mode ownership.
+        doc["features"]["incremental_tools"] = value(true);
+        std::fs::write(home.path().join("config.toml"), doc.to_string()).unwrap();
+        ensure_portable_tool_replay(home.path()).unwrap();
+        ensure_portable_tool_replay(home.path()).unwrap();
+        let mut restored = std::fs::read_to_string(home.path().join("config.toml"))
+            .unwrap()
+            .parse::<Document>()
+            .unwrap();
+        assert_eq!(
+            restored["features"]["incremental_tools"].as_bool(),
+            Some(false)
+        );
+        restore_document(home.path(), &mut restored).unwrap();
+        assert_eq!(restored["model"].as_str(), Some("official-model"));
+        assert_eq!(
+            restored["features"]["incremental_tools"].as_bool(),
+            Some(true)
+        );
+        assert!(restored.get("model_auto_compact_token_limit").is_none());
     }
 }

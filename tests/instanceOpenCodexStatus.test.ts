@@ -141,7 +141,7 @@ test("开启重置开关后才在切换账号前重置 config.toml", () => {
   );
   assert.match(switchCommand, /if switch_settings\.reset_config_on_account_switch\s*&& codex_home_needs_config_reset_before_switch\(&codex_home\)\s*\{\s*reset_codex_config_for_switch\(\s*&instance\.id,\s*switch_settings\.repair_sessions_on_account_switch,?\s*\)\?;/);
   assert.ok(
-    switchCommand.indexOf("reset_codex_config_for_switch") < switchCommand.indexOf("switch_account_with_session_options("),
+    switchCommand.indexOf("reset_codex_config_for_switch") < switchCommand.indexOf("account_store.switch_account(&account_id)"),
     "必须先重置 config.toml，再导入账号数据",
   );
   assert.match(libSource, /codex_home_has_opencodex_routing\(codex_home\)\s*\|\|\s*api_service::codex_home_has_api_service_routing\(codex_home\)/);

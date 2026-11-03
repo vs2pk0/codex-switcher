@@ -198,6 +198,7 @@ pub(crate) fn install_with_settings(
         models
             .iter()
             .find(|row| row["slug"].as_str() == selected_model)
+            .or_else(|| models.first())
     });
     let effort = match selected {
         Some(model) => model["default_reasoning_level"].as_str(),
@@ -206,7 +207,13 @@ pub(crate) fn install_with_settings(
     let path = home.join(filename(account_id));
     write_bytes_atomic(&path, contents)?;
     document["model_catalog_json"] = value(path.to_string_lossy().into_owned());
-    api_model_settings::write_config(home, &mut document, settings, effort)
+    api_model_settings::write_config(
+        home,
+        &mut document,
+        settings,
+        effort,
+        selected.and_then(|row| row["slug"].as_str()),
+    )
 }
 
 #[cfg(test)]

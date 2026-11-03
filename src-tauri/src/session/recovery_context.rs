@@ -201,9 +201,13 @@ pub(super) fn recover_rollout_context(
             }
         }
     }
-    let Some(mut compacted) = context.build_forced_compaction() else {
+    let Some(compacted) = context.build_forced_compaction() else {
         return Ok(None);
     };
+    append_compaction(content, compacted).map(Some)
+}
+
+pub(super) fn append_compaction(content: &str, mut compacted: Value) -> Result<String, String> {
     let first = content
         .lines()
         .find(|line| !line.trim().is_empty())
@@ -228,7 +232,7 @@ pub(super) fn recover_rollout_context(
     }
     next.push_str(&compacted.to_string());
     next.push('\n');
-    Ok(Some(next))
+    Ok(next)
 }
 
 #[cfg(test)]
@@ -298,6 +302,42 @@ mod tests {
             .unwrap();
         assert!(text.contains("保留已有摘要") && text.contains("替换后的问题"));
         assert!(!text.contains("以前已被压缩的旧内容") && !text.contains("/compact"));
+    }
+
+    #[test]
+    fn explicit_recovery_replaces_foreign_protocol_state_even_below_size_limit() {
+        let home = tempdir().unwrap();
+        let path = home.path().join("foreign.jsonl");
+        let original = lines(&[
+            json!({"type":"session_meta","payload":{"id":"foreign"}}),
+            json!({"type":"compacted","payload":{
+                "message":"", "replacement_history":[
+                    {"type":"additional_tools","id":"at_foreign","role":"developer","tools":[]},
+                    {"type":"item_reference","id":"msg_foreign"},
+                    message("user", "保留任务")["payload"].clone()
+                ],
+                "replacement_history_metadata":[{"client_authored":false}],
+                "retained_context":{"user_messages":["旧保留状态"]},
+                "resume_metadata":{"previous_turn_settings":{"model":"foreign/model"}},
+                "latest_token_usage_record":{"usage":{"total_tokens":999999}}
+            }}),
+            json!({"type":"response_item","payload":{"type":"web_search_call","id":"ws_foreign","status":"completed"}}),
+            message("user", "最新问题"),
+        ]);
+        fs::write(&path, &original).unwrap();
+        let next = recover_rollout_context(home.path(), &path, &original)
+            .unwrap()
+            .unwrap();
+        assert!(next.starts_with(&original));
+        let snapshot: Value = serde_json::from_str(next.lines().last().unwrap()).unwrap();
+        let payload = &snapshot["payload"];
+        assert_eq!(payload.as_object().unwrap().len(), 2);
+        let history = payload["replacement_history"].as_array().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["type"], "message");
+        let text = history[0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("保留任务") && text.contains("最新问题"));
+        assert!(!text.contains("旧保留状态") && !text.contains("foreign/model"));
     }
 
     #[test]
@@ -421,6 +461,36 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an isolated local fixture; never run against the live Codex home"]
+    fn recover_isolated_real_session_fixture() {
+        let fixture =
+            std::path::PathBuf::from(std::env::var("CODEX_SWITCHER_REPAIR_FIXTURE_HOME").unwrap())
+                .canonicalize()
+                .unwrap();
+        assert!(
+            fixture.starts_with(std::env::temp_dir().canonicalize().unwrap())
+                || fixture.starts_with(std::path::Path::new("/tmp").canonicalize().unwrap())
+        );
+        assert!(fixture
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("codex-switcher-session-check-"));
+        let path =
+            std::path::PathBuf::from(std::env::var("CODEX_SWITCHER_REPAIR_FIXTURE_PATH").unwrap())
+                .canonicalize()
+                .unwrap();
+        assert!(path.starts_with(&fixture));
+        let original = fs::read_to_string(&path).unwrap();
+        let next = recover_rollout_context(&fixture, &path, &original)
+            .unwrap()
+            .unwrap();
+        assert!(next.starts_with(&original));
+        fs::write(&path, &next).unwrap();
+        println!("isolated real fixture: appended portable context; original bytes preserved");
+    }
+
+    #[test]
     fn context_recovery_resets_only_the_selected_threads_history_projection() {
         let home = tempdir().unwrap();
         fs::create_dir(home.path().join("sessions")).unwrap();
@@ -484,11 +554,19 @@ mod tests {
     #[ignore = "requires an installed Codex runtime; sends requests only to a local HTTP fixture"]
     fn native_runtime_sends_recovered_context_instead_of_oversized_history() {
         for paginated in [false, true] {
-            assert_native_runtime_context(paginated);
+            assert_native_runtime_context(paginated, false);
         }
     }
 
-    fn assert_native_runtime_context(paginated: bool) {
+    #[test]
+    #[ignore = "requires an installed Codex runtime; sends requests only to a local HTTP fixture"]
+    fn native_runtime_rebuilds_foreign_protocol_state_below_size_limit() {
+        for paginated in [false, true] {
+            assert_native_runtime_context(paginated, true);
+        }
+    }
+
+    fn assert_native_runtime_context(paginated: bool, foreign_protocol: bool) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::process::{Command, Stdio};
@@ -563,9 +641,24 @@ stream_max_retries = 0
         let mut original_records = vec![
             json!({"type":"session_meta","payload":{"id":id,"timestamp":"2026-11-01T00:00:00Z","cwd":home.path(),"originator":"codex_cli_rs","cli_version":"0.0.0","source":"cli","model_provider":"local_fixture"}}),
             message("user", "保留近期任务"),
-            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"call_large","output":"OMITTED_TOOL_OUTPUT".repeat(100000)}}),
-            message("assistant", "保留近期进度"),
         ];
+        if foreign_protocol {
+            original_records.push(json!({"type":"compacted","payload":{
+                "message":"", "replacement_history":[
+                    {"type":"additional_tools","id":"at_foreign","role":"developer","tools":[]},
+                    {"type":"item_reference","id":"msg_foreign"},
+                    message("user", "保留近期任务")["payload"].clone()
+                ]
+            }}));
+            original_records.push(json!({"type":"response_item","payload":{
+                "type":"web_search_call","id":"ws_foreign","status":"completed"
+            }}));
+        } else {
+            original_records.push(json!({"type":"response_item","payload":{
+                "type":"function_call_output","call_id":"call_large","output":"OMITTED_TOOL_OUTPUT".repeat(100000)
+            }}));
+        }
+        original_records.push(message("assistant", "保留近期进度"));
         if paginated {
             original_records[0]["payload"]["history_mode"] = json!("paginated");
         }
@@ -576,6 +669,9 @@ stream_max_retries = 0
             }
         }
         let original = lines(&original_records);
+        if foreign_protocol {
+            assert!(original.len() < LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES);
+        }
         fs::write(&path, &original).unwrap();
         let next = recover_rollout_context(home.path(), &path, &original)
             .unwrap()
@@ -657,6 +753,17 @@ stream_max_retries = 0
         assert!(active_input.contains("LOCAL_RECOVERY_PROBE"));
         assert!(active_input.contains("保留近期任务") && active_input.contains("保留近期进度"));
         assert!(!active_input.contains("OMITTED_TOOL_OUTPUT"));
+        if foreign_protocol {
+            for item in body["input"].as_array().unwrap() {
+                // The runtime may add fresh tool definitions for this turn.
+                // Check stale history separately from those current tools.
+                assert_ne!(item["type"], "item_reference");
+                assert_ne!(item["type"], "web_search_call");
+                assert_ne!(item["id"], "at_foreign");
+            }
+            assert!(!active_input.contains("msg_foreign"));
+            assert!(!active_input.contains("ws_foreign"));
+        }
         assert!(active_input.len() < LOCAL_RECOVERY_CONTEXT_MAX_BYTES + 64 * 1024);
         assert!(fs::read_to_string(path).unwrap().starts_with(&next));
         println!("Native request verified (paginated={paginated}): {} active input bytes; original history preserved", active_input.len());
