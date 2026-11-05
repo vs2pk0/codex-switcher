@@ -3509,11 +3509,21 @@ async function openDownloadedAppUpdate(): Promise<void> {
       return;
     }
     await openAppUpdateInstaller(result.path);
-    Message.success(t("安装包已打开，请按安装程序完成更新。"));
+    Message.success(t("已请求系统打开安装包，请按安装程序完成更新。"));
     appUpdateOpening.value = false;
   } catch (error) {
     appUpdateError.value = `${t(automaticInstall ? "更新安装失败" : "打开安装包失败")}：${errorText(error)}`;
     appUpdateOpening.value = false;
+  }
+}
+
+async function openAppUpdateFolder(): Promise<void> {
+  const result = appUpdateResult.value;
+  if (!result || appUpdateDownloading.value || appUpdateOpening.value) return;
+  try {
+    await openPathInFileManager(result.path);
+  } catch (error) {
+    Message.error(`${t("打开文件夹失败")}：${errorText(error)}`);
   }
 }
 
@@ -5407,6 +5417,7 @@ onUnmounted(() => {
       @cancel="cancelCurrentAppUpdate"
       @retry="startAppUpdateDownload()"
       @open-installer="openDownloadedAppUpdate"
+      @open-folder="openAppUpdateFolder"
       @open-releases="openAppUpdateReleases"
     />
 

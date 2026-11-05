@@ -1,7 +1,5 @@
 use semver::Version;
 use serde::{Deserialize, Serialize};
-#[cfg(windows)]
-use std::process::Command;
 use std::{
     fs::{self, File},
     io::{Read, Write},
@@ -13,6 +11,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "windows", test))]
+mod windows;
 
 const LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/vs2pk0/codex-switcher/releases/latest";
@@ -150,21 +150,43 @@ pub fn app_update_cancel_download(
 }
 
 #[tauri::command]
-pub fn app_update_open_installer(app: AppHandle, path: String) -> Result<(), String> {
-    let download = app.state::<AppUpdateDownloadState>();
-    let update_guard = download
+pub async fn app_update_open_installer(app: AppHandle, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let download = app.state::<AppUpdateDownloadState>();
+        run_installer_launch(&download, || {
+            let root = updates_dir()?;
+            let canonical_installer = validated_installer_path(&path, &root)?;
+            open_installer_with_system(&canonical_installer)?;
+            mark_updates_cleanup_pending(&root)
+        })
+    })
+    .await
+    .map_err(|error| format!("打开更新安装包任务失败: {error}"))?
+}
+
+fn run_installer_launch(
+    download: &AppUpdateDownloadState,
+    launch: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    {
+        let mut guard = download
+            .0
+            .lock()
+            .map_err(|_| "应用更新下载状态锁已损坏".to_string())?;
+        if guard.active_id.is_some() || guard.installing {
+            return Err("已有应用更新正在进行".to_string());
+        }
+        guard.installing = true;
+    }
+    // Windows may wait for UAC input. Keep shutdown/cancellation able to take
+    // the state lock while still preventing a second update from starting.
+    let result = launch();
+    let mut guard = download
         .0
         .lock()
         .map_err(|_| "应用更新下载状态锁已损坏".to_string())?;
-    if update_guard.active_id.is_some() || update_guard.installing {
-        return Err("应用更新仍在下载，请等待下载完成后再安装".to_string());
-    }
-
-    let canonical_installer = validated_installer_path(&path, &updates_dir()?)?;
-    open_installer_with_system(&canonical_installer)?;
-    mark_updates_cleanup_pending(&updates_dir()?)?;
-    drop(update_guard);
-    Ok(())
+    guard.installing = false;
+    result
 }
 
 fn validated_installer_path(path: &str, allowed_root: &Path) -> Result<PathBuf, String> {
@@ -522,9 +544,20 @@ fn contains_known_architecture(name: &str) -> bool {
 }
 
 fn updates_dir() -> Result<PathBuf, String> {
-    dirs::home_dir()
-        .map(|home| home.join(".codex_switcher").join("updates"))
-        .ok_or_else(|| "无法确定用户主目录".to_string())
+    #[cfg(target_os = "windows")]
+    {
+        // Keep cleanup confined to our update folder, not the Downloads root
+        // or the user's other exported files.
+        Ok(crate::export_file::downloads_directory()?
+            .join("Codex Switcher")
+            .join("updates"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        dirs::home_dir()
+            .map(|home| home.join(".codex_switcher").join("updates"))
+            .ok_or_else(|| "无法确定用户主目录".to_string())
+    }
 }
 
 fn mark_updates_cleanup_pending(root: &Path) -> Result<(), String> {
@@ -703,16 +736,7 @@ fn open_installer_with_system(path: &Path) -> Result<(), String> {
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("exe") => Command::new(path)
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| format!("打开更新安装包失败: {error}")),
-        Some("msi") => Command::new("msiexec")
-            .arg("/i")
-            .arg(path)
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| format!("打开更新安装包失败: {error}")),
+        Some("exe" | "msi") => windows::open(path),
         _ => Err("Windows 在线更新只允许打开 EXE 或 MSI 安装包".to_string()),
     }
 }
@@ -871,6 +895,25 @@ mod tests {
         cleanup_pending_update_artifacts_at(root).unwrap();
 
         assert!(root.join("installer.dmg").exists());
+    }
+
+    #[test]
+    fn installer_launch_releases_state_lock_and_resets_busy_after_success_or_failure() {
+        let state = AppUpdateDownloadState::default();
+        for outcome in [Ok(()), Err("用户取消授权".to_string())] {
+            let actual = run_installer_launch(&state, || {
+                let guard = state
+                    .0
+                    .try_lock()
+                    .expect("launcher must not hold the state lock");
+                assert!(guard.installing);
+                drop(guard);
+                assert!(run_installer_launch(&state, || panic!("duplicate launch")).is_err());
+                outcome.clone()
+            });
+            assert_eq!(actual, outcome);
+            assert!(!state.0.lock().unwrap().installing);
+        }
     }
 
     #[test]

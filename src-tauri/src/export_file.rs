@@ -11,7 +11,7 @@ pub(crate) struct ExportDownloadResult {
 
 const SESSION_EXPORT_FOLDER: &str = "Codex Account Switcher";
 
-fn downloads_directory() -> Result<PathBuf, String> {
+pub(crate) fn downloads_directory() -> Result<PathBuf, String> {
     dirs::download_dir()
         .or_else(|| dirs::home_dir().map(|home| home.join("Downloads")))
         .ok_or_else(|| "无法定位系统下载目录".to_string())

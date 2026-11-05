@@ -23,6 +23,7 @@ const emit = defineEmits<{
   (event: "cancel"): void;
   (event: "retry"): void;
   (event: "open-installer"): void;
+  (event: "open-folder"): void;
   (event: "open-releases"): void;
 }>();
 
@@ -114,6 +115,11 @@ function close(): void {
 
       <a-progress :percent="percent" :status="progressStatus" />
 
+      <div v-if="result" class="app-update-path">
+        <span>{{ t("保存位置") }}</span>
+        <code>{{ result.path }}</code>
+      </div>
+
       <a-alert v-if="error" type="error" show-icon>
         {{ error }}
       </a-alert>
@@ -139,6 +145,10 @@ function close(): void {
           <a-button v-if="error" :type="result ? 'secondary' : 'primary'" @click="emit('retry')">
             <template #icon><icon-refresh /></template>
             {{ t("重新下载") }}
+          </a-button>
+          <a-button v-if="result" @click="emit('open-folder')">
+            <template #icon><icon-folder /></template>
+            {{ t("打开文件夹") }}
           </a-button>
           <a-button v-if="result" type="primary" :loading="opening" @click="emit('open-installer')">
             <template #icon><icon-download /></template>
@@ -210,8 +220,28 @@ function close(): void {
 
 .app-update-actions {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 10px;
+}
+
+.app-update-path {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border-radius: 8px;
+  background: var(--color-fill-1);
+}
+
+.app-update-path span {
+  color: var(--color-text-3);
+  font-size: 12px;
+}
+
+.app-update-path code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 
 @media (max-width: 680px) {

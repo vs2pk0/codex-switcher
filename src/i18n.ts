@@ -1116,8 +1116,8 @@ const en: Record<string, string> = {
   "重新下载": "Download Again",
   "打开安装包": "Open Installer",
   "取消下载失败": "Failed to cancel download",
-  "安装包已打开，请按安装程序完成更新。":
-    "The installer is open. Follow its prompts to complete the update.",
+  "已请求系统打开安装包，请按安装程序完成更新。":
+    "The system has been asked to open the installer. Follow its prompts to complete the update.",
   "打开安装包失败": "Failed to open installer",
   "当前实例": "Current Instance",
   "未归属项目": "Unassigned Project",
@@ -2350,8 +2350,8 @@ const ru: Record<string, string> = {
   "重新下载": "Загрузить снова",
   "打开安装包": "Открыть установщик",
   "取消下载失败": "Не удалось отменить загрузку",
-  "安装包已打开，请按安装程序完成更新。":
-    "Установщик открыт. Следуйте его инструкциям для завершения обновления.",
+  "已请求系统打开安装包，请按安装程序完成更新。":
+    "Системе отправлен запрос на запуск установщика. Следуйте его инструкциям для завершения обновления.",
   "打开安装包失败": "Не удалось открыть установщик",
   "搜索会话标题": "Поиск по названию сессии",
   "未归属项目": "Проект не назначен",
@@ -3583,6 +3583,8 @@ const simplifiedToTraditional: Record<string, string> = {
     "已從 {files} 個檔案匯入 {accounts} 個帳號，已略過自動重新整理，可稍後手動重新整理",
   "文件已保存到以下位置": "檔案已儲存至以下位置",
   "保存位置": "儲存位置",
+  "已请求系统打开安装包，请按安装程序完成更新。":
+    "已請求系統開啟安裝程式，請依安裝程式提示完成更新。",
   "下载失败": "下載失敗",
   "打开文件夹失败": "開啟資料夾失敗",
   "查看会话内容": "查看會話內容",

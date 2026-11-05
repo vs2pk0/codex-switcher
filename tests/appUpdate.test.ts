@@ -9,7 +9,10 @@ const handlers = source.slice(source.indexOf("async function startAppUpdateDownl
 const compiled = ts.transpileModule(handlers, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
 
 function fixture(target = "macos-aarch64") {
-  const info = { target, latestVersion: "1.2.3", assetName: "update.dmg", assetSize: 10 };
+  const windows = target.startsWith("windows-");
+  const assetName = windows ? "update.exe" : "update.dmg";
+  const path = windows ? "C:\\Users\\测试 用户\\Downloads\\Codex Switcher\\updates\\1.2.3\\update.exe" : "/updates/1.2.3/update.dmg";
+  const info = { target, latestVersion: "1.2.3", assetName, assetSize: 10 };
   const refs = {
     appUpdateInfo: { value: info },
     appUpdateProgress: { value: null },
@@ -21,23 +24,27 @@ function fixture(target = "macos-aarch64") {
     appUpdateOpening: { value: false },
   };
   const calls: string[] = [];
+  const successMessages: string[] = [];
+  const errorMessages: string[] = [];
   const backend = {
-    async downloadAppUpdate() { calls.push("download"); return { path: "/updates/1.2.3/update.dmg", version: "1.2.3", sizeBytes: 10 }; },
+    async downloadAppUpdate() { calls.push("download"); return { path, assetName, version: "1.2.3", sizeBytes: 10 }; },
     async installAppUpdateAndRestart(path: string) { calls.push(`install:${path}`); },
     async openAppUpdateInstaller(path: string) { calls.push(`open:${path}`); },
+    async openPathInFileManager(path: string) { calls.push(`folder:${path}`); },
     async cancelAppUpdateDownload() { calls.push("cancel"); },
   };
   const context = {
     ...refs, ...backend,
     t: (text: string) => text, errorText: String,
-    Message: { success() {}, error() {} },
+    Message: { success(message: string) { successMessages.push(message); }, error(message: string) { errorMessages.push(message); } },
   };
-  const api = runInNewContext(`${compiled}\n({ startAppUpdateDownload, openDownloadedAppUpdate, closeAppUpdateModal })`, context) as {
+  const api = runInNewContext(`${compiled}\n({ startAppUpdateDownload, openDownloadedAppUpdate, openAppUpdateFolder, closeAppUpdateModal })`, context) as {
     startAppUpdateDownload(): Promise<void>;
     openDownloadedAppUpdate(): Promise<void>;
+    openAppUpdateFolder(): Promise<void>;
     closeAppUpdateModal(): void;
   };
-  return { ...refs, api, calls, context };
+  return { ...refs, api, calls, context, path, successMessages, errorMessages };
 }
 
 test("macOS 下载成功后自动安装重启，重启前禁止重复安装和关闭弹窗", async () => {
@@ -59,10 +66,39 @@ test("Windows 下载后仍由用户打开安装器", async () => {
   assert.deepEqual(state.calls, ["download"]);
   assert.equal(state.appUpdateOpening.value, false);
   await state.api.openDownloadedAppUpdate();
-  assert.deepEqual(state.calls, ["download", "open:/updates/1.2.3/update.dmg"]);
+  assert.deepEqual(state.calls, ["download", `open:${state.path}`]);
+  assert.deepEqual(state.successMessages, ["已请求系统打开安装包，请按安装程序完成更新。"]);
   assert.equal(state.appUpdateOpening.value, false);
   state.api.closeAppUpdateModal();
   assert.equal(state.appUpdateVisible.value, false);
+});
+
+test("Windows 启动被拒绝时保留下载文件、显示错误且不提示成功", async () => {
+  const state = fixture("windows-x86_64");
+  await state.api.startAppUpdateDownload();
+  const downloaded = state.appUpdateResult.value;
+  state.context.openAppUpdateInstaller = async () => { throw "操作被用户取消 (os error 1223)"; };
+  await state.api.openDownloadedAppUpdate();
+  assert.match(state.appUpdateError.value, /打开安装包失败.*1223/);
+  assert.equal(state.appUpdateResult.value, downloaded);
+  assert.equal(state.appUpdateOpening.value, false);
+  assert.deepEqual(state.successMessages, []);
+
+  await state.api.openAppUpdateFolder();
+  assert.deepEqual(state.calls, ["download", `folder:${state.path}`]);
+  assert.equal(state.appUpdateResult.value, downloaded);
+});
+
+test("打开更新文件夹失败时反馈错误，且不会触发安装或重新下载", async () => {
+  const state = fixture("windows-x86_64");
+  await state.api.openAppUpdateFolder();
+  assert.deepEqual(state.calls, []);
+  await state.api.startAppUpdateDownload();
+  state.context.openPathInFileManager = async () => { throw "找不到文件夹"; };
+  await state.api.openAppUpdateFolder();
+  assert.deepEqual(state.calls, ["download"]);
+  assert.deepEqual(state.errorMessages, ["打开文件夹失败：找不到文件夹"]);
+  assert.ok(state.appUpdateResult.value);
 });
 
 test("安装失败保留已下载文件并允许直接重试安装", async () => {
