@@ -11,22 +11,23 @@ function account(plan_type: string, auth_file_plan_type?: string): CodexAccount 
 }
 
 test("订阅接口与 Token 中的 Pro Lite 别名都显示 5X", () => {
-  for (const plan of ["chatgptprolite", "prolite", "chatgpt_pro_lite", "pro-5x", "codex-pro-5x"]) {
+  for (const plan of ["chatgptprolite", "prolite", "chatgpt_pro_lite", "pro-5", "pro-5x", "codex-pro-5x"]) {
     assert.equal(normalizeAuthFilePlan(plan), "prolite");
     assert.equal(proPlanLabel(account(plan)), "PRO 5X");
   }
 });
 
-test("只有明确的 20X 档位才显示 20X", () => {
-  for (const plan of ["promax", "chatgptpromax", "pro_20x", "codex-pro-20x"]) {
+test("标准 Pro 和显式 20X 档位都显示 20X", () => {
+  for (const plan of ["pro", "chatgptpro", "chatgpt_pro", "CODEX-PRO", "promax", "chatgptpromax", "pro20", "pro_20x", "codex-pro-20x"]) {
     assert.equal(proPlanLabel(account(plan)), "PRO 20X");
   }
-  assert.equal(proPlanLabel(account("pro")), "PRO");
-  assert.equal(proPlanLabel(account("chatgptpro")), "PRO");
+  assert.equal(proPlanLabel(account("unknown")), "PRO");
 });
 
 test("细分凭据套餐优先，普通 pro 字段不遮挡已有细分套餐", () => {
   assert.equal(accountProPlan(account("pro", "prolite")), "prolite");
   assert.equal(accountProPlan(account("chatgptprolite", "pro")), "prolite");
   assert.equal(proPlanLabel(account("pro", "pro-20x")), "PRO 20X");
+  assert.equal(proPlanLabel(account("pro", "pro5")), "PRO 5X");
+  assert.equal(proPlanLabel(account("pro20", "pro")), "PRO 20X");
 });

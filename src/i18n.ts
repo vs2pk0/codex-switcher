@@ -133,7 +133,7 @@ const en: Record<string, string> = {
   "控制切换账号时的行为，避免不必要的配置变更。": "Control account switching behavior and avoid unnecessary configuration changes.",
   "默认关闭": "Off by default",
   "关闭时保留现有配置，仅更新登录凭据与必要路由。": "When off, keep existing configuration and only update credentials and required routing.",
-  "关闭时保留会话文件和索引，需要时可手动修复。": "When off, keep session files and indexes. Repair manually when needed.",
+  "关闭时保留会话文件和索引；侧栏项目和会话归属仍会随账号切换同步。": "When off, preserve session files and indexes. Sidebar projects and conversation assignments still sync when switching accounts.",
   "额度与刷新": "Usage and refresh",
   "管理额度显示与账号数据刷新策略。": "Manage usage display and account refresh intervals.",
   "保存刷新设置": "Save refresh settings",

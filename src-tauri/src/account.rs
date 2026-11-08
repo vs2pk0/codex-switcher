@@ -730,7 +730,7 @@ impl AccountStore {
             let normalized = crate::subscription::normalize_plan_type(&plan_type);
             if matches!(
                 normalized.as_str(),
-                "prolite" | "pro5x" | "promax" | "pro20x"
+                "prolite" | "pro5" | "pro5x" | "promax" | "pro20" | "pro20x"
             ) {
                 account.auth_file_plan_type = Some(plan_type.clone());
             } else if normalized == "pro" {
@@ -738,7 +738,7 @@ impl AccountStore {
                     account.auth_file_plan_type = account.plan_type.clone().filter(|previous| {
                         matches!(
                             crate::subscription::normalize_plan_type(previous).as_str(),
-                            "prolite" | "pro5x" | "promax" | "pro20x"
+                            "prolite" | "pro5" | "pro5x" | "promax" | "pro20" | "pro20x"
                         )
                     });
                 }
@@ -2916,7 +2916,7 @@ fn jwt_claim_string(token: &str, claim: &str) -> Option<String> {
     read_scalar_string(&value, &[claim])
 }
 
-fn jwt_auth_claim_string(token: &str, claim: &str) -> Option<String> {
+pub(crate) fn jwt_auth_claim_string(token: &str, claim: &str) -> Option<String> {
     let value = jwt_payload_value(token)?;
     let auth = value.get("https://api.openai.com/auth")?;
     read_scalar_string(auth, &[claim])

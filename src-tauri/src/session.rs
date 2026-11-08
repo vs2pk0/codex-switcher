@@ -1,6 +1,7 @@
 use crate::account::{replace_file_atomic, write_bytes_atomic};
 use crate::system_command;
 mod compaction_metadata;
+mod desktop_state;
 mod item_ids;
 mod portable_history;
 mod portable_lineage;
@@ -3140,6 +3141,9 @@ impl SessionStore {
         } else {
             serde_json::json!({})
         };
+        // Recover saved project IDs and custom names before creating fallback
+        // projects from rollout paths, then seed the destination snapshot below.
+        self.merge_account_scoped_local_projects(&mut state)?;
         let state_object = state
             .as_object_mut()
             .ok_or_else(|| "Codex 项目状态不是 JSON 对象，已停止修复以避免覆盖".to_string())?;
@@ -3189,6 +3193,24 @@ impl SessionStore {
             created += 1;
         }
 
+        // Different account snapshots can contain distinct projects for the same
+        // root. Preserve valid saved assignments instead of picking an arbitrary ID.
+        let known_project_ids = local_projects.keys().cloned().collect::<HashSet<_>>();
+        let project_id_by_session = candidates
+            .iter()
+            .filter_map(|(session_id, cwd)| {
+                let saved = state_object
+                    .get("thread-project-assignments")
+                    .and_then(|assignments| assignments.get(session_id))
+                    .filter(|assignment| assignment["projectKind"].as_str() == Some("local"))
+                    .and_then(|assignment| assignment["projectId"].as_str())
+                    .filter(|project_id| known_project_ids.contains(*project_id));
+                saved
+                    .or_else(|| project_id_by_root.get(cwd).map(String::as_str))
+                    .map(|project_id| (session_id.clone(), project_id.to_string()))
+            })
+            .collect::<HashMap<_, _>>();
+
         let mut project_order = state_object
             .get("project-order")
             .and_then(Value::as_array)
@@ -3199,8 +3221,8 @@ impl SessionStore {
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect::<HashSet<_>>();
-        for (_, cwd) in &candidates {
-            let Some(project_id) = project_id_by_root.get(cwd) else {
+        for (session_id, _) in &candidates {
+            let Some(project_id) = project_id_by_session.get(session_id) else {
                 continue;
             };
             if ordered_project_ids.insert(project_id.clone()) {
@@ -3215,8 +3237,8 @@ impl SessionStore {
             .as_object_mut()
             .ok_or_else(|| "Codex thread-project-assignments 状态格式无效".to_string())?;
         let mut updated_assignments = 0usize;
-        for (session_id, cwd) in &candidates {
-            let Some(project_id) = project_id_by_root.get(cwd) else {
+        for (session_id, _) in &candidates {
+            let Some(project_id) = project_id_by_session.get(session_id) else {
                 continue;
             };
             let assignment = serde_json::json!({
@@ -3237,8 +3259,8 @@ impl SessionStore {
             .count();
         let verified_assignments = candidates
             .iter()
-            .filter(|(session_id, cwd)| {
-                let Some(project_id) = project_id_by_root.get(cwd) else {
+            .filter(|(session_id, _)| {
+                let Some(project_id) = project_id_by_session.get(session_id) else {
                     return false;
                 };
                 assignments
@@ -3262,6 +3284,7 @@ impl SessionStore {
                     .is_none_or(|session_id| !assigned_ids.contains(session_id))
             });
         }
+        self.merge_account_scoped_local_projects(&mut state)?;
         let serialized = serde_json::to_vec(&state)
             .map_err(|error| format!("序列化 Codex 项目状态失败: {}", error))?;
         let backup_dir = if state_path.is_file() {

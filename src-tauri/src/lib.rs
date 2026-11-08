@@ -1947,7 +1947,15 @@ fn account_switch_result_after_configuration(
     let (synchronized_session_provider_count, warnings) = if repair_sessions {
         prepare_sessions_after_configuration_change(session_store)?
     } else {
-        (0, Vec::new())
+        // Sidebar continuity is part of switching accounts. The optional repair
+        // setting only controls mutations to saved sessions and their indexes.
+        let warnings = session_store
+            .preserve_account_scoped_local_projects()
+            .err()
+            .map(|error| format!("配置已更新，但账号侧栏项目同步未完成：{error}"))
+            .into_iter()
+            .collect();
+        (0, warnings)
     };
     Ok(CodexAccountSwitchResult {
         account,
@@ -1962,6 +1970,9 @@ pub(crate) fn prepare_sessions_after_configuration_change(
 ) -> Result<(usize, Vec<String>), String> {
     let provider = session_store.read_target_provider()?;
     let mut warnings = Vec::new();
+    if let Err(error) = session_store.preserve_account_scoped_local_projects() {
+        warnings.push(format!("配置已更新，但账号侧栏项目同步未完成：{error}"));
+    }
     let synchronized = match session_store.synchronize_model_provider(&provider) {
         Ok(count) => count,
         Err(error) => {
@@ -2145,6 +2156,9 @@ pub(crate) fn one_click_repair_session_store(
     report_progress: &mut impl FnMut(u8),
 ) -> Result<OneClickStoreRepairOutcome, String> {
     let mut warnings = Vec::new();
+    if let Err(error) = session_store.preserve_account_scoped_local_projects() {
+        warnings.push(format!("账号侧栏项目同步未完成：{error}"));
+    }
     let target_provider = match session_store.read_target_provider() {
         Ok(provider) => provider,
         Err(error) => {
@@ -5519,6 +5533,125 @@ mod tests {
             1,
             "repeated switches reuse the persistent file"
         );
+    }
+
+    #[test]
+    fn oauth_account_switch_preserves_local_sidebar_with_optional_repair_on_or_off() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use sha2::{Digest, Sha256};
+        for (repair_sessions, already_selected) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let storage = tempdir().unwrap();
+            let codex = tempdir().unwrap();
+            let accounts = AccountStore::new(storage.path().into(), codex.path().into());
+            let sessions = SessionStore::new(codex.path().into());
+            let token = format!(
+                "e30.{}.fixture",
+                URL_SAFE_NO_PAD.encode(
+                    serde_json::json!({
+                        "email": "fixture@example.com",
+                        "https://api.openai.com/auth": {
+                            "chatgpt_user_id": "new-user", "chatgpt_account_id": "new-account",
+                            "chatgpt_plan_type": "pro"
+                        }
+                    })
+                    .to_string()
+                )
+            );
+            let account = accounts
+                .import_from_json(
+                    &serde_json::json!({
+                        "tokens": {"id_token": token, "access_token": token}
+                    })
+                    .to_string(),
+                )
+                .unwrap()
+                .remove(0);
+            let target_owner = format!("{:x}", Sha256::digest(br#"["new-user","new-account"]"#));
+            let saved_projects = (0..27)
+                .map(|i| {
+                    (
+                        format!("old-project-{i}"),
+                        json!({"name": format!("Project {i}")}),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            let saved_assignments = (0..56)
+                .map(|i| {
+                    (
+                        format!("old-thread-{i}"),
+                        json!({
+                            "projectKind": "local", "projectId": format!("old-project-{}", i % 27)
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            let original = serde_json::json!({
+                "electron-account-renderer-state-v1": {
+                    "owner": if already_selected { target_owner.as_str() } else { "old-owner" },
+                    "inactive": {"earlier-owner": {"atoms": {}, "globals": {
+                        "local-projects": saved_projects,
+                        "thread-project-assignments": saved_assignments
+                    }}}
+                },
+                "local-projects": {"saved-project": {"name": "Original project"}},
+                "thread-project-assignments": {"saved-thread": {
+                    "projectKind": "local", "projectId": "saved-project"
+                }}
+            });
+            let path = codex.path().join(".codex-global-state.json");
+            std::fs::write(&path, original.to_string()).unwrap();
+            let session_dir = codex.path().join("sessions");
+            std::fs::create_dir_all(&session_dir).unwrap();
+            let rollout_path = session_dir.join("saved-thread.jsonl");
+            let rollout = concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"saved-thread\",\"model_provider\":\"previous-provider\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"previous-provider/gpt-5.4\"}}\n"
+            );
+            std::fs::write(&rollout_path, rollout).unwrap();
+
+            let result = super::switch_account_with_session_options(
+                &accounts,
+                &sessions,
+                &account.id,
+                repair_sessions,
+            )
+            .unwrap();
+            assert!(result.warning.is_none(), "{:?}", result.warning);
+            let state: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let inactive = state["electron-account-renderer-state-v1"]["inactive"]
+                .as_object()
+                .unwrap();
+            let globals = if already_selected {
+                assert_eq!(inactive.len(), 1);
+                &state
+            } else {
+                assert_eq!(inactive.len(), 2);
+                &inactive[&target_owner]["globals"]
+            };
+            assert_eq!(globals["local-projects"].as_object().unwrap().len(), 28);
+            assert_eq!(
+                globals["thread-project-assignments"]
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                57
+            );
+            assert_eq!(
+                globals["local-projects"]["saved-project"],
+                original["local-projects"]["saved-project"]
+            );
+            assert_eq!(
+                globals["thread-project-assignments"]["saved-thread"],
+                original["thread-project-assignments"]["saved-thread"]
+            );
+            if !repair_sessions {
+                assert_eq!(std::fs::read_to_string(rollout_path).unwrap(), rollout);
+                assert_eq!(result.synchronized_session_provider_count, 0);
+            }
+        }
     }
 
     #[test]

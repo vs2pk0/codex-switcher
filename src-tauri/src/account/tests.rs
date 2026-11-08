@@ -288,6 +288,24 @@ fn generic_pro_refresh_preserves_a_variant_previously_read_from_jwt() {
 }
 
 #[test]
+fn generic_pro_refresh_preserves_explicit_numeric_tiers() {
+    for tier in ["pro5", "pro20", "codex_pro_20", "chatgpt_pro_5"] {
+        let (_storage, _codex, store) = test_store();
+        let account = store
+            .import_from_json(&json!({
+                "email": "fixture@example.com", "plan_type": tier,
+                "tokens": {"id_token": "id-token", "access_token": "access-token"}
+            }).to_string())
+            .unwrap()
+            .remove(0);
+        let refreshed = store
+            .update_account_subscription_status(&account.id, Some("pro".into()), None, None)
+            .unwrap();
+        assert_eq!(refreshed.auth_file_plan_type.as_deref(), Some(tier));
+    }
+}
+
+#[test]
 fn paid_subscription_without_renewal_date_clears_a_stale_expired_date() {
     let (_storage, _codex, store) = test_store();
     let account = store
