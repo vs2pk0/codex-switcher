@@ -4,6 +4,27 @@ import { currentLanguage, formatTranslatedText, t } from "../src/i18n.ts";
 
 const originalLanguage = currentLanguage.value;
 
+test("额度刷新后的订阅失败提示支持全部界面语言", () => {
+  for (const language of ["en", "ru", "zh-TW"] as const) {
+    currentLanguage.value = language;
+    const message = formatTranslatedText("额度已刷新，订阅状态未更新：{error}", { error: "fixture-error" });
+    assert.match(message, /fixture-error/);
+    assert.notEqual(message, "额度已刷新，订阅状态未更新：fixture-error");
+  }
+});
+
+test("手动 Token 续期状态和结果支持全部界面语言", () => {
+  for (const language of ["en", "ru", "zh-TW"] as const) {
+    currentLanguage.value = language;
+    for (const text of ["点击续期登录令牌", "正在续期登录令牌，请稍候", "缺少续期凭据，请重新登录", "Token 续期中", "Token 到期时间未知", "登录令牌已续期"]) {
+      assert.notEqual(t(text), text, `${language}: ${text}`);
+    }
+    const message = formatTranslatedText("登录令牌续期失败：{error}", { error: "fixture-error" });
+    assert.match(message, /fixture-error/);
+    assert.notEqual(message, "登录令牌续期失败：fixture-error");
+  }
+});
+
 test("Fast 设置说明支持全部界面语言", () => {
   const description = "开启后默认使用 Fast 档位；需 API 和模型支持，费用以服务商为准。关闭后恢复原有配置。";
   for (const language of ["en", "ru", "zh-TW"] as const) {

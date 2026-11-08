@@ -16,7 +16,7 @@ import { Message, Modal } from "@arco-design/web-vue";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { accountProPlan, proPlanLabel } from "./accountPlan";
-import { isAccountSubscriptionInactive, isSubscriptionExpired, subscriptionUntil } from "./accountStatus";
+import { canRefreshAccountToken, isAccountSubscriptionInactive, isSubscriptionExpired, subscriptionUntil } from "./accountStatus";
 import AccountList from "./components/AccountList.vue";
 import AboutPanel from "./components/AboutPanel.vue";
 import AccountToolbar from "./components/AccountToolbar.vue";
@@ -108,6 +108,7 @@ import {
   openExternalUrl,
   refreshAllCodexQuotas,
   refreshCodexQuota,
+  refreshCodexAccountToken,
   resetCodexConfigToml,
   restoreCodexSwitcherBackup,
   restoreCodexSwitcherSessionBackup,
@@ -292,6 +293,7 @@ const tokenInput = ref("");
 const importing = ref(false);
 const savingApiKey = ref(false);
 const refreshingAllQuotas = ref(false);
+const tokenRefreshingIds = ref<string[]>([]);
 const settingsLoading = ref(false);
 const savingSettings = ref(false);
 const savedApiFastMode = ref(false);
@@ -2399,12 +2401,37 @@ async function handleRefreshCurrentQuota(
   }
 }
 
+async function handleRefreshToken(account: CodexAccount): Promise<void> {
+  const latest = accounts.value.find((item) => item.id === account.id);
+  if (!latest || !canRefreshAccountToken(latest)) return;
+  const pending = beginPendingItem(tokenRefreshingIds.value, latest.id);
+  if (!pending) return;
+  tokenRefreshingIds.value = pending;
+  try {
+    const updated = await refreshCodexAccountToken(latest.id);
+    accounts.value = accounts.value.map((item) => item.id === updated.id ? updated : item);
+    if (currentAccount.value?.id === updated.id) currentAccount.value = updated;
+    Message.success(t("登录令牌已续期"));
+  } catch (error) {
+    Message.error(formatTranslatedText("登录令牌续期失败：{error}", { error: errorText(error) }));
+  } finally {
+    tokenRefreshingIds.value = finishPendingItem(tokenRefreshingIds.value, latest.id);
+    await loadAccounts();
+  }
+}
+
 async function handleRefreshQuota(account: CodexAccount): Promise<void> {
   quotaRefreshingId.value = account.id;
   try {
-    await refreshCodexQuota(account.id, true);
+    const updated = await refreshCodexQuota(account.id, true);
     await loadAccounts();
-    Message.success("额度已刷新");
+    if (updated.subscription_query_last_error) {
+      Message.warning(formatTranslatedText("额度已刷新，订阅状态未更新：{error}", {
+        error: updated.subscription_query_last_error,
+      }));
+    } else {
+      Message.success("额度已刷新");
+    }
   } catch (error) {
     await loadAccounts();
     Message.warning(`额度刷新失败：${errorText(error)}`);
@@ -5117,6 +5144,7 @@ onUnmounted(() => {
         :deleting-id="deletingId"
         :exporting-id="exportingId"
         :quota-refreshing-id="quotaRefreshingId"
+        :token-refreshing-ids="tokenRefreshingIds"
         :api-key-balance-states="apiKeyBalanceStates"
         :quota-list-states="quotaListStates"
         :privacy-masked="privacyMasked"
@@ -5136,6 +5164,7 @@ onUnmounted(() => {
         @open-models="openApiModels"
         @switch-account="handleSwitch"
         @refresh-quota="handleRefreshQuota"
+        @refresh-token="handleRefreshToken"
         @refresh-api-balance="handleRefreshApiKeyBalance"
         @refresh-quota-list="handleRefreshQuotaList"
         @open-export="openExport"

@@ -9501,6 +9501,31 @@ textarea {
   color: #2563eb;
 }
 
+.token-renewal {
+  width: 100%;
+  font-family: inherit;
+  text-align: left;
+  cursor: default;
+}
+
+.token-renewable:not([aria-disabled="true"]) {
+  cursor: pointer;
+}
+
+.token-renewable:not([aria-disabled="true"]):hover {
+  border-color: #2563eb;
+  background: #e3edff;
+}
+
+.token-renewal:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+
+.token-renewal[aria-busy="true"] {
+  cursor: progress;
+}
+
 .empty-wrap {
   min-height: calc(100vh - 190px);
   padding: 10px 0 28px;

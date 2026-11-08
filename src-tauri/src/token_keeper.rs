@@ -88,6 +88,23 @@ async fn refresh_account_if_due(
     refresh_account(&store, account, reason).await.map(Some)
 }
 
+/// Explicit user action: rotate immediately, even if automatic renewal is off
+/// or the access token is still valid. Never hide refresh failures as success.
+pub(crate) async fn refresh_access_token_manually(
+    store: &AccountStore,
+    account_id: &str,
+) -> Result<CodexAccount, String> {
+    let _guard = TOKEN_REFRESH_LOCK.lock().await;
+    store.sync_oauth_account_from_current_auth(account_id)?;
+    let account = load_oauth_account(store, account_id)?;
+    let result = refresh_account(store, account, "手动续期登录令牌").await;
+    match &result {
+        Ok(_) => clear_attempt_backoff(account_id),
+        Err(_) => mark_attempt_failure(account_id),
+    }
+    result
+}
+
 async fn refresh_account(
     store: &AccountStore,
     account: CodexAccount,
@@ -353,6 +370,63 @@ mod tests {
         token_rotation_required, TOKEN_PROACTIVE_REFRESH_SECONDS,
     };
     use crate::account::{CodexAccount, CodexQuotaErrorInfo, CodexTokens};
+
+    #[test]
+    fn manual_renewal_rejects_missing_credentials_even_when_access_token_is_valid() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let storage = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let store = crate::account::AccountStore::new(storage.path().into(), home.path().into());
+        let token = format!(
+            "e30.{}.signature",
+            URL_SAFE_NO_PAD.encode(
+                serde_json::json!({"exp": 4102444800_i64, "email": "fixture@example.com"})
+                    .to_string()
+            )
+        );
+        let account = store
+            .import_from_json(
+                &serde_json::json!({
+                    "tokens": {"id_token": token, "access_token": token}
+                })
+                .to_string(),
+            )
+            .unwrap()
+            .remove(0);
+        assert!(!access_token_refresh_required(&account, 2_000_000));
+        let error = tauri::async_runtime::block_on(super::refresh_access_token_manually(
+            &store,
+            &account.id,
+        ))
+        .unwrap_err();
+        assert!(error.contains("缺少 refresh_token"));
+        let saved = store.list_accounts().unwrap().remove(0);
+        assert_eq!(saved.tokens.access_token, account.tokens.access_token);
+        assert_eq!(saved.token_updated_at, account.token_updated_at);
+        assert!(
+            saved.quota_error.is_none(),
+            "valid access token stays usable"
+        );
+    }
+
+    #[test]
+    fn manual_renewal_rejects_api_keys_and_unknown_accounts_without_network_requests() {
+        let storage = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let store = crate::account::AccountStore::new(storage.path().into(), home.path().into());
+        let account = store
+            .add_api_key_account("fixture-key".into(), None, None, None, None)
+            .unwrap();
+        for (id, expected) in [
+            (account.id.as_str(), "API Key 账号不支持"),
+            ("missing", "账号不存在"),
+        ] {
+            let error =
+                tauri::async_runtime::block_on(super::refresh_access_token_manually(&store, id))
+                    .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
 
     fn account() -> CodexAccount {
         CodexAccount {

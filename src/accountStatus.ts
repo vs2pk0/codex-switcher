@@ -1,5 +1,11 @@
 import type { CodexAccount } from "./types/codex";
 
+export function canRefreshAccountToken(account: CodexAccount): boolean {
+  return account.auth_mode !== "apikey"
+    && !account.openai_api_key && !account.openaiApiKey
+    && Boolean(account.tokens.refresh_token?.trim());
+}
+
 export function isAccountSubscriptionInactive(
   account: CodexAccount,
   referenceTime = Date.now(),

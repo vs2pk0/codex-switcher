@@ -28,6 +28,13 @@ export const languageOptions: Array<{ value: AppLanguage; label: string }> = [
 ];
 
 const en: Record<string, string> = {
+  "点击续期登录令牌": "Click to renew the login token",
+  "正在续期登录令牌，请稍候": "Renewing the login token, please wait",
+  "缺少续期凭据，请重新登录": "No renewal credentials available. Please sign in again",
+  "Token 续期中": "Renewing token",
+  "Token 到期时间未知": "Token expiry unknown",
+  "登录令牌已续期": "Login token renewed",
+  "登录令牌续期失败：{error}": "Login token renewal failed: {error}",
   "价格数据源": "Price source",
   "从模型目录导入单价，按需保持更新": "Import model prices and keep them up to date as needed",
   "计费设置": "Billing settings",
@@ -653,6 +660,7 @@ const en: Record<string, string> = {
   "周配额": "Weekly",
   "可用重置次数": "Available reset credits",
   "刷新额度": "Refresh Quota",
+  "额度已刷新，订阅状态未更新：{error}": "Quota refreshed, but subscription status could not be updated: {error}",
   "列表额度": "Quota list",
   "叠加显示": "Stacked view",
   "tab 显示": "Tab view",
@@ -1297,6 +1305,13 @@ const en: Record<string, string> = {
 };
 
 const ru: Record<string, string> = {
+  "点击续期登录令牌": "Нажмите, чтобы обновить токен входа",
+  "正在续期登录令牌，请稍候": "Обновление токена входа, подождите",
+  "缺少续期凭据，请重新登录": "Нет данных для обновления. Войдите снова",
+  "Token 续期中": "Обновление токена",
+  "Token 到期时间未知": "Срок действия токена неизвестен",
+  "登录令牌已续期": "Токен входа обновлён",
+  "登录令牌续期失败：{error}": "Не удалось обновить токен входа: {error}",
   "价格数据源": "Источник цен",
   "从模型目录导入单价，按需保持更新": "Импортируйте цены моделей и обновляйте их по мере необходимости",
   "计费设置": "Настройки тарификации",
@@ -1892,6 +1907,7 @@ const ru: Record<string, string> = {
   "周配额": "Недельная квота",
   "可用重置次数": "Доступные сбросы",
   "刷新额度": "Обновить квоту",
+  "额度已刷新，订阅状态未更新：{error}": "Квота обновлена, но статус подписки обновить не удалось: {error}",
   "列表额度": "Список квот",
   "叠加显示": "Суммарно",
   "tab 显示": "По вкладкам",
@@ -3975,6 +3991,13 @@ const simplifiedToTraditional: Record<string, string> = {
 };
 
 Object.assign(simplifiedToTraditional, {
+  "点击续期登录令牌": "點擊續期登入權杖",
+  "正在续期登录令牌，请稍候": "正在續期登入權杖，請稍候",
+  "缺少续期凭据，请重新登录": "缺少續期憑證，請重新登入",
+  "Token 续期中": "Token 續期中",
+  "Token 到期时间未知": "Token 到期時間未知",
+  "登录令牌已续期": "登入權杖已續期",
+  "登录令牌续期失败：{error}": "登入權杖續期失敗：{error}",
   "检查版本": "檢查版本",
   "下载 Engine 包": "下載 Engine 套件",
   "安装依赖": "安裝依賴",
@@ -4076,6 +4099,7 @@ Object.assign(simplifiedToTraditional, {
   "叠加显示汇总所有账号额度，tab 显示按账号切换查看":
     "疊加顯示匯總所有帳號額度，tab 顯示按帳號切換查看",
   "刷新额度": "重新整理額度",
+  "额度已刷新，订阅状态未更新：{error}": "額度已重新整理，但訂閱狀態未更新：{error}",
   "暂无额度数据": "暫無額度資料",
   "查询该 Base URL 背后所有 Codex 账号的额度列表": "查詢該 Base URL 背後所有 Codex 帳號的額度列表",
   "{count} 个账号合计": "共 {count} 個帳號",

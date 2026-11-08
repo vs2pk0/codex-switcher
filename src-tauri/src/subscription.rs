@@ -52,13 +52,14 @@ pub(crate) async fn refresh_account_subscription(
     let mut snapshot = if quota_plan.as_deref().is_some_and(is_free_plan) {
         SubscriptionSnapshot::default()
     } else if query_due {
-        match fetch_subscription_status(&account).await {
+        match fetch_subscription_status(&account, quota_plan.as_deref()).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                let fallback = quota_fallback_snapshot(&account, quota_plan);
                 let _ = AccountStore::default().update_account_subscription_status(
                     account_id,
-                    quota_plan,
-                    None,
+                    fallback.plan_type,
+                    fallback.active_until,
                     Some(error.clone()),
                 );
                 return Err(error);
@@ -134,6 +135,28 @@ fn apply_quota_plan(snapshot: &mut SubscriptionSnapshot, quota_plan: Option<Stri
     }
 }
 
+fn quota_fallback_snapshot(
+    account: &CodexAccount,
+    quota_plan: Option<String>,
+) -> SubscriptionSnapshot {
+    // Keep a known date on query failure only while the live plan still matches.
+    let same_plan = quota_plan.as_deref().is_none_or(|plan| {
+        account
+            .plan_type
+            .as_deref()
+            .is_some_and(|old| normalize_plan_type(old) == normalize_plan_type(plan))
+    });
+    let mut snapshot = SubscriptionSnapshot {
+        active_until: account
+            .subscription_active_until
+            .clone()
+            .filter(|_| same_plan),
+        ..Default::default()
+    };
+    apply_quota_plan(&mut snapshot, quota_plan);
+    snapshot
+}
+
 fn plan_from_quota(quota: &CodexQuota, now: i64) -> Option<String> {
     let raw = quota.raw_data.as_ref();
     let plan = raw
@@ -169,14 +192,34 @@ fn plan_from_quota(quota: &CodexQuota, now: i64) -> Option<String> {
     monthly.then(|| "free".to_string())
 }
 
-async fn fetch_subscription_status(account: &CodexAccount) -> Result<SubscriptionSnapshot, String> {
+async fn fetch_subscription_status(
+    account: &CodexAccount,
+    quota_plan: Option<&str>,
+) -> Result<SubscriptionSnapshot, String> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|error| format!("初始化订阅请求失败: {error}"))?;
+    fetch_subscription_status_with_client(
+        &client,
+        account,
+        quota_plan,
+        ACCOUNTS_CHECK_URL,
+        SUBSCRIPTIONS_URL,
+    )
+    .await
+}
+
+async fn fetch_subscription_status_with_client(
+    client: &reqwest::Client,
+    account: &CodexAccount,
+    quota_plan: Option<&str>,
+    accounts_check_url: &str,
+    subscriptions_url: &str,
+) -> Result<SubscriptionSnapshot, String> {
     let payload = request_json(
-        client.get(ACCOUNTS_CHECK_URL).query(&[(
+        client.get(accounts_check_url).query(&[(
             "timezone_offset_min",
             crate::app_time::AppTimeZone::current()
                 .now()
@@ -191,11 +234,13 @@ async fn fetch_subscription_status(account: &CodexAccount) -> Result<Subscriptio
     .await?;
     let mut snapshot = parse_account_check_snapshot(&payload, account)?;
     if snapshot.plan_type.as_deref().is_some_and(is_free_plan)
-        || !subscription_missing_or_expired(snapshot.active_until.as_deref())
+        && !quota_plan.is_some_and(|plan| !is_free_plan(plan))
     {
         return Ok(snapshot);
     }
 
+    // A future accounts/check expiry can predate an early renewal. Always read
+    // the subscription details for paid plans instead of treating it as fresh.
     let remote_account_id = snapshot
         .account_id
         .clone()
@@ -203,7 +248,7 @@ async fn fetch_subscription_status(account: &CodexAccount) -> Result<Subscriptio
         .ok_or_else(|| "未获取到 ChatGPT account_id，无法查询订阅状态".to_string())?;
     let payload = request_json(
         client
-            .get(SUBSCRIPTIONS_URL)
+            .get(subscriptions_url)
             .query(&[("account_id", remote_account_id.as_str())]),
         account,
         "/backend-api/subscriptions",
@@ -427,12 +472,140 @@ fn now_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_quota_plan, parse_account_check_snapshot, parse_subscription_snapshot,
-        plan_from_quota, should_refresh_at, SubscriptionSnapshot,
+        apply_quota_plan, fetch_subscription_status_with_client, parse_account_check_snapshot,
+        parse_subscription_snapshot, plan_from_quota, quota_fallback_snapshot, should_refresh_at,
+        SubscriptionSnapshot,
     };
     use crate::account::{CodexAccount, CodexTokens};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use serde_json::json;
+
+    fn query_fixture(
+        check_plan: &str,
+        quota_plan: Option<&str>,
+        details_status: u16,
+    ) -> (Result<SubscriptionSnapshot, String>, Vec<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let check = json!({"accounts": {"account-b": {
+            "account": {"account_id": "account-b", "plan_type": check_plan},
+            "entitlement": {"expires_at": "2099-01-01T00:00:00Z"}
+        }}})
+        .to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !server_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                }
+                let (status, body) = if request.starts_with("GET /accounts-check?") {
+                    (200, check.clone())
+                } else {
+                    (
+                        details_status,
+                        json!({
+                            "subscription_plan": "pro", "active_until": "2099-02-01T00:00:00Z"
+                        })
+                        .to_string(),
+                    )
+                };
+                requests.push(request.trim().to_string());
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let result = tauri::async_runtime::block_on(fetch_subscription_status_with_client(
+            &client,
+            &account(),
+            quota_plan,
+            &format!("{base}/accounts-check"),
+            &format!("{base}/subscriptions"),
+        ));
+        stop.store(true, Ordering::Relaxed);
+        (result, server.join().unwrap())
+    }
+
+    #[test]
+    fn paid_refresh_reads_renewal_details_even_with_a_future_or_stale_free_account_check() {
+        for check_plan in ["pro", "free"] {
+            let (result, requests) = query_fixture(check_plan, Some("pro"), 200);
+            let snapshot = result.unwrap();
+            assert_eq!(snapshot.plan_type.as_deref(), Some("pro"));
+            assert_eq!(
+                snapshot.active_until.as_deref(),
+                Some("2099-02-01T00:00:00Z")
+            );
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                requests[1],
+                "GET /subscriptions?account_id=account-b HTTP/1.1"
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_details_failure_is_not_reported_as_a_fresh_future_date() {
+        let (result, requests) = query_fixture("pro", Some("pro"), 401);
+        assert!(result.unwrap_err().contains("401"));
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn confirmed_free_account_does_not_require_paid_subscription_details() {
+        let (result, requests) = query_fixture("free", None, 404);
+        assert_eq!(result.unwrap().plan_type.as_deref(), Some("free"));
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn failed_query_preserves_only_a_matching_nonexpired_paid_date() {
+        let mut account = account();
+        account.plan_type = Some("pro".into());
+        account.subscription_active_until = Some("2099-01-01T00:00:00Z".into());
+        let snapshot = quota_fallback_snapshot(&account, Some("pro".into()));
+        assert_eq!(snapshot.active_until, account.subscription_active_until);
+        assert!(quota_fallback_snapshot(&account, Some("plus".into()))
+            .active_until
+            .is_none());
+        assert!(quota_fallback_snapshot(&account, Some("free".into()))
+            .active_until
+            .is_none());
+        account.subscription_active_until = Some("2000-01-01T00:00:00Z".into());
+        assert!(quota_fallback_snapshot(&account, Some("pro".into()))
+            .active_until
+            .is_none());
+    }
 
     fn account() -> CodexAccount {
         let payload = URL_SAFE_NO_PAD

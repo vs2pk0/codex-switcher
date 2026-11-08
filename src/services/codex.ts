@@ -525,6 +525,10 @@ export function consumeCodexResetCredit(accountId: string): Promise<CodexResetCr
   return invoke("consume_codex_reset_credit", { accountId });
 }
 
+export function refreshCodexAccountToken(accountId: string): Promise<CodexAccount> {
+  return invoke("refresh_codex_account_token", { accountId });
+}
+
 export function refreshAllCodexQuotas(): Promise<number> {
   return invoke("refresh_all_codex_quotas");
 }

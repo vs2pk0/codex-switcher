@@ -3,7 +3,7 @@ import { formatAppDateTime, formatWallTime } from "../timeZone";
 import { Message } from "@arco-design/web-vue";
 import { computed, ref } from "vue";
 import { accountProPlan, proPlanLabel } from "../accountPlan";
-import { isAccountSubscriptionInactive, isSubscriptionExpired, subscriptionUntil } from "../accountStatus";
+import { canRefreshAccountToken, isAccountSubscriptionInactive, isSubscriptionExpired, subscriptionUntil } from "../accountStatus";
 import { ADAPTIVE_COLUMNS, normalizeMaxColumns, resolveAccountColumns } from "../services/accountLayout";
 import type { CodexApiKeyBalanceState, CodexSwitcherSettings } from "../services/codex";
 import type { QuotaListAccount, QuotaListState, QuotaListWindow } from "../services/quotaList";
@@ -33,6 +33,7 @@ const props = defineProps<{
   deletingId: string;
   exportingId: string;
   quotaRefreshingId: string;
+  tokenRefreshingIds: string[];
   apiKeyBalanceStates: Record<string, CodexApiKeyBalanceState>;
   quotaListStates: Record<string, QuotaListState>;
   privacyMasked: boolean;
@@ -55,6 +56,7 @@ const emit = defineEmits<{
   (event: "open-models", account: CodexAccount): void;
   (event: "switch-account", account: CodexAccount): void;
   (event: "refresh-quota", account: CodexAccount): void;
+  (event: "refresh-token", account: CodexAccount): void;
   (event: "refresh-api-balance", account: CodexAccount): void;
   (event: "refresh-quota-list", account: CodexAccount): void;
   (event: "open-export", account: CodexAccount): void;
@@ -968,6 +970,25 @@ function isTokenExpiredError(account: CodexAccount): boolean {
   return account.quota_error?.code === "token_expired";
 }
 
+function tokenRefreshTooltip(account: CodexAccount): string {
+  if (props.tokenRefreshingIds.includes(account.id)) return t("正在续期登录令牌，请稍候");
+  return canRefreshAccountToken(account)
+    ? t("点击续期登录令牌")
+    : t("缺少续期凭据，请重新登录");
+}
+
+function requestTokenRefresh(account: CodexAccount): void {
+  if (!canRefreshAccountToken(account) || props.tokenRefreshingIds.includes(account.id)) return;
+  emit("refresh-token", account);
+}
+
+function tokenStatusLabel(account: CodexAccount): string {
+  if (props.tokenRefreshingIds.includes(account.id)) return t("Token 续期中");
+  const expiresAt = accountTokenExpiresAt(account);
+  if (!expiresAt) return t("Token 到期时间未知");
+  return tokenExpiryStatus(expiresAt) === "expired" ? t("Token 失效") : t("Token 可用");
+}
+
 function tokenExpiryStatus(value?: string): "valid" | "expired" {
   const date = normalizeDate(value);
   if (!date) return "valid";
@@ -1391,19 +1412,28 @@ function formatTime(value?: number | null): string {
               </template>
             </div>
 
-            <div
-              class="status-card"
-              :class="accountTokenExpiresAt(account) ? 'status-token-expired' : 'status-placeholder'"
-              :aria-hidden="accountTokenExpiresAt(account) ? undefined : 'true'"
+            <a-tooltip
+              v-if="accountTokenExpiresAt(account) || canRefreshAccountToken(account)"
+              :content="tokenRefreshTooltip(account)"
             >
-              <template v-if="accountTokenExpiresAt(account)">
+              <button
+                type="button"
+                class="status-card status-token-expired token-renewal"
+                :class="{ 'token-renewable': canRefreshAccountToken(account) }"
+                :aria-disabled="!canRefreshAccountToken(account) || tokenRefreshingIds.includes(account.id)"
+                :aria-busy="tokenRefreshingIds.includes(account.id)"
+                :aria-label="tokenRefreshTooltip(account)"
+                @click.stop="requestTokenRefresh(account)"
+              >
                 <span>
-                  <icon-clock-circle />
-                  {{ tokenExpiryStatus(accountTokenExpiresAt(account)) === "expired" ? t("Token 失效") : t("Token 可用") }}
+                  <icon-loading v-if="tokenRefreshingIds.includes(account.id)" />
+                  <icon-clock-circle v-else />
+                  {{ tokenStatusLabel(account) }}
                 </span>
-                <strong>{{ formatDateTime(accountTokenExpiresAt(account)) }}</strong>
-              </template>
-            </div>
+                <strong v-if="accountTokenExpiresAt(account)">{{ formatDateTime(accountTokenExpiresAt(account)) }}</strong>
+              </button>
+            </a-tooltip>
+            <div v-else class="status-card status-placeholder" aria-hidden="true" />
           </div>
         </div>
 

@@ -1164,6 +1164,17 @@ fn codex_oauth_login_cancel(login_id: Option<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn refresh_codex_account_token(
+    app_handle: AppHandle,
+    account_id: String,
+) -> Result<CodexAccount, String> {
+    let result =
+        token_keeper::refresh_access_token_manually(&AccountStore::default(), &account_id).await;
+    let _ = app_handle.emit("codex-account-state-updated", ());
+    result
+}
+
+#[tauri::command]
 fn open_external_url(url: String) -> Result<(), String> {
     external_url::open(&url)
 }
@@ -6776,6 +6787,7 @@ pub fn run() {
             codex_oauth_submit_callback_url,
             codex_oauth_login_completed,
             codex_oauth_login_cancel,
+            refresh_codex_account_token,
             open_external_url,
             open_path_in_file_manager,
             delete_codex_account,
