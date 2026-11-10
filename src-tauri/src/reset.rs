@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -90,6 +91,7 @@ pub(crate) struct ResetClaim {
 
 pub(crate) struct ResetStateStore {
     path: PathBuf,
+    account_id_aliases: BTreeMap<String, String>,
 }
 
 impl Default for ResetStateStore {
@@ -100,7 +102,15 @@ impl Default for ResetStateStore {
 
 impl ResetStateStore {
     pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            account_id_aliases: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn with_account_id_aliases(mut self, aliases: BTreeMap<String, String>) -> Self {
+        self.account_id_aliases = aliases;
+        self
     }
 
     #[cfg(test)]
@@ -128,9 +138,12 @@ impl ResetStateStore {
 
     pub(crate) fn create_scheduled_reset(
         &self,
-        task: ScheduledReset,
+        mut task: ScheduledReset,
         now_ms: i64,
     ) -> Result<ResetState, String> {
+        if let Some(id) = self.account_id_aliases.get(&task.account_id) {
+            task.account_id = id.clone();
+        }
         self.mutate(|state| {
             if task.status != ResetStatus::Scheduled {
                 return Err("新预约任务状态必须为 scheduled".to_string());
@@ -254,7 +267,10 @@ impl ResetStateStore {
         .map(|(state, ())| state)
     }
 
-    pub(crate) fn append_log(&self, log: ResetLog) -> Result<ResetState, String> {
+    pub(crate) fn append_log(&self, mut log: ResetLog) -> Result<ResetState, String> {
+        if let Some(id) = self.account_id_aliases.get(&log.account_id) {
+            log.account_id = id.clone();
+        }
         self.mutate(|state| {
             state.logs.push(log);
             Ok(())
@@ -300,10 +316,20 @@ impl ResetStateStore {
         }
         let content = std::fs::read_to_string(&self.path)
             .map_err(|error| format!("读取重置状态失败 ({}): {}", self.path.display(), error))?;
-        let state: ResetState = serde_json::from_str(&content)
+        let mut state: ResetState = serde_json::from_str(&content)
             .map_err(|error| format!("解析重置状态失败 ({}): {}", self.path.display(), error))?;
         validate_state(&state)
             .map_err(|error| format!("重置状态无效 ({}): {}", self.path.display(), error))?;
+        for task in &mut state.scheduled_resets {
+            if let Some(id) = self.account_id_aliases.get(&task.account_id) {
+                task.account_id = id.clone();
+            }
+        }
+        for log in &mut state.logs {
+            if let Some(id) = self.account_id_aliases.get(&log.account_id) {
+                log.account_id = id.clone();
+            }
+        }
         Ok(state)
     }
 
@@ -439,6 +465,37 @@ mod tests {
             result: ResetLogResult::Success,
             error: None,
         }
+    }
+
+    #[test]
+    fn merged_account_ids_remain_claimable_and_prevent_duplicate_schedules() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ResetStateStore::new(dir.path().join("reset-state.json"));
+        store
+            .save(&ResetState {
+                scheduled_resets: vec![scheduled_task("original-task", 3_000)],
+                logs: vec![test_log(1_000)],
+            })
+            .unwrap();
+        let store = store.with_account_id_aliases(BTreeMap::from([(
+            "account-1".to_string(),
+            "canonical".to_string(),
+        )]));
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.scheduled_resets[0].account_id, "canonical");
+        assert_eq!(loaded.logs[0].account_id, "canonical");
+        let mut duplicate = scheduled_task("duplicate-task", 4_000);
+        duplicate.account_id = "canonical".to_string();
+        assert!(store.create_scheduled_reset(duplicate, 2_000).is_err());
+        assert!(store
+            .create_scheduled_reset(scheduled_task("old-id-task", 4_000), 2_000)
+            .is_err());
+        let claim = store.claim_scheduled_reset("original-task", 3_000).unwrap();
+        assert_eq!(claim.task.unwrap().account_id, "canonical");
+        let raw: ResetState =
+            serde_json::from_str(&std::fs::read_to_string(store.path()).unwrap()).unwrap();
+        assert_eq!(raw.scheduled_resets[0].account_id, "canonical");
+        assert_eq!(raw.logs[0].account_id, "canonical");
     }
 
     #[test]

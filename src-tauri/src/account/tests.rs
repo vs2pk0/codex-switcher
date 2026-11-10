@@ -143,6 +143,500 @@ fn imports_token_json_and_persists_account() {
 }
 
 #[test]
+fn repeated_email_import_preserves_local_id_and_nonempty_profile_fields() {
+    let (_storage, _codex, store) = test_store();
+    let original = store
+        .import_from_json(
+            &json!({
+                "id": "original-id", "email": "owner@example.com", "access_token": "old-token",
+                "refresh_token": "keep-refresh", "account_name": "毛子", "tags": ["常用"],
+                "bound_phone": "+1 123", "is_hidden": true, "created_at": 100
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .remove(0);
+    let updated = store
+        .import_from_json(
+            &json!({
+                "id": "different-id", "email": " OWNER@Example.COM ", "access_token": "new-token",
+                "account_name": "  ", "tags": [" "], "bound_phone": "  "
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .remove(0);
+
+    assert_eq!(updated.id, original.id);
+    assert_eq!(updated.created_at, 100);
+    assert_eq!(updated.account_name.as_deref(), Some("毛子"));
+    assert_eq!(updated.tags, ["常用"]);
+    assert_eq!(updated.bound_phone.as_deref(), Some("+1 123"));
+    assert_eq!(updated.tokens.access_token, "new-token");
+    assert_eq!(
+        updated.tokens.refresh_token.as_deref(),
+        Some("keep-refresh")
+    );
+    assert!(updated.is_hidden);
+    assert_eq!(store.list_accounts().unwrap(), vec![updated]);
+}
+
+#[test]
+fn latest_import_wins_each_nonempty_profile_field_even_with_same_id() {
+    let (_storage, _codex, store) = test_store();
+    for (index, name, tags, phone) in [
+        (0, "旧昵称", vec!["旧标签"], "+1 111"),
+        (1, "新昵称", vec!["新标签", " 新标签 "], "+1 222"),
+        (2, "", Vec::new(), "+1 333"),
+    ] {
+        let updated = store.import_from_json(&json!({
+            "id": "same-id", "email": "owner@example.com", "access_token": format!("token-{index}"),
+            "account_name": name, "tags": tags, "bound_phone": phone
+        }).to_string()).unwrap().remove(0);
+        if index > 0 {
+            assert_eq!(updated.account_name.as_deref(), Some("新昵称"));
+            assert_eq!(updated.tags, ["新标签"]);
+        }
+        assert_eq!(updated.bound_phone.as_deref(), Some(phone));
+    }
+    assert_eq!(store.list_accounts().unwrap().len(), 1);
+}
+
+#[test]
+fn batch_import_returns_final_unique_accounts_and_remaps_oauth_bindings() {
+    let (_storage, _codex, store) = test_store();
+    let imported = store.import_from_json(&json!({"accounts": [
+        {"id": "original", "email": "owner@example.com", "access_token": "one", "account_name": "原名"},
+        {"id": "imported-copy", "email": "OWNER@example.com", "access_token": "two", "tags": ["新标签"]},
+        {"OPENAI_API_KEY": "sk-fixture", "bound_oauth_account_id": "imported-copy"},
+        {"id": "last-copy", "email": "owner@example.com", "access_token": "three", "account_name": "新名"}
+    ]}).to_string()).unwrap();
+
+    assert_eq!(imported.len(), 2);
+    assert_eq!(imported[0].id, "original");
+    assert_eq!(imported[0].tokens.access_token, "three");
+    assert_eq!(imported[0].account_name.as_deref(), Some("新名"));
+    assert_eq!(imported[0].tags, ["新标签"]);
+    assert_eq!(
+        imported[1].bound_oauth_account_id.as_deref(),
+        Some("original")
+    );
+    assert_eq!(store.list_accounts().unwrap().len(), 2);
+}
+
+#[test]
+fn local_auth_import_and_detection_reuse_existing_email_account() {
+    let (_storage, codex, store) = test_store();
+    store
+        .import_from_json(
+            &json!({
+                "id": "original", "email": "owner@example.com", "access_token": "old",
+                "account_name": "毛子", "tags": ["常用"], "phone": "+1 123"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    for token in ["local-token-one", "local-token-two"] {
+        fs::write(
+            codex.path().join("auth.json"),
+            json!({
+                "email": "OWNER@example.com", "tokens": {"access_token": token}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let imported = store.import_from_local().unwrap();
+        assert_eq!(imported[0].id, "original");
+        let detected = store
+            .detect_current_account_from_codex_config()
+            .unwrap()
+            .unwrap();
+        assert_eq!(detected.id, "original");
+        assert_eq!(detected.tokens.access_token, token);
+        assert_eq!(detected.account_name.as_deref(), Some("毛子"));
+        assert_eq!(detected.tags, ["常用"]);
+        assert_eq!(detected.bound_phone.as_deref(), Some("+1 123"));
+        assert_eq!(store.list_accounts().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn oauth_login_reuses_profile_and_updates_the_current_bound_api_key_projection() {
+    let (_storage, codex, store) = test_store();
+    let oauth = store
+        .import_from_json(
+            &json!({
+                "id": "original", "email": "owner@example.com", "access_token": "old",
+                "refresh_token": "old-refresh",
+                "account_name": "毛子", "tags": ["常用"], "phone": "+1 123"
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .remove(0);
+    let api = store
+        .add_api_key_account(
+            "sk-fixture".to_string(),
+            Some("https://relay.example/v1".to_string()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    store
+        .update_api_key_bound_oauth_account(&api.id, Some(oauth.id.clone()), false)
+        .unwrap();
+    store.switch_account(&api.id).unwrap();
+    let refreshed = store
+        .save_oauth_tokens(
+            "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6Im93bmVyQGV4YW1wbGUuY29tIn0.signature".to_string(),
+            "new-access-token".to_string(),
+            Some("new-refresh-token".to_string()),
+        )
+        .unwrap();
+    assert_eq!(refreshed.id, oauth.id);
+    assert_eq!(refreshed.account_name, oauth.account_name);
+    assert_eq!(refreshed.tags, oauth.tags);
+    assert_eq!(refreshed.bound_phone, oauth.bound_phone);
+    assert_eq!(store.list_accounts().unwrap().len(), 2);
+    assert_eq!(store.current_account().unwrap().unwrap().id, api.id);
+    let auth: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(codex.path().join("auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["tokens"]["access_token"], "new-access-token");
+    assert_eq!(auth["tokens"]["refresh_token"], "new-refresh-token");
+}
+
+#[test]
+fn concurrent_imports_with_different_ids_keep_one_email_record() {
+    let (storage, codex, _store) = test_store();
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = (0..2)
+        .map(|index| {
+            let store = AccountStore::new(storage.path().to_path_buf(), codex.path().to_path_buf());
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.import_from_json(&json!({
+                "id": format!("id-{index}"), "email": "owner@example.com",
+                "access_token": format!("token-{index}"), "account_name": format!("name-{index}")
+            }).to_string()).unwrap().remove(0)
+            })
+        })
+        .collect();
+    let imported: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    assert_eq!(imported[0].id, imported[1].id);
+    let store = AccountStore::new(storage.path().to_path_buf(), codex.path().to_path_buf());
+    assert_eq!(store.list_accounts().unwrap().len(), 1);
+}
+
+#[test]
+fn legacy_email_duplicates_merge_latest_profiles_and_keep_internal_references() {
+    let (storage, codex, store) = test_store();
+    let old = store
+        .account_from_import_value(&json!({
+            "id": "original", "email": "owner@example.com", "access_token": "fresh-token",
+            "refresh_token": "keep-refresh", "created_at": 100, "token_updated_at": 500,
+            "account_name": "原昵称", "tags": ["旧标签"], "phone": "+1 111"
+        }))
+        .unwrap();
+    let new = store
+        .account_from_import_value(&json!({
+            "id": "duplicate", "email": "OWNER@example.com", "access_token": "stale-token",
+            "created_at": 200, "token_updated_at": 400, "account_name": " ",
+            "tags": ["最新标签"], "phone": "+1 222"
+        }))
+        .unwrap();
+    let mut api = store
+        .account_from_import_value(&json!({"OPENAI_API_KEY": "sk-fixture"}))
+        .unwrap();
+    api.bound_oauth_account_id = Some("duplicate".to_string());
+    let mut database = super::AccountDatabase {
+        accounts: vec![new, api, old],
+        current_account_id: Some("duplicate".to_string()),
+        managed_model_config_backup: Some(super::ManagedModelConfigBackup {
+            managed_account_id: Some("duplicate".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    database.instance_states.insert(
+        "instance".to_string(),
+        super::AccountInstanceState {
+            current_account_id: Some("duplicate".to_string()),
+            managed_model_config_backup: database.managed_model_config_backup.clone(),
+            ..Default::default()
+        },
+    );
+    store.write_database(&database).unwrap();
+
+    let accounts = store.list_accounts().unwrap();
+    assert_eq!(accounts.len(), 2);
+    let merged = accounts
+        .iter()
+        .find(|account| account.id == "original")
+        .unwrap();
+    assert_eq!(merged.created_at, 100);
+    assert_eq!(merged.account_name.as_deref(), Some("原昵称"));
+    assert_eq!(merged.tags, ["最新标签"]);
+    assert_eq!(merged.bound_phone.as_deref(), Some("+1 222"));
+    assert_eq!(merged.tokens.access_token, "fresh-token");
+    assert_eq!(merged.tokens.refresh_token.as_deref(), Some("keep-refresh"));
+    assert_eq!(store.current_account().unwrap().unwrap().id, "original");
+    assert_eq!(store.resolve_account_id("duplicate").unwrap(), "original");
+    assert_eq!(
+        store
+            .account_id_aliases()
+            .unwrap()
+            .get("duplicate")
+            .map(String::as_str),
+        Some("original")
+    );
+    let updated = store
+        .update_account_phone("duplicate", "+1 333".to_string())
+        .unwrap();
+    assert_eq!(updated.id, "original");
+    assert_eq!(updated.bound_phone.as_deref(), Some("+1 333"));
+    let instance = AccountStore::new_for_instance(
+        storage.path().to_path_buf(),
+        codex.path().to_path_buf(),
+        "instance",
+    );
+    assert_eq!(instance.current_account().unwrap().unwrap().id, "original");
+    let stored: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(storage.path().join("accounts.json")).unwrap())
+            .unwrap();
+    assert_eq!(stored["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(stored["current_account_id"], "original");
+    assert_eq!(
+        stored["managed_model_config_backup"]["managed_account_id"],
+        "original"
+    );
+    assert_eq!(
+        stored["instance_states"]["instance"]["current_account_id"],
+        "original"
+    );
+    assert_eq!(
+        stored["instance_states"]["instance"]["managed_model_config_backup"]["managed_account_id"],
+        "original"
+    );
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.auth_mode.as_deref() == Some("apikey"))
+            .unwrap()
+            .bound_oauth_account_id
+            .as_deref(),
+        Some("original")
+    );
+    let before = fs::read(storage.path().join("accounts.json")).unwrap();
+    let mut expected = accounts;
+    expected
+        .iter_mut()
+        .find(|account| account.id == "original")
+        .unwrap()
+        .bound_phone = Some("+1 333".to_string());
+    assert_eq!(store.list_accounts().unwrap(), expected);
+    assert_eq!(
+        fs::read(storage.path().join("accounts.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn legacy_duplicates_with_equal_creation_times_prefer_the_first_list_record() {
+    let (_storage, _codex, store) = test_store();
+    let make = |id: &str, name: &str| {
+        store
+            .account_from_import_value(&json!({
+                "id": id, "email": "owner@example.com", "access_token": id,
+                "created_at": 100, "token_updated_at": 100, "account_name": name
+            }))
+            .unwrap()
+    };
+    store
+        .write_database(&super::AccountDatabase {
+            accounts: vec![make("new", "最新"), make("old", "原名")],
+            ..Default::default()
+        })
+        .unwrap();
+    let accounts = store.list_accounts().unwrap();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].id, "old");
+    assert_eq!(accounts[0].account_name.as_deref(), Some("最新"));
+    assert_eq!(accounts[0].tokens.access_token, "new");
+}
+
+#[test]
+fn email_deduplication_does_not_merge_api_keys_or_generated_placeholders() {
+    let (_storage, _codex, store) = test_store();
+    // Distinct API keys deliberately share the displayed suffix/email.
+    store
+        .import_from_json(
+            &json!([
+                {"OPENAI_API_KEY": "sk-one-123456"},
+                {"OPENAI_API_KEY": "sk-two-123456"},
+                {"id": "one", "email": "codex-placeholder@local", "access_token": "one"},
+                {"id": "two", "email": "codex-placeholder@local", "access_token": "two"},
+                {"email": "different@example.com", "access_token": "different"}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+    assert_eq!(store.list_accounts().unwrap().len(), 5);
+}
+
+#[test]
+fn conflicting_import_id_rejects_entire_batch_without_overwriting_another_email() {
+    let (storage, _codex, store) = test_store();
+    store
+        .import_from_json(
+            &json!({
+                "id": "existing", "email": "owner@example.com", "access_token": "original"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let before = fs::read(storage.path().join("accounts.json")).unwrap();
+    let error = store
+        .import_from_json(
+            &json!([
+                {"email": "new@example.com", "access_token": "new"},
+                {"id": "existing", "email": "someone-else@example.com", "access_token": "wrong"}
+            ])
+            .to_string(),
+        )
+        .unwrap_err();
+    assert!(error.contains("账号 ID"));
+    assert_eq!(
+        fs::read(storage.path().join("accounts.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn repeated_batch_id_cannot_rebind_a_different_email_after_its_first_record_was_merged() {
+    let (storage, _codex, store) = test_store();
+    store
+        .import_from_json(
+            &json!({
+                "id": "original", "email": "owner@example.com", "access_token": "original"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let before = fs::read(storage.path().join("accounts.json")).unwrap();
+    assert!(store
+        .import_from_json(
+            &json!([
+                {"id": "copy", "email": "owner@example.com", "access_token": "one"},
+                {"id": "copy", "email": "other@example.com", "access_token": "two"}
+            ])
+            .to_string()
+        )
+        .is_err());
+    assert_eq!(
+        fs::read(storage.path().join("accounts.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn merged_ids_follow_json_id_changes_and_are_removed_when_the_account_is_deleted() {
+    let (_storage, _codex, store) = test_store();
+    store
+        .import_from_json(
+            &json!([
+                {"id": "original", "email": "owner@example.com", "access_token": "one"},
+                {"id": "copy", "email": "owner@example.com", "access_token": "two"}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+    store
+        .update_account_from_json(
+            "copy",
+            &json!({
+                "id": "renamed", "email": "owner@example.com", "access_token": "three"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    assert_eq!(store.resolve_account_id("copy").unwrap(), "renamed");
+    assert_eq!(store.resolve_account_id("original").unwrap(), "renamed");
+    let exported: serde_json::Value = serde_json::from_str(
+        &store
+            .export_accounts(&["copy".to_string(), "renamed".to_string()], None)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(exported["accounts"].as_array().unwrap().len(), 1);
+    assert_eq!(store.switch_account("copy").unwrap().id, "renamed");
+    store.delete_account("original").unwrap();
+    assert!(store.list_accounts().unwrap().is_empty());
+    assert!(store.account_id_aliases().unwrap().is_empty());
+}
+
+#[test]
+fn merging_legacy_records_keeps_the_most_recent_live_subscription_check() {
+    let (_storage, _codex, store) = test_store();
+    let old = store
+        .account_from_import_value(&json!({
+            "id": "original", "email": "owner@example.com", "access_token": "one",
+            "created_at": 100, "subscription_is_active": false, "plan_type": "free",
+            "subscription_query_last_attempt_at": 500
+        }))
+        .unwrap();
+    let new = store.account_from_import_value(&json!({
+        "id": "copy", "email": "owner@example.com", "access_token": "two",
+        "created_at": 200, "subscription_is_active": true, "plan_type": "pro",
+        "subscription_active_until": "2099-01-01T00:00:00Z", "subscription_query_last_attempt_at": 400
+    })).unwrap();
+    store
+        .write_database(&super::AccountDatabase {
+            accounts: vec![new, old],
+            ..Default::default()
+        })
+        .unwrap();
+    let merged = store.list_accounts().unwrap().remove(0);
+    assert_eq!(merged.plan_type.as_deref(), Some("free"));
+    assert_eq!(merged.subscription_is_active, Some(false));
+    assert!(merged.subscription_active_until.is_none());
+    assert_eq!(merged.subscription_query_last_attempt_at, Some(500));
+}
+
+#[test]
+fn json_edit_cannot_create_another_account_with_an_existing_email() {
+    let (storage, _codex, store) = test_store();
+    store
+        .import_from_json(
+            &json!([
+                {"id": "one", "email": "one@example.com", "access_token": "one"},
+                {"id": "two", "email": "two@example.com", "access_token": "two"}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+    let before = fs::read(storage.path().join("accounts.json")).unwrap();
+    let error = store
+        .update_account_from_json(
+            "two",
+            &json!({
+                "email": "ONE@example.com", "access_token": "replacement"
+            })
+            .to_string(),
+        )
+        .unwrap_err();
+    assert!(error.contains("邮箱已有账号"));
+    assert_eq!(
+        fs::read(storage.path().join("accounts.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
 fn subscription_downgrade_clears_cached_pro_and_survives_token_refresh() {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     let (_storage, _codex, store) = test_store();
@@ -292,10 +786,13 @@ fn generic_pro_refresh_preserves_explicit_numeric_tiers() {
     for tier in ["pro5", "pro20", "codex_pro_20", "chatgpt_pro_5"] {
         let (_storage, _codex, store) = test_store();
         let account = store
-            .import_from_json(&json!({
-                "email": "fixture@example.com", "plan_type": tier,
-                "tokens": {"id_token": "id-token", "access_token": "access-token"}
-            }).to_string())
+            .import_from_json(
+                &json!({
+                    "email": "fixture@example.com", "plan_type": tier,
+                    "tokens": {"id_token": "id-token", "access_token": "access-token"}
+                })
+                .to_string(),
+            )
             .unwrap()
             .remove(0);
         let refreshed = store

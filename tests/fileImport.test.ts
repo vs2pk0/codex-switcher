@@ -20,6 +20,7 @@ function fixture(failAt = -1) {
   const addModalVisible = { value: true };
   const successes: string[] = [];
   const errors: string[] = [];
+  const refreshed: unknown[] = [];
   const importFiles = runInNewContext(`${compiled}\nhandleFileImport`, {
     importing, addModalVisible,
     async importCodexFromJson(content: string) {
@@ -31,6 +32,7 @@ function fixture(failAt = -1) {
     async refreshAccountsAfterMutation(accounts: unknown[]) {
       calls.refreshes++;
       calls.refreshedAccounts = accounts.length;
+      refreshed.push(...accounts);
       return 0;
     },
     warnQuotaRefreshFailures(count: number) { calls.warnings += count; },
@@ -43,7 +45,7 @@ function fixture(failAt = -1) {
       error(message: string) { errors.push(message); },
     },
   }) as (files: Array<{ text(): Promise<string> }>) => Promise<void>;
-  return { importFiles, calls, importing, addModalVisible, successes, errors };
+  return { importFiles, calls, importing, addModalVisible, successes, errors, refreshed };
 }
 
 function files(count: number, accountsPerFile = 1) {
@@ -86,6 +88,18 @@ test("阈值按 JSON 文件数判断", async () => {
   assert.equal(state.calls.imports, 1);
   assert.equal(state.calls.refreshes, 1);
   assert.equal(state.calls.refreshedAccounts, 11);
+});
+
+test("多文件导入合并成同一账号时，只统计并刷新最终保存的一条记录", async () => {
+  const state = fixture();
+  await state.importFiles(["old-token", "new-token"].map((token) => ({
+    async text() { return JSON.stringify([{ id: "original-id", access_token: token }]); },
+  })));
+  assert.equal(state.calls.imports, 2);
+  assert.equal(state.calls.loads, 1);
+  assert.equal(state.calls.refreshedAccounts, 1);
+  assert.equal((state.refreshed[0] as { access_token: string }).access_token, "new-token");
+  assert.match(state.successes[0]!, /2 个文件导入 1 个账号/);
 });
 
 test("空选择和导入失败不触发刷新，失败后解除导入状态", async () => {

@@ -248,6 +248,7 @@ async fn run_refresh_cycle(app: &AppHandle) {
 }
 
 fn load_oauth_account(store: &AccountStore, account_id: &str) -> Result<CodexAccount, String> {
+    let account_id = store.resolve_account_id(account_id)?;
     let account = store
         .list_accounts()?
         .into_iter()

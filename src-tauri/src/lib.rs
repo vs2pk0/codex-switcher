@@ -2,8 +2,8 @@ mod account;
 mod api_model_catalog;
 mod api_model_settings;
 mod api_service;
-mod app_update;
 mod app_time;
+mod app_update;
 mod export_file;
 mod external_url;
 mod instances;
@@ -1690,6 +1690,7 @@ async fn switch_codex_account(
     account_id: String,
     instance_id: Option<String>,
 ) -> Result<CodexAccountSwitchResult, String> {
+    let account_id = AccountStore::default().resolve_account_id(&account_id)?;
     let instance_id = instance_id.unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
     let selected_instance = instances::resolve_instance(&instance_id)?;
     let selected_codex_home = PathBuf::from(&selected_instance.codex_home);
@@ -2373,7 +2374,31 @@ fn mark_visibility_desktop_reloaded(summary: &mut CodexSessionVisibilityRepairSu
 #[tauri::command]
 fn get_codex_switcher_settings() -> Result<CodexSwitcherSettings, String> {
     let _settings_guard = lock_switcher_settings()?;
-    read_switcher_settings()
+    let mut settings = read_switcher_settings()?;
+    remap_settings_account_ids(
+        &mut settings,
+        &AccountStore::default().account_id_aliases()?,
+    );
+    Ok(settings)
+}
+
+fn remap_settings_account_ids(
+    settings: &mut CodexSwitcherSettings,
+    aliases: &std::collections::BTreeMap<String, String>,
+) {
+    for ids in [&mut settings.custom_order, &mut settings.pinned_account_ids] {
+        let mut seen = HashSet::new();
+        *ids = ids
+            .iter()
+            .map(|id| aliases.get(id).unwrap_or(id).clone())
+            .filter(|id| seen.insert(id.clone()))
+            .collect();
+    }
+}
+
+fn reset_state_store() -> Result<reset::ResetStateStore, String> {
+    Ok(reset::ResetStateStore::default()
+        .with_account_id_aliases(AccountStore::default().account_id_aliases()?))
 }
 
 pub(crate) fn token_keeper_enabled() -> bool {
@@ -2395,18 +2420,17 @@ fn update_codex_switcher_settings(
 
 #[tauri::command]
 fn get_codex_reset_state() -> Result<reset::ResetState, String> {
-    reset::ResetStateStore::default().load()
+    reset_state_store()?.load()
 }
 
 #[tauri::command]
 fn initialize_codex_reset_state() -> Result<reset::ResetState, String> {
-    reset::ResetStateStore::default().initialize(chrono::Utc::now().timestamp_millis())
+    reset_state_store()?.initialize(chrono::Utc::now().timestamp_millis())
 }
 
 #[tauri::command]
 fn create_codex_scheduled_reset(task: reset::ScheduledReset) -> Result<reset::ResetState, String> {
-    reset::ResetStateStore::default()
-        .create_scheduled_reset(task, chrono::Utc::now().timestamp_millis())
+    reset_state_store()?.create_scheduled_reset(task, chrono::Utc::now().timestamp_millis())
 }
 
 #[tauri::command]
@@ -2414,7 +2438,7 @@ fn update_codex_scheduled_reset(
     schedule_id: String,
     scheduled_at: i64,
 ) -> Result<reset::ResetState, String> {
-    reset::ResetStateStore::default().update_scheduled_reset(
+    reset_state_store()?.update_scheduled_reset(
         &schedule_id,
         scheduled_at,
         chrono::Utc::now().timestamp_millis(),
@@ -2427,13 +2451,12 @@ fn cancel_codex_scheduled_reset(
     occurred_at: i64,
     log_id: String,
 ) -> Result<reset::ResetState, String> {
-    reset::ResetStateStore::default().cancel_scheduled_reset(&schedule_id, occurred_at, log_id)
+    reset_state_store()?.cancel_scheduled_reset(&schedule_id, occurred_at, log_id)
 }
 
 #[tauri::command]
 fn claim_codex_scheduled_reset(schedule_id: String) -> Result<reset::ResetClaim, String> {
-    reset::ResetStateStore::default()
-        .claim_scheduled_reset(&schedule_id, chrono::Utc::now().timestamp_millis())
+    reset_state_store()?.claim_scheduled_reset(&schedule_id, chrono::Utc::now().timestamp_millis())
 }
 
 #[tauri::command]
@@ -2444,28 +2467,22 @@ fn finish_codex_scheduled_reset(
     error: Option<String>,
     log_id: String,
 ) -> Result<reset::ResetState, String> {
-    reset::ResetStateStore::default().finish_scheduled_reset(
-        &schedule_id,
-        occurred_at,
-        result,
-        error,
-        log_id,
-    )
+    reset_state_store()?.finish_scheduled_reset(&schedule_id, occurred_at, result, error, log_id)
 }
 
 #[tauri::command]
 fn append_codex_reset_log(log: reset::ResetLog) -> Result<reset::ResetState, String> {
-    reset::ResetStateStore::default().append_log(log)
+    reset_state_store()?.append_log(log)
 }
 
 #[tauri::command]
 fn delete_codex_reset_log(log_id: String) -> Result<reset::ResetState, String> {
-    reset::ResetStateStore::default().delete_log(&log_id)
+    reset_state_store()?.delete_log(&log_id)
 }
 
 #[tauri::command]
 fn clear_codex_reset_logs() -> Result<reset::ResetState, String> {
-    reset::ResetStateStore::default().clear_logs()
+    reset_state_store()?.clear_logs()
 }
 
 fn codex_config_file_path(codex_home: &Path, kind: CodexConfigFileKind) -> PathBuf {
@@ -3038,7 +3055,7 @@ where
             "app": "Codex Switcher",
             "version": 2,
             "exportedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            "accounts": list_codex_accounts()?,
+            "accounts": AccountStore::default().list_accounts_while_locked()?,
             "currentAccount": get_current_codex_account()?,
             "settings": read_switcher_settings()?,
             "codexSessions": codex_session_summary,
@@ -3057,7 +3074,9 @@ where
             .map_err(|error| format!("创建备份目录失败: {}", error))?;
         let filename = format!(
             "codex-switcher-backup-{}.zip",
-            app_time::AppTimeZone::current().now().format("%Y%m%d-%H%M%S-%3f")
+            app_time::AppTimeZone::current()
+                .now()
+                .format("%Y%m%d-%H%M%S-%3f")
         );
         let backup_path = backup_dir.join(filename);
         write_switcher_backup_zip(&backup_path, &content, &mut progress)?;
@@ -3097,7 +3116,9 @@ where
     let filename = format!(
         "codex-session-backup-{}-{}.zip",
         source_instance.id,
-        app_time::AppTimeZone::current().now().format("%Y%m%d-%H%M%S-%3f")
+        app_time::AppTimeZone::current()
+            .now()
+            .format("%Y%m%d-%H%M%S-%3f")
     );
     let backup_path = backup_dir.join(filename);
     write_session_backup_zip(&backup_path, &content, codex_home, &mut progress)?;
@@ -3187,7 +3208,7 @@ fn restore_codex_switcher_backup(
         }
         let store = AccountStore::default();
         if restores_account_database {
-            store.list_accounts()
+            store.list_accounts_while_locked()
         } else {
             store.import_from_json_while_locked(&accounts_json)
         }
@@ -3429,8 +3450,11 @@ async fn codex_export_session_markdown(
 ) -> Result<session::MarkdownExportResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let directory = export_file::session_export_directory()?;
-        session_store_for_instance(instance_id.as_deref())?
-            .export_markdown(&session_id, &title, &directory)
+        session_store_for_instance(instance_id.as_deref())?.export_markdown(
+            &session_id,
+            &title,
+            &directory,
+        )
     })
     .await
     .map_err(|error| format!("导出 Markdown 任务失败: {error}"))?
@@ -4449,8 +4473,7 @@ fn backup_file_info(path: &Path) -> Result<CodexSwitcherBackupFile, String> {
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| {
-            chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH + duration)
-                .to_rfc3339()
+            chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH + duration).to_rfc3339()
         })
         .unwrap_or_else(|| "未知时间".to_string());
     Ok(CodexSwitcherBackupFile {
@@ -4590,6 +4613,8 @@ async fn fetch_codex_quota(
     account_id: &str,
     force_subscription_refresh: bool,
 ) -> Result<CodexQuota, String> {
+    let resolved_id = AccountStore::default().resolve_account_id(account_id)?;
+    let account_id = resolved_id.as_str();
     let source = refreshed_quota_source_account(account_id).await?;
     let accounts = AccountStore::default().list_accounts()?;
     let target = accounts
@@ -4656,6 +4681,8 @@ async fn fetch_codex_quota(
 }
 
 fn quota_source_account(account_id: &str) -> Result<CodexAccount, String> {
+    let resolved_id = AccountStore::default().resolve_account_id(account_id)?;
+    let account_id = resolved_id.as_str();
     let accounts = AccountStore::default().list_accounts()?;
     let account = accounts
         .iter()
@@ -5104,6 +5131,23 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn merged_account_settings_preserve_order_and_remove_duplicate_pins() {
+        let mut settings = super::CodexSwitcherSettings::default();
+        settings.custom_order = vec![
+            "copy".to_string(),
+            "other".to_string(),
+            "original".to_string(),
+        ];
+        settings.pinned_account_ids = vec!["copy".to_string(), "original".to_string()];
+        super::remap_settings_account_ids(
+            &mut settings,
+            &std::collections::BTreeMap::from([("copy".to_string(), "original".to_string())]),
+        );
+        assert_eq!(settings.custom_order, ["original", "other"]);
+        assert_eq!(settings.pinned_account_ids, ["original"]);
+    }
 
     #[test]
     fn custom_model_provider_requires_config_reset_before_switch() {

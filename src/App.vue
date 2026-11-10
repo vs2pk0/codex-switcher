@@ -2097,6 +2097,7 @@ async function handleDetectCurrentAccount(): Promise<void> {
   detectingCurrentAccount.value = true;
   try {
     const detected = await detectCurrentCodexAccount();
+    await loadAccounts();
     if (!detected) {
       currentAccount.value = null;
       Message.warning("未能从当前 Codex 配置匹配到账号");
@@ -3295,12 +3296,13 @@ async function handleFileImport(files: File[]): Promise<void> {
   if (!files.length) return;
   importing.value = true;
   try {
-    const importedAccounts: CodexAccount[] = [];
+    const importedById = new Map<string, CodexAccount>();
     for (const file of files) {
       const content = await file.text();
       const imported = await importCodexFromJson(content);
-      importedAccounts.push(...imported);
+      for (const account of imported) importedById.set(account.id, account);
     }
+    const importedAccounts = [...importedById.values()];
     addModalVisible.value = false;
     await loadAccounts();
     if (files.length > 10) {

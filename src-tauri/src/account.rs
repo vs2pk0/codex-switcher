@@ -194,6 +194,8 @@ struct AccountDatabase {
     managed_model_config_backup: Option<ManagedModelConfigBackup>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     instance_states: BTreeMap<String, AccountInstanceState>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    account_id_aliases: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -421,7 +423,42 @@ impl AccountStore {
     }
 
     pub fn list_accounts(&self) -> Result<Vec<CodexAccount>, String> {
-        Ok(self.read_database()?.accounts)
+        let _database_guard = lock_account_database_mutation()?;
+        self.list_accounts_while_locked()
+    }
+
+    pub(super) fn list_accounts_while_locked(&self) -> Result<Vec<CodexAccount>, String> {
+        let (database, merged_duplicates) = self.read_database_with_migration()?;
+        if merged_duplicates {
+            self.write_database(&database)?;
+        }
+        Ok(database.accounts)
+    }
+
+    pub(crate) fn account_id_aliases(&self) -> Result<BTreeMap<String, String>, String> {
+        Ok(self.read_database()?.account_id_aliases)
+    }
+
+    pub(crate) fn resolve_account_id(&self, account_id: &str) -> Result<String, String> {
+        let database = self.read_database()?;
+        Ok(database
+            .account_id_aliases
+            .get(account_id)
+            .cloned()
+            .unwrap_or_else(|| account_id.to_string()))
+    }
+
+    fn read_database_for_account(
+        &self,
+        account_id: &str,
+    ) -> Result<(AccountDatabase, String), String> {
+        let database = self.read_database()?;
+        let resolved_id = database
+            .account_id_aliases
+            .get(account_id)
+            .cloned()
+            .unwrap_or_else(|| account_id.to_string());
+        Ok((database, resolved_id))
     }
 
     /// 该 store 对应的 Codex Home 目录。
@@ -495,11 +532,36 @@ impl AccountStore {
         }
 
         let mut database = self.read_database()?;
-        for account in imported.iter().cloned() {
-            upsert_account(&mut database.accounts, account);
+        let mut imported_ids = Vec::new();
+        let mut replacements: BTreeMap<String, String> = BTreeMap::new();
+        for mut account in imported {
+            let imported_id = account.id.clone();
+            if let Some(canonical_id) = replacements
+                .get(&account.id)
+                .or_else(|| database.account_id_aliases.get(&account.id))
+            {
+                account.id = canonical_id.clone();
+            }
+            let saved = upsert_account(&mut database.accounts, account)?;
+            if imported_id != saved.id {
+                replacements.insert(imported_id, saved.id.clone());
+            }
+            if !imported_ids.contains(&saved.id) {
+                imported_ids.push(saved.id);
+            }
         }
+        remap_account_references(&mut database, &replacements);
         self.write_database(&database)?;
-        Ok(imported)
+        Ok(imported_ids
+            .iter()
+            .filter_map(|id| {
+                database
+                    .accounts
+                    .iter()
+                    .find(|account| &account.id == id)
+                    .cloned()
+            })
+            .collect())
     }
 
     pub fn import_from_local(&self) -> Result<Vec<CodexAccount>, String> {
@@ -528,40 +590,18 @@ impl AccountStore {
                 "refresh_token": refresh_token.unwrap_or_default()
             }
         });
-        let mut account = self.account_from_import_value(&payload)?;
+        let account = self.account_from_import_value(&payload)?;
         let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
         let current_id = self.current_account_id(&database).map(str::to_string);
-        let existing = database
-            .accounts
-            .iter()
-            .find(|candidate| {
-                candidate.auth_mode.as_deref() != Some("apikey")
-                    && candidate.email.eq_ignore_ascii_case(&account.email)
-            })
-            .cloned();
-        let was_current = existing
-            .as_ref()
-            .is_some_and(|existing| current_id.as_deref() == Some(existing.id.as_str()))
-            || current_id.as_deref() == Some(account.id.as_str());
+        let account = upsert_account(&mut database.accounts, account)?;
+        let was_current = current_id.as_deref() == Some(account.id.as_str());
         let current_api_key_depends_on_refreshed_oauth =
-            existing.as_ref().is_some_and(|existing| {
-                database.accounts.iter().any(|candidate| {
-                    current_id.as_deref() == Some(candidate.id.as_str())
-                        && candidate.auth_mode.as_deref() == Some("apikey")
-                        && candidate.bound_oauth_account_id.as_deref() == Some(existing.id.as_str())
-                })
+            database.accounts.iter().any(|candidate| {
+                current_id.as_deref() == Some(candidate.id.as_str())
+                    && candidate.auth_mode.as_deref() == Some("apikey")
+                    && candidate.bound_oauth_account_id.as_deref() == Some(account.id.as_str())
             });
-        if let Some(existing) = existing {
-            account.id = existing.id;
-            account.account_name = existing.account_name;
-            account.tags = existing.tags;
-            account.is_hidden = existing.is_hidden;
-            account.bound_phone = existing.bound_phone;
-            account.created_at = existing.created_at;
-            account.last_used = existing.last_used;
-        }
-        upsert_account(&mut database.accounts, account.clone());
         if was_current {
             self.set_current_account_id(&mut database, Some(account.id.clone()));
             write_codex_auth_projection(
@@ -595,7 +635,8 @@ impl AccountStore {
         tokens: CodexTokens,
     ) -> Result<CodexAccount, String> {
         let _database_guard = lock_account_database_mutation()?;
-        let mut database = self.read_database()?;
+        let (mut database, resolved_id) = self.read_database_for_account(account_id)?;
+        let account_id = resolved_id.as_str();
         let account = database
             .accounts
             .iter_mut()
@@ -626,7 +667,8 @@ impl AccountStore {
         account_id: &str,
     ) -> Result<Option<CodexAccount>, String> {
         let _database_guard = lock_account_database_mutation()?;
-        let mut database = self.read_database()?;
+        let (mut database, resolved_id) = self.read_database_for_account(account_id)?;
+        let account_id = resolved_id.as_str();
         let is_current_source = self
             .current_account_id(&database)
             .and_then(|current_id| {
@@ -715,7 +757,8 @@ impl AccountStore {
         const SUBSCRIPTION_RETRY_SECONDS: i64 = 30 * 60;
 
         let _database_guard = lock_account_database_mutation()?;
-        let mut database = self.read_database()?;
+        let (mut database, resolved_id) = self.read_database_for_account(account_id)?;
+        let account_id = resolved_id.as_str();
         let account = database
             .accounts
             .iter_mut()
@@ -792,7 +835,7 @@ impl AccountStore {
 
         let _database_guard = lock_account_database_mutation()?;
         let mut database = self.read_database()?;
-        upsert_account(&mut database.accounts, account.clone());
+        let account = upsert_account(&mut database.accounts, account)?;
         self.write_database(&database)?;
         Ok(account)
     }
@@ -870,7 +913,8 @@ impl AccountStore {
     ) -> Result<CodexAccount, String> {
         let model_id = validate_default_model(&model_id)?;
         let _database_guard = lock_account_database_mutation()?;
-        let mut database = self.read_database()?;
+        let (mut database, resolved_id) = self.read_database_for_account(account_id)?;
+        let account_id = resolved_id.as_str();
         let account_index = database
             .accounts
             .iter()
@@ -959,7 +1003,8 @@ impl AccountStore {
     }
 
     pub fn check_api_key_model_access(&self, account_id: &str) -> Result<bool, String> {
-        let database = self.read_database()?;
+        let (database, resolved_id) = self.read_database_for_account(account_id)?;
+        let account_id = resolved_id.as_str();
         let Some(account) = database
             .accounts
             .iter()
@@ -1020,7 +1065,8 @@ impl AccountStore {
         is_hidden: Option<bool>,
     ) -> Result<CodexAccount, String> {
         let _database_guard = lock_account_database_mutation()?;
-        let mut database = self.read_database()?;
+        let (mut database, resolved_id) = self.read_database_for_account(account_id)?;
+        let account_id = resolved_id.as_str();
         let account = database
             .accounts
             .iter_mut()
@@ -1044,7 +1090,8 @@ impl AccountStore {
         account_id: &str,
     ) -> Result<CodexAccount, String> {
         let _database_guard = lock_account_database_mutation()?;
-        let mut database = self.read_database()?;
+        let (mut database, resolved_id) = self.read_database_for_account(account_id)?;
+        let account_id = resolved_id.as_str();
         let account = database
             .accounts
             .iter_mut()
@@ -1066,8 +1113,10 @@ impl AccountStore {
         bound_oauth_use_local_gateway: bool,
     ) -> Result<CodexAccount, String> {
         let _database_guard = lock_account_database_mutation()?;
-        let mut database = self.read_database()?;
-        let bound_id = normalize_optional(bound_oauth_account_id.as_deref());
+        let (mut database, resolved_id) = self.read_database_for_account(account_id)?;
+        let account_id = resolved_id.as_str();
+        let bound_id = normalize_optional(bound_oauth_account_id.as_deref())
+            .map(|id| database.account_id_aliases.get(&id).cloned().unwrap_or(id));
 
         if let Some(bound_id) = bound_id.as_deref() {
             let oauth_account = database
@@ -1127,7 +1176,8 @@ impl AccountStore {
         phone: String,
     ) -> Result<CodexAccount, String> {
         let _database_guard = lock_account_database_mutation()?;
-        let mut database = self.read_database()?;
+        let (mut database, resolved_id) = self.read_database_for_account(account_id)?;
+        let account_id = resolved_id.as_str();
         let account = database
             .accounts
             .iter_mut()
@@ -1147,7 +1197,8 @@ impl AccountStore {
         let value: Value = serde_json::from_str(json_content)
             .map_err(|error| format!("JSON 解析失败: {}", error))?;
         let _database_guard = lock_account_database_mutation()?;
-        let mut database = self.read_database()?;
+        let (mut database, resolved_id) = self.read_database_for_account(account_id)?;
+        let account_id = resolved_id.as_str();
         let old_account = database
             .accounts
             .iter()
@@ -1202,6 +1253,20 @@ impl AccountStore {
                 .any(|account| account.id == updated.id)
         {
             return Err(format!("账号 ID 已存在: {}", updated.id));
+        }
+        if database
+            .account_id_aliases
+            .get(&updated.id)
+            .is_some_and(|id| id != &old_account.id)
+        {
+            return Err(format!("账号 ID 已被其他账号使用: {}", updated.id));
+        }
+        if database
+            .accounts
+            .iter()
+            .any(|account| account.id != old_account.id && same_oauth_email(account, &updated))
+        {
+            return Err("该邮箱已有账号，请通过添加账号导入以合并，避免产生重复账号".to_string());
         }
 
         let was_current = database.current_account_id.as_deref() == Some(account_id);
@@ -1292,25 +1357,14 @@ impl AccountStore {
             };
         }
 
-        if updated.id != old_account.id {
-            for account in &mut database.accounts {
-                if account.bound_oauth_account_id.as_deref() == Some(old_account.id.as_str()) {
-                    account.bound_oauth_account_id = Some(updated.id.clone());
-                }
-            }
-            for state in database.instance_states.values_mut() {
-                if state.current_account_id.as_deref() == Some(old_account.id.as_str()) {
-                    state.current_account_id = Some(updated.id.clone());
-                }
-                if let Some(backup) = state.managed_model_config_backup.as_mut() {
-                    if backup.managed_account_id.as_deref() == Some(old_account.id.as_str()) {
-                        backup.managed_account_id = Some(updated.id.clone());
-                    }
-                }
-            }
-        }
         database.accounts.retain(|account| account.id != account_id);
         database.accounts.insert(0, updated.clone());
+        if updated.id != old_account.id {
+            remap_account_references(
+                &mut database,
+                &BTreeMap::from([(old_account.id.clone(), updated.id.clone())]),
+            );
+        }
         if was_current {
             database.current_account_id = Some(updated.id.clone());
             write_codex_auth_projection(
@@ -1352,7 +1406,8 @@ impl AccountStore {
         quota: CodexQuota,
     ) -> Result<CodexAccount, String> {
         let _database_guard = lock_account_database_mutation()?;
-        let mut database = self.read_database()?;
+        let (mut database, resolved_id) = self.read_database_for_account(account_id)?;
+        let account_id = resolved_id.as_str();
         let account = database
             .accounts
             .iter_mut()
@@ -1372,7 +1427,8 @@ impl AccountStore {
         message: String,
     ) -> Result<CodexAccount, String> {
         let _database_guard = lock_account_database_mutation()?;
-        let mut database = self.read_database()?;
+        let (mut database, resolved_id) = self.read_database_for_account(account_id)?;
+        let account_id = resolved_id.as_str();
         let account = database
             .accounts
             .iter_mut()
@@ -1411,7 +1467,8 @@ impl AccountStore {
         account_id: &str,
     ) -> Result<CodexAccount, String> {
         let _database_guard = lock_account_database_mutation()?;
-        let mut database = self.read_database()?;
+        let (mut database, resolved_id) = self.read_database_for_account(account_id)?;
+        let account_id = resolved_id.as_str();
         let account = database
             .accounts
             .iter_mut()
@@ -1438,8 +1495,11 @@ impl AccountStore {
         format: Option<&str>,
     ) -> Result<String, String> {
         let database = self.read_database()?;
+        let mut seen = std::collections::BTreeSet::new();
         let selected: Vec<CodexAccount> = account_ids
             .iter()
+            .map(|id| database.account_id_aliases.get(id).unwrap_or(id))
+            .filter(|id| seen.insert((*id).clone()))
             .filter_map(|id| {
                 database
                     .accounts
@@ -1482,7 +1542,8 @@ impl AccountStore {
 
     pub fn delete_account(&self, account_id: &str) -> Result<(), String> {
         let _database_guard = lock_account_database_mutation()?;
-        let mut database = self.read_database()?;
+        let (mut database, resolved_id) = self.read_database_for_account(account_id)?;
+        let account_id = resolved_id.as_str();
         let removed_account = database
             .accounts
             .iter()
@@ -1519,6 +1580,9 @@ impl AccountStore {
         }
         let before = database.accounts.len();
         database.accounts.retain(|account| account.id != account_id);
+        database
+            .account_id_aliases
+            .retain(|_, target| target != account_id);
         debug_assert!(database.accounts.len() < before);
         let mut removed_bound_references = false;
         for account in &mut database.accounts {
@@ -1574,7 +1638,8 @@ impl AccountStore {
 
     pub fn switch_account(&self, account_id: &str) -> Result<CodexAccount, String> {
         let _database_guard = lock_account_database_mutation()?;
-        let mut database = self.read_database()?;
+        let (mut database, resolved_id) = self.read_database_for_account(account_id)?;
+        let account_id = resolved_id.as_str();
         let mut config_document = read_toml_document(&self.codex_home.join("config.toml"))?;
         crate::api_model_settings::restore_document(&self.codex_home, &mut config_document)?;
         let stored_current_account_id = self.current_account_id(&database).map(str::to_string);
@@ -1701,9 +1766,14 @@ impl AccountStore {
     }
 
     fn read_database(&self) -> Result<AccountDatabase, String> {
+        self.read_database_with_migration()
+            .map(|(database, _)| database)
+    }
+
+    fn read_database_with_migration(&self) -> Result<(AccountDatabase, bool), String> {
         let path = self.database_path();
         if !path.exists() {
-            return Ok(AccountDatabase::default());
+            return Ok((AccountDatabase::default(), false));
         }
         let content =
             fs::read_to_string(&path).map_err(|error| format!("读取账号库失败: {}", error))?;
@@ -1718,7 +1788,8 @@ impl AccountStore {
                 account.quota_error = None;
             }
         }
-        Ok(database)
+        let merged_duplicates = merge_duplicate_oauth_accounts(&mut database);
+        Ok((database, merged_duplicates))
     }
 
     fn write_database(&self, database: &AccountDatabase) -> Result<(), String> {
@@ -2056,14 +2127,213 @@ pub fn codex_restart_delay_ms() -> u64 {
     }
 }
 
-fn upsert_account(accounts: &mut Vec<CodexAccount>, account: CodexAccount) {
-    if let Some(existing) = accounts.iter_mut().find(|item| item.id == account.id) {
-        let created_at = existing.created_at;
-        *existing = account;
-        existing.created_at = created_at;
-    } else {
-        accounts.insert(0, account);
+fn oauth_email_key(account: &CodexAccount) -> Option<String> {
+    if account.auth_mode.as_deref() == Some("apikey") {
+        return None;
     }
+    let email = account.email.trim().to_ascii_lowercase();
+    // Token-only imports without identity claims use a generated placeholder.
+    // Such a placeholder is not evidence that two credentials share an owner.
+    if email.is_empty() || (email.starts_with("codex-") && email.ends_with("@local")) {
+        return None;
+    }
+    Some(email)
+}
+
+fn same_oauth_email(left: &CodexAccount, right: &CodexAccount) -> bool {
+    oauth_email_key(left)
+        .zip(oauth_email_key(right))
+        .is_some_and(|(left, right)| left == right)
+}
+
+fn merge_oauth_account(existing: &CodexAccount, mut incoming: CodexAccount) -> CodexAccount {
+    incoming.id = existing.id.clone();
+    incoming.created_at = existing.created_at;
+    incoming.last_used = incoming.last_used.max(existing.last_used);
+    incoming.account_name = normalize_optional(incoming.account_name.as_deref())
+        .or_else(|| normalize_optional(existing.account_name.as_deref()));
+    incoming.bound_phone = normalize_optional(incoming.bound_phone.as_deref())
+        .or_else(|| normalize_optional(existing.bound_phone.as_deref()));
+    incoming.tags = normalize_account_tags(incoming.tags);
+    if incoming.tags.is_empty() {
+        incoming.tags = normalize_account_tags(existing.tags.clone());
+    }
+    // Adding fresh credentials must not expose an account hidden by the user.
+    incoming.is_hidden |= existing.is_hidden;
+    incoming.hidden_cleanup_pending |= existing.hidden_cleanup_pending;
+    if normalize_optional(incoming.tokens.refresh_token.as_deref()).is_none() {
+        incoming.tokens.refresh_token =
+            normalize_optional(existing.tokens.refresh_token.as_deref());
+    }
+    if incoming.quota.is_none()
+        || incoming.usage_updated_at.unwrap_or_default()
+            < existing.usage_updated_at.unwrap_or_default()
+    {
+        incoming.quota = existing.quota.clone();
+        incoming.usage_updated_at = existing.usage_updated_at;
+    }
+    // A live subscription check is more authoritative than cached JWT claims.
+    if existing.subscription_is_active.is_some()
+        && (incoming.subscription_is_active.is_none()
+            || existing
+                .subscription_query_last_attempt_at
+                .unwrap_or_default()
+                > incoming
+                    .subscription_query_last_attempt_at
+                    .unwrap_or_default())
+    {
+        incoming.plan_type = existing.plan_type.clone();
+        incoming.auth_file_plan_type = existing.auth_file_plan_type.clone();
+        incoming.subscription_is_active = existing.subscription_is_active;
+        incoming.subscription_active_until = existing.subscription_active_until.clone();
+        incoming.subscription_query_last_attempt_at = existing.subscription_query_last_attempt_at;
+        incoming.subscription_query_next_retry_at = existing.subscription_query_next_retry_at;
+        incoming.subscription_query_last_error = existing.subscription_query_last_error.clone();
+    }
+    if oauth_email_key(&incoming).is_none() && oauth_email_key(existing).is_some() {
+        incoming.email = existing.email.clone();
+    }
+    incoming
+}
+
+fn upsert_account(
+    accounts: &mut Vec<CodexAccount>,
+    account: CodexAccount,
+) -> Result<CodexAccount, String> {
+    if let Some(existing) = accounts.iter().find(|item| item.id == account.id) {
+        if (existing.auth_mode.as_deref() == Some("apikey"))
+            != (account.auth_mode.as_deref() == Some("apikey"))
+            || oauth_email_key(existing)
+                .zip(oauth_email_key(&account))
+                .is_some_and(|(left, right)| left != right)
+        {
+            return Err(format!("账号 ID 已被其他账号使用: {}", account.id));
+        }
+    }
+    if let Some(existing) = accounts
+        .iter_mut()
+        .find(|item| item.id == account.id || same_oauth_email(item, &account))
+    {
+        let saved = if account.auth_mode.as_deref() == Some("apikey") {
+            let mut saved = account;
+            saved.created_at = existing.created_at;
+            saved
+        } else {
+            merge_oauth_account(existing, account)
+        };
+        *existing = saved.clone();
+        Ok(saved)
+    } else {
+        accounts.insert(0, account.clone());
+        Ok(account)
+    }
+}
+
+fn merge_duplicate_oauth_accounts(database: &mut AccountDatabase) -> bool {
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, account) in database.accounts.iter().enumerate() {
+        if let Some(email) = oauth_email_key(account) {
+            groups.entry(email).or_default().push(index);
+        }
+    }
+    let mut replacements = BTreeMap::new();
+    let mut merged_accounts = BTreeMap::new();
+    for indices in groups.values_mut().filter(|indices| indices.len() > 1) {
+        // Keep the original local ID, so existing bindings and ordering stay stable.
+        // Equal timestamps use list order: newly added records are inserted first.
+        indices.sort_by_key(|&index| {
+            (
+                database.accounts[index].created_at,
+                std::cmp::Reverse(index),
+            )
+        });
+        let canonical = &database.accounts[indices[0]];
+        let mut merged = canonical.clone();
+        for &index in indices.iter().skip(1) {
+            merged = merge_oauth_account(&merged, database.accounts[index].clone());
+        }
+        // Token refreshes can make an older record's credentials the newest ones.
+        let freshest = indices
+            .iter()
+            .map(|&index| &database.accounts[index])
+            .max_by_key(|account| account.token_updated_at.unwrap_or(account.created_at))
+            .expect("duplicate group is nonempty");
+        merged.tokens = freshest.tokens.clone();
+        if normalize_optional(merged.tokens.refresh_token.as_deref()).is_none() {
+            merged.tokens.refresh_token = indices.iter().rev().find_map(|&index| {
+                normalize_optional(database.accounts[index].tokens.refresh_token.as_deref())
+            });
+        }
+        merged.access_token_expires_at = freshest.access_token_expires_at.clone();
+        merged.token_updated_at = freshest.token_updated_at;
+        for &index in indices.iter() {
+            replacements.insert(database.accounts[index].id.clone(), canonical.id.clone());
+        }
+        merged_accounts.insert(canonical.id.clone(), merged);
+    }
+    if replacements.is_empty() {
+        return false;
+    }
+    let mut accounts = Vec::new();
+    for account in std::mem::take(&mut database.accounts) {
+        if let Some(canonical_id) = replacements.get(&account.id) {
+            if let Some(merged) = merged_accounts.remove(canonical_id) {
+                accounts.push(merged);
+            }
+        } else {
+            accounts.push(account);
+        }
+    }
+    database.accounts = accounts;
+    remap_account_references(database, &replacements);
+    true
+}
+
+fn remap_account_references(
+    database: &mut AccountDatabase,
+    replacements: &BTreeMap<String, String>,
+) {
+    let remap = |id: &mut Option<String>| {
+        if let Some(replacement) = id.as_ref().and_then(|id| replacements.get(id)) {
+            *id = Some(replacement.clone());
+        }
+    };
+    remap(&mut database.current_account_id);
+    if let Some(backup) = &mut database.managed_model_config_backup {
+        remap(&mut backup.managed_account_id);
+    }
+    for state in database.instance_states.values_mut() {
+        remap(&mut state.current_account_id);
+        if let Some(backup) = &mut state.managed_model_config_backup {
+            remap(&mut backup.managed_account_id);
+        }
+    }
+    for account in &mut database.accounts {
+        remap(&mut account.bound_oauth_account_id);
+    }
+    for id in database.account_id_aliases.values_mut() {
+        if let Some(replacement) = replacements.get(id) {
+            *id = replacement.clone();
+        }
+    }
+    for (old_id, new_id) in replacements {
+        if old_id != new_id {
+            database
+                .account_id_aliases
+                .insert(old_id.clone(), new_id.clone());
+        }
+    }
+    database.account_id_aliases.retain(|old_id, new_id| {
+        old_id != new_id
+            && !database
+                .accounts
+                .iter()
+                .any(|account| &account.id == old_id)
+            && database
+                .accounts
+                .iter()
+                .any(|account| &account.id == new_id)
+    });
 }
 
 fn apply_refreshed_oauth_tokens(
@@ -3236,6 +3506,11 @@ impl AccountStore {
             self.write_database(&database)?;
             return Ok(None);
         };
+        let account_id = database
+            .account_id_aliases
+            .get(&account_id)
+            .cloned()
+            .unwrap_or(account_id);
         let account = database
             .accounts
             .iter_mut()

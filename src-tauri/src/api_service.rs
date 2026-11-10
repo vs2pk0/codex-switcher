@@ -919,6 +919,9 @@ pub fn api_service_delete_account_binding(
     ensure_auth_dir_config(&dirs)?;
     let store = AccountStore::default();
     let local_accounts = store.list_accounts()?;
+    let resolved_id = store.resolve_account_id(account_id)?;
+    let account_id = resolved_id.as_str();
+    let aliases = store.account_id_aliases()?;
     let source = local_accounts
         .iter()
         .find(|account| account.id == account_id)
@@ -946,6 +949,7 @@ pub fn api_service_delete_account_binding(
             &source.email,
             source_chatgpt_account_id.as_deref(),
             duplicate_email_count,
+            &aliases,
         ) {
             matched_paths.push(PathBuf::from(&account.path));
         } else if duplicate_email_count > 1
@@ -2250,9 +2254,14 @@ pub(crate) fn list_all_bound_accounts(
     dirs: &ApiServiceDirs,
 ) -> Result<Vec<ApiServiceBoundAccount>, String> {
     let auth_dir = api_auth_dir(dirs);
-    let local_accounts = AccountStore::default().list_accounts()?;
+    let store = AccountStore::default();
+    let local_accounts = store.list_accounts()?;
+    let aliases = store.account_id_aliases()?;
     let mut bound = list_bound_auth_accounts(&auth_dir)?;
     for item in &mut bound {
+        if let Some(canonical_id) = item.account_id.as_ref().and_then(|id| aliases.get(id)) {
+            item.account_id = Some(canonical_id.clone());
+        }
         if item.account_id.is_none() {
             item.account_id = item.email.as_deref().and_then(|email| {
                 local_accounts
@@ -2432,8 +2441,10 @@ fn api_auth_matches_source_account(
     source_email: &str,
     source_chatgpt_account_id: Option<&str>,
     duplicate_email_count: usize,
+    aliases: &std::collections::BTreeMap<String, String>,
 ) -> bool {
     let switcher_account_id = cpa_switcher_account_id_from_value(value);
+    let switcher_account_id = switcher_account_id.map(|id| aliases.get(&id).cloned().unwrap_or(id));
     let chatgpt_account_id = cpa_chatgpt_account_id_from_value(value);
     if switcher_account_id.as_deref() == Some(source_id) {
         return true;
@@ -4197,6 +4208,7 @@ mod tests {
             "shared@example.com",
             Some("source-chatgpt"),
             2,
+            &Default::default(),
         ));
 
         let legacy = serde_json::json!({
@@ -4209,6 +4221,7 @@ mod tests {
             "shared@example.com",
             Some("source-chatgpt"),
             2,
+            &Default::default(),
         ));
 
         let other_identity = serde_json::json!({
@@ -4221,6 +4234,7 @@ mod tests {
             "shared@example.com",
             Some("source-chatgpt"),
             2,
+            &Default::default(),
         ));
 
         let identity_free = serde_json::json!({ "email": "shared@example.com" });
@@ -4230,6 +4244,7 @@ mod tests {
             "shared@example.com",
             None,
             2,
+            &Default::default(),
         ));
         assert!(api_auth_matches_source_account(
             &identity_free,
@@ -4237,6 +4252,32 @@ mod tests {
             "shared@example.com",
             None,
             1,
+            &Default::default(),
+        ));
+    }
+
+    #[test]
+    fn hidden_account_cleanup_recognizes_a_merged_local_id() {
+        let value = serde_json::json!({
+            "email": "owner@example.com", "codex_switcher_account_id": "copy"
+        });
+        let aliases =
+            std::collections::BTreeMap::from([("copy".to_string(), "original".to_string())]);
+        assert!(api_auth_matches_source_account(
+            &value,
+            "original",
+            "owner@example.com",
+            None,
+            1,
+            &aliases
+        ));
+        assert!(!api_auth_matches_source_account(
+            &value,
+            "other",
+            "owner@example.com",
+            None,
+            1,
+            &aliases
         ));
     }
 
