@@ -4028,7 +4028,8 @@ pub async fn api_service_sync_codex_instance(
             crate::instances::run_with_instance_opened_on_success(&instance_id, |instance| {
                 let codex_home = PathBuf::from(&instance.codex_home);
                 if switch_settings.reset_config_on_account_switch {
-                    crate::reset_codex_config_for_switch(&instance.id, switch_settings.repair_sessions_on_account_switch)?;
+                    // The final destination configuration is repaired below.
+                    crate::reset_codex_config_for_switch(&instance.id, false)?;
                 }
                 let account_store = AccountStore::new_for_instance(
                     crate::switcher_account_dir(),
@@ -4042,10 +4043,10 @@ pub async fn api_service_sync_codex_instance(
                     oauth_account_id.as_deref(),
                 )?;
                 let session_store = crate::session::SessionStore::new(codex_home);
-                let switched = crate::switch_account_with_session_options(
-                    &account_store,
+                let account = account_store.switch_account(&account_id)?;
+                let switched = crate::account_switch_result_before_full_repair(
                     &session_store,
-                    &account_id,
+                    account,
                     switch_settings.repair_sessions_on_account_switch,
                 )?;
                 let mut report = |step: u8| emit(step + 1);

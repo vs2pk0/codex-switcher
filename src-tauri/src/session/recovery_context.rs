@@ -1,7 +1,8 @@
 use super::{fork_source_segments, json_value_with_type};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
 pub(super) const LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES: usize = 1024 * 1024;
@@ -32,9 +33,7 @@ impl LocalRecoveryContext {
                 let history = value
                     .pointer("/payload/replacement_history")
                     .and_then(Value::as_array);
-                self.active_response_bytes = history
-                    .and_then(|items| serde_json::to_vec(items).ok())
-                    .map_or(0, |bytes| bytes.len());
+                self.active_response_bytes = history.map_or(0, serialized_json_len);
                 self.messages.clear();
                 for item in history.into_iter().flatten() {
                     self.observe_message(item);
@@ -51,7 +50,7 @@ impl LocalRecoveryContext {
                 if let Some(payload) = value.get("payload") {
                     self.active_response_bytes = self
                         .active_response_bytes
-                        .saturating_add(serde_json::to_vec(payload).map_or(0, |bytes| bytes.len()));
+                        .saturating_add(serialized_json_len(payload));
                     self.observe_message(payload);
                     self.already_recovered = false;
                 }
@@ -60,7 +59,7 @@ impl LocalRecoveryContext {
         }
     }
 
-    fn observe_message(&mut self, payload: &Value) {
+    pub(super) fn observe_message(&mut self, payload: &Value) {
         if payload.get("type").and_then(Value::as_str) != Some("message") {
             return;
         }
@@ -71,18 +70,55 @@ impl LocalRecoveryContext {
         let Some(content) = payload.get("content").and_then(Value::as_array) else {
             return;
         };
-        let text = content
+        // Only collect the excerpt we retain. A single message can contain
+        // hundreds of megabytes of pasted text or quoted tool output.
+        let mut text = String::new();
+        let mut count = 0;
+        let mut started = false;
+        let mut pending_whitespace = String::new();
+        let mut pending_count = 0;
+        let mut has_part = false;
+        let mut truncated = false;
+        'parts: for part in content
             .iter()
             .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        if text.trim().is_empty() || matches!(text.trim(), "/compact" | "/compact status") {
+        {
+            let separator = if has_part { "\n\n" } else { "" };
+            has_part = true;
+            for ch in separator.chars().chain(part.chars()) {
+                if !started && ch.is_whitespace() {
+                    continue;
+                }
+                if ch.is_whitespace() {
+                    // Keep at most the visible prefix of trailing whitespace.
+                    if count + pending_count < MAX_MESSAGE_CHARS {
+                        pending_whitespace.push(ch);
+                        pending_count += 1;
+                    }
+                    continue;
+                }
+                started = true;
+                for whitespace in pending_whitespace.chars() {
+                    text.push(whitespace);
+                    count += 1;
+                }
+                pending_whitespace.clear();
+                pending_count = 0;
+                if count == MAX_MESSAGE_CHARS {
+                    truncated = true;
+                    break 'parts;
+                }
+                text.push(ch);
+                count += 1;
+            }
+        }
+        if text.is_empty() || matches!(text.as_str(), "/compact" | "/compact status") {
             return;
         }
-        self.messages.push_back(format!(
-            "[{role}]\n{}",
-            truncate_chars(text.trim(), MAX_MESSAGE_CHARS)
-        ));
+        if truncated {
+            text.push_str("\n[excerpt truncated]");
+        }
+        self.messages.push_back(format!("[{role}]\n{}", text));
         while self.messages.len() > MAX_MESSAGES {
             self.messages.pop_front();
         }
@@ -94,7 +130,7 @@ impl LocalRecoveryContext {
             .flatten()
     }
 
-    fn build_forced_compaction(&self) -> Option<Value> {
+    pub(super) fn build_forced_compaction(&self) -> Option<Value> {
         if self.already_recovered {
             return None;
         }
@@ -146,6 +182,28 @@ impl LocalRecoveryContext {
                 }],
             }),
         ))
+    }
+}
+
+/// Measure serialized JSON without allocating a second copy of its strings.
+pub(super) fn serialized_json_len<T: Serialize + ?Sized>(value: &T) -> usize {
+    #[derive(Default)]
+    struct ByteCounter(usize);
+    impl Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = ByteCounter::default();
+    if serde_json::to_writer(&mut counter, value).is_ok() {
+        counter.0
+    } else {
+        0
     }
 }
 
@@ -254,6 +312,52 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
             + "\n"
+    }
+
+    #[test]
+    fn byte_count_matches_json_encoding_without_an_output_buffer() {
+        let value = json!({"messages":["汉字\"\\\n".repeat(100000)],"number":123,"null":null});
+        assert_eq!(
+            serialized_json_len(&value),
+            serde_json::to_vec(&value).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn bounded_message_excerpts_preserve_joining_trimming_and_unicode() {
+        for parts in [
+            vec![
+                "  ".to_string(),
+                "\t用户问题\n".to_string(),
+                " 后续内容 ".to_string(),
+            ],
+            vec!["/compact".to_string()],
+            vec![
+                " ".repeat(100000),
+                "最后文本".to_string(),
+                "\n".repeat(100000),
+            ],
+            vec!["汉字".repeat(2000), "仍然很长".repeat(5000)],
+            vec!["开头".to_string(), " \t".repeat(5000), "结尾".to_string()],
+            vec!["x".repeat(MAX_MESSAGE_CHARS), " ".repeat(10000)],
+        ] {
+            let payload = json!({"type":"message","role":"user","content":parts.iter()
+                .map(|text| json!({"type":"input_text","text":text})).collect::<Vec<_>>()});
+            let mut context = LocalRecoveryContext::default();
+            context.observe_message(&payload);
+            let joined = parts.join("\n\n");
+            if joined.trim().is_empty() || matches!(joined.trim(), "/compact" | "/compact status") {
+                assert!(context.messages.is_empty());
+            } else {
+                assert_eq!(
+                    context.messages.front().unwrap(),
+                    &format!(
+                        "[user]\n{}",
+                        truncate_chars(joined.trim(), MAX_MESSAGE_CHARS)
+                    )
+                );
+            }
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@ import { jsPDF } from "jspdf";
 import { createPdfAssembler, pdfCaptureSlices, type PdfAssembler } from "../sessionPdfWorker";
 import { marked, Renderer } from "marked";
 import { t } from "../i18n";
+import { SESSION_MESSAGE_PREVIEW_CHARS, sessionMessagePreview, sessionPreviewPageSize } from "../sessionPreview";
 import ExportDownloadModal from "./ExportDownloadModal.vue";
 import type { ExportDownloadResult } from "../services/codex";
 import {
@@ -57,6 +58,8 @@ const exportProgress = ref("");
 const searchQuery = ref("");
 const sortDirection = ref<"asc" | "desc">("desc");
 const renderMarkdownEnabled = ref(true);
+const messagePreviewLimits = ref<Record<string, number>>({});
+const pageSize = computed(() => sessionPreviewPageSize(props.session?.sizeBytes));
 const assetUrls = ref<Record<string, string>>({});
 const assetLoadingIds = ref<Set<string>>(new Set());
 const lastBackupId = ref("");
@@ -123,6 +126,7 @@ function resetState(): void {
   searchQuery.value = "";
   sortDirection.value = "desc";
   renderMarkdownEnabled.value = true;
+  messagePreviewLimits.value = {};
   assetUrls.value = {};
   assetLoadingIds.value = new Set();
   lastBackupId.value = "";
@@ -257,6 +261,17 @@ function renderMessageMarkdown(message: CodexSessionMessage): string {
   return html;
 }
 
+function previewText(message: CodexSessionMessage): string {
+  return sessionMessagePreview(message.text, messagePreviewLimits.value[message.id]);
+}
+
+function showMoreMessage(message: CodexSessionMessage): void {
+  messagePreviewLimits.value = {
+    ...messagePreviewLimits.value,
+    [message.id]: (messagePreviewLimits.value[message.id] ?? SESSION_MESSAGE_PREVIEW_CHARS) + SESSION_MESSAGE_PREVIEW_CHARS,
+  };
+}
+
 function handleMarkdownClick(event: MouseEvent): void {
   const element = event.target instanceof Element ? event.target.closest("a") : null;
   const href = element?.getAttribute("href")?.trim() || "";
@@ -290,7 +305,7 @@ async function loadFirstPage(): Promise<void> {
     const page = await listSessionContent(
       session.id,
       null,
-      20,
+      pageSize.value,
       sortDirection.value,
       props.instanceId,
     );
@@ -314,7 +329,7 @@ async function loadMore(): Promise<void> {
     const page = await listSessionContent(
       session.id,
       cursor,
-      20,
+      pageSize.value,
       sortDirection.value,
       props.instanceId,
     );
@@ -868,6 +883,9 @@ function formatTime(value?: string | number | null): string {
       <a-alert type="warning" class="session-content-safety-note">
         {{ t("支持删除单条消息或完整对话轮次；会话仍在生成时将禁止删除。所有删除都会先自动备份。") }}
       </a-alert>
+      <a-alert v-if="pageSize < 20" type="info" class="session-content-safety-note">
+        {{ t("大文件按需加载对话，图片点击后加载。") }}
+      </a-alert>
 
       <a-spin :loading="loading" dot class="session-content-spin">
         <main class="session-content-list">
@@ -937,12 +955,18 @@ function formatTime(value?: string | number | null): string {
                   <icon-right />
                 </button>
                 <div
-                  v-else-if="entry.message.text && renderMarkdownEnabled"
+                  v-else-if="entry.message.text && renderMarkdownEnabled && entry.message.text.length <= SESSION_MESSAGE_PREVIEW_CHARS"
                   class="session-message-markdown"
                   v-html="renderMessageMarkdown(entry.message)"
                   @click="handleMarkdownClick"
                 ></div>
-                <pre v-else-if="entry.message.text" class="session-message-text">{{ entry.message.text }}</pre>
+                <pre v-else-if="entry.message.text" class="session-message-text">{{ previewText(entry.message) }}</pre>
+                <div v-if="!entry.skill && entry.message.text.length > SESSION_MESSAGE_PREVIEW_CHARS">
+                  <small>{{ t("长消息以纯文本分段显示，导出包含完整内容。") }}</small>
+                  <a-button v-if="previewText(entry.message).length < entry.message.text.length" size="small" type="text" @click="showMoreMessage(entry.message)">
+                    {{ t("继续展开消息") }}
+                  </a-button>
+                </div>
                 <div v-if="entry.message.attachments.length" class="session-attachment-grid">
                   <article
                     v-for="attachment in entry.message.attachments"
@@ -1043,12 +1067,18 @@ function formatTime(value?: string | number | null): string {
         </div>
       </header>
       <div
-        v-if="renderMarkdownEnabled"
+        v-if="renderMarkdownEnabled && skillDetail.payload.text.length <= SESSION_MESSAGE_PREVIEW_CHARS"
         class="session-message-markdown"
         v-html="renderMessageMarkdown(skillDetail.payload)"
         @click="handleMarkdownClick"
       ></div>
-      <pre v-else class="session-message-text">{{ skillDetail.payload.text }}</pre>
+      <pre v-else class="session-message-text">{{ previewText(skillDetail.payload) }}</pre>
+      <div v-if="skillDetail.payload.text.length > SESSION_MESSAGE_PREVIEW_CHARS">
+        <small>{{ t("长消息以纯文本分段显示，导出包含完整内容。") }}</small>
+        <a-button v-if="previewText(skillDetail.payload).length < skillDetail.payload.text.length" size="small" type="text" @click="showMoreMessage(skillDetail.payload)">
+          {{ t("继续展开消息") }}
+        </a-button>
+      </div>
     </div>
   </a-modal>
 </template>

@@ -307,7 +307,13 @@ const configEditorFormatting = ref(false);
 const sessionModelRepairing = ref(false);
 const sessionOneClickRepairing = ref(false);
 /** 全局忙碌遮罩状态：非空时覆盖整个窗口并拦截所有交互（一键修复等长耗时流程）。 */
-const appBusy = ref<{ title: string; message?: string; steps?: string[]; activeStep?: number } | null>(null);
+const appBusy = ref<{
+  title: string;
+  message?: string;
+  steps?: string[];
+  activeStep?: number;
+  operation?: "account-switch" | "api-key-sync" | "one-click-repair" | "model-repair";
+} | null>(null);
 let oneClickRepairProgressUnlisten: UnlistenFn | null = null;
 let apiKeyAccountSyncProgressUnlisten: UnlistenFn | null = null;
 const appPaths = ref<CodexSwitcherPaths | null>(null);
@@ -484,6 +490,13 @@ const expandedSessionGroups = ref<Set<string>>(new Set());
 const sessionLoading = ref(false);
 const sessionRepairing = ref(false);
 const repairingSessionId = ref("");
+// Recheck at execution time as well as before opening a confirmation: another
+// operation may have started while the dialog or instance picker was open.
+const accountOrSessionOperationBusy = computed(() => Boolean(
+  switchingId.value || sessionRepairing.value || repairingSessionId.value ||
+  sessionModelRepairing.value || sessionOneClickRepairing.value ||
+  backupWorking.value || appBusy.value,
+));
 const sessionHistoryRepairVisible = ref(false);
 const sessionHistoryRepairTarget = ref<CodexSessionRecord | null>(null);
 const repairVisible = ref(false);
@@ -2706,7 +2719,9 @@ async function handleRefreshEveryQuota(): Promise<void> {
 }
 
 async function handleSwitch(account: CodexAccount): Promise<void> {
+  if (accountOrSessionOperationBusy.value) return;
   if (!codexInstances.value.length) await loadCodexInstances();
+  if (accountOrSessionOperationBusy.value) return;
   pendingSwitchAccount.value = account;
   if (codexInstances.value.length <= 1) {
     await performAccountSwitch(codexInstances.value[0]?.id || "default");
@@ -2717,9 +2732,8 @@ async function handleSwitch(account: CodexAccount): Promise<void> {
 
 async function performAccountSwitch(instanceId: string): Promise<void> {
   const account = pendingSwitchAccount.value;
-  if (!account) return;
+  if (!account || accountOrSessionOperationBusy.value) return;
   accountInstancePickerVisible.value = false;
-  if (switchingId.value) return;
   switchingId.value = account.id;
   try {
     const targetInstance = codexInstances.value.find((instance) => instance.id === instanceId);
@@ -2727,6 +2741,10 @@ async function performAccountSwitch(instanceId: string): Promise<void> {
       await performApiKeyAccountSync(account, instanceId, targetInstance?.name || "Codex");
       return;
     }
+    appBusy.value = {
+      operation: "account-switch",
+      title: `${t("切换 Codex")}「${targetInstance?.name || "Codex"}」`,
+    };
     const result = await switchCodexAccount(account.id, instanceId);
     currentAccount.value = result.account;
     await Promise.all([loadAccounts(), loadCodexInstances()]);
@@ -2741,6 +2759,7 @@ async function performAccountSwitch(instanceId: string): Promise<void> {
   } catch (error) {
     Message.error(`切换失败：${errorText(error)}`);
   } finally {
+    appBusy.value = null;
     switchingId.value = "";
     pendingSwitchAccount.value = null;
   }
@@ -2762,6 +2781,7 @@ async function performApiKeyAccountSync(
   instanceName: string,
 ): Promise<void> {
   appBusy.value = {
+    operation: "api-key-sync",
     title: `${t(settings.repairSessionsOnAccountSwitch ? "正在同步配置并一键修复" : "正在同步配置")} 「${instanceName}」`,
     message: settings.repairSessionsOnAccountSwitch
       ? t("同步配置后会先对该实例执行一键修复（切号修复 + 恢复全部完整会话），修复完成后再重新打开 Codex。请勿关闭应用。")
@@ -2830,7 +2850,7 @@ async function handleSettingsInstanceChange(instanceId: string): Promise<void> {
 
 async function handleSessionInstanceChange(instanceId: string): Promise<void> {
   if (instanceId === sessionInstanceId.value) return;
-  if (backupWorking.value || sessionRepairing.value || sessionModelRepairing.value || sessionOneClickRepairing.value || repairingSessionId.value) {
+  if (accountOrSessionOperationBusy.value) {
     Message.warning(t("当前会话操作完成后再切换实例"));
     return;
   }
@@ -4203,6 +4223,7 @@ async function handleSessionDirectorySave(projectPath: string): Promise<void> {
 }
 
 async function handleRepairSessions(): Promise<void> {
+  if (accountOrSessionOperationBusy.value) return;
   repairResult.value = null;
   repairMode.value = "quick";
   repairSessionScope.value = selectedSessionIdList.value.length ? "selected" : "all";
@@ -4229,6 +4250,7 @@ async function handleRepairSessions(): Promise<void> {
 }
 
 async function runRepairSessions(): Promise<void> {
+  if (accountOrSessionOperationBusy.value) return;
   sessionRepairing.value = true;
   try {
     const target = repairTargetInstance.value;
@@ -4263,14 +4285,14 @@ async function runRepairSessions(): Promise<void> {
 }
 
 function confirmRepairSingleSessionHistory(session: CodexSessionRecord): void {
-  if (repairingSessionId.value || sessionRepairing.value || sessionModelRepairing.value || sessionOneClickRepairing.value) return;
+  if (accountOrSessionOperationBusy.value) return;
   sessionHistoryRepairTarget.value = session;
   sessionHistoryRepairVisible.value = true;
 }
 
 async function handleRepairSingleSessionHistory(recoverContext: boolean): Promise<void> {
   const session = sessionHistoryRepairTarget.value;
-  if (!session || repairingSessionId.value || sessionRepairing.value || sessionModelRepairing.value || sessionOneClickRepairing.value) return;
+  if (!session || accountOrSessionOperationBusy.value) return;
   repairingSessionId.value = session.id;
   try {
     const instanceList = await listSessionVisibilityRepairInstances();
@@ -4384,7 +4406,8 @@ function confirmResetConfig(): void {
 }
 
 function confirmRepairSessionModels(): void {
-  if (sessionModelRepairing.value || sessionOneClickRepairing.value) return;
+  if (accountOrSessionOperationBusy.value) return;
+  const instanceId = sessionInstanceId.value;
   Modal.warning({
     title: t("一键修复切号会话"),
     content: t(
@@ -4394,9 +4417,11 @@ function confirmRepairSessionModels(): void {
     cancelText: t("取消"),
     hideCancel: false,
     onOk: async () => {
+      if (accountOrSessionOperationBusy.value) return;
       sessionModelRepairing.value = true;
+      appBusy.value = { operation: "model-repair", title: t("正在一键修复") };
       try {
-        const summary = await repairCodexSessionModelCompatibility(sessionInstanceId.value);
+        const summary = await repairCodexSessionModelCompatibility(instanceId);
         if (summary.warnings?.length) {
           Message.warning(summary.warnings.join("；"));
         } else if (
@@ -4416,6 +4441,7 @@ function confirmRepairSessionModels(): void {
       } catch (error) {
         Message.error(`${t("一键修复切号会话失败")}：${errorText(error)}`);
       } finally {
+        appBusy.value = null;
         sessionModelRepairing.value = false;
       }
     },
@@ -4424,14 +4450,7 @@ function confirmRepairSessionModels(): void {
 
 /** 一键修复：切号会话修复 + 当前实例所有会话「恢复完整会话」，全部完成后再询问是否重启 Codex。 */
 function confirmOneClickRepairSessions(): void {
-  if (
-    sessionOneClickRepairing.value ||
-    sessionModelRepairing.value ||
-    sessionRepairing.value ||
-    repairingSessionId.value
-  ) {
-    return;
-  }
+  if (accountOrSessionOperationBusy.value) return;
   const instanceId = sessionInstanceId.value || "default";
   const instanceName =
     codexInstances.value.find((instance) => instance.id === instanceId)?.name || t("默认实例");
@@ -4455,8 +4474,10 @@ function oneClickRepairSteps(): string[] {
 }
 
 async function runOneClickRepairSessions(instanceId: string, instanceName: string): Promise<void> {
+  if (accountOrSessionOperationBusy.value) return;
   sessionOneClickRepairing.value = true;
   appBusy.value = {
+    operation: "one-click-repair",
     title: `${t("正在一键修复")}「${instanceName}」`,
     message: t("会话较多时耗时较长，请勿关闭应用；完成后会询问是否重启 Codex。"),
     steps: oneClickRepairSteps(),
@@ -5040,14 +5061,14 @@ onMounted(() => {
     accountStateUnlisten = unlisten;
   });
   void listen<{ step: number }>("codex-one-click-repair-progress", (event) => {
-    if (appBusy.value?.steps) {
+    if (appBusy.value?.operation === "one-click-repair" && appBusy.value.steps) {
       appBusy.value = { ...appBusy.value, activeStep: event.payload.step };
     }
   }).then((unlisten) => {
     oneClickRepairProgressUnlisten = unlisten;
   });
   void listen<{ step: number }>(API_KEY_ACCOUNT_SYNC_PROGRESS_EVENT, (event) => {
-    if (appBusy.value?.steps) {
+    if (appBusy.value?.operation === "api-key-sync" && appBusy.value.steps) {
       appBusy.value = { ...appBusy.value, activeStep: settings.repairSessionsOnAccountSwitch ? event.payload.step : (event.payload.step >= 3 ? 1 : 0) };
     }
   }).then((unlisten) => {

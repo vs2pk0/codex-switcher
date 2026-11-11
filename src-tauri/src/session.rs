@@ -6,6 +6,7 @@ mod item_ids;
 mod portable_history;
 mod portable_lineage;
 mod recovery_context;
+mod streaming_repair;
 use compaction_metadata::{repair_compaction_metadata, retain_compacted_history};
 use recovery_context::{recover_rollout_context, LocalRecoveryContext};
 #[cfg(test)]
@@ -880,7 +881,7 @@ impl SessionStore {
                     .and_then(|id| protected_prefix_bytes(&protected, &path, &id))
                     .unwrap_or(0)
             };
-            let Some((tmp_path, rewrite_stats)) =
+            let Some((model_rewrite, rewrite_stats)) =
                 prepare_rollout_model_compatibility_rewrite_guarded(
                     &path,
                     target_provider,
@@ -890,38 +891,17 @@ impl SessionStore {
             else {
                 continue;
             };
-            let normalized = fs::read_to_string(&tmp_path)
-                .map_err(|error| format!("读取会话模型修复临时文件失败：{error}"))
-                .and_then(|content| {
-                    normalize_paginated_rollout_ordinals_guarded(&content, protected_prefix)
-                });
-            match normalized {
-                Ok(Some(content)) => {
-                    if let Err(error) = fs::write(&tmp_path, content) {
-                        let _ = fs::remove_file(&tmp_path);
-                        return Err(format!("写入会话分页序号修复失败：{error}"));
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Err(error);
-                }
+            if let (Some(normalized), _) = streaming_repair::prepare_visibility(
+                &model_rewrite.path,
+                None,
+                protected_prefix,
+                false,
+                true,
+            )? {
+                normalized.commit(&model_rewrite.path)?;
             }
-            let backup_path = match self.backup_session_file(&path, "model-compatibility") {
-                Ok(path) => path,
-                Err(error) => {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Err(error);
-                }
-            };
-            if let Err(error) = replace_file_atomic(&path, &tmp_path) {
-                return Err(format!(
-                    "写入会话模型修复结果失败 ({}): {}",
-                    path.display(),
-                    error
-                ));
-            }
+            let backup_path = self.backup_session_file(&path, "model-compatibility")?;
+            model_rewrite.commit(&path)?;
             let _ = system_command::new("touch")
                 .arg("-r")
                 .arg(&backup_path)
@@ -960,19 +940,17 @@ impl SessionStore {
             let session = entry.record;
             let path = PathBuf::from(&session.path);
             let result = (|| -> Result<Option<bool>, String> {
-                let content =
-                    fs::read_to_string(&path).map_err(|e| format!("读取会话失败：{e}"))?;
-                let Some((next, reduced)) = portable_history::migrate_protocol_context(
+                let Some((compacted, reduced)) = portable_history::build_protocol_compaction(
                     &self.codex_home,
                     &path,
-                    &content,
                     target_provider,
                 )?
                 else {
                     return Ok(None);
                 };
+                let staged = streaming_repair::prepare_compaction(&path, compacted)?;
                 let backup = self.backup_session_file(&path, "protocol-migration")?;
-                write_bytes_atomic(&path, next.as_bytes())?;
+                staged.commit(&path)?;
                 let _ = system_command::new("touch")
                     .arg("-r")
                     .arg(&backup)
@@ -1232,10 +1210,18 @@ impl SessionStore {
         &self,
         paths: Vec<PathBuf>,
     ) -> Result<Vec<SessionLineageEntry>, String> {
+        self.session_lineage_entries_from_paths_with_titles(paths, true)
+    }
+
+    fn session_lineage_entries_from_paths_with_titles(
+        &self,
+        paths: Vec<PathBuf>,
+        include_titles: bool,
+    ) -> Result<Vec<SessionLineageEntry>, String> {
         let mut groups =
             HashMap::<String, Vec<(CodexSessionRecord, Option<RolloutHistoryBase>)>>::new();
         for path in paths {
-            let summary = build_session_record_summary(&path)?;
+            let summary = build_session_record_summary(&path, include_titles)?;
             let base = read_rollout_history_base(&path);
             groups
                 .entry(summary.id.clone())
@@ -1321,7 +1307,12 @@ impl SessionStore {
         let (cursor, turns, next_cursor) = match direction {
             "asc" => {
                 let cursor = cursor.unwrap_or(0);
-                let (turns, next_cursor) = read_session_turn_page(&path, cursor, limit)?;
+                let (turns, next_cursor) = read_session_turn_page_with_mode(
+                    &path,
+                    cursor,
+                    limit,
+                    SessionReadMode::Preview,
+                )?;
                 (cursor, turns, next_cursor)
             }
             "desc" => {
@@ -3335,6 +3326,18 @@ impl SessionStore {
                     Ok(line) => line,
                     Err(_) => continue,
                 };
+                let Ok(header) = serde_json::from_str::<SessionRecordKind>(&line) else {
+                    continue;
+                };
+                if !header.payload.is_some_and(|payload| {
+                    matches!(
+                        (header.kind.as_str(), payload.kind.as_str()),
+                        ("event_msg", "image_generation_end")
+                            | ("response_item", "image_generation_call")
+                    )
+                }) {
+                    continue;
+                }
                 let value: Value = match serde_json::from_str(&line) {
                     Ok(value) => value,
                     Err(_) => continue,
@@ -3405,24 +3408,24 @@ impl SessionStore {
                 result.images.invalid += 1;
                 continue;
             }
-            let content = match fs::read_to_string(&session.path) {
-                Ok(content) => content,
-                Err(_) => continue,
-            };
-            let (rewritten, image_result) =
-                rewrite_local_image_attachments(&content, &self.codex_home, &session.id)?;
+            if !session.path.is_file() {
+                continue;
+            }
+            let (rewritten, image_result, protected_change) =
+                streaming_repair::prepare_local_images(
+                    &session.path,
+                    &self.codex_home,
+                    &session.id,
+                    protected_prefix_bytes(protected, &session.path, &session.id).unwrap_or(0),
+                )?;
             result.images.add(image_result);
+            if protected_change {
+                result.skipped_protected_ancestors.push(session.id.clone());
+                continue;
+            }
             let Some(rewritten) = rewritten else {
                 continue;
             };
-            if let Some(protected_bytes) =
-                protected_prefix_bytes(protected, &session.path, &session.id)
-            {
-                if !rollout_prefix_preserved(&content, &rewritten, protected_bytes) {
-                    result.skipped_protected_ancestors.push(session.id.clone());
-                    continue;
-                }
-            }
             if !backup_created {
                 fs::create_dir_all(&backup_dir)
                     .map_err(|error| format!("创建图片恢复备份目录失败: {error}"))?;
@@ -3438,7 +3441,7 @@ impl SessionStore {
             fs::copy(&session.path, &backup_path).map_err(|error| {
                 format!("备份图片会话文件失败 ({}): {error}", session.path.display())
             })?;
-            write_bytes_atomic(&session.path, rewritten.as_bytes()).map_err(|error| {
+            rewritten.commit(&session.path).map_err(|error| {
                 format!(
                     "写入图片恢复会话文件失败 ({}): {error}",
                     session.path.display()
@@ -4187,9 +4190,22 @@ impl SessionStore {
         &self,
         session_ids: Option<&[String]>,
     ) -> Result<usize, String> {
+        self.hydrate_missing_history_projections_with(session_ids, run_codex_history_hydration)
+    }
+
+    pub(crate) fn hydrate_missing_history_projections_with(
+        &self,
+        session_ids: Option<&[String]>,
+        hydrate: impl FnOnce(&Path, &[String]) -> Result<(), String>,
+    ) -> Result<usize, String> {
         let selected = normalized_id_set(session_ids.map(|ids| ids.to_vec()));
         let protected = self.protected_rollout_prefixes();
-        let sessions = self.session_lineage_entries()?;
+        // Hydration needs identity and lineage, not a display title. A writable
+        // segment may have no user message and otherwise require a full scan.
+        let sessions = self.session_lineage_entries_from_paths_with_titles(
+            collect_jsonl_files(&self.sessions_dir())?,
+            false,
+        )?;
         let mut missing = HashSet::new();
         let mut expected = HashSet::new();
         for path in self.thread_history_db_paths() {
@@ -4205,18 +4221,26 @@ impl SessionStore {
                 {
                     continue;
                 }
+                // Only the current writable segment can be hydrated. Check its
+                // state before scanning rollout contents, so healthy large files
+                // do not incur another full read during every account switch.
+                let head = entry.lineage.head();
+                if head.retained.is_some() || protected.contains_key(&head.physical_id) {
+                    continue;
+                }
+                let exists: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM thread_history_projection_state WHERE thread_id=?1)",
+                    params![head.physical_id], |row| row.get(0),
+                ).map_err(|e| e.to_string())?;
+                if exists {
+                    continue;
+                }
                 for target in lineage_projection_targets(&entry.lineage)? {
-                    if target.retained || protected.contains_key(&target.physical_id) {
+                    if target.retained || target.physical_id != head.physical_id {
                         continue;
                     }
-                    let exists: bool = db.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM thread_history_projection_state WHERE thread_id=?1)",
-                        params![target.physical_id], |row| row.get(0),
-                    ).map_err(|e| e.to_string())?;
-                    if !exists {
-                        missing.insert(session.id.clone());
-                        expected.insert(target.physical_id);
-                    }
+                    missing.insert(session.id.clone());
+                    expected.insert(target.physical_id);
                 }
             }
         }
@@ -4225,7 +4249,7 @@ impl SessionStore {
         }
         let mut ids = missing.into_iter().collect::<Vec<_>>();
         ids.sort();
-        run_codex_history_hydration(&self.codex_home, &ids)?;
+        hydrate(&self.codex_home, &ids)?;
         for path in self.thread_history_db_paths() {
             let db = Connection::open(path).map_err(|e| e.to_string())?;
             for id in expected.clone() {
@@ -4553,6 +4577,52 @@ impl SessionStore {
             None
         };
         for session in sessions {
+            if !recover_context {
+                let staged = streaming_repair::prepare_visibility(
+                    &session.path,
+                    Some((target_provider, rewrite_all_meta)),
+                    protected_prefix_bytes(protected, &session.path, &session.id).unwrap_or(0),
+                    true,
+                    false,
+                );
+                let staged = match staged {
+                    Ok((_, true)) => {
+                        outcome.skipped_protected_ancestors.push(session.id.clone());
+                        continue;
+                    }
+                    Ok((Some(staged), false)) => staged,
+                    Ok((None, false)) => continue,
+                    Err(error) => {
+                        outcome
+                            .warnings
+                            .push(format!("完整历史修复跳过会话 {}：{error}", session.id));
+                        continue;
+                    }
+                };
+                let result = (|| -> Result<(), String> {
+                    fs::create_dir_all(&backup_dir).map_err(|e| e.to_string())?;
+                    backup_created = true;
+                    let backup = backup_dir.join(session.path.file_name().unwrap_or_default());
+                    fs::copy(&session.path, &backup).map_err(|e| format!("备份会话失败：{e}"))?;
+                    staged.commit(&session.path)?;
+                    let _ = system_command::new("touch")
+                        .arg("-r")
+                        .arg(&backup)
+                        .arg(&session.path)
+                        .output();
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => {
+                        changed += 1;
+                        outcome.changed_session_ids.insert(session.id.clone());
+                    }
+                    Err(error) => outcome
+                        .warnings
+                        .push(format!("完整历史修复跳过会话 {}：{error}", session.id)),
+                }
+                continue;
+            }
             let content = match fs::read_to_string(&session.path) {
                 Ok(content) => content,
                 Err(error) => {
@@ -5296,11 +5366,19 @@ fn sqlite_metadata_for_session(session: &SessionRepairRecord) -> SessionSqliteMe
         approval_mode: "on-request".to_string(),
         history_mode: rollout_history_mode(&session.path).to_string(),
     };
-    let Ok(content) = fs::read_to_string(&session.path) else {
+    let Ok(file) = fs::File::open(&session.path) else {
         return metadata;
     };
-    for line in content.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        if serde_json::from_str::<SessionRecordKind>(&line)
+            .is_ok_and(|header| !matches!(header.kind.as_str(), "session_meta" | "turn_context"))
+        {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         let item_type = value.get("type").and_then(Value::as_str);
@@ -5665,173 +5743,66 @@ fn prepare_rollout_model_compatibility_rewrite_guarded(
     target_provider: &str,
     forced_model: Option<&str>,
     protected_prefix_bytes: u64,
-) -> Result<Option<(PathBuf, RolloutModelCompatibilityRewriteStats)>, String> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("session.jsonl");
-    let tmp_path = parent.join(format!(
-        ".{file_name}.model-compatibility-{:016x}.tmp",
-        rand::random::<u64>()
-    ));
-    let input = fs::File::open(path)
-        .map_err(|error| format!("读取会话模型状态失败 ({}): {}", path.display(), error))?;
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let output = options.open(&tmp_path).map_err(|error| {
-        format!(
-            "创建会话模型修复临时文件失败 ({}): {}",
-            path.display(),
-            error
-        )
-    })?;
-    let mut reader = BufReader::new(input);
-    let mut writer = BufWriter::new(output);
-    let mut line = Vec::new();
-    let mut rewrite_stats = RolloutModelCompatibilityRewriteStats::default();
-    let mut line_offset = 0u64;
-    let result = (|| -> Result<(), String> {
-        loop {
-            line.clear();
-            let read = reader
-                .read_until(b'\n', &mut line)
-                .map_err(|error| format!("读取会话模型状态失败 ({}): {}", path.display(), error))?;
-            if read == 0 {
-                break;
-            }
-            let starts_in_protected_prefix = line_offset < protected_prefix_bytes;
-            line_offset = line_offset.saturating_add(read as u64);
-            if starts_in_protected_prefix {
-                // 受保护前缀内的记录不做任何改写，保证 history_base 边界仍然有效。
-                writer.write_all(&line).map_err(|error| {
-                    format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
-                })?;
-                continue;
-            }
-
-            let may_contain_model = line
-                .windows(b"\"model\"".len())
-                .any(|window| window == b"\"model\"");
-            let may_contain_provider = line
-                .windows(b"\"model_provider\"".len())
-                .any(|window| window == b"\"model_provider\"");
-            let may_be_session_meta = line
-                .windows(b"session_meta".len())
-                .any(|window| window == b"session_meta");
-            let may_contain_encrypted_content = line
-                .windows(b"encrypted_content".len())
-                .any(|window| window == b"encrypted_content");
-            let may_contain_remote_reasoning_id = line
-                .windows(b"\"rs_".len())
-                .any(|window| window == b"\"rs_");
-            let may_contain_remote_compaction_id = line
-                .windows(b"\"cmp_".len())
-                .any(|window| window == b"\"cmp_");
-            let may_contain_local_recovery_compaction = line
-                .windows(b"Earlier messages and oversized tool outputs".len())
-                .any(|window| window == b"Earlier messages and oversized tool outputs");
-            let may_contain_item_id = line
-                .windows(b"\"id\"".len())
-                .any(|window| window == b"\"id\"");
-            let may_contain_compaction_metadata = line
-                .windows(b"replacement_history_metadata".len())
-                .any(|window| window == b"replacement_history_metadata");
-            if !may_contain_model
-                && !may_contain_provider
-                && !may_be_session_meta
-                && !may_contain_encrypted_content
-                && !may_contain_remote_reasoning_id
-                && !may_contain_remote_compaction_id
-                && !may_contain_local_recovery_compaction
-                && !may_contain_item_id
-                && !may_contain_compaction_metadata
-            {
-                writer.write_all(&line).map_err(|error| {
-                    format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
-                })?;
-                continue;
-            }
-
-            let mut value = match serde_json::from_slice::<Value>(&line) {
-                Ok(value) => value,
-                Err(_) => {
-                    writer.write_all(&line).map_err(|error| {
-                        format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
-                    })?;
-                    continue;
-                }
-            };
-            if value.get("type").and_then(Value::as_str) == Some("compacted")
-                && value
-                    .pointer("/payload/message")
-                    .and_then(Value::as_str)
-                    .is_some_and(|message| {
-                        message.starts_with("Earlier messages and oversized tool outputs")
-                            || message
-                                .starts_with("Earlier messages and oversized tool outputs remain")
-                    })
-            {
-                // This was produced by the old recovery-context experiment. Its
-                // synthetic assistant content is not accepted as Responses input.
-                continue;
-            }
-            let line_stats = rewrite_rollout_model_compatibility_value(
-                &mut value,
-                target_provider,
-                forced_model,
-            );
-            if !line_stats.changed() {
-                writer.write_all(&line).map_err(|error| {
-                    format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
-                })?;
-                continue;
-            }
-            rewrite_stats.add(line_stats);
-
-            if line_stats.removed_encrypted_reasoning_items > 0 {
-                continue;
-            }
-
-            let ending = if line.ends_with(b"\r\n") {
-                b"\r\n".as_slice()
-            } else if line.ends_with(b"\n") {
-                b"\n".as_slice()
-            } else {
-                b"".as_slice()
-            };
-            serde_json::to_writer(&mut writer, &value).map_err(|error| {
-                format!("序列化会话模型修复结果失败 ({}): {}", path.display(), error)
-            })?;
-            writer.write_all(ending).map_err(|error| {
-                format!("写入会话模型修复结果失败 ({}): {}", path.display(), error)
-            })?;
+) -> Result<
+    Option<(
+        streaming_repair::StagedRewrite,
+        RolloutModelCompatibilityRewriteStats,
+    )>,
+    String,
+> {
+    let mut stats = RolloutModelCompatibilityRewriteStats::default();
+    let staged = streaming_repair::stage_lines(path, |line, offset| {
+        if offset < protected_prefix_bytes {
+            return Ok(None);
         }
-        writer
-            .flush()
-            .map_err(|error| format!("刷新会话模型修复结果失败 ({}): {}", path.display(), error))?;
-        writer
-            .get_ref()
-            .sync_all()
-            .map_err(|error| format!("同步会话模型修复结果失败 ({}): {}", path.display(), error))?;
-        Ok(())
-    })();
-    if let Err(error) = result {
-        drop(writer);
-        let _ = fs::remove_file(&tmp_path);
-        return Err(error);
-    }
-    drop(writer);
-    if !rewrite_stats.changed() {
-        let _ = fs::remove_file(&tmp_path);
-        return Ok(None);
-    }
-    Ok(Some((tmp_path, rewrite_stats)))
+        let header = serde_json::from_slice::<SessionRecordKind>(line).ok();
+        let relevant = header.is_none_or(|header| match header.kind.as_str() {
+            "session_meta" | "turn_context" | "world_state" | "compacted" => true,
+            "event_msg" => line
+                .windows(b"thread_settings".len())
+                .any(|w| w == b"thread_settings"),
+            "response_item" => header.payload.is_some_and(|p| {
+                matches!(
+                    p.kind.as_str(),
+                    "message" | "function_call" | "custom_tool_call" | "reasoning"
+                )
+            }),
+            _ => false,
+        });
+        if !relevant {
+            return Ok(None);
+        }
+        let Ok(mut value) = serde_json::from_slice::<Value>(line) else {
+            return Ok(None);
+        };
+        if value.get("type").and_then(Value::as_str) == Some("compacted")
+            && value
+                .pointer("/payload/message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| {
+                    message.starts_with("Earlier messages and oversized tool outputs")
+                })
+        {
+            return Ok(Some(Vec::new()));
+        }
+        let line_stats =
+            rewrite_rollout_model_compatibility_value(&mut value, target_provider, forced_model);
+        if !line_stats.changed() {
+            return Ok(None);
+        }
+        stats.add(line_stats);
+        if line_stats.removed_encrypted_reasoning_items > 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let mut next = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+        if line.ends_with(b"\r\n") {
+            next.extend_from_slice(b"\r\n");
+        } else if line.ends_with(b"\n") {
+            next.push(b'\n');
+        }
+        Ok(Some(next))
+    })?;
+    Ok(staged.map(|staged| (staged, stats)))
 }
 
 fn rewrite_recovery_resume_settings(
@@ -6303,6 +6274,87 @@ fn read_session_turn_page(
     cursor: u64,
     limit: usize,
 ) -> Result<(Vec<ParsedSessionTurn>, Option<u64>), String> {
+    read_session_turn_page_with_mode(path, cursor, limit, SessionReadMode::Full)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionReadMode {
+    Preview,
+    Full,
+}
+
+// Inspect only the real record/payload types. Nested tool output may contain a
+// complete replay of earlier records, including misleading task/message markers.
+// Ignored fields are scanned without allocating their large strings or arrays.
+#[derive(Deserialize)]
+struct SessionRecordKind {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default, deserialize_with = "deserialize_session_payload_kind")]
+    payload: Option<SessionPayloadKind>,
+}
+
+#[derive(Deserialize)]
+struct SessionPayloadKind {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    role: Value,
+}
+
+fn deserialize_session_payload_kind<'de, D>(
+    deserializer: D,
+) -> Result<Option<SessionPayloadKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ObjectPayload;
+    impl<'de> serde::de::Visitor<'de> for ObjectPayload {
+        type Value = Option<SessionPayloadKind>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a session payload object or null")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_map(self)
+        }
+
+        fn visit_map<M: serde::de::MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+            SessionPayloadKind::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                .map(Some)
+        }
+    }
+    deserializer.deserialize_option(ObjectPayload)
+}
+
+fn parse_session_preview_value(line: &[u8]) -> Option<Value> {
+    let record: SessionRecordKind = serde_json::from_slice(line).ok()?;
+    let payload = record.payload?;
+    let visible = match record.kind.as_str() {
+        "response_item" => payload.kind == "message",
+        "event_msg" => matches!(
+            payload.kind.as_str(),
+            "task_started" | "task_complete" | "turn_aborted" | "user_message" | "agent_message"
+        ),
+        _ => false,
+    };
+    visible.then(|| serde_json::from_slice(line).ok()).flatten()
+}
+
+fn read_session_turn_page_with_mode(
+    path: &Path,
+    cursor: u64,
+    limit: usize,
+    mode: SessionReadMode,
+) -> Result<(Vec<ParsedSessionTurn>, Option<u64>), String> {
     let file = fs::File::open(path)
         .map_err(|error| format!("读取会话内容失败 ({}): {}", path.display(), error))?;
     let file_len = file
@@ -6338,9 +6390,13 @@ fn read_session_turn_page(
             || text.contains("response_item")
             || text.contains("user_message")
             || text.contains("agent_message");
-        let value = needs_parse
-            .then(|| serde_json::from_slice::<Value>(&line).ok())
-            .flatten();
+        let value = if mode == SessionReadMode::Preview {
+            parse_session_preview_value(&line)
+        } else {
+            needs_parse
+                .then(|| serde_json::from_slice::<Value>(&line).ok())
+                .flatten()
+        };
 
         if let Some((turn_id, timestamp)) = value.as_ref().and_then(task_started_marker) {
             if let Some(previous) = current.take() {
@@ -6378,14 +6434,17 @@ fn read_session_turn_page(
         accumulator.end_offset = position;
         let mut handled = false;
         if let Some(value) = value.as_ref() {
-            if let Some((item_id, fingerprint)) = response_item_identity(value) {
-                if let Some(item_id) = item_id {
-                    accumulator.response_item_ids.insert(item_id);
+            // Deletion needs complete fingerprints; a read-only preview does not.
+            if mode == SessionReadMode::Full {
+                if let Some((item_id, fingerprint)) = response_item_identity(value) {
+                    if let Some(item_id) = item_id {
+                        accumulator.response_item_ids.insert(item_id);
+                    }
+                    *accumulator
+                        .response_item_fingerprints
+                        .entry(fingerprint)
+                        .or_insert(0) += 1;
                 }
-                *accumulator
-                    .response_item_fingerprints
-                    .entry(fingerprint)
-                    .or_insert(0) += 1;
             }
             if let Some(message) = parse_response_message(value, line_start) {
                 handled = true;
@@ -6455,7 +6514,12 @@ fn read_session_turn_page_desc(
             return read_session_turn_page_desc_legacy(path, cursor, limit);
         }
         let earliest_offset = *scan.offsets.last().unwrap_or(&0);
-        let (mut turns, _) = read_session_turn_page(path, earliest_offset, marker_limit)?;
+        let (mut turns, _) = read_session_turn_page_with_mode(
+            path,
+            earliest_offset,
+            marker_limit,
+            SessionReadMode::Preview,
+        )?;
         turns.retain(|turn| turn.start_offset < cursor);
         if turns.len() > limit {
             let selected = turns.split_off(turns.len() - limit);
@@ -6499,7 +6563,10 @@ fn find_task_started_offsets_reverse(
     }
 
     let mut position = cursor;
-    let mut suffix = Vec::new();
+    // Keep fragments separately until the line is complete. Repeatedly prepending
+    // each chunk to a multi-megabyte tool result makes a reverse scan quadratic.
+    let mut suffix_parts: Vec<Vec<u8>> = Vec::new();
+    let mut suffix_len = 0usize;
     let mut offsets = Vec::with_capacity(max_count);
     while position > 0 && offsets.len() < max_count {
         let start = position.saturating_sub(REVERSE_READ_CHUNK_SIZE as u64);
@@ -6510,38 +6577,38 @@ fn find_task_started_offsets_reverse(
             .map_err(|error| format!("定位会话内容失败: {}", error))?;
         file.read_exact(&mut chunk)
             .map_err(|error| format!("读取会话内容失败: {}", error))?;
-        chunk.extend_from_slice(&suffix);
-
-        let first_complete_index = if start == 0 {
-            0
-        } else {
-            chunk
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map(|index| index + 1)
-                .unwrap_or(chunk.len())
-        };
         let mut line_end = chunk.len();
-        if line_end > first_complete_index && chunk[line_end - 1] == b'\n' {
-            line_end -= 1;
-        }
-        while line_end > first_complete_index && offsets.len() < max_count {
-            let line_start = chunk[first_complete_index..line_end]
-                .iter()
-                .rposition(|byte| *byte == b'\n')
-                .map(|index| first_complete_index + index + 1)
-                .unwrap_or(first_complete_index);
-            let line = &chunk[line_start..line_end];
+        loop {
+            let newline = chunk[..line_end].iter().rposition(|byte| *byte == b'\n');
+            if newline.is_none() && start > 0 {
+                suffix_len += line_end;
+                suffix_parts.push(chunk[..line_end].to_vec());
+                break;
+            }
+            let line_start = newline.map_or(0, |index| index + 1);
+            let prefix = &chunk[line_start..line_end];
+            let joined;
+            let line = if suffix_parts.is_empty() {
+                prefix
+            } else {
+                let mut bytes = Vec::with_capacity(prefix.len() + suffix_len);
+                bytes.extend_from_slice(prefix);
+                for part in suffix_parts.iter().rev() {
+                    bytes.extend_from_slice(part);
+                }
+                joined = bytes;
+                joined.as_slice()
+            };
             if line_contains_task_started(line) {
                 offsets.push(start.saturating_add(line_start as u64));
             }
-            if line_start == first_complete_index {
+            suffix_parts.clear();
+            suffix_len = 0;
+            if offsets.len() >= max_count || newline.is_none() {
                 break;
             }
-            line_end = line_start - 1;
+            line_end = newline.unwrap();
         }
-
-        suffix = chunk[..first_complete_index].to_vec();
         position = start;
     }
 
@@ -6553,12 +6620,18 @@ fn find_task_started_offsets_reverse(
 }
 
 fn line_contains_task_started(line: &[u8]) -> bool {
-    line.windows(12).any(|window| window == b"task_started")
-        && serde_json::from_slice::<Value>(line)
+    // Serde's derived struct parser also accepts positional arrays. Neither a
+    // root array nor a payload array is a real rollout event or a page boundary.
+    line.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{')
+        && String::from_utf8_lossy(line).contains("task_started")
+        && serde_json::from_slice::<SessionRecordKind>(line)
             .ok()
-            .as_ref()
-            .and_then(task_started_marker)
-            .is_some()
+            .is_some_and(|record| {
+                record.kind == "event_msg"
+                    && record
+                        .payload
+                        .is_some_and(|payload| payload.kind == "task_started")
+            })
 }
 
 fn read_session_turn_page_desc_legacy(
@@ -6569,7 +6642,8 @@ fn read_session_turn_page_desc_legacy(
     let mut recent = VecDeque::with_capacity(limit.saturating_add(1));
     let mut scan_cursor = 0u64;
     loop {
-        let (page, next_cursor) = read_session_turn_page(path, scan_cursor, 50)?;
+        let (page, next_cursor) =
+            read_session_turn_page_with_mode(path, scan_cursor, 50, SessionReadMode::Preview)?;
         let mut reached_cursor = false;
         for turn in page {
             if turn.start_offset >= cursor {
@@ -7425,10 +7499,13 @@ fn scrub_compacted_line(
     Ok(serialized)
 }
 
-fn build_session_record_summary(path: &Path) -> Result<CodexSessionRecord, String> {
+fn build_session_record_summary(
+    path: &Path,
+    include_titles: bool,
+) -> Result<CodexSessionRecord, String> {
     let metadata = fs::metadata(path)
         .map_err(|error| format!("读取会话元数据失败 {}: {error}", path.display()))?;
-    let header = read_session_record_header(path)?;
+    let header = read_session_record_header_with_title(path, include_titles)?;
     let title = header.title.unwrap_or_else(|| file_stem(path));
     let project_path = header.project_path.unwrap_or_default();
     let project_name =
@@ -7464,6 +7541,13 @@ struct SessionRecordHeader {
 }
 
 fn read_session_record_header(path: &Path) -> Result<SessionRecordHeader, String> {
+    read_session_record_header_with_title(path, true)
+}
+
+fn read_session_record_header_with_title(
+    path: &Path,
+    include_title: bool,
+) -> Result<SessionRecordHeader, String> {
     let file = fs::File::open(path)
         .map_err(|error| format!("读取会话失败 {}: {error}", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -7489,7 +7573,10 @@ fn read_session_record_header(path: &Path) -> Result<SessionRecordHeader, String
             if header.project_path.is_none() {
                 header.project_path = extract_project_path(&line);
             }
-        } else {
+            if !include_title && header.id.is_some() {
+                break;
+            }
+        } else if include_title {
             let title = normalize_session_title(find_text(&value));
             if is_user_message_value(&value) && title.is_some() {
                 header.title = title;
@@ -9436,6 +9523,7 @@ struct RepairedInlineUserImage {
     stable_path: Option<String>,
 }
 
+#[cfg(test)]
 fn rewrite_local_image_attachments(
     content: &str,
     codex_home: &Path,
@@ -9457,145 +9545,13 @@ fn rewrite_local_image_attachments(
                 continue;
             }
         };
-        let mut line_changed = false;
-        if let Some(images) = inline_user_image_payloads(&value) {
-            let image_key = value
-                .get("payload")
-                .and_then(|payload| payload.get("id"))
-                .and_then(Value::as_str)
-                .filter(|value| safe_generated_image_id(value))
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    // 同尺寸图片的头部可能完全相同，必须以完整内容生成资源标识。
-                    let mut digest = Sha256::new();
-                    for image in &images {
-                        digest.update(image.encoded.len().to_le_bytes());
-                        digest.update(image.encoded.as_bytes());
-                    }
-                    format!("{:x}", digest.finalize())
-                });
-            let mut repaired_images = Vec::with_capacity(images.len());
-            for (index, image) in images.into_iter().enumerate() {
-                // 已持久化的图片只检查文件头，切号时无需反复解码历史 base64。
-                if let Some(extension) = encoded_generated_image_extension(&image.encoded) {
-                    let image_path = codex_home
-                        .join("generated_images")
-                        .join(session_id)
-                        .join(format!("recovered-{image_key}-{index}.{extension}"));
-                    if generated_image_extension_from_file(&image_path) == Some(extension) {
-                        result.verified += 1;
-                        let stable_path = image_path.to_string_lossy().to_string();
-                        if let Some(source_path) = image.source_path.as_deref() {
-                            line_changed |= rewrite_user_message_image_path(
-                                &mut value,
-                                source_path,
-                                &stable_path,
-                            );
-                        }
-                        repaired_images.push(RepairedInlineUserImage {
-                            source_path: image.source_path,
-                            stable_path: Some(stable_path),
-                        });
-                        continue;
-                    }
-                }
-                let Some((bytes, extension)) = decode_generated_image(&image.encoded) else {
-                    result.invalid += 1;
-                    repaired_images.push(RepairedInlineUserImage {
-                        source_path: image.source_path,
-                        stable_path: None,
-                    });
-                    continue;
-                };
-                let image_path = codex_home
-                    .join("generated_images")
-                    .join(session_id)
-                    .join(format!("recovered-{image_key}-{index}.{extension}"));
-                if generated_image_extension_from_file(&image_path) != Some(extension) {
-                    if let Some(parent) = image_path.parent() {
-                        fs::create_dir_all(parent).map_err(|error| {
-                            format!("创建历史图片恢复目录失败 ({}): {error}", parent.display())
-                        })?;
-                    }
-                    write_bytes_atomic(&image_path, &bytes).map_err(|error| {
-                        format!("恢复历史图片失败 ({}): {error}", image_path.display())
-                    })?;
-                    result.recreated += 1;
-                }
-                if generated_image_extension_from_file(&image_path) != Some(extension) {
-                    result.invalid += 1;
-                    repaired_images.push(RepairedInlineUserImage {
-                        source_path: image.source_path,
-                        stable_path: None,
-                    });
-                    continue;
-                }
-                result.verified += 1;
-                let stable_path = image_path.to_string_lossy().to_string();
-                if let Some(source_path) = image.source_path.as_deref() {
-                    line_changed |=
-                        rewrite_user_message_image_path(&mut value, source_path, &stable_path);
-                }
-                repaired_images.push(RepairedInlineUserImage {
-                    source_path: image.source_path,
-                    stable_path: Some(stable_path),
-                });
-            }
-            pending_inline_images = repaired_images;
-        }
-
-        if !pending_inline_images.is_empty()
-            && value.get("type").and_then(Value::as_str) == Some("event_msg")
-            && value
-                .get("payload")
-                .and_then(|payload| payload.get("type"))
-                .and_then(Value::as_str)
-                == Some("item_completed")
-            && value
-                .get("payload")
-                .and_then(|payload| payload.get("item"))
-                .and_then(|item| item.get("type"))
-                .and_then(Value::as_str)
-                == Some("UserMessage")
-        {
-            if let Some(items) = value
-                .get_mut("payload")
-                .and_then(|payload| payload.get_mut("item"))
-                .and_then(|item| item.get_mut("content"))
-                .and_then(Value::as_array_mut)
-            {
-                let local_images = items
-                    .iter_mut()
-                    .filter(|item| {
-                        matches!(
-                            item.get("type").and_then(Value::as_str),
-                            Some("local_image" | "localImage")
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                for (item, repaired) in local_images.into_iter().zip(pending_inline_images.iter()) {
-                    let Some(stable_path) = repaired.stable_path.as_deref() else {
-                        continue;
-                    };
-                    if item.get("path").and_then(Value::as_str) != Some(stable_path) {
-                        item["path"] = Value::String(stable_path.to_string());
-                        line_changed = true;
-                    }
-                }
-            }
-            pending_inline_images.clear();
-        } else if !pending_inline_images.is_empty()
-            && value.get("type").and_then(Value::as_str) == Some("event_msg")
-            && value
-                .get("payload")
-                .and_then(|payload| payload.get("type"))
-                .and_then(Value::as_str)
-                == Some("user_message")
-        {
-            line_changed |=
-                rewrite_event_user_message_image_paths(&mut value, &pending_inline_images);
-            pending_inline_images.clear();
-        }
+        let line_changed = rewrite_local_image_attachment_record(
+            &mut value,
+            codex_home,
+            session_id,
+            &mut pending_inline_images,
+            &mut result,
+        )?;
 
         if line_changed {
             rewritten.push_str(
@@ -9609,6 +9565,150 @@ fn rewrite_local_image_attachments(
         }
     }
     Ok((changed.then_some(rewritten), result))
+}
+
+fn rewrite_local_image_attachment_record(
+    value: &mut Value,
+    codex_home: &Path,
+    session_id: &str,
+    pending_inline_images: &mut Vec<RepairedInlineUserImage>,
+    result: &mut GeneratedImageRepairResult,
+) -> Result<bool, String> {
+    let mut line_changed = false;
+    if let Some(images) = inline_user_image_payloads(value) {
+        let image_key = value
+            .get("payload")
+            .and_then(|payload| payload.get("id"))
+            .and_then(Value::as_str)
+            .filter(|value| safe_generated_image_id(value))
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                // 同尺寸图片的头部可能完全相同，必须以完整内容生成资源标识。
+                let mut digest = Sha256::new();
+                for image in &images {
+                    digest.update(image.encoded.len().to_le_bytes());
+                    digest.update(image.encoded.as_bytes());
+                }
+                format!("{:x}", digest.finalize())
+            });
+        let mut repaired_images = Vec::with_capacity(images.len());
+        for (index, image) in images.into_iter().enumerate() {
+            // 已持久化的图片只检查文件头，切号时无需反复解码历史 base64。
+            if let Some(extension) = encoded_generated_image_extension(&image.encoded) {
+                let image_path = codex_home
+                    .join("generated_images")
+                    .join(session_id)
+                    .join(format!("recovered-{image_key}-{index}.{extension}"));
+                if generated_image_extension_from_file(&image_path) == Some(extension) {
+                    result.verified += 1;
+                    let stable_path = image_path.to_string_lossy().to_string();
+                    if let Some(source_path) = image.source_path.as_deref() {
+                        line_changed |=
+                            rewrite_user_message_image_path(value, source_path, &stable_path);
+                    }
+                    repaired_images.push(RepairedInlineUserImage {
+                        source_path: image.source_path,
+                        stable_path: Some(stable_path),
+                    });
+                    continue;
+                }
+            }
+            let Some((bytes, extension)) = decode_generated_image(&image.encoded) else {
+                result.invalid += 1;
+                repaired_images.push(RepairedInlineUserImage {
+                    source_path: image.source_path,
+                    stable_path: None,
+                });
+                continue;
+            };
+            let image_path = codex_home
+                .join("generated_images")
+                .join(session_id)
+                .join(format!("recovered-{image_key}-{index}.{extension}"));
+            if generated_image_extension_from_file(&image_path) != Some(extension) {
+                if let Some(parent) = image_path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| {
+                        format!("创建历史图片恢复目录失败 ({}): {error}", parent.display())
+                    })?;
+                }
+                write_bytes_atomic(&image_path, &bytes).map_err(|error| {
+                    format!("恢复历史图片失败 ({}): {error}", image_path.display())
+                })?;
+                result.recreated += 1;
+            }
+            if generated_image_extension_from_file(&image_path) != Some(extension) {
+                result.invalid += 1;
+                repaired_images.push(RepairedInlineUserImage {
+                    source_path: image.source_path,
+                    stable_path: None,
+                });
+                continue;
+            }
+            result.verified += 1;
+            let stable_path = image_path.to_string_lossy().to_string();
+            if let Some(source_path) = image.source_path.as_deref() {
+                line_changed |= rewrite_user_message_image_path(value, source_path, &stable_path);
+            }
+            repaired_images.push(RepairedInlineUserImage {
+                source_path: image.source_path,
+                stable_path: Some(stable_path),
+            });
+        }
+        *pending_inline_images = repaired_images;
+    }
+
+    if !pending_inline_images.is_empty()
+        && value.get("type").and_then(Value::as_str) == Some("event_msg")
+        && value
+            .get("payload")
+            .and_then(|payload| payload.get("type"))
+            .and_then(Value::as_str)
+            == Some("item_completed")
+        && value
+            .get("payload")
+            .and_then(|payload| payload.get("item"))
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            == Some("UserMessage")
+    {
+        if let Some(items) = value
+            .get_mut("payload")
+            .and_then(|payload| payload.get_mut("item"))
+            .and_then(|item| item.get_mut("content"))
+            .and_then(Value::as_array_mut)
+        {
+            let local_images = items
+                .iter_mut()
+                .filter(|item| {
+                    matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some("local_image" | "localImage")
+                    )
+                })
+                .collect::<Vec<_>>();
+            for (item, repaired) in local_images.into_iter().zip(pending_inline_images.iter()) {
+                let Some(stable_path) = repaired.stable_path.as_deref() else {
+                    continue;
+                };
+                if item.get("path").and_then(Value::as_str) != Some(stable_path) {
+                    item["path"] = Value::String(stable_path.to_string());
+                    line_changed = true;
+                }
+            }
+        }
+        pending_inline_images.clear();
+    } else if !pending_inline_images.is_empty()
+        && value.get("type").and_then(Value::as_str) == Some("event_msg")
+        && value
+            .get("payload")
+            .and_then(|payload| payload.get("type"))
+            .and_then(Value::as_str)
+            == Some("user_message")
+    {
+        line_changed |= rewrite_event_user_message_image_paths(value, &pending_inline_images);
+        pending_inline_images.clear();
+    }
+    Ok(line_changed)
 }
 
 fn inline_user_image_payloads(value: &Value) -> Option<Vec<InlineUserImagePayload>> {
@@ -9939,9 +10039,11 @@ mod tests {
         archive_staged_thread_row, copy_history_onto_target, create_staged_fork_rollout,
         extract_title, find_task_started_offsets_reverse, fork_history_modes_are_compatible,
         format_copy_validation_failure, normalize_copy_target_directory,
-        parse_codex_thread_fork_response, remove_staged_thread_rows, repair_sqlite_db,
-        restore_session_file_if_unchanged, same_existing_directory, session_file_fingerprint,
-        sql_quote, SessionRepairRecord, SessionStore, LOCAL_RECOVERY_CONTEXT_MAX_BYTES,
+        parse_codex_thread_fork_response, read_session_asset, read_session_record_header,
+        read_session_turn_page, read_session_turn_page_desc, read_session_turn_page_with_mode,
+        remove_staged_thread_rows, repair_sqlite_db, restore_session_file_if_unchanged,
+        same_existing_directory, session_file_fingerprint, sql_quote, SessionReadMode,
+        SessionRepairRecord, SessionStore, LOCAL_RECOVERY_CONTEXT_MAX_BYTES,
         LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES,
     };
     use crate::system_command;
@@ -9949,7 +10051,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::io::Write;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
     #[test]
@@ -11372,6 +11474,199 @@ mod tests {
         assert_eq!(scan.offsets.len(), 21);
         assert!(!scan.reached_start);
         assert!(scan.offsets.iter().all(|offset| *offset > 300_000));
+    }
+
+    #[test]
+    fn session_preview_skips_deletion_metadata_without_changing_messages_or_assets() {
+        let codex = tempdir().expect("codex tempdir");
+        let path = codex.path().join("preview.jsonl");
+        write_jsonl(
+            &path,
+            &[
+                task_started("preview-turn", "2026-08-10T01:00:00Z"),
+                response_message(
+                    "preview-user",
+                    "user",
+                    "2026-08-10T01:00:01Z",
+                    vec![
+                        json!({"type":"input_text","text":"查看大文件"}),
+                        json!({"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}),
+                    ],
+                ),
+                json!({"type":"response_item","payload":{
+                    "type":"custom_tool_call_output",
+                    "output":"large tool output ".repeat(100_000),
+                    "nested":task_started("fake-turn", "2026-08-10T01:00:01Z")
+                }}),
+                response_message(
+                    "preview-assistant",
+                    "assistant",
+                    "2026-08-10T01:00:02Z",
+                    vec![json!({"type":"output_text","text":"完整回复"})],
+                ),
+                task_complete("preview-turn", "2026-08-10T01:00:03Z"),
+            ],
+        );
+        let (full, full_next) = read_session_turn_page(&path, 0, 1).expect("full turn");
+        let (preview, preview_next) =
+            read_session_turn_page_with_mode(&path, 0, 1, SessionReadMode::Preview)
+                .expect("preview turn");
+        assert_eq!(full_next, preview_next);
+        assert_eq!(full.len(), 1);
+        assert_eq!(preview.len(), 1);
+        assert_eq!(full[0].public, preview[0].public);
+        assert_eq!(full[0].start_offset, preview[0].start_offset);
+        assert_eq!(full[0].end_offset, preview[0].end_offset);
+        assert_eq!(full[0].response_item_fingerprints.len(), 3);
+        assert!(preview[0].response_item_fingerprints.is_empty());
+        assert!(preview[0].response_item_ids.is_empty());
+        let asset_id = &preview[0].public.messages[0].attachments[0].id;
+        assert_eq!(
+            read_session_asset(&path, asset_id)
+                .expect("preview image")
+                .data_url,
+            "data:image/png;base64,aGVsbG8="
+        );
+    }
+
+    #[test]
+    fn session_preview_reverse_scan_handles_huge_lines_and_chunk_boundaries() {
+        let codex = tempdir().expect("codex tempdir");
+        let path = codex.path().join("preview-boundaries.jsonl");
+        for tail_padding in [0, 1, 256 * 1024 - 1, 256 * 1024, 256 * 1024 + 1] {
+            let first = task_started("first-turn", "2026-08-10T01:00:00Z").to_string();
+            let huge = json!({"type":"response_item","payload":{
+                "type":"custom_tool_call_output",
+                "output":"x".repeat(4 * 256 * 1024 + 7),
+                "nested":task_started("fake-turn", "2026-08-10T01:00:00Z")
+            }})
+            .to_string();
+            let second = task_started("second-turn", "2026-08-10T02:00:00Z").to_string();
+            let second_offset = first.len() + 1 + huge.len() + 1;
+            let content = format!("{first}\n{huge}\n{second}\n{}", " ".repeat(tail_padding));
+            fs::write(&path, content.as_bytes()).expect("write boundary fixture");
+            let scan = find_task_started_offsets_reverse(&path, content.len() as u64, 3)
+                .expect("reverse scan across huge line");
+            assert_eq!(scan.offsets, vec![second_offset as u64, 0]);
+            assert!(scan.reached_start);
+        }
+    }
+
+    #[test]
+    fn session_preview_preserves_long_text_and_legacy_fallbacks() {
+        let codex = tempdir().expect("codex tempdir");
+        let path = codex.path().join("legacy-preview.jsonl");
+        let long_text = "完整长消息𠮷".repeat(10_000);
+        write_jsonl(
+            &path,
+            &[
+                response_message(
+                    "legacy-user",
+                    "user",
+                    "2026-08-10T01:00:00Z",
+                    vec![json!({"type":"input_text","text":long_text})],
+                ),
+                json!({"type":"event_msg","payload":{
+                    "type":"agent_message", "message":"旧格式回复"
+                }}),
+            ],
+        );
+        let before = session_file_fingerprint(&path).expect("original state");
+        let (turns, next) =
+            read_session_turn_page_desc(&path, fs::metadata(&path).expect("metadata").len(), 5)
+                .expect("legacy preview");
+        assert!(next.is_none());
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0]
+            .public
+            .messages
+            .iter()
+            .any(|message| message.text == long_text));
+        assert!(turns[0]
+            .public
+            .messages
+            .iter()
+            .any(|message| message.text == "旧格式回复"));
+        assert_eq!(
+            session_file_fingerprint(&path).expect("unchanged state"),
+            before
+        );
+    }
+
+    #[test]
+    fn session_preview_does_not_treat_array_records_as_turn_boundaries() {
+        let codex = tempdir().unwrap();
+        let path = codex.path().join("legacy-array-markers.jsonl");
+        for fake_marker in [
+            json!(["event_msg", {"type":"task_started"}]),
+            json!(["event_msg", ["task_started"]]),
+            json!({"type":"event_msg","payload":["task_started"]}),
+        ] {
+            write_jsonl(
+                &path,
+                &[
+                    response_message(
+                        "legacy-user",
+                        "user",
+                        "2026-08-10T01:00:00Z",
+                        vec![json!({"type":"input_text","text":"legacy visible message"})],
+                    ),
+                    fake_marker,
+                ],
+            );
+            let len = fs::metadata(&path).unwrap().len();
+            let scan = find_task_started_offsets_reverse(&path, len, 2).unwrap();
+            assert!(scan.offsets.is_empty());
+            assert!(scan.reached_start);
+            let (turns, next) = read_session_turn_page_desc(&path, len, 5).unwrap();
+            assert!(next.is_none());
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[0].public.messages[0].text, "legacy visible message");
+        }
+    }
+
+    #[test]
+    #[ignore = "Set CODEX_SWITCHER_PREVIEW_BENCH_PATH to benchmark a local rollout read-only"]
+    fn session_preview_large_local_rollout_benchmark() {
+        let path = PathBuf::from(
+            std::env::var_os("CODEX_SWITCHER_PREVIEW_BENCH_PATH")
+                .expect("CODEX_SWITCHER_PREVIEW_BENCH_PATH"),
+        );
+        let before = session_file_fingerprint(&path).expect("original state");
+        let start = std::time::Instant::now();
+        let (turns, next) = read_session_turn_page_desc(&path, before.len, 5).expect("preview");
+        println!(
+            "Large preview: {} bytes, {} turns, {} messages, has more: {}, elapsed: {:?}",
+            before.len,
+            turns.len(),
+            turns
+                .iter()
+                .map(|turn| turn.public.messages.len())
+                .sum::<usize>(),
+            next.is_some(),
+            start.elapsed()
+        );
+        assert!(!turns.is_empty());
+        if let Some(home) = std::env::var_os("CODEX_SWITCHER_PREVIEW_BENCH_HOME") {
+            let id = read_session_record_header(&path)
+                .expect("header")
+                .id
+                .expect("session ID");
+            let start = std::time::Instant::now();
+            let page = SessionStore::new(PathBuf::from(home))
+                .list_session_content(&id, None, Some(5), Some("desc"))
+                .expect("preview through session store");
+            println!(
+                "Session store preview: {} turns, elapsed: {:?}",
+                page.turns.len(),
+                start.elapsed()
+            );
+            assert!(!page.turns.is_empty());
+        }
+        assert_eq!(
+            session_file_fingerprint(&path).expect("unchanged state"),
+            before
+        );
     }
 
     #[test]
@@ -14790,6 +15085,101 @@ mod tests {
             )
             .trim(),
             "1"
+        );
+    }
+
+    #[test]
+    fn history_hydration_skips_reading_healthy_rollout_bodies() {
+        let codex = tempdir().unwrap();
+        let directory = codex.path().join("sessions");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("healthy.jsonl");
+        let mut content = format!(
+            "{}\n",
+            json!({"type":"session_meta","ordinal":0,"payload":{"id":"healthy"}})
+        )
+        .into_bytes();
+        // A title scan would reach this invalid UTF-8 and fail. Metadata-only
+        // lineage construction and the SQL fast path must leave it unread.
+        content.extend_from_slice(b"\xff\xfe\n");
+        fs::write(&path, content).unwrap();
+        let history =
+            rusqlite::Connection::open(codex.path().join("thread_history_1.sqlite")).unwrap();
+        history.execute_batch("CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER); INSERT INTO thread_history_projection_state VALUES ('healthy', 1, 1);").unwrap();
+        let store = SessionStore::new(codex.path().to_path_buf());
+        assert_eq!(
+            store
+                .hydrate_missing_history_projections_with(None, |_, _| {
+                    panic!("healthy projections must not invoke native hydration")
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn history_hydration_only_rebuilds_missing_current_paginated_segments() {
+        let codex = tempdir().unwrap();
+        let directory = codex.path().join("sessions");
+        fs::create_dir_all(&directory).unwrap();
+        let parent = directory.join("parent.jsonl");
+        write_jsonl(
+            &parent,
+            &[
+                json!({"type":"session_meta","ordinal":0,"payload":{"id":"parent"}}),
+                json!({"type":"event_msg","ordinal":1,"payload":{"type":"task_started","turn_id":"parent-turn"}}),
+            ],
+        );
+        write_jsonl(
+            &directory.join("child.jsonl"),
+            &[
+                json!({"type":"session_meta","ordinal":2,"payload":{"id":"child","history_base":{"thread_id":"parent","end_byte_offset":fs::metadata(&parent).unwrap().len(),"end_ordinal_exclusive":2}}}),
+            ],
+        );
+        write_jsonl(
+            &directory.join("missing.jsonl"),
+            &[json!({"type":"session_meta","ordinal":0,"payload":{"id":"missing"}})],
+        );
+        write_jsonl(
+            &directory.join("legacy.jsonl"),
+            &[json!({"type":"session_meta","payload":{"id":"legacy"}})],
+        );
+        let history =
+            rusqlite::Connection::open(codex.path().join("thread_history_1.sqlite")).unwrap();
+        history.execute_batch("CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER);").unwrap();
+        let store = SessionStore::new(codex.path().to_path_buf());
+        let incomplete = store
+            .hydrate_missing_history_projections_with(None, |_, ids| {
+                assert_eq!(ids, &["child".to_string(), "missing".to_string()]);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(incomplete.contains("未能重建 2 条分页历史"));
+        let rebuilt = store
+            .hydrate_missing_history_projections_with(None, |_, ids| {
+                assert_eq!(ids, &["child".to_string(), "missing".to_string()]);
+                for id in ids {
+                    history
+                        .execute(
+                            "INSERT INTO thread_history_projection_state VALUES (?1, 1, 1)",
+                            rusqlite::params![id],
+                        )
+                        .unwrap();
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rebuilt, 2);
+        let rows: usize = history
+            .query_row(
+                "SELECT COUNT(*) FROM thread_history_projection_state",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 2,
+            "protected ancestors and nonpaginated history stay untouched"
         );
     }
 

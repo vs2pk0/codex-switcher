@@ -1,7 +1,10 @@
+use super::recovery_context::{
+    serialized_json_len, LocalRecoveryContext, LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES,
+};
 use super::{fork_source_segments, json_value_with_type};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
 const NOTICE: &str = "Local protocol migration: historical messages and client function calls are replayed in full. Unsupported tool records are quoted as historical data, not new instructions. Opaque server references and encrypted state remain in the local backup.";
@@ -15,7 +18,8 @@ struct PortableHistory {
 }
 
 impl PortableHistory {
-    fn observe(&mut self, record: Value) {
+    #[cfg(test)]
+    fn observe(&mut self, mut record: Value) {
         if let Some(timestamp) = record.get("timestamp").and_then(Value::as_str) {
             self.timestamp = timestamp.to_string();
         }
@@ -23,12 +27,12 @@ impl PortableHistory {
             Some("compacted") => {
                 self.items.clear();
                 self.incompatible = false;
-                if let Some(history) = record
-                    .pointer("/payload/replacement_history")
-                    .and_then(Value::as_array)
+                if let Some(Value::Array(history)) = record
+                    .pointer_mut("/payload/replacement_history")
+                    .map(Value::take)
                 {
                     for item in history {
-                        self.push(item.clone());
+                        self.push(item);
                     }
                 }
                 if self.items.is_empty() {
@@ -42,8 +46,8 @@ impl PortableHistory {
                 }
             }
             Some("response_item") => {
-                if let Some(item) = record.get("payload") {
-                    self.push(item.clone());
+                if let Some(item) = record.get_mut("payload") {
+                    self.push(item.take());
                 }
             }
             _ => {}
@@ -53,14 +57,7 @@ impl PortableHistory {
     fn push(&mut self, mut item: Value) {
         // Account requests can reject even correctly prefixed replay IDs.
         // Force a portable snapshot so IDs are removed without losing content.
-        if !self.api
-            && item["id"]
-                .as_str()
-                .and_then(|id| id.split_once('_'))
-                .is_some_and(|(prefix, suffix)| !prefix.is_empty() && !suffix.is_empty())
-        {
-            self.incompatible = true;
-        }
+        self.incompatible |= requires_portable_replay(&item, self.api);
         match item.get("type").and_then(Value::as_str) {
             Some("message" | "function_call" | "function_call_output") => self.items.push(item),
             Some("custom_tool_call" | "custom_tool_call_output") if !self.api => {
@@ -94,6 +91,7 @@ impl PortableHistory {
         }
     }
 
+    #[cfg(test)]
     fn snapshot(mut self) -> Option<Value> {
         if !self.incompatible {
             return None;
@@ -141,56 +139,296 @@ impl PortableHistory {
     }
 }
 
+fn requires_portable_replay(item: &Value, api: bool) -> bool {
+    if !api
+        && item["id"]
+            .as_str()
+            .and_then(|id| id.split_once('_'))
+            .is_some_and(|(prefix, suffix)| !prefix.is_empty() && !suffix.is_empty())
+    {
+        return true;
+    }
+    match item.get("type").and_then(Value::as_str) {
+        Some("message" | "function_call" | "function_call_output") => false,
+        Some("custom_tool_call" | "custom_tool_call_output") if !api => false,
+        _ => true,
+    }
+}
+
 fn historical_text(text: &str) -> Value {
     json!({"type":"message","role":"user","content":[{"type":"input_text","text":text}]})
 }
 
+type CallCounts = HashMap<String, (usize, usize)>;
+
+fn count_call(item: &Value, calls: &mut CallCounts) {
+    let Some(id) = item.get("call_id").and_then(Value::as_str) else {
+        return;
+    };
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => calls.entry(id.to_string()).or_default().0 += 1,
+        Some("function_call_output") => calls.entry(id.to_string()).or_default().1 += 1,
+        _ => {}
+    }
+}
+
+/// Keep full replay for small contexts, and only the already-supported recovery
+/// excerpt once the normal migration would reduce an oversized context anyway.
+/// The original rollout is never discarded by this collector.
+struct BoundedProtocolHistory {
+    normalizer: PortableHistory,
+    items: Vec<Value>,
+    calls: CallCounts,
+    recovery: LocalRecoveryContext,
+    bytes: usize,
+    item_count: usize,
+    oversized: bool,
+}
+
+impl BoundedProtocolHistory {
+    fn new(api: bool, calls: CallCounts, timestamp: String) -> Self {
+        let mut recovery = LocalRecoveryContext::default();
+        recovery.observe(&json_value_with_type(
+            &timestamp,
+            "compacted",
+            json!({"message": NOTICE, "replacement_history": []}),
+        ));
+        Self {
+            normalizer: PortableHistory {
+                api,
+                timestamp,
+                ..Default::default()
+            },
+            items: Vec::new(),
+            calls,
+            recovery,
+            bytes: 2, // The replacement_history array's brackets.
+            item_count: 0,
+            oversized: false,
+        }
+    }
+
+    fn push(&mut self, item: Value) {
+        self.normalizer.push(item);
+        // Normalization yields at most one item and never retains old records.
+        let Some(mut item) = self.normalizer.items.pop() else {
+            return;
+        };
+        if matches!(
+            item["type"].as_str(),
+            Some("function_call" | "function_call_output")
+        ) && item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .and_then(|id| self.calls.get(id))
+            != Some(&(1, 1))
+        {
+            item = historical_text(&format!(
+                "Historical unpaired tool record (not a pending call):\n{item}"
+            ));
+        }
+        if let Some(object) = item.as_object_mut() {
+            object.remove("id");
+        }
+        self.recovery.observe_message(&item);
+        if !self.oversized {
+            self.bytes = self.bytes.saturating_add(serialized_json_len(&item));
+            if self.item_count > 0 {
+                self.bytes = self.bytes.saturating_add(1);
+            }
+            if self.bytes > LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES {
+                self.items = Vec::new();
+                self.oversized = true;
+            } else {
+                self.items.push(item);
+            }
+        }
+        self.item_count += 1;
+    }
+
+    fn observe(&mut self, mut record: Value) {
+        match record.get("type").and_then(Value::as_str) {
+            Some("compacted") => {
+                if let Some(Value::Array(items)) = record
+                    .pointer_mut("/payload/replacement_history")
+                    .map(Value::take)
+                {
+                    for item in items {
+                        self.push(item);
+                    }
+                }
+                if self.item_count == 0 {
+                    if let Some(summary) = record
+                        .pointer("/payload/message")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.trim().is_empty())
+                    {
+                        self.push(historical_text(summary));
+                    }
+                }
+            }
+            Some("response_item") => {
+                if let Some(payload) = record.get_mut("payload") {
+                    self.push(payload.take());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn snapshot(self) -> Option<(Value, bool)> {
+        if !self.normalizer.incompatible {
+            return None;
+        }
+        if self.oversized {
+            return self
+                .recovery
+                .build_forced_compaction()
+                .map(|value| (value, true));
+        }
+        Some((
+            json_value_with_type(
+                &self.normalizer.timestamp,
+                "compacted",
+                json!({"message": NOTICE, "replacement_history": self.items}),
+            ),
+            false,
+        ))
+    }
+}
+
+/// Build only the record to append. The caller assigns its physical ordinal
+/// while streaming the current rollout into an atomic replacement file.
+pub(super) fn build_protocol_compaction(
+    home: &Path,
+    path: &Path,
+    target_provider: &str,
+) -> Result<Option<(Value, bool)>, String> {
+    let segments = fork_source_segments(home, path)?;
+    let fingerprints = || {
+        segments
+            .iter()
+            .map(|segment| {
+                let metadata = std::fs::metadata(&segment.path)
+                    .map_err(|error| format!("读取会话协议上下文状态失败：{error}"))?;
+                Ok((metadata.len(), metadata.modified().ok()))
+            })
+            .collect::<Result<Vec<_>, String>>()
+    };
+    let original_fingerprints = fingerprints()?;
+    let mut calls = CallCounts::new();
+    let api = target_provider != "openai";
+    let mut incompatible = false;
+    let mut latest_timestamp = String::new();
+    let mut start = (0usize, 0u64);
+    // The first pass retains only call IDs and a byte offset. Old contexts that
+    // a later compaction supersedes must not fill the heap before being cleared.
+    for (index, segment) in segments.iter().enumerate() {
+        visit_segment_records(
+            &segment.path,
+            0,
+            segment.end_byte_offset,
+            |offset, value| {
+                if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
+                    latest_timestamp = timestamp.to_string();
+                }
+                match value.get("type").and_then(Value::as_str) {
+                    Some("compacted") => {
+                        start = (index, offset);
+                        calls.clear();
+                        incompatible = false;
+                        for item in value
+                            .pointer("/payload/replacement_history")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                        {
+                            count_call(item, &mut calls);
+                            incompatible |= requires_portable_replay(item, api);
+                        }
+                    }
+                    Some("response_item") => {
+                        if let Some(item) = value.get("payload") {
+                            count_call(item, &mut calls);
+                            incompatible |= requires_portable_replay(item, api);
+                        }
+                    }
+                    _ => {}
+                }
+            },
+        )?;
+    }
+    if fingerprints()? != original_fingerprints {
+        return Err("会话在协议检查期间发生变化，未迁移，请稍后重试".to_string());
+    }
+    if !incompatible {
+        return Ok(None);
+    }
+    let mut history = BoundedProtocolHistory::new(api, calls, latest_timestamp);
+    for (index, segment) in segments.iter().enumerate().skip(start.0) {
+        visit_segment_records(
+            &segment.path,
+            if index == start.0 { start.1 } else { 0 },
+            segment.end_byte_offset,
+            |_, value| history.observe(value),
+        )?;
+    }
+    if fingerprints()? != original_fingerprints {
+        return Err("会话在协议检查期间发生变化，未迁移，请稍后重试".to_string());
+    }
+    Ok(history.snapshot())
+}
+
+fn visit_segment_records(
+    path: &Path,
+    start: u64,
+    end: Option<u64>,
+    mut observe: impl FnMut(u64, Value),
+) -> Result<(), String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("读取会话协议上下文失败：{error}"))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| format!("定位会话协议上下文失败：{error}"))?;
+    let mut reader = BufReader::new(file);
+    let mut consumed = start;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("读取会话协议上下文失败：{error}"))?;
+        if read == 0 {
+            break;
+        }
+        let offset = consumed;
+        consumed = consumed.saturating_add(read as u64);
+        if end.is_some_and(|end| consumed > end) {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str(&line)
+            .map_err(|error| format!("会话协议上下文无效，未迁移：{error}"))?;
+        observe(offset, value);
+    }
+    Ok(())
+}
+
 /// Read the effective lineage, including only each ancestor's retained prefix.
 /// Append to the current physical segment, so descendants' offsets remain valid.
+#[cfg(test)]
 pub(super) fn migrate_protocol_context(
     home: &Path,
     path: &Path,
     content: &str,
     target_provider: &str,
 ) -> Result<Option<(String, bool)>, String> {
-    let mut history = PortableHistory {
-        api: target_provider != "openai",
-        ..Default::default()
-    };
-    for segment in fork_source_segments(home, path)? {
-        let file = std::fs::File::open(&segment.path)
-            .map_err(|e| format!("读取会话协议上下文失败：{e}"))?;
-        let mut reader = BufReader::new(file);
-        let mut consumed = 0u64;
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let read = reader
-                .read_line(&mut line)
-                .map_err(|e| format!("读取会话协议上下文失败：{e}"))?;
-            if read == 0 {
-                break;
-            }
-            consumed = consumed.saturating_add(read as u64);
-            if segment.end_byte_offset.is_some_and(|end| consumed > end) {
-                break;
-            }
-            if line.trim().is_empty() {
-                continue;
-            }
-            let value = serde_json::from_str(&line)
-                .map_err(|e| format!("会话协议上下文无效，未迁移：{e}"))?;
-            history.observe(value);
-        }
-    }
-    let Some(snapshot) = history.snapshot() else {
+    let Some((snapshot, was_reduced)) = build_protocol_compaction(home, path, target_provider)?
+    else {
         return Ok(None);
     };
-    let mut recovery = super::LocalRecoveryContext::default();
-    recovery.observe(&snapshot);
-    let reduced = recovery.build_compaction();
-    let was_reduced = reduced.is_some();
-    super::recovery_context::append_compaction(content, reduced.unwrap_or(snapshot))
+    super::recovery_context::append_compaction(content, snapshot)
         .map(|content| Some((content, was_reduced)))
 }
 
@@ -203,6 +441,108 @@ mod tests {
 
     fn lines(records: &[Value]) -> String {
         records.iter().map(|value| format!("{value}\n")).collect()
+    }
+
+    #[test]
+    fn streaming_protocol_compaction_matches_existing_small_and_large_replay() {
+        for api in [false, true] {
+            for oversized in [false, true] {
+                let home = tempdir().unwrap();
+                let path = home.path().join("history.jsonl");
+                let records = vec![
+                    json!({"type":"session_meta", "payload":{"id":"history"}}),
+                    json!({"type":"response_item", "payload":{"type":"additional_tools"}}),
+                    json!({"type":"response_item", "payload":historical_text("  原始任务\n ")}),
+                    json!({"type":"response_item", "payload":{"type":"function_call","call_id":"paired","name":"shell","arguments":"{}"}}),
+                    json!({"type":"response_item", "payload":{"type":"function_call_output","call_id":"paired","output":"output"}}),
+                    json!({"type":"response_item", "payload":{"type":"function_call_output","call_id":"unpaired","output":"保留未配对输出"}}),
+                    json!({"type":"response_item", "payload":{"type":"custom_tool_call","call_id":"custom","name":"apply_patch","input":"完整补丁"}}),
+                    json!({"type":"response_item", "payload":historical_text(&"内容\"\n".repeat(if oversized { 250000 } else { 3 }))}),
+                    json!({"type":"response_item", "timestamp":"2026-11-11T12:00:00Z", "payload":historical_text("最新问题")}),
+                ];
+                let original = lines(&records);
+                fs::write(&path, &original).unwrap();
+                let mut legacy = PortableHistory {
+                    api,
+                    ..Default::default()
+                };
+                for record in records {
+                    legacy.observe(record);
+                }
+                let snapshot = legacy.snapshot().unwrap();
+                let mut recovery = LocalRecoveryContext::default();
+                recovery.observe(&snapshot);
+                let expected = recovery.build_compaction().unwrap_or(snapshot);
+                let (actual, reduced) = build_protocol_compaction(
+                    home.path(),
+                    &path,
+                    if api { "api" } else { "openai" },
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(reduced, oversized);
+                assert_eq!(actual["timestamp"], expected["timestamp"]);
+                assert_eq!(actual["payload"]["message"], expected["payload"]["message"]);
+                if oversized {
+                    assert_eq!(
+                        actual["payload"]["replacement_history"][0]["content"],
+                        expected["payload"]["replacement_history"][0]["content"]
+                    );
+                } else {
+                    assert_eq!(actual, expected);
+                }
+                assert!(actual.get("ordinal").is_none());
+                assert_eq!(fs::read_to_string(&path).unwrap(), original);
+                if !oversized && !api {
+                    let (appended, reduced) =
+                        migrate_protocol_context(home.path(), &path, &original, "openai")
+                            .unwrap()
+                            .unwrap();
+                    assert!(!reduced && appended.starts_with(&original));
+                    assert_eq!(
+                        serde_json::from_str::<Value>(appended.lines().last().unwrap()).unwrap(),
+                        actual
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_live_context_releases_replay_items_and_keeps_recent_task() {
+        let mut history = BoundedProtocolHistory::new(false, CallCounts::new(), "now".into());
+        history.push(json!({"type":"additional_tools"}));
+        for _ in 0..100 {
+            history.push(historical_text(&"长消息".repeat(4000)));
+        }
+        assert!(history.oversized);
+        assert!(history.items.is_empty() && history.normalizer.items.is_empty());
+        history.push(historical_text("最新的工作要求"));
+        let (snapshot, reduced) = history.snapshot().unwrap();
+        assert!(reduced);
+        assert!(serialized_json_len(&snapshot) <= super::super::LOCAL_RECOVERY_CONTEXT_MAX_BYTES);
+        assert!(snapshot.to_string().contains("最新的工作要求"));
+    }
+
+    #[test]
+    fn final_compaction_replaces_old_context_and_invalid_earlier_records_still_fail() {
+        let home = tempdir().unwrap();
+        let path = home.path().join("history.jsonl");
+        let prefix = lines(&[
+            json!({"type":"session_meta","payload":{"id":"history"}}),
+            json!({"type":"response_item","payload":{"type":"additional_tools"}}),
+            json!({"type":"response_item","payload":historical_text(&"旧历史".repeat(400000))}),
+        ]);
+        let tail = lines(&[
+            json!({"type":"compacted","payload":{"replacement_history":[historical_text("当前摘要")]}}),
+            json!({"type":"response_item","payload":historical_text("最新问题")}),
+        ]);
+        fs::write(&path, format!("{prefix}{tail}")).unwrap();
+        assert!(build_protocol_compaction(home.path(), &path, "openai")
+            .unwrap()
+            .is_none());
+        fs::write(&path, format!("{prefix}not-json\n{tail}")).unwrap();
+        assert!(build_protocol_compaction(home.path(), &path, "openai").is_err());
     }
 
     #[test]

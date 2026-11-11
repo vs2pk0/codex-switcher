@@ -139,7 +139,8 @@ test("开启重置开关后才在切换账号前重置 config.toml", () => {
     libSource.indexOf("async fn switch_codex_account("),
     libSource.indexOf("fn switch_account_and_sync_session_provider("),
   );
-  assert.match(switchCommand, /if switch_settings\.reset_config_on_account_switch\s*&& codex_home_needs_config_reset_before_switch\(&codex_home\)\s*\{\s*reset_codex_config_for_switch\(\s*&instance\.id,\s*switch_settings\.repair_sessions_on_account_switch,?\s*\)\?;/);
+  assert.match(switchCommand, /if switch_settings\.reset_config_on_account_switch\s*&& codex_home_needs_config_reset_before_switch\(&codex_home\)\s*\{\s*(?:\/\/[^\n]*\n\s*)*reset_codex_config_for_switch\(\s*&instance\.id,\s*false,?\s*\)\?;/);
+  assert.match(switchCommand, /account_switch_result_after_configuration\(\s*&session_store,\s*account,\s*switch_settings\.repair_sessions_on_account_switch/);
   assert.ok(
     switchCommand.indexOf("reset_codex_config_for_switch") < switchCommand.indexOf("account_store.switch_account(&account_id)"),
     "必须先重置 config.toml，再导入账号数据",
@@ -168,7 +169,8 @@ test("OpenCodex 同步保留账号且不绑定 OAuth，API 服务仍自动绑定
   );
   assert.match(apiSync, /prepare_default_oauth_account\(&instance_id\)\.await\?/);
   assert.match(apiSync, /auto_bind_default_oauth\(\s*crate::service_binding::ServiceKind::ApiService/);
-  assert.ok(apiSync.indexOf("auto_bind_default_oauth") < apiSync.indexOf("switch_account_with_session_options("));
+  assert.ok(apiSync.indexOf("auto_bind_default_oauth") < apiSync.indexOf("account_store.switch_account(&account_id)"));
+  assert.ok(apiSync.indexOf("account_switch_result_before_full_repair(") < apiSync.indexOf("crate::repair_sessions_on_switch("));
 
   // 两个面板都提供「绑定 OAuth」按钮并交给 App 复用 OAuth 绑定弹窗
   assert.match(openCodexPanelSource, /emit\("bind-oauth", \{\s*kind: "opencodex"/);

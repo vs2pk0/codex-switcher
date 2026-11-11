@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::Duration;
 
@@ -24,6 +24,17 @@ const INSTANCES_FILE: &str = "codex-instances.json";
 const OPENCODEX_SECTION_MARKER: &str = "# Auto-injected by opencodex";
 const OPENCODEX_JOURNAL_FILE: &str = "opencodex-journal.json";
 static INSTANCE_OPERATION_LOCK: Mutex<()> = Mutex::new(());
+
+fn try_instance_operation_lock(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>, String> {
+    // Session repair can hold this guard for minutes. A synchronous command must
+    // reject overlapping work instead of blocking the desktop event loop.
+    lock.try_lock().map_err(|error| match error {
+        TryLockError::WouldBlock => {
+            "正在处理 Codex 实例操作，请等待当前切换或修复完成后重试".to_string()
+        }
+        TryLockError::Poisoned(_) => "Codex 实例操作锁已损坏".to_string(),
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1035,9 +1046,7 @@ pub fn save_codex_instance(input: SaveCodexInstanceInput) -> Result<CodexInstanc
     if !managed_instances_supported() {
         return Err(managed_instances_unavailable_error());
     }
-    let _guard = INSTANCE_OPERATION_LOCK
-        .lock()
-        .map_err(|_| "Codex 实例配置锁已损坏".to_string())?;
+    let _guard = try_instance_operation_lock(&INSTANCE_OPERATION_LOCK)?;
     let mut stored = read_stored_instances()?;
     let previous = input
         .id
@@ -1079,9 +1088,7 @@ pub fn delete_codex_instance(instance_id: String) -> Result<DeleteCodexInstanceR
     if instance_id == DEFAULT_INSTANCE_ID {
         return Err("系统默认实例不能删除".to_string());
     }
-    let _guard = INSTANCE_OPERATION_LOCK
-        .lock()
-        .map_err(|_| "Codex 实例配置锁已损坏".to_string())?;
+    let _guard = try_instance_operation_lock(&INSTANCE_OPERATION_LOCK)?;
     let mut stored = read_stored_instances()?;
     let instance = stored
         .iter()
@@ -1238,9 +1245,7 @@ fn launch_stored(instance: &StoredCodexInstance) -> Result<CodexInstance, String
 
 #[tauri::command]
 pub fn launch_codex_instance(instance_id: String) -> Result<CodexInstance, String> {
-    let _guard = INSTANCE_OPERATION_LOCK
-        .lock()
-        .map_err(|_| "Codex 实例操作锁已损坏".to_string())?;
+    let _guard = try_instance_operation_lock(&INSTANCE_OPERATION_LOCK)?;
     let instance = stored_instance(&instance_id)?;
     launch_stored(&instance)
 }
@@ -1314,17 +1319,13 @@ fn hide_command_window(command: &mut Command) {
 
 #[tauri::command]
 pub fn stop_codex_instance(instance_id: String) -> Result<(), String> {
-    let _guard = INSTANCE_OPERATION_LOCK
-        .lock()
-        .map_err(|_| "Codex 实例操作锁已损坏".to_string())?;
+    let _guard = try_instance_operation_lock(&INSTANCE_OPERATION_LOCK)?;
     stop_stored(&stored_instance(&instance_id)?)
 }
 
 #[tauri::command]
 pub fn restart_codex_instance(instance_id: String) -> Result<CodexInstance, String> {
-    let _guard = INSTANCE_OPERATION_LOCK
-        .lock()
-        .map_err(|_| "Codex 实例操作锁已损坏".to_string())?;
+    let _guard = try_instance_operation_lock(&INSTANCE_OPERATION_LOCK)?;
     let instance = stored_instance(&instance_id)?;
     stop_stored(&instance)?;
     thread::sleep(Duration::from_millis(250));
@@ -1335,9 +1336,7 @@ pub fn run_with_instance_restarted<T>(
     instance_id: &str,
     action: impl FnOnce(&CodexInstance) -> Result<T, String>,
 ) -> Result<T, String> {
-    let _guard = INSTANCE_OPERATION_LOCK
-        .lock()
-        .map_err(|_| "Codex 实例操作锁已损坏".to_string())?;
+    let _guard = try_instance_operation_lock(&INSTANCE_OPERATION_LOCK)?;
     let stored = stored_instance(instance_id)?;
     let public = checked_public_instance(stored.clone())?;
     if public.running {
@@ -1364,9 +1363,7 @@ pub fn run_with_instance_stopped<T>(
     instance_id: &str,
     action: impl FnOnce(&CodexInstance) -> Result<T, String>,
 ) -> Result<(T, bool), String> {
-    let _guard = INSTANCE_OPERATION_LOCK
-        .lock()
-        .map_err(|_| "Codex 实例操作锁已损坏".to_string())?;
+    let _guard = try_instance_operation_lock(&INSTANCE_OPERATION_LOCK)?;
     let stored = stored_instance(instance_id)?;
     let public = checked_public_instance(stored.clone())?;
     let was_running = public.running;
@@ -1382,9 +1379,7 @@ pub fn run_with_instance_restarted_if_running<T>(
     instance_id: &str,
     action: impl FnOnce(&CodexInstance) -> Result<T, String>,
 ) -> Result<T, String> {
-    let _guard = INSTANCE_OPERATION_LOCK
-        .lock()
-        .map_err(|_| "Codex 实例操作锁已损坏".to_string())?;
+    let _guard = try_instance_operation_lock(&INSTANCE_OPERATION_LOCK)?;
     let stored = stored_instance(instance_id)?;
     let public = checked_public_instance(stored.clone())?;
     if !public.running {
@@ -1409,9 +1404,7 @@ pub(crate) fn run_with_instance_opened_on_success<T>(
     instance_id: &str,
     action: impl FnOnce(&CodexInstance) -> Result<T, String>,
 ) -> Result<T, String> {
-    let _guard = INSTANCE_OPERATION_LOCK
-        .lock()
-        .map_err(|_| "Codex 实例操作锁已损坏".to_string())?;
+    let _guard = try_instance_operation_lock(&INSTANCE_OPERATION_LOCK)?;
     let stored = stored_instance(instance_id)?;
     let public = checked_public_instance(stored.clone())?;
     let was_running = public.running;
@@ -1691,6 +1684,29 @@ pub fn delete_session_edit_backups(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn instance_operations_reject_contention_without_waiting_and_release_afterward() {
+        let lock = Mutex::new(());
+        let guard = try_instance_operation_lock(&lock).unwrap();
+        let error = try_instance_operation_lock(&lock).unwrap_err();
+        assert!(error.contains("请等待当前切换或修复完成"));
+        drop(guard);
+        assert!(try_instance_operation_lock(&lock).is_ok());
+    }
+
+    #[test]
+    fn instance_operations_report_a_poisoned_lock() {
+        let lock = Mutex::new(());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = lock.lock().unwrap();
+            panic!("fixture panic while holding the instance lock");
+        });
+        assert_eq!(
+            try_instance_operation_lock(&lock).unwrap_err(),
+            "Codex 实例操作锁已损坏"
+        );
+    }
 
     #[test]
     fn parses_session_edit_backup_names_with_dashed_operations() {

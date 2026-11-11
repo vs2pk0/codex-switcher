@@ -1730,53 +1730,55 @@ async fn switch_codex_account(
         )
         .await?;
     }
-    instances::run_with_instance_restarted(&instance_id, |instance| {
-        let codex_home = PathBuf::from(&instance.codex_home);
-        // 仅在用户启用重置选项时清空旧配置；默认保留自定义配置。
-        if switch_settings.reset_config_on_account_switch
-            && codex_home_needs_config_reset_before_switch(&codex_home)
-        {
-            reset_codex_config_for_switch(
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::run_with_instance_restarted(&instance_id, |instance| {
+            let codex_home = PathBuf::from(&instance.codex_home);
+            // 仅在用户启用重置选项时清空旧配置；默认保留自定义配置。
+            if switch_settings.reset_config_on_account_switch
+                && codex_home_needs_config_reset_before_switch(&codex_home)
+            {
+                // The destination provider is repaired after switching accounts.
+                reset_codex_config_for_switch(&instance.id, false)?;
+            }
+            let account_store = AccountStore::new_for_instance(
+                switcher_account_dir(),
+                codex_home.clone(),
                 &instance.id,
+            );
+            let session_store = SessionStore::new(codex_home.clone());
+            // Install the destination catalog before migrating saved thread models.
+            // Otherwise repair still sees the previous account's model defaults.
+            let account = account_store.switch_account(&account_id)?;
+            if let Some(catalog) = &model_catalog {
+                api_model_catalog::install_with_settings(
+                    &codex_home,
+                    &account_id,
+                    catalog,
+                    &switch_settings.api_model_settings,
+                )
+                .map_err(|error| {
+                    format!("账号已切换，但模型目录或 API 偏好写入失败，请重试：{error}")
+                })?;
+            }
+            let mut switched = account_switch_result_after_configuration(
+                &session_store,
+                account,
                 switch_settings.repair_sessions_on_account_switch,
             )?;
-        }
-        let account_store = AccountStore::new_for_instance(
-            switcher_account_dir(),
-            codex_home.clone(),
-            &instance.id,
-        );
-        let session_store = SessionStore::new(codex_home.clone());
-        // Install the destination catalog before migrating saved thread models.
-        // Otherwise repair still sees the previous account's model defaults.
-        let account = account_store.switch_account(&account_id)?;
-        if let Some(catalog) = &model_catalog {
-            api_model_catalog::install_with_settings(
-                &codex_home,
-                &account_id,
-                catalog,
-                &switch_settings.api_model_settings,
-            )
-            .map_err(|error| {
-                format!("账号已切换，但模型目录或 API 偏好写入失败，请重试：{error}")
-            })?;
-        }
-        let mut switched = account_switch_result_after_configuration(
-            &session_store,
-            account,
-            switch_settings.repair_sessions_on_account_switch,
-        )?;
-        if switch_settings.repair_sessions_on_account_switch {
-            if let Err(error) = session_store.hydrate_missing_history_projections(None) {
-                let warning = format!("配置已更新，但分页历史重建未完成：{error}");
-                switched.warning = Some(match switched.warning {
-                    Some(previous) => format!("{previous}；{warning}"),
-                    None => warning,
-                });
+            if switch_settings.repair_sessions_on_account_switch {
+                if let Err(error) = session_store.hydrate_missing_history_projections(None) {
+                    let warning = format!("配置已更新，但分页历史重建未完成：{error}");
+                    switched.warning = Some(match switched.warning {
+                        Some(previous) => format!("{previous}；{warning}"),
+                        None => warning,
+                    });
+                }
             }
-        }
-        Ok(switched)
+            Ok(switched)
+        })
     })
+    .await
+    .map_err(|error| format!("切换账号任务失败：{error}"))?
 }
 
 /// API Key 账号「同步配置」的进度事件名；payload 为 [`ApiKeyAccountSyncProgress`]。
@@ -1858,7 +1860,8 @@ async fn sync_api_key_account_to_instance(
                 let codex_home = PathBuf::from(&instance.codex_home);
                 if switch_settings.reset_config_on_account_switch
             && codex_home_needs_config_reset_before_switch(&codex_home) {
-                    reset_codex_config_for_switch(&instance.id, switch_settings.repair_sessions_on_account_switch)?;
+                    // Repair once after installing the destination configuration.
+                    reset_codex_config_for_switch(&instance.id, false)?;
                 }
                 let account_store = AccountStore::new_for_instance(
                     switcher_account_dir(),
@@ -1870,7 +1873,7 @@ async fn sync_api_key_account_to_instance(
                 api_model_catalog::install_with_settings(
                     &codex_home, &account_id, &model_catalog, &switch_settings.api_model_settings,
                 ).map_err(|error| format!("账号已切换，但模型目录或 API 偏好写入失败，请重试：{error}"))?;
-                let switched = account_switch_result_after_configuration(&session_store, account, switch_settings.repair_sessions_on_account_switch)?;
+                let switched = account_switch_result_before_full_repair(&session_store, account, switch_settings.repair_sessions_on_account_switch)?;
                 let mut report = |step: u8| emit(step);
                 let mut outcome = repair_sessions_on_switch(
                     &session_store,
@@ -1976,6 +1979,40 @@ fn account_switch_result_after_configuration(
     })
 }
 
+/// A full repair follows immediately; synchronize the database here without
+/// scanning and rewriting every rollout twice.
+pub(crate) fn account_switch_result_before_full_repair(
+    session_store: &SessionStore,
+    account: CodexAccount,
+    repair_sessions: bool,
+) -> Result<CodexAccountSwitchResult, String> {
+    let mut result = account_switch_result_after_configuration(session_store, account, false)?;
+    if repair_sessions {
+        let provider = session_store.read_target_provider()?;
+        let mut warnings = result.warning.take().into_iter().collect::<Vec<_>>();
+        result.synchronized_session_provider_count =
+            synchronize_session_provider(session_store, &provider, &mut warnings);
+        result.warning = (!warnings.is_empty()).then(|| warnings.join("；"));
+    }
+    Ok(result)
+}
+
+fn synchronize_session_provider(
+    session_store: &SessionStore,
+    provider: &str,
+    warnings: &mut Vec<String>,
+) -> usize {
+    match session_store.synchronize_model_provider(provider) {
+        Ok(count) => count,
+        Err(error) => {
+            warnings.push(format!(
+                "配置已更新，但会话数据库 Provider 同步未完成：{error}"
+            ));
+            0
+        }
+    }
+}
+
 /// 调用方须已停止目标实例；统一修复会话路由、模型和图片，再允许重新打开实例。
 pub(crate) fn prepare_sessions_after_configuration_change(
     session_store: &SessionStore,
@@ -1985,15 +2022,7 @@ pub(crate) fn prepare_sessions_after_configuration_change(
     if let Err(error) = session_store.preserve_account_scoped_local_projects() {
         warnings.push(format!("配置已更新，但账号侧栏项目同步未完成：{error}"));
     }
-    let synchronized = match session_store.synchronize_model_provider(&provider) {
-        Ok(count) => count,
-        Err(error) => {
-            warnings.push(format!(
-                "配置已更新，但会话数据库 Provider 同步未完成：{error}"
-            ));
-            0
-        }
-    };
+    let synchronized = synchronize_session_provider(session_store, &provider, &mut warnings);
     match session_store.repair_model_compatibility(&provider) {
         Ok(summary) => warnings.extend(summary.warnings),
         Err(error) => warnings.push(format!(
@@ -2062,21 +2091,25 @@ fn restart_codex_app(instance_id: Option<String>) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn repair_codex_session_model_compatibility(
+async fn repair_codex_session_model_compatibility(
     instance_id: Option<String>,
 ) -> Result<CodexSessionModelCompatibilityRepairSummary, String> {
     let instance_id = instance_id.unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
-    instances::run_with_instance_restarted(&instance_id, |instance| {
-        let session_store = SessionStore::new(PathBuf::from(&instance.codex_home));
-        let target_provider = session_store.read_target_provider()?;
-        let mut summary = session_store.repair_model_compatibility(&target_provider)?;
-        if let Err(error) = session_store.hydrate_missing_history_projections(None) {
-            summary
-                .warnings
-                .push(format!("分页历史重建未完成：{error}"));
-        }
-        Ok(summary)
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::run_with_instance_restarted(&instance_id, |instance| {
+            let session_store = SessionStore::new(PathBuf::from(&instance.codex_home));
+            let target_provider = session_store.read_target_provider()?;
+            let mut summary = session_store.repair_model_compatibility(&target_provider)?;
+            if let Err(error) = session_store.hydrate_missing_history_projections(None) {
+                summary
+                    .warnings
+                    .push(format!("分页历史重建未完成：{error}"));
+            }
+            Ok(summary)
+        })
     })
+    .await
+    .map_err(|error| format!("切号会话修复任务失败：{error}"))?
 }
 
 /// 「一键修复」结果：切号会话修复 + 当前实例全部会话的完整历史修复。
@@ -2201,35 +2234,24 @@ pub(crate) fn one_click_repair_session_store(
         Ok(image_warnings) => warnings.extend(image_warnings),
         Err(error) => warnings.push(format!("历史图片恢复未完成：{error}")),
     }
-    let session_ids = match session_store.list_sessions(None, None) {
-        Ok(sessions) => sessions
-            .into_iter()
-            .map(|session| session.id)
-            .collect::<Vec<_>>(),
-        Err(error) => {
-            warnings.push(format!("读取会话列表失败，已跳过完整历史修复：{error}"));
-            Vec::new()
-        }
-    };
-    let session_count = session_ids.len();
     report_progress(2);
-    let visibility = if session_ids.is_empty() {
-        CodexSessionVisibilityRepairSummary::default()
-    } else {
-        match session_store.repair_visibility_with_options(
-            Some("deep"),
-            Some(target_provider),
-            None,
-            None,
-            Some(session_ids),
-        ) {
-            Ok(summary) => summary,
-            Err(error) => {
-                warnings.push(format!("完整历史修复未完成，已跳过并继续：{error}"));
-                CodexSessionVisibilityRepairSummary::default()
-            }
+    // No explicit selection means inspect every projection and reset only stale
+    // or rewritten history. Passing every ID would force a complete rebuild even
+    // for healthy sessions. Explicit single-session recovery keeps that behavior.
+    let visibility = match session_store.repair_visibility_with_options(
+        Some("deep"),
+        Some(target_provider),
+        None,
+        None,
+        None,
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            warnings.push(format!("完整历史修复未完成，已跳过并继续：{error}"));
+            CodexSessionVisibilityRepairSummary::default()
         }
     };
+    let session_count = visibility.scanned;
     warnings.extend(visibility.warnings.iter().cloned());
     Ok(OneClickStoreRepairOutcome {
         session_count,
@@ -2245,12 +2267,12 @@ pub(crate) fn one_click_repair_session_store_with_native_history(
     report_progress: &mut impl FnMut(u8),
 ) -> Result<OneClickStoreRepairOutcome, String> {
     let mut outcome = one_click_repair_session_store(store, report_progress)?;
-    if outcome.visibility.reset_history_projection_count > 0 {
-        if let Err(error) = store.hydrate_missing_history_projections(None) {
-            outcome
-                .warnings
-                .push(format!("分页历史重建未完成：{error}"));
-        }
+    // Model/image repair may already have cleared a projection before the
+    // visibility phase; its reset count alone cannot tell whether one is missing.
+    if let Err(error) = store.hydrate_missing_history_projections(None) {
+        outcome
+            .warnings
+            .push(format!("分页历史重建未完成：{error}"));
     }
     Ok(outcome)
 }
@@ -3427,19 +3449,23 @@ async fn codex_get_session_token_stats_across_instances(
 }
 
 #[tauri::command]
-fn codex_list_session_content(
+async fn codex_list_session_content(
     session_id: String,
     cursor: Option<u64>,
     limit: Option<usize>,
     direction: Option<String>,
     instance_id: Option<String>,
 ) -> Result<CodexSessionContentPage, String> {
-    session_store_for_instance(instance_id.as_deref())?.list_session_content(
-        &session_id,
-        cursor,
-        limit,
-        direction.as_deref(),
-    )
+    tauri::async_runtime::spawn_blocking(move || {
+        session_store_for_instance(instance_id.as_deref())?.list_session_content(
+            &session_id,
+            cursor,
+            limit,
+            direction.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| format!("读取会话内容任务失败: {error}"))?
 }
 
 #[tauri::command]
@@ -3461,12 +3487,17 @@ async fn codex_export_session_markdown(
 }
 
 #[tauri::command]
-fn codex_get_session_asset(
+async fn codex_get_session_asset(
     session_id: String,
     asset_id: String,
     instance_id: Option<String>,
 ) -> Result<CodexSessionAsset, String> {
-    session_store_for_instance(instance_id.as_deref())?.get_session_asset(&session_id, &asset_id)
+    tauri::async_runtime::spawn_blocking(move || {
+        session_store_for_instance(instance_id.as_deref())?
+            .get_session_asset(&session_id, &asset_id)
+    })
+    .await
+    .map_err(|error| format!("读取会话附件任务失败: {error}"))?
 }
 
 #[tauri::command]
@@ -5413,6 +5444,178 @@ mod tests {
             )
             .unwrap();
         assert_eq!(provider, "openai");
+    }
+
+    #[test]
+    fn full_repair_preparation_only_syncs_provider_and_preserves_rollouts() {
+        let storage = tempdir().unwrap();
+        let codex = tempdir().unwrap();
+        let directory = codex.path().join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("broken.jsonl");
+        let original = "invalid session bytes must not be parsed twice\n";
+        std::fs::write(&path, original).unwrap();
+        let state = rusqlite::Connection::open(codex.path().join("state_5.sqlite")).unwrap();
+        state.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT); INSERT INTO threads VALUES ('broken','api');").unwrap();
+        let accounts = AccountStore::new(storage.path().to_path_buf(), codex.path().to_path_buf());
+        let account = accounts.import_from_json(&json!({
+            "email":"fixture@example.com", "tokens":{"access_token":"fixture","id_token":"fixture","refresh_token":"fixture"}
+        }).to_string()).unwrap().remove(0);
+        let sessions = SessionStore::new(codex.path().to_path_buf());
+        for repair in [false, true] {
+            let result =
+                super::account_switch_result_before_full_repair(&sessions, account.clone(), repair)
+                    .unwrap();
+            assert_eq!(
+                result.synchronized_session_provider_count,
+                usize::from(repair)
+            );
+            assert!(result.warning.is_none(), "{:?}", result.warning);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            let provider: String = state
+                .query_row(
+                    "SELECT model_provider FROM threads WHERE id='broken'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(provider, if repair { "openai" } else { "api" });
+        }
+    }
+
+    #[test]
+    fn bulk_repair_preserves_healthy_history_but_resets_stale_and_explicit_history() {
+        let codex = tempdir().unwrap();
+        let directory = codex.path().join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("healthy.jsonl");
+        let values = [
+            json!({"type":"session_meta","ordinal":0,"payload":{"id":"healthy","model_provider":"openai","cwd":codex.path(),"source":"cli"}}),
+            json!({"type":"event_msg","ordinal":1,"payload":{"type":"task_started","turn_id":"turn-1"}}),
+            json!({"type":"event_msg","ordinal":2,"payload":{"type":"task_complete","turn_id":"turn-1"}}),
+        ];
+        std::fs::write(
+            &path,
+            values
+                .iter()
+                .map(|value| format!("{value}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let sessions = SessionStore::new(codex.path().to_path_buf());
+        let initial = super::one_click_repair_session_store(&sessions, &mut |_| {}).unwrap();
+        assert!(initial.warnings.is_empty(), "{:?}", initial.warnings);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let next_ordinal = content
+            .lines()
+            .filter_map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["ordinal"].as_u64()
+            })
+            .max()
+            .unwrap()
+            + 1;
+        let history =
+            rusqlite::Connection::open(codex.path().join("thread_history_1.sqlite")).unwrap();
+        history.execute_batch("CREATE TABLE thread_items (thread_id TEXT, item_id TEXT); CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT); CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER);").unwrap();
+        let seed_projection = || {
+            history.execute_batch("INSERT INTO thread_items VALUES ('healthy','item'); INSERT INTO thread_turns VALUES ('healthy','turn-1');").unwrap();
+            history
+                .execute(
+                    "INSERT INTO thread_history_projection_state VALUES ('healthy',?1,?2)",
+                    rusqlite::params![content.len() as i64, next_ordinal as i64],
+                )
+                .unwrap();
+        };
+        seed_projection();
+        let healthy = super::one_click_repair_session_store(&sessions, &mut |_| {}).unwrap();
+        assert_eq!(healthy.session_count, 1);
+        assert_eq!(healthy.visibility.reset_history_projection_count, 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        let item_count: i64 = history
+            .query_row("SELECT COUNT(*) FROM thread_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(item_count, 1);
+
+        history
+            .execute(
+                "UPDATE thread_history_projection_state SET next_rollout_byte_offset=0",
+                [],
+            )
+            .unwrap();
+        let stale = super::one_click_repair_session_store(&sessions, &mut |_| {}).unwrap();
+        assert_eq!(stale.visibility.reset_history_projection_count, 1);
+        seed_projection();
+        let explicit = sessions
+            .repair_visibility_with_options(
+                Some("deep"),
+                Some("openai".into()),
+                None,
+                None,
+                Some(vec!["healthy".into()]),
+            )
+            .unwrap();
+        assert_eq!(explicit.reset_history_projection_count, 1);
+    }
+
+    #[test]
+    fn bulk_repair_hydrates_legacy_projection_cleared_before_visibility() {
+        let codex = tempdir().unwrap();
+        let directory = codex.path().join("sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("legacy.jsonl");
+        let values = [
+            json!({"type":"session_meta","ordinal":0,"payload":{"id":"legacy","model_provider":"api","cwd":codex.path(),"source":"cli"}}),
+            json!({"type":"response_item","ordinal":1,"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"legacy visible message"}]}}),
+        ];
+        let content = values
+            .iter()
+            .map(|value| format!("{value}\n"))
+            .collect::<String>();
+        std::fs::write(&path, &content).unwrap();
+        let history =
+            rusqlite::Connection::open(codex.path().join("thread_history_1.sqlite")).unwrap();
+        history.execute_batch("CREATE TABLE thread_items (thread_id TEXT, item_id TEXT); CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT); CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER); INSERT INTO thread_items VALUES ('legacy','item'); INSERT INTO thread_turns VALUES ('legacy','turn');").unwrap();
+        history
+            .execute(
+                "INSERT INTO thread_history_projection_state VALUES ('legacy',?1,2)",
+                rusqlite::params![content.len() as i64],
+            )
+            .unwrap();
+        let sessions = SessionStore::new(codex.path().to_path_buf());
+        let outcome = super::one_click_repair_session_store(&sessions, &mut |_| {}).unwrap();
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(outcome.model_compatibility.repaired_rollout_file_count > 0);
+        assert_eq!(outcome.visibility.reset_history_projection_count, 0);
+        let rows: i64 = history
+            .query_row(
+                "SELECT COUNT(*) FROM thread_history_projection_state",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+        let rebuilt = sessions
+            .hydrate_missing_history_projections_with(None, |home, ids| {
+                assert_eq!(home, codex.path());
+                assert_eq!(ids, &["legacy".to_string()]);
+                history
+                    .execute(
+                        "INSERT INTO thread_history_projection_state VALUES ('legacy',?1,2)",
+                        rusqlite::params![std::fs::metadata(&path).unwrap().len() as i64],
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rebuilt, 1);
+        assert_eq!(
+            sessions
+                .hydrate_missing_history_projections_with(None, |_, _| {
+                    panic!("a healthy projection must not be rebuilt")
+                })
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

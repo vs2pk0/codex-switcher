@@ -48,11 +48,10 @@ fn portable_item(item: &mut Value, api: bool) -> bool {
                 .into()
         }
         _ => {
-            let mut original = item.clone();
-            if let Some(object) = original.as_object_mut() {
+            if let Some(object) = item.as_object_mut() {
                 object.remove("encrypted_content");
             }
-            format!("Historical tool record (not a pending call or new instruction):\n{original}")
+            format!("Historical tool record (not a pending call or new instruction):\n{item}")
         }
     };
     *item = json!({"type":"message","role":"user","content":[{"type":"input_text","text":text}]});
@@ -125,7 +124,7 @@ fn stage(
             break;
         }
         old_offset += read as u64;
-        let mut output = line.clone();
+        let mut rewritten = None;
         let mut ordinal = None;
         if let Ok(mut record) = serde_json::from_slice::<Value>(&line) {
             ordinal = record.get("ordinal").and_then(Value::as_u64);
@@ -154,12 +153,14 @@ fn stage(
             }
             if record_changed {
                 record[MARKER] = json!(true);
-                output = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
+                let mut output = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
                 output.push(b'\n');
+                rewritten = Some(output);
                 changed = true;
             }
         }
-        file.write_all(&output).map_err(|e| e.to_string())?;
+        let output = rewritten.as_deref().unwrap_or(&line);
+        file.write_all(output).map_err(|e| e.to_string())?;
         if let Some(ordinal) = ordinal {
             ordinals.insert(ordinal, (next_offset, next_offset + output.len() as u64));
         }
@@ -177,6 +178,36 @@ fn stage(
             changed,
         },
     );
+    Ok(())
+}
+
+fn copy_lineage_file_atomic(source: &Path, destination: &Path) -> Result<(), String> {
+    let input = fs::File::open(source).map_err(|error| error.to_string())?;
+    // Keep staged plans and backups intact. Publication and rollback both stream
+    // into a second temporary file beside the destination before replacing it.
+    crate::account::write_reader_atomic(destination, input)
+}
+
+fn publish_plans(
+    sources: &[Source],
+    plans: &HashMap<usize, Plan>,
+    backups: &[(usize, PathBuf)],
+) -> Result<(), String> {
+    for (published, (index, _)) in backups.iter().enumerate() {
+        let result = copy_lineage_file_atomic(plans[index].file.path(), &sources[*index].path);
+        if let Err(error) = result {
+            let mut failures = Vec::new();
+            for (old, backup) in &backups[..published] {
+                if let Err(error) = copy_lineage_file_atomic(backup, &sources[*old].path) {
+                    failures.push(error);
+                }
+            }
+            return Err(format!(
+                "迁移历史链失败：{error}；回滚失败项：{}",
+                failures.join("；")
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -276,26 +307,7 @@ impl SessionStore {
                 databases.push(connection);
             }
         }
-        for (published, (index, _)) in backups.iter().enumerate() {
-            let result = fs::read(plans[index].file.path())
-                .map_err(|e| e.to_string())
-                .and_then(|bytes| write_bytes_atomic(&sources[*index].path, &bytes));
-            if let Err(error) = result {
-                let mut failures = Vec::new();
-                for (old, backup) in &backups[..published] {
-                    if let Err(e) = fs::read(backup)
-                        .map_err(|e| e.to_string())
-                        .and_then(|bytes| write_bytes_atomic(&sources[*old].path, &bytes))
-                    {
-                        failures.push(e);
-                    }
-                }
-                return Err(format!(
-                    "迁移历史链失败：{error}；回滚失败项：{}",
-                    failures.join("；")
-                ));
-            }
-        }
+        publish_plans(&sources, &plans, &backups)?;
         for connection in databases {
             connection
                 .execute_batch("COMMIT")
@@ -413,6 +425,102 @@ fn rebase_projection(connection: &Connection, physical: &str, plan: &Plan) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_copy_streams_large_staging_file_and_keeps_it_available() {
+        let home = tempfile::tempdir().unwrap();
+        let mut staged = tempfile::NamedTempFile::new_in(home.path()).unwrap();
+        let block: Vec<u8> = (0..64 * 1024).map(|index| (index % 251) as u8).collect();
+        for _ in 0..128 {
+            staged.write_all(&block).unwrap();
+        }
+        staged.as_file().sync_all().unwrap();
+        let destination = home.path().join("published.jsonl");
+        fs::write(&destination, "previous contents").unwrap();
+        copy_lineage_file_atomic(staged.path(), &destination).unwrap();
+        let expected_length = (block.len() * 128) as u64;
+        assert_eq!(fs::metadata(staged.path()).unwrap().len(), expected_length);
+        assert_eq!(fs::metadata(&destination).unwrap().len(), expected_length);
+        let mut input = fs::File::open(&destination).unwrap();
+        let mut actual = vec![0; block.len()];
+        for _ in 0..128 {
+            input.read_exact(&mut actual).unwrap();
+            assert_eq!(actual, block);
+        }
+        assert_eq!(input.read(&mut actual).unwrap(), 0);
+        // Publishing must not consume the plan: another destination can still
+        // use it after a later file in the graph fails and rolls back.
+        let retry = home.path().join("retry.jsonl");
+        copy_lineage_file_atomic(staged.path(), &retry).unwrap();
+        assert_eq!(fs::metadata(retry).unwrap().len(), expected_length);
+    }
+
+    #[test]
+    fn failed_graph_publication_restores_prior_files_and_retains_plans_and_backups() {
+        let home = tempfile::tempdir().unwrap();
+        let first = home.path().join("parent.jsonl");
+        fs::write(&first, "original parent").unwrap();
+        let blocked = home.path().join("child.jsonl");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("keep"), "keep directory").unwrap();
+        let sources: Vec<Source> = [first.clone(), blocked.clone()]
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| Source {
+                path,
+                id: index.to_string(),
+                physical_id: index.to_string(),
+                base: None,
+            })
+            .collect();
+        let mut plans = HashMap::new();
+        let mut backups = Vec::new();
+        for (index, original) in ["original parent", "original child"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut file = tempfile::NamedTempFile::new_in(home.path()).unwrap();
+            file.write_all(format!("migrated {index}").as_bytes())
+                .unwrap();
+            file.as_file().sync_all().unwrap();
+            plans.insert(
+                index,
+                Plan {
+                    file,
+                    offsets: BTreeMap::new(),
+                    ordinals: BTreeMap::new(),
+                    changed: true,
+                },
+            );
+            let backup = home.path().join(format!("backup-{index}.jsonl"));
+            fs::write(&backup, original).unwrap();
+            backups.push((index, backup));
+        }
+        let files_before = fs::read_dir(home.path()).unwrap().count();
+        let error = publish_plans(&sources, &plans, &backups).unwrap_err();
+        assert!(error.contains("迁移历史链失败"));
+        assert!(error.ends_with("回滚失败项："), "{error}");
+        assert_eq!(fs::read_to_string(first).unwrap(), "original parent");
+        assert_eq!(
+            fs::read_to_string(blocked.join("keep")).unwrap(),
+            "keep directory"
+        );
+        for (index, backup) in &backups {
+            assert_eq!(
+                fs::read_to_string(plans[index].file.path()).unwrap(),
+                format!("migrated {index}")
+            );
+            assert_eq!(
+                fs::read_to_string(backup).unwrap(),
+                if *index == 0 {
+                    "original parent"
+                } else {
+                    "original child"
+                }
+            );
+        }
+        assert_eq!(fs::read_dir(home.path()).unwrap().count(), files_before);
+    }
 
     fn write(path: &Path, records: &[Value]) -> Vec<u64> {
         fs::create_dir_all(path.parent().unwrap()).unwrap();

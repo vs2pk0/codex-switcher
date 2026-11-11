@@ -28,6 +28,9 @@ export const languageOptions: Array<{ value: AppLanguage; label: string }> = [
 ];
 
 const en: Record<string, string> = {
+  "大文件按需加载对话，图片点击后加载。": "Large sessions load conversations on demand. Click images to load them.",
+  "长消息以纯文本分段显示，导出包含完整内容。": "Long messages are shown in plain-text sections. Exports include the full content.",
+  "继续展开消息": "Show more of this message",
   "点击续期登录令牌": "Click to renew the login token",
   "正在续期登录令牌，请稍候": "Renewing the login token, please wait",
   "缺少续期凭据，请重新登录": "No renewal credentials available. Please sign in again",
@@ -1305,6 +1308,9 @@ const en: Record<string, string> = {
 };
 
 const ru: Record<string, string> = {
+  "大文件按需加载对话，图片点击后加载。": "Диалоги больших сеансов загружаются по запросу. Нажмите на изображение, чтобы загрузить его.",
+  "长消息以纯文本分段显示，导出包含完整内容。": "Длинные сообщения отображаются частями как обычный текст. Экспорт содержит полный текст.",
+  "继续展开消息": "Показать следующую часть сообщения",
   "点击续期登录令牌": "Нажмите, чтобы обновить токен входа",
   "正在续期登录令牌，请稍候": "Обновление токена входа, подождите",
   "缺少续期凭据，请重新登录": "Нет данных для обновления. Войдите снова",
