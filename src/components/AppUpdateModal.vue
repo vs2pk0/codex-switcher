@@ -113,7 +113,12 @@ function close(): void {
         </div>
       </div>
 
-      <a-progress :percent="percent" :status="progressStatus" />
+      <a-progress :percent="percent" :status="progressStatus">
+        <template #text>
+          {{ (percent * 100).toFixed(2) }}%
+          <icon-exclamation-circle-fill v-if="progressStatus === 'danger'" />
+        </template>
+      </a-progress>
 
       <div v-if="result" class="app-update-path">
         <span>{{ t("保存位置") }}</span>

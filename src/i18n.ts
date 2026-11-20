@@ -966,6 +966,7 @@ const en: Record<string, string> = {
   "浏览器登录，自动带回授权结果": "Sign in with browser and return the authorization result automatically.",
   "账号接入": "Account Setup",
   "浏览器授权流程": "Browser Flow",
+  "在浏览器完成 OpenAI 登录": "Sign in to OpenAI in your browser.",
   "选择一种方式，把账号接到 Codex Switcher": "Choose how to connect an account to Codex Switcher",
   "推荐使用浏览器授权；如果已经有本地 token、JSON 或 API Key，也可以直接导入。":
     "Browser authorization is recommended. Existing local token, JSON, or API Key data can also be imported directly.",
@@ -973,6 +974,10 @@ const en: Record<string, string> = {
   "继续打开授权页": "Open Auth Page Again",
   "复制链接": "Copy Link",
   "手动完成": "Manual Completion",
+  "如果应用没有收到回调，可复制地址栏里的完整 localhost 回调地址手动完成。":
+    "If the app does not receive the callback, copy the full localhost callback URL to finish manually.",
+  "应用未收到回调时，把完整的 localhost 回调地址粘贴到这里。":
+    "Paste the full localhost callback URL here if the app did not receive it.",
   "完成接入": "Complete",
   "重试保存": "Retry Save",
   "从本地文件导入": "Import from local file",
@@ -2217,6 +2222,7 @@ const ru: Record<string, string> = {
   "浏览器登录，自动带回授权结果": "Войдите в браузере, результат вернется автоматически.",
   "账号接入": "Подключение аккаунта",
   "浏览器授权流程": "Авторизация в браузере",
+  "在浏览器完成 OpenAI 登录": "Войдите в OpenAI в браузере.",
   "选择一种方式，把账号接到 Codex Switcher": "Выберите способ подключения аккаунта к Codex Switcher",
   "推荐使用浏览器授权；如果已经有本地 token、JSON 或 API Key，也可以直接导入。":
     "Рекомендуется авторизация в браузере. Локальный token, JSON или API Key также можно импортировать напрямую.",
@@ -2224,6 +2230,10 @@ const ru: Record<string, string> = {
   "继续打开授权页": "Открыть страницу снова",
   "复制链接": "Копировать ссылку",
   "手动完成": "Завершить вручную",
+  "如果应用没有收到回调，可复制地址栏里的完整 localhost 回调地址手动完成。":
+    "Если приложение не получило ответ, скопируйте полный URL обратного вызова localhost и завершите вход вручную.",
+  "应用未收到回调时，把完整的 localhost 回调地址粘贴到这里。":
+    "Если приложение не получило ответ, вставьте сюда полный URL обратного вызова localhost.",
   "完成接入": "Готово",
   "重试保存": "Повторить сохранение",
   "从本地文件导入": "Импорт из локального файла",

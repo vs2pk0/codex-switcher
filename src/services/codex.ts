@@ -175,6 +175,10 @@ export function startCodexOAuthLogin(): Promise<CodexOAuthLoginStartResponse> {
   return invoke("codex_oauth_login_start");
 }
 
+export function openCodexOAuthBrowser(loginId: string): Promise<void> {
+  return invoke("codex_oauth_open_browser", { loginId });
+}
+
 export function submitCodexOAuthCallbackUrl(input: {
   loginId: string;
   callbackUrl: string;

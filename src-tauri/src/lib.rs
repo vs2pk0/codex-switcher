@@ -39,7 +39,7 @@ use session::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv6Addr, TcpListener};
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "macos"))]
@@ -66,6 +66,7 @@ struct CodexOAuthCallbackEvent {
 }
 
 static OAUTH_CALLBACK_LISTENER_GENERATION: AtomicU64 = AtomicU64::new(0);
+const OAUTH_BROWSER_START_PREFIX: &str = "/auth/start/";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1136,11 +1137,22 @@ fn export_codex_accounts(
 #[tauri::command]
 fn codex_oauth_login_start(app_handle: AppHandle) -> Result<CodexOAuthLoginStartResponse, String> {
     let response = oauth::start_oauth_login()?;
-    if let Err(error) = start_oauth_callback_listener(app_handle, response.login_id.clone()) {
+    if let Err(error) = start_oauth_callback_listener(app_handle, response.clone()) {
         let _ = oauth::cancel_oauth_login(Some(&response.login_id));
         return Err(error);
     }
     Ok(response)
+}
+
+#[tauri::command]
+fn codex_oauth_open_browser(login_id: String) -> Result<(), String> {
+    if !oauth::is_login_active(&login_id) {
+        return Err("OAuth 授权流程不存在或已过期".to_string());
+    }
+    external_url::open(&format!(
+        "http://localhost:{}{OAUTH_BROWSER_START_PREFIX}{login_id}",
+        oauth::CALLBACK_PORT
+    ))
 }
 
 #[tauri::command]
@@ -1193,134 +1205,41 @@ fn open_path_in_file_manager(path: String) -> Result<(), String> {
     open_path_with_system(&target)
 }
 
-fn start_oauth_callback_listener(app_handle: AppHandle, login_id: String) -> Result<(), String> {
+fn start_oauth_callback_listener(
+    app_handle: AppHandle,
+    login: CodexOAuthLoginStartResponse,
+) -> Result<(), String> {
+    // Let a previous browser handoff release the callback port before rebinding.
+    let generation = OAUTH_CALLBACK_LISTENER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let listeners = bind_oauth_callback_listeners()?;
-    let listener_generation = OAUTH_CALLBACK_LISTENER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     for listener in &listeners {
         listener
             .set_nonblocking(true)
-            .map_err(|error| format!("OAuth 回调监听配置失败: {}", error))?;
+            .map_err(|error| format!("OAuth 回调监听配置失败: {error}"))?;
     }
 
     thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30 * 60);
-        let mut callback_received = false;
-        let mut close_deadline: Option<Instant> = None;
-        while Instant::now() < deadline
-            && OAUTH_CALLBACK_LISTENER_GENERATION.load(Ordering::SeqCst) == listener_generation
-            && (oauth::is_login_active(&login_id) || close_deadline.is_some())
+        let CodexOAuthLoginStartResponse { login_id, auth_url } = login;
+        let login_deadline = Instant::now() + Duration::from_secs(30 * 60);
+        let result_path = format!("/auth/result/{login_id}");
+        let mut result_deadline = None;
+        let mut accepted_callback = None;
+        while Instant::now() < result_deadline.unwrap_or(login_deadline)
+            && OAUTH_CALLBACK_LISTENER_GENERATION.load(Ordering::SeqCst) == generation
+            && (result_deadline.is_some() || oauth::is_login_active(&login_id))
         {
-            if close_deadline.is_some_and(|target| Instant::now() >= target) {
-                break;
-            }
             let accepted = listeners
                 .iter()
                 .find_map(|listener| match listener.accept() {
                     Ok(connection) => Some(Ok(connection)),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
                     Err(error) => Some(Err(error)),
                 });
-            match accepted {
-                Some(Ok((mut stream, _))) => {
-                    let mut buffer = [0_u8; 4096];
-                    let size = stream.read(&mut buffer).unwrap_or(0);
-                    let request = String::from_utf8_lossy(&buffer[..size]);
-                    let request_path = request
-                        .lines()
-                        .next()
-                        .and_then(|line| line.split_whitespace().nth(1))
-                        .unwrap_or("/");
-
-                    if request_path.starts_with("/close-tab") {
-                        let html = oauth_close_tab_html();
-                        let body = html.as_bytes();
-                        let _ = write!(
-                            stream,
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        );
-                        let _ = stream.write_all(body);
-                        close_oauth_callback_tab_soon();
-                        close_deadline = Some(Instant::now() + Duration::from_secs(2));
-                        continue;
-                    }
-
-                    if request_path == "/favicon.ico" {
-                        let _ = write!(
-                            stream,
-                            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        );
-                        continue;
-                    }
-
-                    if !request_path.starts_with("/auth/callback") {
-                        let body = b"Not Found";
-                        let _ = write!(
-                            stream,
-                            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        );
-                        let _ = stream.write_all(body);
-                        continue;
-                    }
-
-                    let should_emit = !callback_received;
-                    let callback_result = if callback_received {
-                        Ok(())
-                    } else {
-                        oauth::submit_callback_url(
-                            &login_id,
-                            &format!(
-                                "{}{}",
-                                oauth::redirect_uri().trim_end_matches("/auth/callback"),
-                                request_path
-                            ),
-                        )
-                    };
-                    let (ok, message, html) = match callback_result {
-                        Ok(()) => {
-                            callback_received = true;
-                            close_deadline = Some(Instant::now() + Duration::from_secs(45));
-                            (
-                                true,
-                                "已收到 OAuth 回调，正在保存账号".to_string(),
-                                oauth_callback_html(
-                                    true,
-                                    "授权回调已收到",
-                                    "正在回到 Codex Switcher 保存账号，本页面将自动关闭。",
-                                ),
-                            )
-                        }
-                        Err(error) => {
-                            close_deadline = Some(Instant::now() + Duration::from_secs(60));
-                            let html = oauth_callback_html(
-                                false,
-                                "授权回调失败",
-                                "请回到 Codex Switcher 重试，或复制地址栏里的完整回调地址手动完成。",
-                            );
-                            (false, error, html)
-                        }
-                    };
-                    let body = html.as_bytes();
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = stream.write_all(body);
-                    if should_emit {
-                        let _ = app_handle.emit(
-                            "codex-oauth-callback-received",
-                            CodexOAuthCallbackEvent {
-                                login_id: login_id.clone(),
-                                ok,
-                                message,
-                            },
-                        );
-                    }
-                }
+            let mut stream = match accepted {
+                Some(Ok((stream, _))) => stream,
                 None => {
-                    thread::sleep(Duration::from_millis(200));
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
                 }
                 Some(Err(error)) => {
                     let _ = app_handle.emit(
@@ -1328,10 +1247,98 @@ fn start_oauth_callback_listener(app_handle: AppHandle, login_id: String) -> Res
                         CodexOAuthCallbackEvent {
                             login_id: login_id.clone(),
                             ok: false,
-                            message: format!("OAuth 回调监听失败: {}", error),
+                            message: format!("OAuth 回调监听失败: {error}"),
                         },
                     );
                     break;
+                }
+            };
+
+            // Browsers may open a speculative socket without sending a request.
+            let timeout = Some(Duration::from_millis(500));
+            if stream.set_nonblocking(false).is_err()
+                || stream.set_read_timeout(timeout).is_err()
+                || stream.set_write_timeout(timeout).is_err()
+            {
+                continue;
+            }
+            let mut lines = BufReader::new(&mut stream)
+                .take(16 * 1024)
+                .lines()
+                .map_while(Result::ok);
+            let Some(request_line) = lines.next() else {
+                continue;
+            };
+            if !lines.any(|line| line.is_empty())
+                || OAUTH_CALLBACK_LISTENER_GENERATION.load(Ordering::SeqCst) != generation
+            {
+                continue;
+            }
+
+            match oauth_browser_action(
+                &request_line,
+                &login_id,
+                &result_path,
+                &mut accepted_callback,
+            ) {
+                OAuthBrowserAction::StartRedirect => {
+                    let _ = write_oauth_response(&mut stream, "303 See Other", Some(&auth_url), "");
+                }
+                OAuthBrowserAction::Redirect { first } => {
+                    if first {
+                        result_deadline = Some(Instant::now() + Duration::from_secs(45));
+                    }
+                    let _ =
+                        write_oauth_response(&mut stream, "303 See Other", Some(&result_path), "");
+                    if first {
+                        let _ = app_handle.emit(
+                            "codex-oauth-callback-received",
+                            CodexOAuthCallbackEvent {
+                                login_id: login_id.clone(),
+                                ok: true,
+                                message: "已收到 OAuth 回调，正在保存账号".to_string(),
+                            },
+                        );
+                        focus_oauth_window(&app_handle);
+                    }
+                }
+                OAuthBrowserAction::InvalidCallback(error) => {
+                    let _ = write_oauth_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        None,
+                        &oauth_callback_html(false),
+                    );
+                    let _ = app_handle.emit(
+                        "codex-oauth-callback-received",
+                        CodexOAuthCallbackEvent {
+                            login_id: login_id.clone(),
+                            ok: false,
+                            message: error,
+                        },
+                    );
+                }
+                OAuthBrowserAction::ResultPage => {
+                    let _ = write_oauth_response(
+                        &mut stream,
+                        "200 OK",
+                        None,
+                        &oauth_callback_html(true),
+                    );
+                }
+                OAuthBrowserAction::ReturnToApp => {
+                    let status = if focus_oauth_window(&app_handle) {
+                        "204 No Content"
+                    } else {
+                        "503 Service Unavailable"
+                    };
+                    let _ = write_oauth_response(&mut stream, status, None, "");
+                }
+                OAuthBrowserAction::Favicon => {
+                    let _ = write_oauth_response(&mut stream, "204 No Content", None, "");
+                }
+                OAuthBrowserAction::NotFound => {
+                    let _ = write_oauth_response(&mut stream, "404 Not Found", None, "");
                 }
             }
         }
@@ -1339,102 +1346,153 @@ fn start_oauth_callback_listener(app_handle: AppHandle, login_id: String) -> Res
     Ok(())
 }
 
-fn oauth_close_tab_html() -> String {
-    r#"<!doctype html>
-<html lang="zh-CN">
-  <head>
-    <meta charset="utf-8" />
-    <title>Codex OAuth</title>
-  </head>
-  <body>
-    <script>
-      try { window.close(); } catch (_) {}
-    </script>
-  </body>
-</html>"#
-        .to_string()
+#[derive(Debug, PartialEq, Eq)]
+enum OAuthBrowserAction {
+    StartRedirect,
+    Redirect { first: bool },
+    InvalidCallback(String),
+    ResultPage,
+    ReturnToApp,
+    Favicon,
+    NotFound,
 }
 
-fn close_oauth_callback_tab_soon() {
-    thread::spawn(|| {
-        thread::sleep(Duration::from_millis(220));
-        close_oauth_callback_tab();
-    });
-}
-
-#[cfg(target_os = "macos")]
-fn close_oauth_callback_tab() {
-    let script = r#"
-tell application "System Events"
-  set browserNames to {"Safari", "Google Chrome", "Chromium", "Microsoft Edge", "Brave Browser", "Arc", "Firefox"}
-  set frontApp to name of first application process whose frontmost is true
-  if browserNames contains frontApp then
-    keystroke "w" using command down
-  end if
-end tell
-"#;
-    let _ = system_command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .status();
-}
-
-#[cfg(not(target_os = "macos"))]
-fn close_oauth_callback_tab() {}
-
-fn oauth_callback_html(success: bool, title: &str, description: &str) -> String {
-    let status_class = if success { "success" } else { "error" };
-    let icon = if success { "✓" } else { "!" };
-    let countdown_html = if success {
-        r#"<div class="countdown">正在尝试关闭页面，<span id="countdown">3</span> 秒后如未关闭，可直接关闭此标签页。</div>"#
-    } else {
-        ""
+fn oauth_browser_action(
+    request_line: &str,
+    login_id: &str,
+    result_path: &str,
+    accepted_callback: &mut Option<[u8; 32]>,
+) -> OAuthBrowserAction {
+    let mut fields = request_line.split_ascii_whitespace();
+    let (Some(method), Some(target)) = (fields.next(), fields.next()) else {
+        return OAuthBrowserAction::NotFound;
     };
-    let auto_close_script = if success {
-        r#"
-        <script>
-          (function () {
-            var seconds = 3;
-            var countdown = document.getElementById('countdown');
-            var closeButton = document.getElementById('closeButton');
-            var closeHint = document.getElementById('closeHint');
-            var closeStatus = document.getElementById('closeStatus');
-            var nativeCloseRequested = false;
-            function requestNativeClose() {
-              if (nativeCloseRequested) return;
-              nativeCloseRequested = true;
-              try {
-                fetch('/close-tab', { method: 'POST', keepalive: true }).catch(function () {});
-              } catch (_) {}
-            }
-            function markBlocked() {
-              if (document.hidden) return;
-              if (closeButton) closeButton.textContent = '关闭标签页';
-              if (closeStatus) closeStatus.textContent = '浏览器限制脚本关闭当前标签页，请使用标签页关闭按钮或快捷键关闭。';
-              if (closeHint) closeHint.className = 'hint blocked';
-            }
-            function tryClose() {
-              requestNativeClose();
-              try { window.close(); } catch (_) {}
-            }
-            closeButton && closeButton.addEventListener('click', function () {
-              tryClose();
-              window.setTimeout(markBlocked, 280);
+    // Only the flow that passed OAuth state validation gets a return URL.
+    if accepted_callback.is_some() && target == result_path {
+        return match method {
+            "GET" => OAuthBrowserAction::ResultPage,
+            "POST" => OAuthBrowserAction::ReturnToApp,
+            _ => OAuthBrowserAction::NotFound,
+        };
+    }
+    if method != "GET" {
+        return OAuthBrowserAction::NotFound;
+    }
+    if accepted_callback.is_none()
+        && target.strip_prefix(OAUTH_BROWSER_START_PREFIX) == Some(login_id)
+    {
+        return OAuthBrowserAction::StartRedirect;
+    }
+    if target == "/favicon.ico" {
+        return OAuthBrowserAction::Favicon;
+    }
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    if path != "/auth/callback" {
+        return OAuthBrowserAction::NotFound;
+    }
+
+    let fingerprint: [u8; 32] = Sha256::digest(target.as_bytes()).into();
+    if let Some(accepted) = accepted_callback {
+        // A browser retry can reload the result without exchanging the code again.
+        return if *accepted == fingerprint {
+            OAuthBrowserAction::Redirect { first: false }
+        } else {
+            OAuthBrowserAction::NotFound
+        };
+    }
+    let callback_url = format!("{}?{query}", oauth::redirect_uri());
+    match oauth::submit_callback_url(login_id, &callback_url) {
+        Ok(()) => {
+            *accepted_callback = Some(fingerprint);
+            OAuthBrowserAction::Redirect { first: true }
+        }
+        Err(error) => OAuthBrowserAction::InvalidCallback(error),
+    }
+}
+
+fn write_oauth_response(
+    mut stream: impl Write,
+    status: &str,
+    location: Option<&str>,
+    body: &str,
+) -> io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n"
+    )?;
+    if let Some(location) = location {
+        write!(stream, "Location: {location}\r\n")?;
+    }
+    if status != "204 No Content" {
+        write!(stream, "Content-Length: {}\r\n", body.len())?;
+    }
+    if !body.is_empty() {
+        write!(stream, "Content-Type: text/html; charset=utf-8\r\n")?;
+    }
+    write!(stream, "\r\n{body}")
+}
+
+fn focus_oauth_window(app: &AppHandle) -> bool {
+    let Some(window) = app.get_webview_window("main") else {
+        return false;
+    };
+    app.run_on_main_thread(move || {
+        let _ = window.unminimize();
+        let _ = window.show();
+        if window.set_focus().is_err() || !window.is_focused().unwrap_or(false) {
+            let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
+        }
+    })
+    .is_ok()
+}
+
+fn oauth_callback_html(success: bool) -> String {
+    let (status_class, icon, title, description, actions) = if success {
+        (
+            "success",
+            "✓",
+            "授权回调已收到",
+            "请在 Codex Switcher 中查看账号保存结果。",
+            r#"
+      <div class="actions">
+        <button id="returnButton" type="button">返回 Codex Switcher</button>
+      </div>
+      <p id="returnStatus" class="hint" role="status" hidden>暂时无法从此页唤回应用，请从程序坞或任务栏切回 Codex Switcher。</p>
+      <p class="hint">可用 ⌘W（Mac）或 Ctrl+W（Windows / Linux）关闭此标签页。</p>
+      <script>
+        const button = document.getElementById('returnButton');
+        const returnStatus = document.getElementById('returnStatus');
+        button.addEventListener('click', async () => {
+          button.disabled = true;
+          returnStatus.hidden = true;
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 2000);
+          try {
+            const response = await fetch(location.pathname, {
+              method: 'POST',
+              redirect: 'error',
+              signal: controller.signal
             });
-            var timer = window.setInterval(function () {
-              seconds -= 1;
-              if (countdown) countdown.textContent = String(Math.max(seconds, 0));
-              tryClose();
-              if (seconds <= 0) {
-                window.clearInterval(timer);
-                markBlocked();
-              }
-            }, 1000);
-            window.setTimeout(tryClose, 250);
-          })();
-        </script>"#
+            if (response.status === 204) return;
+          } catch (_) {
+            // The short-lived callback listener may have already stopped.
+          } finally {
+            clearTimeout(timeout);
+            button.disabled = false;
+          }
+          returnStatus.hidden = false;
+        });
+        window.close();
+      </script>"#,
+        )
     } else {
-        ""
+        (
+            "error",
+            "!",
+            "授权回调失败",
+            "请回到 Codex Switcher 查看错误，或复制地址栏里的完整回调地址手动完成。",
+            "",
+        )
     };
     format!(
         r#"<!doctype html>
@@ -1515,37 +1573,21 @@ fn oauth_callback_html(success: bool, title: &str, description: &str) -> String 
         font-weight: 700;
         background: linear-gradient(135deg, #2563eb, #0ea5a8);
       }}
+      button:disabled {{ cursor: wait; opacity: 0.7; }}
       .hint {{
         margin-top: 16px;
-        color: #8a97a8;
-        font-size: 13px;
-      }}
-      .hint.blocked {{
-        padding: 10px 12px;
-        border: 1px solid #fed7aa;
-        border-radius: 10px;
-        color: #9a3412;
-        background: #fff7ed;
-      }}
-      .countdown {{
-        margin-top: 14px;
         color: #64748b;
-        font-size: 14px;
+        font-size: 13px;
       }}
     </style>
   </head>
   <body>
     <main class="card {status_class}">
-      <div class="icon">{icon}</div>
+      <div class="icon" aria-hidden="true">{icon}</div>
       <h1>{title}</h1>
       <p>{description}</p>
-      {countdown_html}
-      <div class="actions">
-        <button id="closeButton" type="button">关闭页面</button>
-      </div>
-      <div id="closeHint" class="hint"><span id="closeStatus">如果浏览器拦截自动关闭，可以直接关闭此标签页。</span></div>
+      {actions}
     </main>
-    {auto_close_script}
   </body>
 </html>"#,
     )
@@ -5200,6 +5242,74 @@ mod tests {
     }
 
     #[test]
+    fn oauth_browser_handoff_requires_a_valid_callback_and_the_current_result_path() {
+        use super::OAuthBrowserAction::*;
+
+        let login = super::oauth::start_oauth_login().expect("start fixture login");
+        let auth_url = url::Url::parse(&login.auth_url).unwrap();
+        let state = auth_url
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1;
+        let result_path = format!("/auth/result/{}", login.login_id);
+        let start_path = format!("{}{}", super::OAUTH_BROWSER_START_PREFIX, login.login_id);
+        let start_request = format!("GET {start_path} HTTP/1.1");
+        let result_request = format!("GET {result_path} HTTP/1.1");
+        let return_request = format!("POST {result_path} HTTP/1.1");
+        let callback = format!("GET /auth/callback?code=fixture&state={state} HTTP/1.1");
+        let mut accepted_callback = None;
+        let mut respond = |line: &str| {
+            super::oauth_browser_action(line, &login.login_id, &result_path, &mut accepted_callback)
+        };
+
+        assert_eq!(respond(&start_request), StartRedirect);
+        assert_eq!(respond("GET /auth/start/old-login HTTP/1.1"), NotFound);
+        assert_eq!(respond(&format!("POST {start_path} HTTP/1.1")), NotFound,);
+        assert_eq!(respond(&result_request), NotFound);
+        assert_eq!(respond(&return_request), NotFound);
+        assert!(matches!(
+            respond("GET /auth/callback?code=fixture&state=wrong HTTP/1.1"),
+            InvalidCallback(_),
+        ));
+        assert_eq!(
+            respond(&callback.replace("/auth/callback?", "/auth/callback-extra?")),
+            NotFound,
+        );
+        assert_eq!(respond(&callback), Redirect { first: true });
+        super::oauth::cancel_oauth_login(Some(&login.login_id)).unwrap();
+
+        assert_eq!(respond(&start_request), NotFound);
+        assert_eq!(respond(&callback), Redirect { first: false });
+        assert_eq!(respond(&result_request), ResultPage);
+        assert_eq!(respond(&return_request), ReturnToApp);
+        assert_eq!(respond("POST /auth/result/old-login HTTP/1.1"), NotFound);
+        assert_eq!(respond("POST /close-tab HTTP/1.1"), NotFound);
+        assert_eq!(
+            respond("GET /auth/callback?code=other&state=wrong HTTP/1.1"),
+            NotFound,
+        );
+    }
+
+    #[test]
+    fn oauth_browser_callback_redirect_has_a_clean_uncached_result_url() {
+        let mut response = Vec::new();
+        super::write_oauth_response(
+            &mut response,
+            "303 See Other",
+            Some("/auth/result/fixture"),
+            "",
+        )
+        .unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 303 See Other\r\n"));
+        assert!(response.contains("Location: /auth/result/fixture\r\n"));
+        assert!(response.contains("Cache-Control: no-store\r\n"));
+        assert!(response.contains("Referrer-Policy: no-referrer\r\n"));
+        assert!(response.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    #[test]
     fn tcp_listener_retry_succeeds_after_previous_listener_releases_port() {
         let previous = TcpListener::bind(("127.0.0.1", 0)).expect("bind previous listener");
         let port = previous
@@ -7031,6 +7141,7 @@ pub fn run() {
             export_file::download_codex_export,
             export_file::save_codex_session_pdf,
             codex_oauth_login_start,
+            codex_oauth_open_browser,
             codex_oauth_submit_callback_url,
             codex_oauth_login_completed,
             codex_oauth_login_cancel,

@@ -96,7 +96,7 @@ function handleTabChange(key: string | number): void {
               <li>{{ t("回调成功后应用会自动保存账号") }}</li>
             </ul>
             <div class="oauth-guide-note">
-              {{ t("如果浏览器没有自动回到应用，可复制地址栏里的 localhost 回调地址继续。") }}
+              {{ t("如果应用没有收到回调，可复制地址栏里的完整 localhost 回调地址手动完成。") }}
             </div>
           </aside>
           <div class="modal-form oauth-form">
@@ -127,7 +127,7 @@ function handleTabChange(key: string | number): void {
             <div class="oauth-manual-box">
               <div>
                 <strong>{{ t("手动完成") }}</strong>
-                <span>{{ t("浏览器未自动返回时，把 localhost 回调地址粘贴到这里。") }}</span>
+                <span>{{ t("应用未收到回调时，把完整的 localhost 回调地址粘贴到这里。") }}</span>
               </div>
               <div class="oauth-url-row">
                 <a-input

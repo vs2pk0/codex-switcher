@@ -105,6 +105,7 @@ import {
   listCodexSwitcherBackups,
   listCodexSwitcherSessionBackups,
   listCodexAccounts,
+  openCodexOAuthBrowser,
   openExternalUrl,
   refreshAllCodexQuotas,
   refreshCodexQuota,
@@ -3403,8 +3404,8 @@ async function copyOAuthUrl(): Promise<void> {
 }
 
 function openOAuthUrl(): void {
-  if (!oauthUrl.value) return;
-  void openExternalUrl(oauthUrl.value).catch((error) => {
+  if (!oauthLoginId.value) return;
+  void openCodexOAuthBrowser(oauthLoginId.value).catch((error) => {
     Message.error(`打开浏览器失败：${errorText(error)}`);
   });
 }
@@ -3586,6 +3587,7 @@ function openAppUpdateReleases(): void {
 }
 
 async function completeOAuthLoginFlow(loginId: string): Promise<void> {
+  if (oauthCompleting.value || loginId !== oauthLoginId.value) return;
   oauthCompleting.value = true;
   oauthError.value = "";
   try {
