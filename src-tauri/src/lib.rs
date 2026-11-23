@@ -1,4 +1,5 @@
 mod account;
+mod extensions;
 mod api_model_catalog;
 mod api_model_settings;
 mod api_service;
@@ -140,6 +141,10 @@ struct CodexSwitcherSettings {
     account_view_mode: String,
     #[serde(default = "default_sidebar_enabled")]
     sidebar_enabled: bool,
+    #[serde(default)]
+    plugin_management_unlocked: bool,
+    #[serde(default)]
+    plugin_management_enabled: bool,
     #[serde(default = "default_show_quota_countdowns")]
     show_quota_countdowns: bool,
     #[serde(default = "default_show_additional_quota_windows")]
@@ -180,6 +185,8 @@ impl Default for CodexSwitcherSettings {
             page_size: default_page_size(),
             account_view_mode: default_account_view_mode(),
             sidebar_enabled: default_sidebar_enabled(),
+            plugin_management_unlocked: false,
+            plugin_management_enabled: false,
             show_quota_countdowns: default_show_quota_countdowns(),
             show_additional_quota_windows: default_show_additional_quota_windows(),
             token_keeper_enabled: default_token_keeper_enabled(),
@@ -207,6 +214,7 @@ impl CodexSwitcherSettings {
         self.account_view_mode = normalize_account_view_mode(&self.account_view_mode);
         self.language = normalize_language(&self.language);
         self.time_zone = app_time::normalize_time_zone(&self.time_zone);
+        self.plugin_management_enabled &= self.plugin_management_unlocked;
         self
     }
 }
@@ -7088,6 +7096,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            extensions::extension_list,
+            extensions::extension_import,
+            extensions::extension_set_enabled,
+            extensions::extension_uninstall,
+            extensions::extension_call,
             api_service::api_service_state,
             api_service::api_service_update_settings,
             api_service::api_service_start,

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { startModelsDevAutoSync } from "./services/modelsDev";
 import { currentTimeZone, formatAppDateTime, formatWallTime, setTimeZone, trackSystemTimeZone } from "./timeZone";
+import { listExtensions, type InstalledExtension } from "./services/extensions";
 import { defaultApiModelSettings, normalizeApiModelSettings, validateApiModelSettings } from "./services/apiModelSettings";
 import {
   computed,
@@ -34,6 +35,7 @@ import ExportJsonModal from "./components/ExportJsonModal.vue";
 import ExportDownloadModal from "./components/ExportDownloadModal.vue";
 import OAuthBindingModal from "./components/OAuthBindingModal.vue";
 import PhoneModal from "./components/PhoneModal.vue";
+import PluginManagerPanel from "./components/PluginManagerPanel.vue";
 import PushSettingsPanel from "./components/PushSettingsPanel.vue";
 import ResetCreditModal from "./components/ResetCreditModal.vue";
 import ResetPanel from "./components/ResetPanel.vue";
@@ -216,6 +218,8 @@ import {
 
 const ApiServicePanel = defineAsyncComponent(() => import("./components/ApiServicePanel.vue"));
 const UsagePanel = defineAsyncComponent(() => import("./components/UsagePanel.vue"));
+const PlatformAccountsPanel = defineAsyncComponent(() => import("./components/PlatformAccountsPanel.vue"));
+const UsageWorkspace = defineAsyncComponent(() => import("./components/UsageWorkspace.vue"));
 const OpenCodexPanel = defineAsyncComponent(
   () => import("./opencodex/OpenCodexPanel.vue"),
 );
@@ -233,6 +237,10 @@ const appUpdateDownloading = ref(false);
 const appUpdateCancelling = ref(false);
 const appUpdateOpening = ref(false);
 const usagePanelMounted = ref(false);
+const extensions = ref<InstalledExtension[]>([]);
+const platformExtensions = computed(() => extensions.value.filter((extension) => extension.enabled !== false && extension.platforms.length));
+const usageExtensions = computed(() => extensions.value.filter((extension) => extension.enabled !== false && extension.usage));
+const usageTab = ref("");
 const apiServicePanelMounted = ref(false);
 const openCodexPanelMounted = ref(false);
 const apiServiceAutoUpdateEvent = ref<ApiServiceAutoUpdateEvent | null>(null);
@@ -296,6 +304,7 @@ const savingApiKey = ref(false);
 const refreshingAllQuotas = ref(false);
 const tokenRefreshingIds = ref<string[]>([]);
 const settingsLoading = ref(false);
+let unlockingPluginManagement = false;
 const savingSettings = ref(false);
 const savedApiFastMode = ref(false);
 const configEditorVisible = ref(false);
@@ -355,6 +364,8 @@ const settings = reactive<CodexSwitcherSettings>({
   pageSize: 50,
   accountViewMode: "card",
   sidebarEnabled: true,
+  pluginManagementUnlocked: false,
+  pluginManagementEnabled: false,
   showQuotaCountdowns: true,
   showAdditionalQuotaWindows: true,
   tokenKeeperEnabled: true,
@@ -2128,7 +2139,7 @@ async function handleDetectCurrentAccount(): Promise<void> {
   }
 }
 
-async function loadSettings(options: { includeStorage?: boolean } = {}): Promise<void> {
+async function loadSettings(options: { includeStorage?: boolean } = {}): Promise<boolean> {
   settingsLoading.value = true;
   try {
     const [nextSettings, nextPaths, nextBackups] = await Promise.all([
@@ -2154,6 +2165,8 @@ async function loadSettings(options: { includeStorage?: boolean } = {}): Promise
       pageSize: Math.max(1, Number(nextSettings.pageSize || 50)),
       accountViewMode: normalizeAccountViewMode(nextSettings.accountViewMode),
       sidebarEnabled: nextSettings.sidebarEnabled ?? true,
+      pluginManagementUnlocked: nextSettings.pluginManagementUnlocked ?? false,
+      pluginManagementEnabled: !!nextSettings.pluginManagementUnlocked && !!nextSettings.pluginManagementEnabled,
       quotaRefreshMinutes: clampRefreshMinutes(nextSettings.quotaRefreshMinutes),
       currentAccountRefreshMinutes: clampRefreshMinutes(nextSettings.currentAccountRefreshMinutes),
       quotaNextRefreshAt: Number(nextSettings.quotaNextRefreshAt || 0),
@@ -2172,8 +2185,10 @@ async function loadSettings(options: { includeStorage?: boolean } = {}): Promise
     if (nextBackups) backupFiles.value = nextBackups;
     resetQuotaTimer();
     resetCurrentAccountQuotaTimer();
+    return true;
   } catch (error) {
     Message.error(`加载设置失败：${errorText(error)}`);
+    return false;
   } finally {
     settingsLoading.value = false;
   }
@@ -2201,12 +2216,12 @@ async function loadSessionBackups(options: { silent?: boolean } = {}): Promise<v
   }
 }
 
-async function saveSettings(): Promise<void> {
+async function saveSettings(): Promise<boolean> {
   const apiSettingsError = validateApiModelSettings(settings.apiModelSettings);
   if (apiSettingsError) {
     settings.apiModelSettings.fastMode = savedApiFastMode.value;
     Message.warning(apiSettingsError);
-    return;
+    return false;
   }
   savingSettings.value = true;
   try {
@@ -2243,10 +2258,12 @@ async function saveSettings(): Promise<void> {
     resetQuotaTimer();
     resetCurrentAccountQuotaTimer();
     Message.success("设置已保存");
+    return true;
   } catch (error) {
     settings.apiModelSettings.fastMode = savedApiFastMode.value;
     settings.timeZone = currentTimeZone.value;
     Message.error(`保存设置失败：${errorText(error)}`);
+    return false;
   } finally {
     savingSettings.value = false;
   }
@@ -4892,6 +4909,7 @@ function handleAddTabChange(key: string | number): void {
 
 function switchView(view: ActiveView): void {
   if (view === "instances" && !managedInstancesSupported.value) return;
+  if (view === "plugins" && !settings.pluginManagementEnabled) return;
   window.scrollTo({ top: 0, left: 0, behavior: "auto" });
   activeView.value = view;
   if (view === "usage") {
@@ -4921,6 +4939,40 @@ function switchView(view: ActiveView): void {
       }
     }, 0);
   });
+}
+
+async function unlockPluginManagement(): Promise<void> {
+  if (unlockingPluginManagement) return;
+  unlockingPluginManagement = true;
+  try {
+    if (settingsLoading.value || savingSettings.value) {
+      await new Promise<void>((resolve) => {
+        const stop = watch([settingsLoading, savingSettings], ([loading, saving]) => {
+          if (loading || saving) return;
+          stop();
+          resolve();
+        });
+      });
+    }
+    if (!settings.pluginManagementUnlocked) {
+      if (!appPaths.value && !await loadSettings({ includeStorage: false })) return;
+      settings.pluginManagementUnlocked = true;
+      if (!await saveSettings()) {
+        settings.pluginManagementUnlocked = false;
+        return;
+      }
+    }
+    switchView("settings");
+  } finally {
+    unlockingPluginManagement = false;
+  }
+}
+
+async function changePluginManagement(enabled: boolean): Promise<void> {
+  if (savingSettings.value || !settings.pluginManagementUnlocked) return;
+  const previous = settings.pluginManagementEnabled;
+  settings.pluginManagementEnabled = enabled;
+  if (!await saveSettings()) settings.pluginManagementEnabled = previous;
 }
 
 async function refreshOpenCodexAccountIds(): Promise<void> {
@@ -4979,6 +5031,10 @@ watch(
 let stopModelsDevAutoSync: (() => void) | undefined;
 let stopTrackingSystemTimeZone: (() => void) | undefined;
 onMounted(() => {
+  void listExtensions().then((installed) => {
+    const known = new Set(extensions.value.map(({ id }) => id));
+    extensions.value = [...installed.filter(({ id }) => !known.has(id)), ...extensions.value];
+  }).catch((error) => console.error("读取已安装的插件失败", error));
   stopModelsDevAutoSync = startModelsDevAutoSync();
   stopTrackingSystemTimeZone = trackSystemTimeZone();
   void takeAppUpdateInstallError().then((message) => {
@@ -5108,13 +5164,15 @@ onUnmounted(() => {
     class="app-shell"
     :class="{
       'sidebar-disabled': !settings.sidebarEnabled,
-      'accounts-view': activeView === 'accounts',
+      'accounts-view': activeView === 'accounts' || activeView === 'platforms',
     }"
   >
     <AppHeader
       :active-view="activeView"
       :sidebar-enabled="settings.sidebarEnabled"
       :managed-instances-supported="managedInstancesSupported"
+      :has-platform-extensions="platformExtensions.length > 0"
+      :plugin-management-enabled="settings.pluginManagementEnabled"
       :accounts-count="accounts.length"
       :oauth-count="oauthCount"
       :api-key-count="apiKeyCount"
@@ -5361,13 +5419,36 @@ onUnmounted(() => {
       @save="handleSessionDirectorySave"
     />
 
-    <UsagePanel
-      v-if="usagePanelMounted"
-      v-show="activeView === 'usage'"
-      :active="activeView === 'usage'"
-      :instances="codexInstances"
-      :current-instance-id="sessionInstanceId"
+    <PlatformAccountsPanel
+      v-if="activeView === 'platforms' && platformExtensions.length"
+      :extensions="platformExtensions"
+      :display-text="privacyMasked ? maskDisplayText : undefined"
+      :settings="settings"
+      :viewport-width="viewportWidth"
+      :expanded-layout="expandedLayout"
+      :status-clock-ms="accountStatusClockMs"
+      :download-export="downloadJsonText"
+      @toggle-privacy="privacyMasked = !privacyMasked"
+      @open-badge-style="badgeStyleVisible = true"
     />
+
+    <div v-if="usagePanelMounted" v-show="activeView === 'usage'">
+      <UsageWorkspace
+        v-model="usageTab"
+        :extensions="usageExtensions"
+        :account-extensions="platformExtensions"
+        :active="activeView === 'usage'"
+      >
+        <template #codex="{ visible, active }">
+          <UsagePanel
+            v-show="visible"
+            :active="active"
+            :instances="codexInstances"
+            :current-instance-id="sessionInstanceId"
+          />
+        </template>
+      </UsageWorkspace>
+    </div>
 
     <ApiServicePanel
       v-if="apiServicePanelMounted"
@@ -5424,8 +5505,12 @@ onUnmounted(() => {
       @delete-backup="handleDeleteBackup"
       @open-push-settings="switchView('pushSettings')"
       @open-reset-records="switchView('resets')"
+      @change-plugin-management="changePluginManagement"
+      @open-plugin-management="switchView('plugins')"
       @select-instance="handleSettingsInstanceChange"
     />
+
+    <PluginManagerPanel v-if="activeView === 'plugins' && settings.pluginManagementEnabled" v-model="extensions" />
 
     <InstancePickerModal
       v-model:visible="accountInstancePickerVisible"
@@ -5456,6 +5541,7 @@ onUnmounted(() => {
       @open-sponsor-page="openSponsorPage"
       @open-feedback-page="openFeedbackPage"
       @check-update="checkAppUpdate"
+      @unlock-plugins="unlockPluginManagement"
     />
 
     <AppUpdateModal
@@ -5595,10 +5681,9 @@ onUnmounted(() => {
 
     <PhoneModal
       v-model:visible="phoneVisible"
-      :account="phoneAccount"
+      :account-name="phoneAccount ? displayNameForUi(phoneAccount) : ''"
       :phone-form="phoneForm"
       :saving="savingPhone"
-      :display-name="displayNameForUi"
       @save="handlePhoneSave"
     />
 

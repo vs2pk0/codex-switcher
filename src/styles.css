@@ -3537,6 +3537,10 @@ textarea {
   }
 }
 
+.usage-extension-switch {
+  margin-bottom: 12px;
+}
+
 .usage-panel {
   width: 100%;
   margin: 0;
@@ -8245,6 +8249,7 @@ textarea {
 
 .about-icon-wrap {
   display: inline-flex;
+  cursor: pointer;
   padding: 9px;
   border: 1px solid rgba(148, 163, 184, 0.16);
   border-radius: 28px;

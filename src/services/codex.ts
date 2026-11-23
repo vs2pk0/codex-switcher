@@ -37,6 +37,8 @@ export interface CodexSwitcherSettings {
   pageSize: number;
   accountViewMode: "card" | "compact" | "table";
   sidebarEnabled: boolean;
+  pluginManagementUnlocked: boolean;
+  pluginManagementEnabled: boolean;
   showQuotaCountdowns: boolean;
   showAdditionalQuotaWindows: boolean;
   tokenKeeperEnabled: boolean;

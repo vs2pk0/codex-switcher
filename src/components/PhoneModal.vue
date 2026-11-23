@@ -1,13 +1,12 @@
 <script setup lang="ts">
 import { t } from "../i18n";
-import type { CodexAccount } from "../types/codex";
 
 defineProps<{
   visible: boolean;
-  account: CodexAccount | null;
+  accountName: string;
   phoneForm: { phone: string };
   saving: boolean;
-  displayName: (account: CodexAccount) => string;
+  maxLength?: number;
 }>();
 
 defineEmits<{
@@ -25,12 +24,12 @@ defineEmits<{
     @update:visible="$emit('update:visible', $event)"
   >
     <div class="modal-form">
-      <a-typography-paragraph v-if="account">
-        {{ t("给") }} {{ displayName(account) }} {{ t("保存一个绑定手机号，后续会直接显示在账号卡片上。") }}
+      <a-typography-paragraph v-if="accountName">
+        {{ t("给") }} {{ accountName }} {{ t("保存一个绑定手机号，后续会直接显示在账号卡片上。") }}
       </a-typography-paragraph>
       <a-form :model="phoneForm" layout="vertical">
         <a-form-item :label="t('手机号')">
-          <a-input v-model="phoneForm.phone" placeholder="+1 (724) 806-2018" />
+          <a-input v-model="phoneForm.phone" placeholder="+1 (724) 806-2018" :max-length="maxLength" :input-attrs="{ 'aria-label': t('手机号') }" />
         </a-form-item>
       </a-form>
       <div class="form-actions">

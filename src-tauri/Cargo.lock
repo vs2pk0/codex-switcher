@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "codex-switcher"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -511,6 +511,7 @@ dependencies = [
  "rand 0.8.6",
  "regex",
  "reqwest 0.12.28",
+ "ring",
  "rusqlite",
  "semver",
  "serde",
@@ -4155,6 +4156,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "windows-sys 0.61.2",
 ]

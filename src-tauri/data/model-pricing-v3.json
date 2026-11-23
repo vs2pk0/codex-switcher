@@ -1,0 +1,66 @@
+[
+  {
+    "modelId": "claude-fable-5-2",
+    "displayName": "Claude Fable 5.2",
+    "inputCostPerMillion": "8",
+    "outputCostPerMillion": "40",
+    "cacheReadCostPerMillion": "0.20",
+    "cacheCreationCostPerMillion": "10"
+  },
+  {
+    "modelId": "claude-mythos-5-2",
+    "displayName": "Claude Mythos 5.2",
+    "inputCostPerMillion": "8",
+    "outputCostPerMillion": "40",
+    "cacheReadCostPerMillion": "0.20",
+    "cacheCreationCostPerMillion": "10"
+  },
+  {
+    "modelId": "gemini-4-carbon",
+    "displayName": "Gemini 4 Carbon",
+    "inputCostPerMillion": "2.00",
+    "outputCostPerMillion": "10.00",
+    "cacheReadCostPerMillion": "0.10",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gemini-4-hydrogen",
+    "displayName": "Gemini 4 Hydrogen",
+    "inputCostPerMillion": "1.50",
+    "outputCostPerMillion": "7.50",
+    "cacheReadCostPerMillion": "0.075",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gemini-4-neon",
+    "displayName": "Gemini 4 Neon",
+    "inputCostPerMillion": "3.00",
+    "outputCostPerMillion": "15.00",
+    "cacheReadCostPerMillion": "0.15",
+    "cacheCreationCostPerMillion": "0"
+  },
+  {
+    "modelId": "gpt-6.1-terra",
+    "displayName": "GPT-6.1 Terra",
+    "inputCostPerMillion": "1",
+    "outputCostPerMillion": "5",
+    "cacheReadCostPerMillion": "0.05",
+    "cacheCreationCostPerMillion": "1.25"
+  },
+  {
+    "modelId": "gpt-6.2-astra",
+    "displayName": "GPT-6.2 Astra",
+    "inputCostPerMillion": "8",
+    "outputCostPerMillion": "40",
+    "cacheReadCostPerMillion": "0.40",
+    "cacheCreationCostPerMillion": "10"
+  },
+  {
+    "modelId": "gpt-6.2-sol",
+    "displayName": "GPT-6.2 Sol",
+    "inputCostPerMillion": "2",
+    "outputCostPerMillion": "10",
+    "cacheReadCostPerMillion": "0.10",
+    "cacheCreationCostPerMillion": "2.50"
+  }
+]

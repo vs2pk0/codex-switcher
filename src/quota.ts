@@ -56,6 +56,26 @@ export function formatCreditBalance(balance: number, locale: string): string {
   return formatter.format(balance);
 }
 
+export function quotaColor(value?: number): string {
+  const percentage = value ?? 0;
+  if (percentage >= 70) return "#22c55e";
+  if (percentage >= 40) return "#f59e0b";
+  return "#ef4444";
+}
+
+export function quotaProgressStyle(value?: number): Record<string, string> {
+  const width = Number.isFinite(value) ? Math.max(0, Math.min(100, Number(value))) : 0;
+  return { width: `${width}%`, background: quotaColor(value) };
+}
+
+export function quotaResetCountdown(resetAtMs: number, nowMs: number): string {
+  const totalMinutes = Math.floor(Math.max(0, resetAtMs - nowMs) / 60_000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  return days ? `${days}d ${hours}h ${minutes}m` : `${hours}h ${minutes}m`;
+}
+
 function isPositiveNumber(value: unknown): boolean {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
 }

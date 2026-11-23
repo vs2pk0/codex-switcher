@@ -6,6 +6,8 @@ Source: `src-tauri/src/database/schema.rs`, `seed_model_pricing`, followed by it
 
 `model-pricing-v1.json` freezes this app's previous built-in GPT/Codex prices. The version 2 migration uses it to update unchanged built-in prices while preserving custom entries and prices. Migration runs once; deleting a rule afterwards does not recreate it. Resetting defaults explicitly replaces all prices with the bundled snapshot.
 
+`model-pricing-v3.json` adds eight rates checked on 2026-11-20 from [OpenAI](https://developers.openai.com/api/docs/pricing), [Anthropic](https://platform.claude.com/docs/en/about-claude/pricing) and [Google](https://aistudio.google.com/docs/pricing). Rates use Standard short-context API prices, 30-minute OpenAI cache writes, and five-minute Anthropic cache writes. Gemini 4 Carbon uses the introductory rate effective through 2026-11-30. The version 3 migration adds missing new models and keeps existing prices.
+
 The models.dev catalog selection, price formatting and Codex session request timing also adapt CC Switch code at the same revision (`src/lib/modelsDevPricing.ts`, `src/components/usage/format.ts`, `src-tauri/src/services/session_usage_codex.rs`). Session speed is estimated from timestamps, includes first-token waiting, and excludes requests with fewer than 200 output tokens or less than 1 second of duration. Aggregate speed divides eligible total output by eligible total duration.
 
 Live optional price synchronization fetches the public [models.dev API](https://models.dev/api.json); it is disabled by default and only updates selected models.

@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import UsagePricingSync from "./UsagePricingSync.vue";
 import OpenAiIcon from "./OpenAiIcon.vue";
+import UsageSummaryCards from "./UsageSummaryCards.vue";
+import UsageTrendChart from "./UsageTrendChart.vue";
 import { modelsDevPricingRevision } from "../services/modelsDev";
 import { calendarDateKey, calendarParts, effectiveTimeZone, formatAppDateTime, formatWallTime, nextCalendarDayStart, parseWallTime, usageCalendarRange } from "../timeZone";
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { Message } from "@arco-design/web-vue";
-import type { ECharts, EChartsCoreOption } from "echarts/core";
 import {
   deleteModelPricing,
   getCodexUsageActivity,
@@ -23,7 +24,6 @@ import {
   type CodexUsagePricingConfig,
 } from "../services/usage";
 import {
-  currentLanguage,
   currentLocale,
   formatLocalizedCount,
   formatLocalizedNumber,
@@ -37,12 +37,6 @@ import {
 } from "../services/instances";
 
 type UsageRange = "today" | "yesterday" | "beforeYesterday" | "thisMonth" | "lastMonth" | "custom";
-type UsageTooltipParam = {
-  seriesName?: string;
-  marker?: string;
-  value?: number | Array<string | number>;
-};
-type EChartsCoreApi = typeof import("echarts/core");
 type ActivityMode = "daily" | "weekly" | "cumulative";
 type ActivityCell = {
   key: string;
@@ -85,8 +79,6 @@ const activeUsageTab = ref("logs");
 const pricingSearch = ref("");
 const range = ref<UsageRange>("today");
 const page = ref(1);
-const chartContainer = ref<HTMLDivElement | null>(null);
-const usageChart = shallowRef<ECharts | null>(null);
 const dateRange = ref<[string, string] | undefined>();
 const dashboard = ref<CodexUsageDashboard | null>(null);
 const activity = ref<CodexUsageActivity | null>(null);
@@ -290,9 +282,6 @@ const activityModeOptions: Array<{ value: ActivityMode; label: string }> = [
   { value: "weekly", label: "每周" },
   { value: "cumulative", label: "累计" },
 ];
-let chartResizeObserver: ResizeObserver | null = null;
-let echartsApi: EChartsCoreApi | null = null;
-let echartsLoading: Promise<EChartsCoreApi> | null = null;
 let autoRefreshTimer: number | undefined;
 let activationRefreshTimer: number | undefined;
 let presetBoundaryTimer: number | undefined;
@@ -763,10 +752,6 @@ function formatUsd(value?: string): string {
   return `$${parsed.toFixed(parsed >= 10 ? 2 : 4)}`;
 }
 
-function formatPercent(value?: number): string {
-  return `${((value || 0) * 100).toFixed(1)}%`;
-}
-
 function activityHourToCellSource(hour: CodexUsageActivityHour): ActivityCell {
   return {
     key: `hour-${hour.hour}`,
@@ -827,268 +812,17 @@ function formatTime(timestamp: number): string {
   });
 }
 
-function compactAxisNumber(value: number): string {
-  return formatTokens(value);
-}
-
-function tooltipParams(value: unknown): UsageTooltipParam[] {
-  if (Array.isArray(value)) return value as UsageTooltipParam[];
-  return value ? [value as UsageTooltipParam] : [];
-}
-
-function tooltipValue(param: UsageTooltipParam): number {
-  if (Array.isArray(param.value)) {
-    const value = param.value[param.value.length - 1];
-    return typeof value === "number" ? value : Number(value || 0);
-  }
-  return Number(param.value || 0);
-}
-
-function formatChartTooltip(params: unknown): string {
-  const items = tooltipParams(params);
-  const label = Array.isArray(items[0]?.value) ? items[0]?.value?.[0] : "";
-  const rows = items
-    .map((item) => {
-      const value = tooltipValue(item);
-      const formatted =
-        item.seriesName === t("预估费用") ? formatUsd(String(value)) : formatFullNumber(value);
-      return `<div class="usage-echart-tooltip-row">${item.marker || ""}<span>${item.seriesName}</span><strong>${formatted}</strong></div>`;
-    })
-    .join("");
-  return `<div class="usage-echart-tooltip"><strong>${label || "--"}</strong>${rows}</div>`;
-}
-
-function trendSeriesData(key: "inputTokens" | "outputTokens" | "cacheReadTokens" | "cacheCreationTokens" | "totalCost") {
-  return trends.value.map((item) => [
-    item.label,
-    key === "totalCost" ? Number(item.totalCost || 0) : Number(item[key] || 0),
-  ]);
-}
-
-async function loadEchartsApi(): Promise<EChartsCoreApi> {
-  if (echartsApi) return echartsApi;
-  if (!echartsLoading) {
-    echartsLoading = Promise.all([
-      import("echarts/core"),
-      import("echarts/charts"),
-      import("echarts/components"),
-      import("echarts/renderers"),
-    ]).then(([core, charts, components, renderers]) => {
-      core.use([
-        charts.LineChart,
-        components.GridComponent,
-        components.LegendComponent,
-        components.TooltipComponent,
-        renderers.CanvasRenderer,
-      ]);
-      echartsApi = core;
-      return core;
-    });
-  }
-  return echartsLoading;
-}
-
-function usageChartOption(core: EChartsCoreApi): EChartsCoreOption {
-  const labels = trends.value.map((item) => item.label);
-  return {
-    color: ["#ef4444", "#f97316", "#a855f7", "#3b82f6", "#22c55e"],
-    animation: true,
-    animationDuration: 900,
-    animationEasing: "cubicOut",
-    grid: {
-      top: 28,
-      right: 48,
-      bottom: 72,
-      left: 54,
-      containLabel: true,
-    },
-    tooltip: {
-      trigger: "axis",
-      confine: true,
-      appendToBody: true,
-      backgroundColor: "rgba(255, 255, 255, 0.96)",
-      borderColor: "rgba(85, 113, 156, 0.18)",
-      borderWidth: 1,
-      padding: 0,
-      extraCssText: "box-shadow: 0 18px 42px rgba(15, 23, 42, 0.18); border-radius: 8px;",
-      axisPointer: {
-        type: "line",
-        lineStyle: {
-          color: "rgba(100, 116, 139, 0.38)",
-          width: 1,
-        },
-      },
-      formatter: formatChartTooltip,
-    },
-    legend: {
-      bottom: 10,
-      left: "center",
-      itemWidth: 18,
-      itemHeight: 8,
-      icon: "roundRect",
-      textStyle: {
-        color: "#64748b",
-        fontSize: 12,
-        fontWeight: 600,
-      },
-      data: ["预估费用", "缓存写入", "缓存复用", "输入", "输出"].map(t),
-    },
-    xAxis: {
-      type: "category",
-      boundaryGap: false,
-      data: labels,
-      axisTick: { show: false },
-      axisLine: { lineStyle: { color: "rgba(85, 113, 156, 0.18)" } },
-      axisLabel: {
-        interval: isHourlyTrend.value ? 0 : "auto",
-        hideOverlap: true,
-        margin: 18,
-        color: "#8a97aa",
-        fontSize: 12,
-      },
-    },
-    yAxis: [
-      {
-        type: "value",
-        min: 0,
-        splitNumber: 5,
-        axisLabel: {
-          color: "#8a97aa",
-          formatter: compactAxisNumber,
-        },
-        splitLine: {
-          lineStyle: {
-            color: "rgba(85, 113, 156, 0.16)",
-            type: "dashed",
-          },
-        },
-      },
-      {
-        type: "value",
-        min: 0,
-        axisLabel: {
-          color: "#8a97aa",
-          formatter: (value: number) => `$${Number(value).toFixed(0)}`,
-        },
-        splitLine: { show: false },
-      },
-    ],
-    series: [
-      {
-        name: t("预估费用"),
-        type: "line",
-        yAxisIndex: 1,
-        smooth: 0.42,
-        showSymbol: false,
-        symbol: "circle",
-        symbolSize: 7,
-        data: trendSeriesData("totalCost"),
-        lineStyle: { width: 2.5, type: "dashed" },
-        emphasis: { focus: "series" },
-      },
-      {
-        name: t("缓存写入"),
-        type: "line",
-        smooth: 0.42,
-        showSymbol: false,
-        symbol: "circle",
-        symbolSize: 7,
-        data: trendSeriesData("cacheCreationTokens"),
-        lineStyle: { width: 2.5 },
-        emphasis: { focus: "series" },
-      },
-      {
-        name: t("缓存复用"),
-        type: "line",
-        smooth: 0.42,
-        showSymbol: false,
-        symbol: "circle",
-        symbolSize: 8,
-        data: trendSeriesData("cacheReadTokens"),
-        lineStyle: { width: 3.5 },
-        areaStyle: {
-          color: new core.graphic.LinearGradient(0, 0, 0, 1, [
-            { offset: 0, color: "rgba(168, 85, 247, 0.24)" },
-            { offset: 1, color: "rgba(168, 85, 247, 0)" },
-          ]),
-        },
-        emphasis: { focus: "series" },
-      },
-      {
-        name: t("输入"),
-        type: "line",
-        smooth: 0.42,
-        showSymbol: false,
-        symbol: "circle",
-        symbolSize: 7,
-        data: trendSeriesData("inputTokens"),
-        lineStyle: { width: 3 },
-        emphasis: { focus: "series" },
-      },
-      {
-        name: t("输出"),
-        type: "line",
-        smooth: 0.42,
-        showSymbol: false,
-        symbol: "circle",
-        symbolSize: 7,
-        data: trendSeriesData("outputTokens"),
-        lineStyle: { width: 3 },
-        emphasis: { focus: "series" },
-      },
-    ],
-  };
-}
-
-async function ensureUsageChart(): Promise<ECharts | null> {
-  if (disposed || !props.active || !chartContainer.value) return null;
-  const core = await loadEchartsApi();
-  const container = chartContainer.value;
-  // A hidden panel has no usable dimensions. Initialize only after it is shown.
-  if (disposed || !props.active || !container?.clientWidth || !container.clientHeight) return null;
-  if (!usageChart.value) {
-    usageChart.value = core.init(container, undefined, { renderer: "canvas" });
-    chartResizeObserver = new ResizeObserver(() => {
-      if (props.active && container.clientWidth && container.clientHeight) usageChart.value?.resize();
-    });
-    chartResizeObserver.observe(container);
-  }
-  return usageChart.value;
-}
-
-function renderUsageChart(): void {
-  void nextTick(async () => {
-    if (disposed) return;
-    if (!trends.value.length) {
-      chartResizeObserver?.disconnect();
-      chartResizeObserver = null;
-      usageChart.value?.dispose();
-      usageChart.value = null;
-      return;
-    }
-    if (!props.active) return;
-    const core = await loadEchartsApi();
-    if (!trends.value.length) return;
-    const chart = await ensureUsageChart();
-    chart?.resize();
-    chart?.setOption(usageChartOption(core), true);
-  });
-}
-
 onMounted(() => {
   presetBoundaryKey = localDayKey(new Date());
   syncPickerToPreset("today");
   window.setTimeout(() => {
     void loadUsage(false);
-    renderUsageChart();
   }, props.active ? 120 : 0);
   scheduleAutoRefresh();
   schedulePresetBoundaryRefresh();
   window.addEventListener("focus", handleWindowFocus);
   document.addEventListener("visibilitychange", handleVisibilityChange);
 });
-
-watch([trends, isHourlyTrend, currentLanguage, effectiveTimeZone, tokenDisplayUnit], renderUsageChart, { deep: true });
 
 watch(effectiveTimeZone, (_next, previous) => {
   if (range.value === "custom" && dateRange.value) {
@@ -1125,7 +859,6 @@ watch(
   () => props.active,
   (active) => {
     if (active) {
-      renderUsageChart();
       scheduleActivationRefresh();
     } else if (activationRefreshTimer) {
       window.clearTimeout(activationRefreshTimer);
@@ -1143,10 +876,6 @@ onBeforeUnmount(() => {
   if (presetBoundaryTimer) window.clearTimeout(presetBoundaryTimer);
   window.removeEventListener("focus", handleWindowFocus);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
-  chartResizeObserver?.disconnect();
-  chartResizeObserver = null;
-  usageChart.value?.dispose();
-  usageChart.value = null;
 });
 </script>
 
@@ -1214,62 +943,15 @@ onBeforeUnmount(() => {
     <a-spin :loading="loading" dot class="usage-dashboard-spin">
       <div class="usage-dashboard-grid">
         <div class="usage-main-column">
-          <div class="usage-hero">
-            <div class="usage-hero-main">
-              <div class="usage-app-mark"><OpenAiIcon /></div>
-              <div>
-                <div class="usage-token-heading">
-                  <span>{{ t("真实消耗 Tokens") }}</span>
-                </div>
-                <strong :title="formatFullNumber(summary?.realTotalTokens)">{{ formatTokens(summary?.realTotalTokens) }}</strong>
-              </div>
-            </div>
-            <div class="usage-hero-side">
-              <div>
-                <span>{{ t("总请求数") }}</span>
-                <strong>{{ formatFullNumber(summary?.totalRequests) }}</strong>
-              </div>
-              <div>
-                <span>{{ t("预估费用") }}</span>
-                <strong>{{ formatUsd(summary?.totalCost) }}</strong>
-              </div>
-            </div>
-          </div>
-
-          <div class="usage-metrics">
-            <article>
-              <span><icon-arrow-down /> {{ t("新增输入 Tokens") }}</span>
-              <strong>{{ formatTokens(summary?.totalInputTokens) }}</strong>
-            </article>
-            <article>
-              <span><icon-arrow-up /> {{ t("输出 Tokens") }}</span>
-              <strong>{{ formatTokens(summary?.totalOutputTokens) }}</strong>
-            </article>
-            <article>
-              <span><icon-storage /> {{ t("缓存写入") }}</span>
-              <strong>{{ formatTokens(summary?.totalCacheCreationTokens) }}</strong>
-            </article>
-            <article>
-              <span><icon-thunderbolt /> {{ t("缓存复用") }}</span>
-              <strong>{{ formatTokens(summary?.totalCacheReadTokens) }}</strong>
-            </article>
-            <article>
-              <span>{{ t("复用占比") }}</span>
-              <strong>{{ formatPercent(summary?.cacheHitRate) }}</strong>
-              <div class="usage-hit-bar">
-                <i :style="{ width: formatPercent(summary?.cacheHitRate) }" />
-              </div>
-            </article>
-          </div>
+          <UsageSummaryCards :summary="summary" :cost="formatUsd(summary?.totalCost)" :unit="tokenDisplayUnit">
+            <template #icon><OpenAiIcon /></template>
+          </UsageSummaryCards>
 
           <div class="usage-chart-card">
             <div class="usage-card-title">
               <strong>{{ t("时段消耗曲线") }}</strong>
             </div>
-            <div v-if="trends.length" class="usage-chart">
-              <div ref="chartContainer" class="usage-echart" />
-            </div>
-            <a-empty v-else :description="t('暂无趋势数据')" />
+            <UsageTrendChart :points="trends" :hourly="isHourlyTrend" :active="active" :unit="tokenDisplayUnit" />
           </div>
         </div>
 

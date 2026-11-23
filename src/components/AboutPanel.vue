@@ -7,21 +7,32 @@ defineProps<{
   checkingUpdate: boolean;
 }>();
 
-defineEmits<{
+const emit = defineEmits<{
   (event: "open-github-profile"): void;
   (event: "open-repository"): void;
   (event: "open-sponsor-page"): void;
   (event: "open-feedback-page"): void;
   (event: "check-update"): void;
+  (event: "unlock-plugins"): void;
 }>();
+
+let iconClicks = 0;
+
+function activateIcon(): void {
+  iconClicks += 1;
+  if (iconClicks === 20) {
+    iconClicks = 0;
+    emit("unlock-plugins");
+  }
+}
 </script>
 
 <template>
   <section class="about-panel">
     <div class="about-hero">
-      <div class="about-icon-wrap">
+      <button type="button" class="about-icon-wrap" @click="activateIcon">
         <img :src="appIcon" alt="Codex Switcher" class="about-app-icon" />
-      </div>
+      </button>
       <span class="about-kicker">{{ t("本地 Codex 管理工具") }}</span>
       <h2>Codex Switcher</h2>
       <div class="about-badges">

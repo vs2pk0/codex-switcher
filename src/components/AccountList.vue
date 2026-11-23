@@ -4,7 +4,7 @@ import { Message } from "@arco-design/web-vue";
 import { computed, ref } from "vue";
 import { accountProPlan, proPlanLabel } from "../accountPlan";
 import { canRefreshAccountToken, isAccountSubscriptionInactive, isSubscriptionExpired, subscriptionUntil } from "../accountStatus";
-import { ADAPTIVE_COLUMNS, normalizeMaxColumns, resolveAccountColumns } from "../services/accountLayout";
+import { accountGridLayout } from "../services/accountLayout";
 import type { CodexApiKeyBalanceState, CodexSwitcherSettings } from "../services/codex";
 import type { QuotaListAccount, QuotaListState, QuotaListWindow } from "../services/quotaList";
 import type { CodexAccount, CodexResetCredit } from "../types/codex";
@@ -14,11 +14,15 @@ import {
   hasAnyQuotaWindow,
   hasCreditBalance,
   hasQuotaWindow,
+  quotaColor,
+  quotaProgressStyle,
+  quotaResetCountdown,
   stackQuotaAccounts,
   type AdditionalQuotaWindowSnapshot,
 } from "../quota";
 import PlanBadge from "./PlanBadge.vue";
 import CreditBalance from "./CreditBalance.vue";
+import AccountQuotaMetric from "./AccountQuotaMetric.vue";
 
 const props = defineProps<{
   accounts: CodexAccount[];
@@ -68,23 +72,9 @@ const emit = defineEmits<{
 
 const dragOverAccountId = ref("");
 
-const isAdaptiveColumns = computed(
-  () => normalizeMaxColumns(props.settings.maxColumns) === ADAPTIVE_COLUMNS,
+const gridLayout = computed(() =>
+  accountGridLayout(props.settings.maxColumns, props.viewportWidth, props.expandedLayout),
 );
-
-const accountColumns = computed(() =>
-  resolveAccountColumns(props.settings.maxColumns, props.viewportWidth),
-);
-
-const gridClass = computed(() => {
-  // 超过 5 列时复用 5 列的紧凑样式，实际列数由内联 grid-template-columns 控制。
-  const styleColumns = Math.min(5, accountColumns.value);
-  return {
-    [`columns-${styleColumns}`]: true,
-    adaptive: isAdaptiveColumns.value,
-    expanded: props.expandedLayout,
-  };
-});
 
 const accountViewMode = computed(() => {
   const mode = props.settings.accountViewMode;
@@ -99,19 +89,17 @@ const additionalQuotaByAccountId = computed(() => {
   return new Map(entries);
 });
 
-const accountGridStyle = computed<Record<string, string>>(() => {
+const accountGridStyle = computed(() => {
   const maxQuotaRows = props.accounts.reduce(
     (currentMax, account) => Math.max(currentMax, visibleQuotaRowCount(account)),
     0,
   );
   const extraRows = Math.max(0, maxQuotaRows - 2);
   const creditHeight = props.accounts.some(shouldShowCredits) ? 46 : 0;
-  const style: Record<string, string> = { "--additional-quota-height": `${extraRows * 70 + creditHeight}px` };
-  if (isAdaptiveColumns.value) {
-    // 自适应模式下按窗口宽度直接写列数，覆盖固定列数的样式规则。
-    style.gridTemplateColumns = `repeat(${accountColumns.value}, minmax(0, 1fr))`;
-  }
-  return style;
+  return {
+    ...gridLayout.value.style,
+    "--additional-quota-height": `${extraRows * 70 + creditHeight}px`,
+  };
 });
 
 function isPinned(account: CodexAccount): boolean {
@@ -875,27 +863,12 @@ function additionalQuotaWindowLabel(window: AdditionalQuotaWindowSnapshot): stri
   return `${window.label} ${quotaWindowShortLabel(window.windowMinutes, window.windowMinutes)}`;
 }
 
-function quotaColor(value?: number): string {
-  const percentage = value ?? 0;
-  if (percentage >= 70) return "#22c55e";
-  if (percentage >= 40) return "#f59e0b";
-  return "#ef4444";
-}
-
 function quotaPercentLabel(value?: number): string {
   return Number.isFinite(value) ? `${value}%` : "--";
 }
 
 function quotaDotStyle(value?: number): Record<string, string> {
   return { background: quotaColor(value) };
-}
-
-function quotaProgressStyle(value?: number): Record<string, string> {
-  const width = Number.isFinite(value) ? Math.max(0, Math.min(100, Number(value))) : 0;
-  return {
-    width: `${width}%`,
-    background: quotaColor(value),
-  };
 }
 
 function accountSubscriptionClass(account: CodexAccount): string {
@@ -924,12 +897,7 @@ function quotaResetLeftLabel(value?: string | number): string {
     ? new Date(timestamp > 10_000_000_000 ? timestamp : timestamp * 1000)
     : new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
-  const diff = date.getTime() - props.statusClockMs;
-  const abs = Math.max(0, diff);
-  const day = Math.floor(abs / 86_400_000);
-  const hour = Math.floor((abs % 86_400_000) / 3_600_000);
-  const minute = Math.floor((abs % 3_600_000) / 60_000);
-  return day > 0 ? `${day}d ${hour}h ${minute}m` : `${hour}h ${minute}m`;
+  return quotaResetCountdown(date.getTime(), props.statusClockMs);
 }
 
 function quotaResetDateLabel(value?: string | number): string {
@@ -1021,7 +989,7 @@ function formatTime(value?: number | null): string {
     <section
       v-if="accounts.length && accountViewMode === 'card'"
       class="account-grid"
-      :class="gridClass"
+      :class="gridLayout.classes"
       :style="accountGridStyle"
     >
       <a-card
@@ -1291,78 +1259,32 @@ function formatTime(value?: number | null): string {
                 <small>{{ t("自动同步") }}</small>
               </div>
               <div class="quota-metrics" :class="{ single: isFreePlanAccount(account) }">
-                <div v-if="hasQuotaWindow(account.quota, 'hourly')" class="quota-metric">
-                  <div class="quota-metric-main">
-                    <span class="quota-window-label">
-                      <icon-calendar v-if="isFreePlanAccount(account)" />
-                      <icon-clock-circle v-else />
-                      {{ quotaWindowShortLabel(account.quota.hourly_window_minutes, isFreePlanAccount(account) ? 43200 : 300) }}
-                    </span>
-                    <em>{{ quotaResetDateLabel(account.quota.hourly_reset_time) }}</em>
-                    <small>{{ quotaResetLeftLabel(account.quota.hourly_reset_time) }}</small>
-                    <strong :style="{ color: quotaColor(account.quota.hourly_percentage) }">
-                      {{ account.quota.hourly_percentage }}%
-                    </strong>
-                  </div>
-                  <div class="quota-bar">
-                    <span
-                      :style="{
-                        width: `${Math.max(0, Math.min(100, account.quota.hourly_percentage))}%`,
-                        background: quotaColor(account.quota.hourly_percentage),
-                      }"
-                    />
-                  </div>
-                </div>
-
-                <div
+                <AccountQuotaMetric
+                  v-if="hasQuotaWindow(account.quota, 'hourly')"
+                  :label="quotaWindowShortLabel(account.quota.hourly_window_minutes, isFreePlanAccount(account) ? 43200 : 300)"
+                  :calendar="isFreePlanAccount(account)"
+                  :detail="quotaResetDateLabel(account.quota.hourly_reset_time)"
+                  :countdown="quotaResetLeftLabel(account.quota.hourly_reset_time)"
+                  :percentage="account.quota.hourly_percentage"
+                />
+                <AccountQuotaMetric
                   v-if="!isFreePlanAccount(account) && hasQuotaWindow(account.quota, 'weekly')"
-                  class="quota-metric"
-                >
-                  <div class="quota-metric-main">
-                    <span class="quota-window-label">
-                      <icon-calendar />
-                      {{ quotaWindowShortLabel(account.quota.weekly_window_minutes, 10080) }}
-                    </span>
-                    <em>{{ quotaResetDateLabel(account.quota.weekly_reset_time) }}</em>
-                    <small>{{ quotaResetLeftLabel(account.quota.weekly_reset_time) }}</small>
-                    <strong :style="{ color: quotaColor(account.quota.weekly_percentage) }">
-                      {{ account.quota.weekly_percentage }}%
-                    </strong>
-                  </div>
-                  <div class="quota-bar">
-                    <span
-                      :style="{
-                        width: `${Math.max(0, Math.min(100, account.quota.weekly_percentage))}%`,
-                        background: quotaColor(account.quota.weekly_percentage),
-                      }"
-                    />
-                  </div>
-                </div>
-
-                <div
+                  :label="quotaWindowShortLabel(account.quota.weekly_window_minutes, 10080)"
+                  calendar
+                  :detail="quotaResetDateLabel(account.quota.weekly_reset_time)"
+                  :countdown="quotaResetLeftLabel(account.quota.weekly_reset_time)"
+                  :percentage="account.quota.weekly_percentage"
+                />
+                <AccountQuotaMetric
                   v-for="window in visibleAdditionalQuotaWindows(account)"
                   :key="window.key"
-                  class="quota-metric additional-quota-metric"
-                >
-                  <div class="quota-metric-main">
-                    <span
-                      class="quota-window-label"
-                      :title="additionalQuotaWindowLabel(window)"
-                    >
-                      <icon-calendar v-if="(window.windowMinutes || 0) >= 1440" />
-                      <icon-clock-circle v-else />
-                      <span>{{ additionalQuotaWindowLabel(window) }}</span>
-                    </span>
-                    <em>{{ quotaResetDateLabel(window.resetTime) }}</em>
-                    <small>{{ quotaResetLeftLabel(window.resetTime) }}</small>
-                    <strong :style="{ color: quotaColor(window.percentage) }">
-                      {{ quotaPercentLabel(window.percentage) }}
-                    </strong>
-                  </div>
-                  <div class="quota-bar">
-                    <span :style="quotaProgressStyle(window.percentage)" />
-                  </div>
-                </div>
+                  class="additional-quota-metric"
+                  :label="additionalQuotaWindowLabel(window)"
+                  :calendar="(window.windowMinutes || 0) >= 1440"
+                  :detail="quotaResetDateLabel(window.resetTime)"
+                  :countdown="quotaResetLeftLabel(window.resetTime)"
+                  :percentage="window.percentage"
+                />
 
                 <div
                   v-if="isFreePlanAccount(account) && hasQuotaWindow(account.quota, 'hourly')"

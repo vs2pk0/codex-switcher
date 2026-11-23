@@ -2,6 +2,7 @@ import type { CodexSessionRecord } from "../services/session";
 
 export type ActiveView =
   | "accounts"
+  | "platforms"
   | "resets"
   | "sessions"
   | "usage"
@@ -9,6 +10,7 @@ export type ActiveView =
   | "openCodex"
   | "instances"
   | "settings"
+  | "plugins"
   | "pushSettings"
   | "about";
 

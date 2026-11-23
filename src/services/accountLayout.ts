@@ -34,3 +34,12 @@ export function resolveAccountColumns(setting: unknown, windowWidth: number): nu
   const normalized = normalizeMaxColumns(setting);
   return normalized === ADAPTIVE_COLUMNS ? resolveAdaptiveColumns(windowWidth) : normalized;
 }
+
+export function accountGridLayout(setting: unknown, windowWidth: number, expanded: boolean) {
+  const adaptive = normalizeMaxColumns(setting) === ADAPTIVE_COLUMNS;
+  const columns = resolveAccountColumns(setting, windowWidth);
+  return {
+    classes: { [`columns-${Math.min(5, columns)}`]: true, adaptive, expanded },
+    style: adaptive ? { gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` } : {},
+  };
+}

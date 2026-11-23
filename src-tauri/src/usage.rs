@@ -319,7 +319,7 @@ struct UsageEventIdentity {
 
 const PROVENANCE_USAGE_CACHE_VERSION: u32 = 4;
 const USAGE_CACHE_VERSION: u32 = 9;
-const PRICING_DEFAULTS_VERSION: u32 = 2;
+const PRICING_DEFAULTS_VERSION: u32 = 3;
 static USAGE_DATA_LOCK: Mutex<()> = Mutex::new(());
 
 pub(super) fn lock_usage_data() -> Result<MutexGuard<'static, ()>, String> {
@@ -2119,6 +2119,15 @@ fn migrate_pricing_defaults(
         return (pricing, false);
     }
 
+    if applied_version == 2 {
+        for default in added_pricing_v3() {
+            if !pricing.iter().any(|row| row.model_id == default.model_id) {
+                pricing.push(default);
+            }
+        }
+        return (pricing, true);
+    }
+
     let previous: Vec<CodexUsagePricing> =
         serde_json::from_str(include_str!("../data/model-pricing-v1.json"))
             .expect("valid version 1 pricing snapshot");
@@ -2314,8 +2323,17 @@ fn apply_pricing_model_source(logs: &mut [ParsedUsageLog], configs: &[CodexUsage
 
 fn default_pricing() -> Vec<CodexUsagePricing> {
     // Source and license: ../data/README.md. Bundle the full catalog for offline use.
-    serde_json::from_str(include_str!("../data/model-pricing.json"))
-        .expect("valid bundled model pricing")
+    let mut pricing: Vec<CodexUsagePricing> =
+        serde_json::from_str(include_str!("../data/model-pricing.json"))
+            .expect("valid bundled model pricing");
+    pricing.extend(added_pricing_v3());
+    pricing.sort_by(|left, right| left.model_id.cmp(&right.model_id));
+    pricing
+}
+
+fn added_pricing_v3() -> Vec<CodexUsagePricing> {
+    serde_json::from_str(include_str!("../data/model-pricing-v3.json"))
+        .expect("valid version 3 model prices")
 }
 
 fn model_pricing_candidates(model_id: &str) -> Vec<String> {
@@ -4509,9 +4527,9 @@ mod tests {
     }
 
     #[test]
-    fn bundled_pricing_contains_all_cc_switch_presets_and_valid_prices() {
+    fn bundled_pricing_contains_all_presets_and_valid_prices() {
         let pricing = default_pricing();
-        assert_eq!(pricing.len(), 232);
+        assert_eq!(pricing.len(), 240);
         let mut ids = HashSet::new();
         for entry in &pricing {
             assert!(ids.insert(entry.model_id.clone()), "duplicate pricing ID");
@@ -4521,8 +4539,11 @@ mod tests {
         for model in [
             "gpt-6-astra",
             "gpt-6.1-sol",
+            "gpt-6.2-sol",
             "claude-opus-5-5",
+            "claude-mythos-5-2",
             "gemini-4-argon",
+            "gemini-4-carbon",
             "deepseek-v4.1-flash",
             "qwen3.8-max",
             "kimi-k3",
@@ -4630,7 +4651,7 @@ mod tests {
         existing.push(custom.clone());
         let (migrated, changed) = migrate_pricing_defaults(existing, 1);
         assert!(changed);
-        assert_eq!(migrated.len(), 233);
+        assert_eq!(migrated.len(), default_pricing().len() + 1);
         assert!(migrated.contains(&custom));
         let terra = migrated
             .iter()
@@ -4649,5 +4670,20 @@ mod tests {
         let (second, changed) = migrate_pricing_defaults(after_delete, PRICING_DEFAULTS_VERSION);
         assert!(!changed);
         assert!(!second.iter().any(|row| row.model_id == "claude-opus-5-5"));
+    }
+
+    #[test]
+    fn version_three_prices_preserve_existing_edits_and_deletions() {
+        let mut local = added_pricing_v3()
+            .into_iter()
+            .find(|entry| entry.model_id == "gpt-6.2-sol")
+            .unwrap();
+        local.input_cost_per_million = "9".into();
+        let (pricing, changed) = migrate_pricing_defaults(vec![local.clone()], 2);
+        assert!(changed);
+        assert!(pricing.contains(&local));
+        assert!(!pricing.iter().any(|row| row.model_id == "gpt-6.1-sol"));
+        assert!(pricing.iter().any(|row| row.model_id == "gpt-6.2-astra"
+            && row.cache_read_cost_per_million == "0.40"));
     }
 }

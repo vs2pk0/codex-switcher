@@ -8,6 +8,8 @@ defineProps<{
   activeView: ActiveView;
   sidebarEnabled: boolean;
   managedInstancesSupported: boolean;
+  hasPlatformExtensions: boolean;
+  pluginManagementEnabled: boolean;
   accountsCount: number;
   oauthCount: number;
   apiKeyCount: number;
@@ -47,6 +49,22 @@ const sidebarCollapsed = ref(true);
         >
           <icon-list />
           <span class="sidebar-label">{{ t("账号总览") }}</span>
+        </button>
+      </a-tooltip>
+      <a-tooltip
+        v-if="hasPlatformExtensions"
+        :content="t('其他平台')"
+        position="right"
+        :disabled="!sidebarCollapsed"
+      >
+        <button
+          type="button"
+          :class="{ active: activeView === 'platforms' }"
+          :aria-label="t('其他平台')"
+          @click="$emit('switch-view', 'platforms')"
+        >
+          <icon-common />
+          <span class="sidebar-label">{{ t("其他平台") }}</span>
         </button>
       </a-tooltip>
       <a-tooltip :content="t('会话管理')" position="right" :disabled="!sidebarCollapsed">
@@ -112,6 +130,16 @@ const sidebarCollapsed = ref(true);
         >
           <icon-apps />
           <span class="sidebar-label">{{ t("Codex 多开") }}</span>
+        </button>
+      </a-tooltip>
+      <a-tooltip v-if="pluginManagementEnabled" :content="t('插件管理')" position="right" :disabled="!sidebarCollapsed">
+        <button
+          type="button"
+          :class="{ active: activeView === 'plugins' }"
+          @click="$emit('switch-view', 'plugins')"
+        >
+          <icon-apps />
+          <span class="sidebar-label">{{ t("插件管理") }}</span>
         </button>
       </a-tooltip>
       <a-tooltip :content="t('设置')" position="right" :disabled="!sidebarCollapsed">
@@ -208,6 +236,14 @@ const sidebarCollapsed = ref(true);
         <template #icon><icon-list /></template>
         {{ t("账号总览") }}
       </a-button>
+      <a-button
+        v-if="hasPlatformExtensions"
+        :type="activeView === 'platforms' ? 'primary' : 'text'"
+        @click="$emit('switch-view', 'platforms')"
+      >
+        <template #icon><icon-common /></template>
+        {{ t("其他平台") }}
+      </a-button>
       <a-button :type="activeView === 'sessions' ? 'primary' : 'text'" @click="$emit('switch-view', 'sessions')">
         <template #icon><icon-folder /></template>
         {{ t("会话管理") }}
@@ -235,6 +271,14 @@ const sidebarCollapsed = ref(true);
       >
         <template #icon><icon-apps /></template>
         {{ t("Codex 多开") }}
+      </a-button>
+      <a-button
+        v-if="pluginManagementEnabled"
+        :type="activeView === 'plugins' ? 'primary' : 'text'"
+        @click="$emit('switch-view', 'plugins')"
+      >
+        <template #icon><icon-apps /></template>
+        {{ t("插件管理") }}
       </a-button>
       <a-button :type="activeView === 'settings' || activeView === 'pushSettings' ? 'primary' : 'text'" @click="$emit('switch-view', 'settings')">
         <template #icon><icon-settings /></template>
