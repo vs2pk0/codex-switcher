@@ -15,7 +15,7 @@ use std::{
     },
     time::Duration,
 };
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, FilePath};
 use tempfile::{NamedTempFile, TempDir};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -67,6 +67,8 @@ pub struct Extension {
     #[serde(default)]
     account_actions: bool,
     #[serde(default)]
+    account_json_editing: bool,
+    #[serde(default)]
     usage: bool,
     #[serde(default)]
     usage_app_discovery: bool,
@@ -117,6 +119,14 @@ pub enum Action {
         account_id: String,
         nickname: String,
         tags: Vec<String>,
+    },
+    ReadJson {
+        account_id: String,
+    },
+    SaveJson {
+        account_id: String,
+        json: String,
+        revision: String,
     },
     SetPhone {
         account_id: String,
@@ -194,6 +204,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
         || semver::Version::parse(&extension.version).is_err()
         || (!extension.usage && extension.platforms.is_empty())
         || (extension.account_actions && extension.platforms.is_empty())
+        || (extension.account_json_editing && !extension.account_actions)
         || (extension.usage_app_discovery && !extension.usage)
         || extension.platforms.len() > 50
         || extension.usage_icons.len() > 50
@@ -578,17 +589,25 @@ fn list_installed(root: &Path) -> Result<Vec<InstalledExtension>, String> {
 }
 
 #[tauri::command]
-pub async fn extension_import(app: tauri::AppHandle) -> Result<ExtensionImportResult, String> {
-    let paths = tauri::async_runtime::spawn_blocking(move || {
-        app.dialog()
-            .file()
-            .add_filter("Codex Switcher Plugin", &["csplugin"])
-            .blocking_pick_files()
-    })
-    .await
-    .map_err(|_| "无法选择插件包。")?;
+pub async fn extension_import(
+    app: tauri::AppHandle,
+    paths: Option<Vec<PathBuf>>,
+) -> Result<ExtensionImportResult, String> {
+    let paths = match paths {
+        Some(paths) => paths.into_iter().map(FilePath::Path).collect(),
+        None => tauri::async_runtime::spawn_blocking(move || {
+            app.dialog()
+                .file()
+                .add_filter("Codex Switcher Plugin", &["csplugin"])
+                .blocking_pick_files()
+                .unwrap_or_default()
+        })
+        .await
+        .map_err(|_| "无法选择插件包。")?,
+    };
     let mut result = ExtensionImportResult::default();
-    for path in paths.into_iter().flatten() {
+    let mut seen = HashSet::new();
+    for path in paths {
         let Ok(path) = path.into_path() else {
             result.failed.push(ExtensionImportFailure {
                 file: "插件包".into(),
@@ -596,22 +615,32 @@ pub async fn extension_import(app: tauri::AppHandle) -> Result<ExtensionImportRe
             });
             continue;
         };
-        match install_extension(path.clone()).await {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let file = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        match install_extension(path).await {
             Ok(extension) => result.installed.push(extension),
-            Err(error) => result.failed.push(ExtensionImportFailure {
-                file: path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-                error,
-            }),
+            Err(error) => result.failed.push(ExtensionImportFailure { file, error }),
         }
     }
     Ok(result)
 }
 
 async fn install_extension(path: PathBuf) -> Result<InstalledExtension, String> {
+    if !path.is_absolute() {
+        return Err("请选择本地插件包。".into());
+    }
+    if !path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("csplugin"))
+    {
+        return Err("请选择 .csplugin 插件包。".into());
+    }
     let root = root();
     let staging_root = root.clone();
     let (file, extension) =
@@ -736,6 +765,9 @@ pub async fn extension_call(
                         | Action::SetPinned { .. }
                         | Action::Switch { .. }
                         | Action::Export { .. } => worker.extension.account_actions,
+                        Action::ReadJson { .. } | Action::SaveJson { .. } => {
+                            worker.extension.account_json_editing
+                        }
                         _ => true,
                     }
             })

@@ -1,12 +1,42 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { stackQuotaAccounts } from "../src/quota.ts";
+import { antigravityQuotaGroups, stackQuotaAccounts } from "../src/quota.ts";
 
 const modalSource = readFileSync(new URL("../src/components/EditAccountModal.vue", import.meta.url), "utf8");
 const serviceSource = readFileSync(new URL("../src/services/quotaList.ts", import.meta.url), "utf8");
 const backendSource = readFileSync(new URL("../src-tauri/src/quota_list.rs", import.meta.url), "utf8");
 const libSource = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+
+test("反重力只显示官方的分组额度，组内周额度优先", () => {
+  const resetAt = 1_800_000_000_000;
+  const groups = antigravityQuotaGroups([
+    { id: "claude:5h", remainingPercent: 100, resetAt: null },
+    ...Array.from({ length: 35 }, () => ({ remainingPercent: 94, resetAt })),
+    { id: "argon:weekly", remainingPercent: 30, resetAt },
+    { id: "gemini:5h", remainingPercent: 99, resetAt },
+    { id: "gemini:weekly", remainingPercent: 0, resetAt },
+    { id: "claude:weekly", remainingPercent: 81, resetAt: null },
+  ]);
+  assert.deepEqual(groups.map(({ label, windows }) => [label, windows.map(({ id, percentage }) => [id, percentage])]), [
+    ["Gemini 模型", [["gemini:weekly", 0], ["gemini:5h", 99]]],
+    ["Claude 和 GPT 模型", [["claude:weekly", 81], ["claude:5h", 100]]],
+  ]);
+  assert.equal(groups[0].windows[0].resetAt, resetAt);
+});
+
+test("反重力缺少官方时间窗口时只显示已经返回的额度", () => {
+  const groups = antigravityQuotaGroups([
+    { remainingPercent: 100, resetAt: null },
+    { id: "gemini:5h", remainingPercent: null, resetAt: null },
+    { id: "claude:weekly", remainingPercent: 100, resetAt: null },
+  ]);
+  assert.deepEqual(groups, [{
+    label: "Claude 和 GPT 模型",
+    windows: [{ id: "claude:weekly", label: "每周额度", percentage: 100, resetAt: null }],
+  }]);
+  assert.deepEqual(antigravityQuotaGroups([{ remainingPercent: 100, resetAt: null }]), []);
+});
 
 test("叠加显示按窗口时长分桶，任一账号有的窗口都会显示", () => {
   const a1 = {

@@ -113,7 +113,7 @@ const sidebarCollapsed = ref(true);
           :class="{ active: activeView === 'openCodex' }"
           @click="$emit('switch-view', 'openCodex')"
         >
-          <icon-command />
+          <icon-desktop />
           <span class="sidebar-label">OpenCodex</span>
         </button>
       </a-tooltip>
@@ -128,7 +128,7 @@ const sidebarCollapsed = ref(true);
           :class="{ active: activeView === 'instances' }"
           @click="$emit('switch-view', 'instances')"
         >
-          <icon-apps />
+          <icon-layers />
           <span class="sidebar-label">{{ t("Codex 多开") }}</span>
         </button>
       </a-tooltip>
@@ -138,7 +138,7 @@ const sidebarCollapsed = ref(true);
           :class="{ active: activeView === 'plugins' }"
           @click="$emit('switch-view', 'plugins')"
         >
-          <icon-apps />
+          <icon-tool />
           <span class="sidebar-label">{{ t("插件管理") }}</span>
         </button>
       </a-tooltip>
@@ -261,7 +261,7 @@ const sidebarCollapsed = ref(true);
         {{ t("API 服务") }}
       </a-button>
       <a-button :type="activeView === 'openCodex' ? 'primary' : 'text'" @click="$emit('switch-view', 'openCodex')">
-        <template #icon><icon-command /></template>
+        <template #icon><icon-desktop /></template>
         OpenCodex
       </a-button>
       <a-button
@@ -269,7 +269,7 @@ const sidebarCollapsed = ref(true);
         :type="activeView === 'instances' ? 'primary' : 'text'"
         @click="$emit('switch-view', 'instances')"
       >
-        <template #icon><icon-apps /></template>
+        <template #icon><icon-layers /></template>
         {{ t("Codex 多开") }}
       </a-button>
       <a-button
@@ -277,7 +277,7 @@ const sidebarCollapsed = ref(true);
         :type="activeView === 'plugins' ? 'primary' : 'text'"
         @click="$emit('switch-view', 'plugins')"
       >
-        <template #icon><icon-apps /></template>
+        <template #icon><icon-tool /></template>
         {{ t("插件管理") }}
       </a-button>
       <a-button :type="activeView === 'settings' || activeView === 'pushSettings' ? 'primary' : 'text'" @click="$emit('switch-view', 'settings')">

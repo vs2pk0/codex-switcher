@@ -156,25 +156,6 @@ function displayPath(path?: string): string {
             <div class="section-heading"><div><h2>{{ t("外观") }}</h2><p>{{ t("自定义界面显示与布局。") }}</p></div></div>
             <div class="preference-row"><div class="preference-copy"><strong>{{ t('语言') }}</strong></div><div class="preference-control"><a-select :aria-label="t('语言')" :model-value="settings.language || 'zh-CN'" popup-container="body" :scrollbar="false" @change="changeLanguage"><a-option v-for="item in languageOptions" :key="item.value" :value="item.value">{{ item.label }}</a-option></a-select></div></div><div class="preference-row"><div class="preference-copy"><strong>{{ t('侧边栏') }}</strong></div><div class="preference-control"><a-switch v-model="settings.sidebarEnabled" :aria-label="t('侧边栏')" :disabled="saving" @change="emit('save')" /></div></div><div class="preference-row"><div class="preference-copy"><strong>{{ t('每行账号数') }}</strong></div><div class="preference-control"><a-radio-group :aria-label="t('每行账号数')" v-model="settings.maxColumns" type="button" @change="emit('save')"><a-radio :value="0">{{ t("自适应") }}</a-radio><a-radio :value="3">3</a-radio><a-radio :value="4">4</a-radio><a-radio :value="5">5</a-radio></a-radio-group></div></div><div class="preference-row"><div class="preference-copy"><strong>{{ t('每页账号数') }}</strong></div><div class="preference-control"><a-input-number :aria-label="t('每页账号数')" v-model="settings.pageSize" :step="10" :min="10" :max="500" mode="button" @change="emit('save')"></a-input-number></div></div>
           </a-card>
-          <a-card v-if="settings.pluginManagementUnlocked" :bordered="false" class="settings-card">
-            <div class="preference-row">
-              <div class="preference-copy">
-                <strong>{{ t("插件管理") }}</strong>
-                <p>{{ t("在导航栏显示插件管理入口。") }}</p>
-              </div>
-              <div class="preference-control plugin-preference">
-                <a-button v-if="settings.pluginManagementEnabled" type="text" size="small" @click="emit('open-plugin-management')">
-                  {{ t("管理插件") }}
-                </a-button>
-                <a-switch
-                  :model-value="settings.pluginManagementEnabled"
-                  :aria-label="t('插件管理')"
-                  :disabled="saving"
-                  @change="emit('change-plugin-management', !!$event)"
-                />
-              </div>
-            </div>
-          </a-card>
           <a-card :bordered="false" class="settings-card settings-data">
             <div class="section-heading"><div><h2>{{ t("本地数据") }}</h2><p>{{ t("路径仅用于显示，点击文件夹按钮打开原始位置。") }}</p></div></div>
             <div v-for="item in directoryRows" :key="item.label" class="directory-row">
@@ -300,6 +281,36 @@ function displayPath(path?: string): string {
         </a-card>
 
       </div>
+      <a-card v-if="settings.pluginManagementUnlocked" :bordered="false" class="settings-card plugin-settings">
+        <div class="plugin-settings-row">
+          <div class="section-heading plugin-settings-heading">
+            <span class="plugin-settings-icon" aria-hidden="true"><icon-tool /></span>
+            <div>
+              <h2>{{ t("插件管理") }}</h2>
+              <p>{{ t("安装本地插件，管理启用状态。") }}</p>
+            </div>
+          </div>
+          <div class="plugin-settings-actions">
+            <div class="plugin-settings-toggle">
+              <span>{{ t("显示导航入口") }}</span>
+              <a-switch
+                :model-value="settings.pluginManagementEnabled"
+                :aria-label="t('显示导航入口')"
+                :disabled="saving"
+                @change="emit('change-plugin-management', !!$event)"
+              />
+            </div>
+            <a-button
+              v-if="settings.pluginManagementEnabled"
+              type="primary"
+              @click="emit('open-plugin-management')"
+            >
+              {{ t("管理插件") }}
+              <icon-right />
+            </a-button>
+          </div>
+        </div>
+      </a-card>
     </a-spin>
   </section>
 </template>
@@ -345,7 +356,42 @@ function displayPath(path?: string): string {
 .preference-copy strong { color: #28364b; font-size: 14px; font-weight: 550; line-height: 1.5; }
 .preference-copy p { margin: 4px 0 0; color: #8390a4; font-size: 12px; line-height: 1.6; max-width: 450px; }
 .preference-control { flex-shrink: 0; display: flex; align-items: center; justify-content: flex-end; }
-.plugin-preference { gap: 8px; }
+.plugin-settings { margin-top: 20px; }
+.plugin-settings-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px 24px;
+}
+.plugin-settings-heading {
+  align-items: center;
+  justify-content: flex-start;
+  margin-bottom: 0;
+}
+.plugin-settings-icon {
+  display: grid;
+  flex: 0 0 44px;
+  height: 44px;
+  place-items: center;
+  border-radius: 10px;
+  background: rgb(var(--primary-1));
+  color: rgb(var(--primary-6));
+  font-size: 22px;
+}
+.plugin-settings-actions, .plugin-settings-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+.plugin-settings-toggle {
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text-soft);
+  font-size: 13px;
+}
 .preference-control :deep(.arco-input-number), .preference-control :deep(.arco-select) { width: 216px; }
 .preference-control :deep(.arco-radio-group-button) { white-space: nowrap; }
 .settings-switching .preference-row { align-items: center; }

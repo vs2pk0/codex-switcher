@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, reactive, ref, watch } from "vue";
 import { Message, Modal } from "@arco-design/web-vue";
 import { formatLocalizedCount, t } from "../i18n";
+import { antigravityQuotaGroups } from "../quota";
 import { formatWallTime } from "../timeZone";
 import { accountGridLayout } from "../services/accountLayout";
 import { openExternalUrl, type CodexSwitcherSettings } from "../services/codex";
@@ -13,6 +14,7 @@ import {
   type PlatformQuota,
   type PlatformSwitchResult,
 } from "../services/extensions";
+import AntigravityQuotaSummary from "./AntigravityQuotaSummary.vue";
 import PhoneModal from "./PhoneModal.vue";
 import PlanBadge from "./PlanBadge.vue";
 import PlatformPicker from "./PlatformPicker.vue";
@@ -40,6 +42,7 @@ const choices = computed(() => props.extensions.flatMap((extension) =>
     key: `${extension.id}:${platform.id}`,
     revision: extension.version,
     accountActions: extension.accountActions === true,
+    accountJsonEditing: extension.accountJsonEditing === true,
     iconUrl: platform.iconPng ? `data:image/png;base64,${platform.iconPng}` : null,
   })),
 ));
@@ -51,13 +54,16 @@ const saved = ref(new Map<string, { revision: string; rows: PlatformAccount[] }>
 const loading = ref(false);
 const updating = ref<{ key: string; action: string } | null>(null);
 const readingCurrent = ref(false);
-const busy = computed(() => updating.value !== null || readingCurrent.value);
+const refreshing = reactive(new Set<string>());
+const busy = computed(() => updating.value !== null || readingCurrent.value || refreshing.size > 0);
 const lastRead = ref(new Map<string, { revision: string; ids: Set<string> }>());
 const editing = ref<{ target: Choice; account: PlatformAccount; kind: "edit" | "phone" } | null>(null);
 const quotaDetailsKey = ref<string | null>(null);
 const quotaScroll = ref<HTMLElement | null>(null);
 let quotaTrigger: HTMLElement | null = null;
 const detailsForm = reactive({ nickname: "", tags: [] as string[], phone: "" });
+const detailsTab = ref("form");
+const detailsJson = reactive({ text: "", revision: "", loading: false, error: "" });
 const tagOptions = computed(() => editing.value ? [...new Set(
   platformRows(editing.value.target).flatMap(({ tags }) => tags),
 )] : []);
@@ -94,6 +100,10 @@ function accountKey(target: Choice, id: string): string {
   return JSON.stringify([target.key, id]);
 }
 
+function canRefresh(key: string): boolean {
+  return !loading.value && !updating.value && !readingCurrent.value && !refreshing.has(key);
+}
+
 const inlineQuotaLimit = 2;
 
 function groupQuotas(quotas: PlatformQuota[]) {
@@ -107,18 +117,43 @@ function groupQuotas(quotas: PlatformQuota[]) {
   return { metrics, balances };
 }
 
+function quotaStatus(account: PlatformAccount, summary: ReturnType<typeof antigravityQuotaGroups> | null) {
+  if (account.quotaError) return summary?.length ? "未能刷新额度，显示上次结果" : "未能刷新额度";
+  if (summary) {
+    if (summary.length) return account.quotaSummaryStale ? "显示上次同步的额度" : "";
+    return account.quotaSummaryStale === undefined && account.quotas.length
+      ? "更新账号插件以查看分组额度"
+      : "暂无分组额度";
+  }
+  return account.quotas.length ? "" : "暂无额度数据";
+}
+
 const accounts = computed(() => {
-  const targets = platform.value ? [platform.value] : choices.value;
-  const rows = targets.flatMap((target) => platformRows(target).map((account) => ({
-    target,
-    account,
-    key: accountKey(target, account.id),
-    quotas: groupQuotas(account.quotas),
-  })));
-  return rows.sort((a, b) =>
-    Number(!!b.account.pinned) - Number(!!a.account.pinned) ||
-    (platform.value ? 0 : (b.account.updatedAt ?? 0) - (a.account.updatedAt ?? 0)),
-  );
+  const selected = platform.value;
+  const targets = selected ? [selected] : choices.value;
+  return targets.flatMap((target) => {
+    const rows = [...platformRows(target)].sort((a, b) =>
+      Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) ||
+      (selected ? 0 : (b.updatedAt ?? 0) - (a.updatedAt ?? 0)),
+    );
+    return rows.map((account) => {
+      const name = accountName(account);
+      const email = display(account.email?.trim() || null);
+      const summary = target.id === "antigravity" ? antigravityQuotaGroups(account.quotas) : null;
+      const hasLongQuotaList = account.quotas.length > inlineQuotaLimit;
+      return {
+        target,
+        account,
+        key: accountKey(target, account.id),
+        name,
+        email: email === name ? "" : email,
+        summary,
+        inlineQuotas: !summary && account.quotas.length && !hasLongQuotaList ? groupQuotas(account.quotas) : null,
+        showQuotaDetails: !summary && hasLongQuotaList,
+        quotaStatusText: quotaStatus(account, summary),
+      };
+    });
+  });
 });
 const filtered = computed(() => {
   const query = keyword.value.trim().toLowerCase();
@@ -133,13 +168,14 @@ const abnormalCount = computed(() => accounts.value.filter(({ account }) => acco
 const gridLayout = computed(() =>
   accountGridLayout(props.settings.maxColumns, props.viewportWidth, props.expandedLayout),
 );
-const hasBalance = computed(() => filtered.value.some(({ account, quotas }) =>
-  account.quotas.length <= inlineQuotaLimit && quotas.balances.length > 0,
-));
-const quotaDetails = computed(() => quotaDetailsKey.value === null
-  ? undefined
-  : filtered.value.find(({ key }) => key === quotaDetailsKey.value),
+const hasBalance = computed(() =>
+  filtered.value.some(({ inlineQuotas }) => inlineQuotas?.balances.length),
 );
+const quotaDetails = computed(() => {
+  if (quotaDetailsKey.value === null) return;
+  const row = filtered.value.find(({ key, showQuotaDetails }) => key === quotaDetailsKey.value && showQuotaDetails);
+  return row && { ...row, quotas: groupQuotas(row.account.quotas) };
+});
 
 watch(quotaDetails, (row) => {
   if (!row) quotaDetailsKey.value = null;
@@ -236,8 +272,16 @@ async function updateAccount(
   action: string,
   apply: () => Promise<void>,
 ): Promise<boolean> {
-  if (busy.value || loading.value || !isInstalled(target)) return false;
-  updating.value = { key: accountKey(target, id), action };
+  if (!isInstalled(target)) return false;
+  const key = accountKey(target, id);
+  const isRefresh = action === "refresh";
+  if (isRefresh) {
+    if (!canRefresh(key)) return false;
+    refreshing.add(key);
+  } else {
+    if (busy.value || loading.value) return false;
+    updating.value = { key, action };
+  }
   try {
     await apply();
     return true;
@@ -245,7 +289,8 @@ async function updateAccount(
     if (isInstalled(target)) Message.error(t(String(cause)));
     return false;
   } finally {
-    updating.value = null;
+    if (isRefresh) refreshing.delete(key);
+    else updating.value = null;
   }
 }
 
@@ -276,24 +321,65 @@ function togglePin(target: Choice, account: PlatformAccount): void {
 }
 
 function openDetails(target: Choice, account: PlatformAccount, kind: "edit" | "phone"): void {
+  resetDetailsJson();
   detailsForm.nickname = account.nickname ?? "";
   detailsForm.tags = [...account.tags];
   detailsForm.phone = account.phone ?? "";
   editing.value = { target, account, kind };
 }
 
+function resetDetailsJson(): void {
+  detailsTab.value = "form";
+  Object.assign(detailsJson, { text: "", revision: "", loading: false, error: "" });
+}
+
 function closeDetails(): void {
-  if (!updating.value) editing.value = null;
+  if (updating.value) return;
+  editing.value = null;
+  resetDetailsJson();
+}
+
+async function loadDetailsJson(): Promise<void> {
+  const entry = editing.value;
+  if (!entry?.target.accountJsonEditing || !isInstalled(entry.target) || detailsJson.loading) return;
+  const { target, account } = entry;
+  detailsJson.loading = true;
+  detailsJson.error = "";
+  try {
+    const result = await callPlatform<{ text: string; revision: string }>(target.extensionId, target.id, {
+      operation: "read_json", account_id: account.id,
+    });
+    if (editing.value === entry && isInstalled(target)) {
+      detailsJson.text = result.text;
+      detailsJson.revision = result.revision;
+    }
+  } catch (cause) {
+    if (editing.value === entry) detailsJson.error = String(cause);
+  } finally {
+    if (editing.value === entry) detailsJson.loading = false;
+  }
+}
+
+function changeDetailsTab(key: string | number): void {
+  detailsTab.value = String(key);
+  if (key === "json" && !detailsJson.revision) void loadDetailsJson();
 }
 
 async function saveDetails(): Promise<boolean> {
   const entry = editing.value;
   if (!entry || !isInstalled(entry.target)) return true;
   const { target, account, kind } = entry;
+  const saveJson = kind === "edit" && detailsTab.value === "json";
+  if (saveJson && (!detailsJson.revision || detailsJson.loading)) return false;
   const saved = await updateAccount(target, account.id, kind, async () => {
-    const updated = await callPlatform<PlatformAccount>(target.extensionId, target.id, kind === "phone"
-      ? { operation: "set_phone", account_id: account.id, phone: detailsForm.phone }
-      : { operation: "edit", account_id: account.id, nickname: detailsForm.nickname, tags: detailsForm.tags });
+    const action = kind === "phone"
+      ? { operation: "set_phone", phone: detailsForm.phone } as const
+      : saveJson
+        ? { operation: "save_json", json: detailsJson.text, revision: detailsJson.revision } as const
+        : { operation: "edit", nickname: detailsForm.nickname, tags: detailsForm.tags } as const;
+    const updated = await callPlatform<PlatformAccount>(target.extensionId, target.id, {
+      ...action, account_id: account.id,
+    });
     mergeRows(target, [updated]);
   });
   if (saved) closeDetails();
@@ -358,7 +444,10 @@ function clearLogin(target: Choice | null | undefined = dialogPlatform.value): v
 
 watch(() => JSON.stringify(choices.value.map(({ key, revision }) => [key, revision])), () => {
   if (!platform.value) selection.value = "";
-  if (editing.value && !isInstalled(editing.value.target)) editing.value = null;
+  if (editing.value && !isInstalled(editing.value.target)) {
+    editing.value = null;
+    resetDetailsJson();
+  }
   void load();
 }, { immediate: true });
 watch(dialogPlatform, (target, previous) => {
@@ -371,6 +460,8 @@ watch(dialogPlatform, (target, previous) => {
 onBeforeUnmount(() => {
   mounted = false;
   loadVersion += 1;
+  editing.value = null;
+  resetDetailsJson();
   clearLogin();
 });
 
@@ -532,7 +623,7 @@ async function importJson(): Promise<void> {
 }
 
 function accountName(account: PlatformAccount): string {
-  return display(account.nickname || account.name || account.email) || t("账号");
+  return display(account.nickname?.trim() || account.email?.trim() || account.name?.trim() || null) || t("账号");
 }
 
 function accountId(id: string): string {
@@ -630,7 +721,7 @@ function badgeClass(plan: string): string {
           :style="gridLayout.style"
         >
           <a-card
-            v-for="{ target, account, key, quotas } in filtered"
+            v-for="{ target, account, key, name, email, summary, inlineQuotas, showQuotaDetails, quotaStatusText } in filtered"
             :key="key"
             class="account-card platform-account-card"
             :class="{ active: isCurrent(target, account), pinned: account.pinned, 'platform-card-legacy': !target.accountActions }"
@@ -644,11 +735,7 @@ function badgeClass(plan: string): string {
                 </span>
                 <div class="account-title">
                   <div class="account-title-main">
-                    <span
-                      class="account-name"
-                      :title="account.email && (account.nickname || account.name) !== account.email
-                        ? `${accountName(account)} · ${display(account.email)}` : accountName(account)"
-                    >{{ accountName(account) }}</span>
+                    <span class="account-name" :title="name">{{ name }}</span>
                   </div>
                   <div class="account-action-meta">
                     <small :title="`${t('账号 ID')} · ${accountId(account.id)}`">{{ t("账号 ID") }}: {{ accountId(account.id) }}</small>
@@ -663,14 +750,24 @@ function badgeClass(plan: string): string {
                     </a-tooltip>
                     <PlanBadge v-if="account.plan" :label="account.plan.toUpperCase()" :badge-class="badgeClass(account.plan)" />
                   </div>
-                  <span class="platform-account-label">{{ target.label }}</span>
+                  <div class="platform-account-caption">
+                    <span v-if="email" class="platform-account-email" :title="email">{{ email }}</span>
+                    <span class="platform-account-label" :title="target.label">{{ target.label }}</span>
+                  </div>
                 </div>
               </div>
             </div>
 
             <div class="account-health">
+              <AntigravityQuotaSummary v-if="summary?.length" :groups="summary" :status-clock-ms="statusClockMs" />
+              <PlatformQuotaList
+                v-else-if="inlineQuotas"
+                v-bind="inlineQuotas"
+                :status-clock-ms="statusClockMs"
+                :hide-amounts="!!displayText"
+              />
               <button
-                v-if="account.quotas.length > inlineQuotaLimit"
+                v-if="showQuotaDetails"
                 class="platform-quota-trigger"
                 type="button"
                 aria-haspopup="dialog"
@@ -682,14 +779,9 @@ function badgeClass(plan: string): string {
                 <small>{{ formatLocalizedCount(account.quotas.length, "项") }}</small>
                 <icon-right />
               </button>
-              <PlatformQuotaList
-                v-else-if="account.quotas.length"
-                v-bind="quotas"
-                :status-clock-ms="statusClockMs"
-                :hide-amounts="!!displayText"
-              />
-              <div v-if="account.quotaError" class="quota-error platform-quota-status">{{ t("未能刷新额度") }}</div>
-              <p v-else-if="!account.quotas.length" class="platform-quota-status">{{ t("暂无额度数据") }}</p>
+              <p v-if="quotaStatusText" class="platform-quota-status" :class="{ 'quota-error': account.quotaError }">
+                {{ t(quotaStatusText) }}
+              </p>
             </div>
 
             <footer class="card-footer">
@@ -759,8 +851,8 @@ function badgeClass(plan: string): string {
                   <a-button
                     size="small"
                     :aria-label="t('刷新额度')"
-                    :loading="actionLoading(key, 'refresh')"
-                    :disabled="loading || busy"
+                    :loading="refreshing.has(key)"
+                    :disabled="!canRefresh(key)"
                     @click="refresh(target, account)"
                   >
                     <template #icon><icon-refresh /></template>
@@ -861,9 +953,11 @@ function badgeClass(plan: string): string {
             :status-clock-ms="statusClockMs"
             :hide-amounts="!!displayText"
           />
-          <div v-if="quotaDetails.account.quotaError" class="quota-error platform-quota-status">
-            {{ t("未能刷新额度") }}
-          </div>
+          <p
+            v-if="quotaDetails.quotaStatusText"
+            class="platform-quota-status"
+            :class="{ 'quota-error': quotaDetails.account.quotaError }"
+          >{{ t(quotaDetails.quotaStatusText) }}</p>
         </div>
       </template>
     </a-modal>
@@ -872,11 +966,37 @@ function badgeClass(plan: string): string {
       :visible="editing?.kind === 'edit'"
       :title="t('编辑账号')"
       :ok-text="t('保存')"
+      :width="editing?.target.accountJsonEditing ? 'min(760px, 94vw)' : undefined"
       :mask-closable="false"
       :on-before-ok="saveDetails"
+      :ok-button-props="{ disabled: busy || loading || (detailsTab === 'json' && !detailsJson.revision) }"
+      unmount-on-close
       @cancel="closeDetails"
     >
-      <a-form :model="detailsForm" layout="vertical">
+      <a-tabs
+        v-if="editing?.target.accountJsonEditing"
+        :active-key="detailsTab"
+        hide-content
+        @change="changeDetailsTab"
+      >
+        <a-tab-pane key="form" :title="t('表单')" />
+        <a-tab-pane key="json" title="JSON" />
+      </a-tabs>
+      <div v-if="detailsTab === 'json'">
+        <a-spin v-if="detailsJson.loading" :tip="t('正在读取账号 JSON…')" />
+        <a-alert v-else-if="detailsJson.error" type="error">
+          {{ t(detailsJson.error) }}
+          <a-button size="small" @click="loadDetailsJson">{{ t('重新读取') }}</a-button>
+        </a-alert>
+        <a-textarea
+          v-else
+          v-model="detailsJson.text"
+          class="token-textarea json-edit-area"
+          :auto-size="{ minRows: 12, maxRows: 20 }"
+          :textarea-attrs="{ 'aria-label': t('账号 JSON'), spellcheck: false, autocomplete: 'off', autocapitalize: 'off' }"
+        />
+      </div>
+      <a-form v-else :model="detailsForm" layout="vertical">
         <a-form-item :label="t('账号名称')">
           <a-input
             v-model="detailsForm.nickname"
@@ -1003,14 +1123,37 @@ function badgeClass(plan: string): string {
   font-size: 17px;
 }
 .platform-account-icon img {
-  width: 21px;
-  height: 21px;
+  width: 24px;
+  height: 24px;
   object-fit: contain;
 }
-.platform-account-label {
+.platform-account-caption {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  min-width: 0;
   color: var(--text-soft);
+}
+.platform-account-email,
+.platform-account-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.platform-account-email {
+  font-size: 12px;
+}
+.platform-account-label {
+  flex: 0 0 auto;
+  max-width: 100%;
   font-size: 11px;
   font-weight: 600;
+}
+.platform-account-email + .platform-account-label {
+  max-width: 44%;
+  padding-inline-start: 8px;
+  border-inline-start: 1px solid var(--line);
 }
 .platform-account-card .account-action-meta small {
   flex: 1 1 0;
@@ -1064,9 +1207,11 @@ function badgeClass(plan: string): string {
   border-color: var(--line-strong);
   background: #edf4ff;
 }
+.platform-quota-trigger span {
+  flex: 1;
+}
 .platform-quota-trigger small {
   flex: 0 0 auto;
-  margin-inline-start: auto;
   color: var(--text-soft);
   font-size: 11px;
   font-weight: 650;

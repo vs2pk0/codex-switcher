@@ -5439,9 +5439,8 @@ onUnmounted(() => {
         :account-extensions="platformExtensions"
         :active="activeView === 'usage'"
       >
-        <template #codex="{ visible, active }">
+        <template #codex="{ active }">
           <UsagePanel
-            v-show="visible"
             :active="active"
             :instances="codexInstances"
             :current-instance-id="sessionInstanceId"

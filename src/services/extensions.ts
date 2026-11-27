@@ -15,6 +15,7 @@ export interface InstalledExtension {
   version: string;
   enabled?: boolean;
   accountActions?: boolean;
+  accountJsonEditing?: boolean;
   usage: boolean;
   usageAppDiscovery?: boolean;
   usageIcons?: Record<string, string>;
@@ -50,10 +51,12 @@ export interface PlatformAccount {
   /** Unix timestamp in milliseconds. */
   updatedAt: number | null;
   quotaError: boolean;
+  quotaSummaryStale?: boolean;
   quotas: PlatformQuota[];
 }
 
 export interface PlatformQuota {
+  id?: string;
   label: string;
   used: number | null;
   limit: number | null;
@@ -80,8 +83,9 @@ type AccountAction =
   | { operation: "list" }
   | { operation: "import_current" }
   | { operation: "import"; json: string }
-  | { operation: "refresh" | "remove" | "switch" | "export"; account_id: string }
+  | { operation: "refresh" | "remove" | "switch" | "export" | "read_json"; account_id: string }
   | { operation: "edit"; account_id: string; nickname: string; tags: string[] }
+  | { operation: "save_json"; account_id: string; json: string; revision: string }
   | { operation: "set_phone"; account_id: string; phone: string }
   | { operation: "set_pinned"; account_id: string; pinned: boolean }
   | { operation: "login_start"; option?: string }
@@ -159,8 +163,8 @@ export interface ExtensionImportResult {
   failed: { file: string; error: string }[];
 }
 
-export function importExtensions(): Promise<ExtensionImportResult> {
-  return invoke("extension_import");
+export function importExtensions(paths?: string[]): Promise<ExtensionImportResult> {
+  return invoke("extension_import", { paths });
 }
 
 export function setExtensionEnabled(extensionId: string, enabled: boolean): Promise<void> {

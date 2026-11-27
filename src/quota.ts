@@ -1,4 +1,5 @@
 import type { CodexQuota } from "./types/codex";
+import type { PlatformQuota } from "./services/extensions";
 
 export type QuotaWindowKind = "hourly" | "weekly";
 
@@ -74,6 +75,29 @@ export function quotaResetCountdown(resetAtMs: number, nowMs: number): string {
   const hours = Math.floor((totalMinutes % 1440) / 60);
   const minutes = totalMinutes % 60;
   return days ? `${days}d ${hours}h ${minutes}m` : `${hours}h ${minutes}m`;
+}
+
+const antigravityQuotaWindows = [
+  { label: "Gemini 模型", weekly: "gemini:weekly", short: "gemini:5h" },
+  { label: "Claude 和 GPT 模型", weekly: "claude:weekly", short: "claude:5h" },
+] as const;
+
+export function antigravityQuotaGroups(quotas: readonly Pick<PlatformQuota, "id" | "remainingPercent" | "resetAt">[]) {
+  return antigravityQuotaWindows.flatMap(({ label, weekly, short }) => {
+    const definitions = [[weekly, "每周额度"], [short, "5 小时额度"]] as const;
+    const windows = definitions.flatMap(([id, windowLabel]) => {
+      const quota = quotas.find((quota) => quota.id === id);
+      if (!quota || quota.remainingPercent === null || !Number.isFinite(quota.remainingPercent)) return [];
+      const { resetAt } = quota;
+      return [{
+        id,
+        label: windowLabel,
+        percentage: quota.remainingPercent,
+        resetAt: resetAt !== null && Number.isFinite(new Date(resetAt).getTime()) ? resetAt : null,
+      }];
+    });
+    return windows.length ? [{ label, windows }] : [];
+  });
 }
 
 function isPositiveNumber(value: unknown): boolean {

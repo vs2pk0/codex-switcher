@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, reactive, watch } from "vue";
+import { computed, defineAsyncComponent, reactive, ref, watch } from "vue";
+import { Message } from "@arco-design/web-vue";
 import { t } from "../i18n";
 import {
   listExtensionUsageApps,
@@ -27,6 +28,12 @@ type UsageState = {
 
 const states = reactive(new Map<string, UsageState>());
 const opened = reactive(new Set<string>());
+const tabOrderStorageKey = "codex-switcher:usage-tab-order";
+const tabOrders = ref(readTabOrders());
+const sortExtensionId = ref("");
+const draftOrder = ref<string[] | null>(null);
+const draggedApp = ref("");
+const hoveredApp = ref("");
 const accountPlatformByApp: Record<string, string> = {
   claude: "claude",
   grokbuild: "grok",
@@ -61,17 +68,109 @@ const tabs = computed(() => packages.value.flatMap(({ extension, icons, apps, is
   const name = t(extension.name);
   return [
     { key: extension.id, extensionId: extension.id, app: "", label: isPlatformUsage ? t("全部") : name, title: name, iconPng: undefined },
-    ...apps.map((app) => ({
+    ...orderedApps(apps, tabOrders.value.get(extension.id)).map((app) => ({
       key: `${extension.id}:${app}`,
       extensionId: extension.id,
       app,
-      label: usageAppNames[app] ?? app,
-      title: app === "codex" ? `Codex · ${t("会话日志")}` : usageAppNames[app] ?? app,
+      label: appLabel(app),
+      title: app === "codex" ? `Codex · ${t("会话日志")}` : appLabel(app),
       iconPng: icons[app],
     })),
   ];
 }));
-const activeTab = computed(() => tabs.value.find(({ key }) => key === selection.value));
+const activeTab = computed(() =>
+  tabs.value.find(({ key }) => key === selection.value) ?? tabs.value[0],
+);
+const activePackage = computed(() => packages.value.find(({ extension }) => extension.id === activeTab.value?.extensionId));
+const sortPackage = computed(() => packages.value.find(({ extension }) => extension.id === sortExtensionId.value));
+const sortApps = computed(() => orderedApps(sortPackage.value?.apps ?? [], draftOrder.value));
+
+function readTabOrders(): Map<string, string[]> {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(tabOrderStorageKey) ?? "{}");
+    if (!stored || typeof stored !== "object" || Array.isArray(stored)) return new Map();
+    return new Map(Object.entries(stored).flatMap(([id, apps]) =>
+      Array.isArray(apps) ? [[id, [...new Set(apps.filter((app): app is string => typeof app === "string"))]]] : [],
+    ));
+  } catch {
+    return new Map();
+  }
+}
+
+function orderedApps(apps: string[], order?: string[] | null): string[] {
+  if (!order?.length) return apps;
+  const remaining = new Set(apps);
+  return [...order.filter((app) => remaining.delete(app)), ...remaining];
+}
+
+function appLabel(app: string): string {
+  return usageAppNames[app] ?? app;
+}
+
+function openSort(): void {
+  if (!activePackage.value) return;
+  const { id } = activePackage.value.extension;
+  draftOrder.value = tabOrders.value.get(id) ?? null;
+  sortExtensionId.value = id;
+}
+
+function resetDrag(): void {
+  draggedApp.value = "";
+  hoveredApp.value = "";
+}
+
+function closeSort(): void {
+  sortExtensionId.value = "";
+  resetDrag();
+}
+
+function moveApp(source: string, target: string): void {
+  const apps = [...sortApps.value];
+  const from = apps.indexOf(source);
+  const to = apps.indexOf(target);
+  if (from < 0 || to < 0 || from === to) return;
+  apps.splice(from, 1);
+  apps.splice(to, 0, source);
+  draftOrder.value = apps;
+}
+
+function startDrag(event: PointerEvent, app: string): void {
+  if (!event.isPrimary || event.button !== 0) return;
+  (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+  draggedApp.value = app;
+}
+
+function appUnderPointer(event: PointerEvent): string {
+  return document.elementFromPoint(event.clientX, event.clientY)
+    ?.closest<HTMLElement>(".usage-sort-row")?.dataset.app ?? "";
+}
+
+function dropApp(event: PointerEvent): void {
+  moveApp(draggedApp.value, appUnderPointer(event));
+  resetDrag();
+}
+
+function saveSort(): void {
+  const id = sortExtensionId.value;
+  if (!sortPackage.value) return;
+  if (draftOrder.value === null) {
+    tabOrders.value.delete(id);
+  } else {
+    // Keep the cached positions of apps that discovery has not reported yet.
+    const visible = new Set(sortApps.value);
+    const reordered = sortApps.value.values();
+    const cached = (tabOrders.value.get(id) ?? []).map((app) =>
+      visible.has(app) ? reordered.next().value ?? app : app,
+    );
+    tabOrders.value.set(id, [...cached, ...reordered]);
+  }
+  try {
+    localStorage.setItem(tabOrderStorageKey, JSON.stringify(Object.fromEntries(tabOrders.value)));
+  } catch {
+    Message.warning(t("排序已应用，本机缓存写入失败。"));
+  }
+  closeSort();
+}
 
 async function sync(extension: InstalledExtension, state: UsageState, discover = false): Promise<void> {
   if (state.syncing) return;
@@ -108,15 +207,19 @@ watch([() => props.active, () => props.extensions.map(revision).join("|")], ([ac
 }, { immediate: true });
 
 watch(activeTab, (tab) => {
+  selection.value = tab?.key ?? "";
   if (tab) opened.add(tab.extensionId);
-  else if (selection.value) selection.value = "";
 }, { immediate: true });
+
+watch([() => props.active, sortPackage], ([active, pkg]) => {
+  if (!active || !pkg) closeSort();
+});
 </script>
 
 <template>
   <a-tabs
     v-if="tabs.length"
-    :active-key="selection"
+    :active-key="activeTab?.key"
     class="usage-extension-switch"
     type="rounded"
     size="small"
@@ -124,20 +227,23 @@ watch(activeTab, (tab) => {
     hide-content
     @change="selection = String($event)"
   >
-    <a-tab-pane key="">
-      <template #title><span class="usage-app-cell"><UsageAppIcon app="codex" /> Codex</span></template>
-    </a-tab-pane>
+    <template v-if="(activePackage?.apps.length ?? 0) > 1" #extra>
+      <a-button type="text" size="small" class="usage-sort-button" aria-haspopup="dialog" @click="openSort">
+        <template #icon><icon-sort /></template>
+        {{ t("编辑排序") }}
+      </a-button>
+    </template>
     <a-tab-pane v-for="tab in tabs" :key="tab.key">
       <template #title>
         <span class="usage-app-cell usage-platform-tab" :title="tab.title">
           <UsageAppIcon :app="tab.app" :icon-png="tab.iconPng" />
-          <span :class="{ 'usage-tab-label': tab.app }">{{ tab.app ? tab.title : tab.label }}</span>
+          <span>{{ tab.label }}</span>
         </span>
       </template>
     </a-tab-pane>
   </a-tabs>
 
-  <slot name="codex" :visible="!activeTab" :active="active && !activeTab" />
+  <slot v-if="!tabs.length" name="codex" :active="active" />
   <template v-for="{ extension, key, state, icons } in packages" :key="key">
     <ExtensionUsagePanel
       v-if="state && opened.has(extension.id)"
@@ -152,23 +258,88 @@ watch(activeTab, (tab) => {
       @sync="sync(extension, state)"
     />
   </template>
+
+  <a-modal
+    :visible="!!sortPackage"
+    :title="t('用量标签排序')"
+    :ok-text="t('保存排序')"
+    :cancel-text="t('取消')"
+    unmount-on-close
+    @ok="saveSort"
+    @cancel="closeSort"
+  >
+    <p class="usage-sort-hint">{{ t("拖动或使用箭头调整标签顺序。") }}</p>
+    <div class="sort-editor-list">
+      <div
+        v-for="(app, index) in sortApps"
+        :key="app"
+        class="sort-editor-row usage-sort-row"
+        :class="{ dragging: draggedApp === app, over: hoveredApp === app && draggedApp !== app }"
+        :data-app="app"
+      >
+        <span
+          class="sort-editor-grip"
+          :title="t('按住拖动排序')"
+          aria-hidden="true"
+          @pointerdown.prevent="startDrag($event, app)"
+          @pointermove="draggedApp && (hoveredApp = appUnderPointer($event))"
+          @pointerup="dropApp"
+          @lostpointercapture="resetDrag"
+        ><icon-drag-dot-vertical /></span>
+        <span class="usage-app-cell"><UsageAppIcon :app="app" :icon-png="sortPackage?.icons[app]" />{{ appLabel(app) }}</span>
+        <div class="sort-editor-actions">
+          <a-button
+            size="small"
+            :disabled="index === 0"
+            :aria-label="`${t('上移')} ${appLabel(app)}`"
+            @click="moveApp(app, sortApps[index - 1])"
+          ><template #icon><icon-up /></template></a-button>
+          <a-button
+            size="small"
+            :disabled="index === sortApps.length - 1"
+            :aria-label="`${t('下移')} ${appLabel(app)}`"
+            @click="moveApp(app, sortApps[index + 1])"
+          ><template #icon><icon-down /></template></a-button>
+        </div>
+      </div>
+    </div>
+    <a-button type="text" class="usage-sort-reset" @click="draftOrder = null">
+      <template #icon><icon-undo /></template>
+      {{ t("恢复默认") }}
+    </a-button>
+  </a-modal>
 </template>
 
 <style scoped>
 .usage-platform-tab {
-  position: relative;
   min-height: 21px;
-  font-size: 15px;
-}
-.usage-platform-tab:not(:has(.usage-tab-label)) {
   font-size: 13px;
 }
-.usage-tab-label {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip-path: inset(50%);
+.usage-platform-tab :deep(.usage-app-icon) {
+  width: 18px;
+  height: 18px;
+}
+.usage-sort-button {
+  margin-inline-start: 8px;
   white-space: nowrap;
+}
+.usage-sort-hint {
+  margin: 0 0 10px;
+  color: var(--text-soft);
+}
+.sort-editor-row.usage-sort-row {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  padding: 6px 8px;
+  box-shadow: none;
+}
+.usage-sort-row.over {
+  background: rgb(var(--primary-1));
+  transform: none;
+}
+.usage-sort-row .usage-app-cell {
+  overflow-wrap: anywhere;
+}
+.usage-sort-reset {
+  margin-top: 10px;
 }
 </style>
