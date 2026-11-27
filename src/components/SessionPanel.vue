@@ -17,6 +17,7 @@ const props = defineProps<{
   sessionBackupLoading: boolean;
   sessionRepairing: boolean;
   repairingSessionId: string;
+  exportingMarkdownSessionId?: string;
   sessionModelRepairing: boolean;
   sessionOneClickRepairing: boolean;
   activeSessionIds: string[];
@@ -50,6 +51,7 @@ const emit = defineEmits<{
   (event: "toggle-session-group-selection", group: SessionGroup): void;
   (event: "toggle-session", id: string): void;
   (event: "open-session-folder", path: string): void;
+  (event: "export-session-markdown", session: CodexSessionRecord): void;
   (event: "view-session-content", session: CodexSessionRecord): void;
   (event: "copy-session", session: CodexSessionRecord): void;
   (event: "rename-session", session: CodexSessionRecord): void;
@@ -208,6 +210,18 @@ function switchMode(trashMode: boolean): void {
               <span class="session-size">{{ formatFileSize(session.sizeBytes) }}</span>
               <span>{{ formatTime(session.updatedAt) }}</span>
               <div class="session-child-actions">
+                <a-tooltip :content="`${t('导出 MD')} · ${t('导出完整会话，图片和文件保存到同级 assets 目录')}`">
+                  <a-button
+                    size="mini"
+                    type="outline"
+                    class="session-export-md-button"
+                    :loading="exportingMarkdownSessionId === session.id"
+                    :disabled="Boolean((exportingMarkdownSessionId && exportingMarkdownSessionId !== session.id) || repairingSessionId || sessionRepairing || sessionModelRepairing || sessionOneClickRepairing)"
+                    @click="emit('export-session-markdown', session)"
+                  >
+                    <template #icon><icon-download /></template>MD
+                  </a-button>
+                </a-tooltip>
                 <a-tooltip :content="t('恢复完整会话')">
                   <a-button
                     size="small"

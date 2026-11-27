@@ -40,7 +40,7 @@ pub(super) fn desktop_in_directory(directory: &Path) -> Option<PathBuf> {
 
 pub(super) fn discover() -> Option<PathBuf> {
     static CACHED: Mutex<Option<PathBuf>> = Mutex::new(None);
-    let mut cached = CACHED.lock().ok()?;
+    let mut cached = CACHED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(path) = cached.as_ref().filter(|path| path.is_file()) {
         return Some(path.clone());
     }
@@ -176,7 +176,7 @@ fn validate_store_activation(instance: &StoredCodexInstance) -> Result<(), Strin
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoreApplication {
     app_user_model_id: String,
@@ -200,7 +200,14 @@ fn store_app_id<'a>(
         })
 }
 
-fn registered_store_apps() -> Result<Vec<StoreApplication>, String> {
+fn registered_store_apps(force_refresh: bool) -> Result<Vec<StoreApplication>, String> {
+    static CACHED: Mutex<Option<Vec<StoreApplication>>> = Mutex::new(None);
+    if !force_refresh {
+        let cached = CACHED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(apps) = cached.as_ref() {
+            return Ok(apps.clone());
+        }
+    }
     // Read Application.Id from the registered manifest instead of assuming
     // "!App" or a display name, which can change between Codex/ChatGPT releases.
     let output = powershell(
@@ -222,7 +229,10 @@ $apps = @(Get-AppxPackage -Name 'OpenAI.Codex' | ForEach-Object {
 ConvertTo-Json -InputObject $apps -Compress
 "#,
     )?;
-    serde_json::from_str(&output).map_err(|error| format!("解析商店应用入口失败：{error}"))
+    let apps: Vec<StoreApplication> =
+        serde_json::from_str(&output).map_err(|error| format!("解析商店应用入口失败：{error}"))?;
+    *CACHED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(apps.clone());
+    Ok(apps)
 }
 
 fn quote_workspace_argument(workspace: &str) -> String {
@@ -304,9 +314,15 @@ pub(super) fn launch_store_instance(
     executable: &Path,
 ) -> Result<CodexInstance, String> {
     validate_store_activation(instance)?;
-    let applications = registered_store_apps()?;
-    let app_id = store_app_id(executable, &applications)?;
-    activate_store_app(app_id, instance.workspace.as_deref())?;
+    let mut applications = registered_store_apps(false)?;
+    let app_id = match store_app_id(executable, &applications) {
+        Ok(app_id) => app_id.to_string(),
+        Err(_) => {
+            applications = registered_store_apps(true)?;
+            store_app_id(executable, &applications)?.to_string()
+        }
+    };
+    activate_store_app(&app_id, instance.workspace.as_deref())?;
     // Shell success means the activation request was accepted, not that the
     // desktop is ready. Check the actual instance instead of the shell process.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -321,7 +337,7 @@ pub(super) fn launch_store_instance(
                 instance.name
             ));
         }
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(80));
     }
 }
 
@@ -392,7 +408,196 @@ fn pid_in_rows(instance: &StoredCodexInstance, rows: &[ProcessRow]) -> Result<Op
     Ok(None)
 }
 
+struct HandleGuard(windows_sys::Win32::Foundation::HANDLE);
+
+impl Drop for HandleGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+fn query_process_image_path(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<Option<String>, ()> {
+    use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
+    let mut capacity = 1024u32;
+    while capacity <= 32768 {
+        let mut buf = vec![0u16; capacity as usize];
+        let mut size = capacity;
+        if unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size) } != 0 {
+            return Ok(Some(String::from_utf16_lossy(&buf[..size as usize])));
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(122) => capacity *= 2,
+            Some(6 | 87 | 299) => return Ok(None),
+            _ => return Err(()),
+        }
+    }
+    Err(())
+}
+
+fn query_process_command_line(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<Option<String>, ()> {
+    use windows_sys::{
+        Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation},
+        Win32::Foundation::UNICODE_STRING,
+    };
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC0000004_u32 as i32;
+    const STATUS_BUFFER_TOO_SMALL: i32 = 0xC0000023_u32 as i32;
+    const STATUS_BUFFER_OVERFLOW: i32 = 0x80000005_u32 as i32;
+    const STATUS_PROCESS_IS_TERMINATING: i32 = 0xC000010A_u32 as i32;
+
+    let mut byte_len = 2048usize;
+    for _ in 0..4 {
+        let words = byte_len.div_ceil(8).max(4);
+        let mut buf = vec![0u64; words];
+        let mut ret_len = 0u32;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle,
+                ProcessCommandLineInformation,
+                buf.as_mut_ptr().cast(),
+                (words * 8) as u32,
+                &mut ret_len,
+            )
+        };
+        if status >= 0 {
+            let us = unsafe { &*(buf.as_ptr() as *const UNICODE_STRING) };
+            if us.Length == 0 || us.Buffer.is_null() {
+                return Ok(Some(String::new()));
+            }
+            if us.Length % 2 != 0 {
+                return Err(());
+            }
+            let buf_start = buf.as_ptr() as usize;
+            let buf_end = buf_start.saturating_add(words * 8);
+            let str_start = us.Buffer as usize;
+            let str_end = str_start.saturating_add(us.Length as usize);
+            if str_start < buf_start || str_end > buf_end {
+                return Err(());
+            }
+            let slice =
+                unsafe { std::slice::from_raw_parts(us.Buffer, (us.Length / 2) as usize) };
+            return Ok(Some(String::from_utf16_lossy(slice)));
+        }
+        if status == STATUS_PROCESS_IS_TERMINATING {
+            return Ok(None);
+        }
+        if matches!(
+            status,
+            STATUS_INFO_LENGTH_MISMATCH | STATUS_BUFFER_TOO_SMALL | STATUS_BUFFER_OVERFLOW
+        ) {
+            let next = (ret_len as usize).max(words * 8 * 2);
+            if next > 1024 * 1024 {
+                return Err(());
+            }
+            byte_len = next + 16;
+            continue;
+        }
+        return Err(());
+    }
+    Err(())
+}
+
+/// Fast in-process Win32 snapshot (~0.05ms) avoiding cold `powershell.exe` + WMI spawns.
+/// Falls back to PowerShell/CIM only if an active Codex/ChatGPT process cannot be inspected.
+fn native_process_rows() -> Option<Vec<ProcessRow>> {
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+                TH32CS_SNAPPROCESS,
+            },
+            Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        },
+    };
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
+        return None;
+    }
+    let _snapshot = HandleGuard(snapshot);
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut pids = Vec::new();
+    const MAX_SNAPSHOT_PROCESSES: usize = 65_536;
+    if unsafe { Process32FirstW(snapshot, &mut entry) } != 0 {
+        let mut scanned = 0usize;
+        loop {
+            scanned += 1;
+            if scanned > MAX_SNAPSHOT_PROCESSES {
+                return None;
+            }
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&ch| ch == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            if name.eq_ignore_ascii_case("Codex.exe") || name.eq_ignore_ascii_case("ChatGPT.exe") {
+                pids.push(entry.th32ProcessID);
+            }
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+                break;
+            }
+        }
+    }
+    if pids.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut rows = Vec::with_capacity(pids.len());
+    for pid in pids {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            if std::io::Error::last_os_error().raw_os_error() == Some(87) {
+                continue;
+            }
+            return None;
+        }
+        let _handle = HandleGuard(handle);
+        let executable_path = match query_process_image_path(handle) {
+            Ok(Some(path)) => path,
+            Ok(None) => continue,
+            Err(()) => return None,
+        };
+        let command_line = match query_process_command_line(handle) {
+            Ok(Some(cmd)) => cmd,
+            Ok(None) => continue,
+            Err(()) => return None,
+        };
+        rows.push(ProcessRow {
+            process_id: pid,
+            executable_path: Some(executable_path),
+            command_line: Some(command_line),
+        });
+    }
+    Some(rows)
+}
+
+pub(super) fn wait_for_exit(pid: u32, timeout: Duration) {
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if !handle.is_null() {
+        let _handle = HandleGuard(handle);
+        let millis = timeout.as_millis().min(u32::MAX as u128) as u32;
+        unsafe {
+            WaitForSingleObject(handle, millis);
+        }
+    }
+}
+
 fn process_rows() -> Result<Vec<ProcessRow>, String> {
+    if let Some(rows) = native_process_rows() {
+        return Ok(rows);
+    }
     let output = powershell(
         r#"
 $ErrorActionPreference = 'Stop'

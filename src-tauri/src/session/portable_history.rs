@@ -1,8 +1,10 @@
 use super::recovery_context::{
     serialized_json_len, LocalRecoveryContext, LOCAL_RECOVERY_CONTEXT_TRIGGER_BYTES,
 };
-use super::{fork_source_segments, json_value_with_type};
+use super::{fork_source_segments_with_lookup, json_value_with_type, RolloutSegmentLookup};
+use serde::Deserialize;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
@@ -139,20 +141,27 @@ impl PortableHistory {
     }
 }
 
-fn requires_portable_replay(item: &Value, api: bool) -> bool {
+fn requires_portable_replay_fields(kind: Option<&str>, id: Option<&str>, api: bool) -> bool {
     if !api
-        && item["id"]
-            .as_str()
+        && id
             .and_then(|id| id.split_once('_'))
             .is_some_and(|(prefix, suffix)| !prefix.is_empty() && !suffix.is_empty())
     {
         return true;
     }
-    match item.get("type").and_then(Value::as_str) {
+    match kind {
         Some("message" | "function_call" | "function_call_output") => false,
         Some("custom_tool_call" | "custom_tool_call_output") if !api => false,
         _ => true,
     }
+}
+
+fn requires_portable_replay(item: &Value, api: bool) -> bool {
+    requires_portable_replay_fields(
+        item.get("type").and_then(Value::as_str),
+        item.get("id").and_then(Value::as_str),
+        api,
+    )
 }
 
 fn historical_text(text: &str) -> Value {
@@ -160,17 +169,6 @@ fn historical_text(text: &str) -> Value {
 }
 
 type CallCounts = HashMap<String, (usize, usize)>;
-
-fn count_call(item: &Value, calls: &mut CallCounts) {
-    let Some(id) = item.get("call_id").and_then(Value::as_str) else {
-        return;
-    };
-    match item.get("type").and_then(Value::as_str) {
-        Some("function_call") => calls.entry(id.to_string()).or_default().0 += 1,
-        Some("function_call_output") => calls.entry(id.to_string()).or_default().1 += 1,
-        _ => {}
-    }
-}
 
 /// Keep full replay for small contexts, and only the already-supported recovery
 /// excerpt once the normal migration would reduce an oversized context anyway.
@@ -297,14 +295,71 @@ impl BoundedProtocolHistory {
     }
 }
 
-/// Build only the record to append. The caller assigns its physical ordinal
-/// while streaming the current rollout into an atomic replacement file.
+#[allow(dead_code)]
 pub(super) fn build_protocol_compaction(
     home: &Path,
     path: &Path,
     target_provider: &str,
 ) -> Result<Option<(Value, bool)>, String> {
-    let segments = fork_source_segments(home, path)?;
+    build_protocol_compaction_with_lookup(home, path, target_provider, None)
+}
+
+#[derive(Deserialize)]
+struct FirstPassEnvelope<'a> {
+    #[serde(borrow, default)]
+    timestamp: Option<Cow<'a, str>>,
+    #[serde(borrow, rename = "type", default)]
+    kind: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+struct FirstPassItem<'a> {
+    #[serde(borrow, rename = "type", default)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    id: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    call_id: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+struct FirstPassResponseRecord<'a> {
+    #[serde(borrow, default)]
+    payload: Option<FirstPassItem<'a>>,
+}
+
+#[derive(Deserialize)]
+struct FirstPassCompactedPayload<'a> {
+    #[serde(borrow, default)]
+    replacement_history: Option<Vec<FirstPassItem<'a>>>,
+}
+
+#[derive(Deserialize)]
+struct FirstPassCompactedRecord<'a> {
+    #[serde(borrow, default)]
+    payload: Option<FirstPassCompactedPayload<'a>>,
+}
+
+fn count_first_pass_item(item: &FirstPassItem<'_>, calls: &mut CallCounts) {
+    let Some(id) = item.call_id.as_deref() else {
+        return;
+    };
+    match item.kind.as_deref() {
+        Some("function_call") => calls.entry(id.to_string()).or_default().0 += 1,
+        Some("function_call_output") => calls.entry(id.to_string()).or_default().1 += 1,
+        _ => {}
+    }
+}
+
+/// Build only the record to append. The caller assigns its physical ordinal
+/// while streaming the current rollout into an atomic replacement file.
+pub(super) fn build_protocol_compaction_with_lookup(
+    home: &Path,
+    path: &Path,
+    target_provider: &str,
+    lookup: Option<&RolloutSegmentLookup>,
+) -> Result<Option<(Value, bool)>, String> {
+    let segments = fork_source_segments_with_lookup(home, path, lookup)?;
     let fingerprints = || {
         segments
             .iter()
@@ -321,40 +376,56 @@ pub(super) fn build_protocol_compaction(
     let mut incompatible = false;
     let mut latest_timestamp = String::new();
     let mut start = (0usize, 0u64);
-    // The first pass retains only call IDs and a byte offset. Old contexts that
-    // a later compaction supersedes must not fill the heap before being cleared.
+    // The first pass retains only call IDs and a byte offset without allocating
+    // full DOM trees for multi-megabyte tool outputs or unrelated event records.
     for (index, segment) in segments.iter().enumerate() {
-        visit_segment_records(
+        visit_segment_lines(
             &segment.path,
             0,
             segment.end_byte_offset,
-            |offset, value| {
-                if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
-                    latest_timestamp = timestamp.to_string();
+            |offset, line| {
+                let envelope = serde_json::from_str::<FirstPassEnvelope<'_>>(line)
+                    .map_err(|error| format!("会话协议上下文无效，未迁移：{error}"))?;
+                if let Some(timestamp) = envelope.timestamp.as_deref() {
+                    latest_timestamp.clear();
+                    latest_timestamp.push_str(timestamp);
                 }
-                match value.get("type").and_then(Value::as_str) {
+                match envelope.kind.as_deref() {
                     Some("compacted") => {
                         start = (index, offset);
                         calls.clear();
                         incompatible = false;
-                        for item in value
-                            .pointer("/payload/replacement_history")
-                            .and_then(Value::as_array)
+                        let record = serde_json::from_str::<FirstPassCompactedRecord<'_>>(line)
+                            .map_err(|error| format!("会话协议上下文无效，未迁移：{error}"))?;
+                        for item in record
+                            .payload
+                            .and_then(|p| p.replacement_history)
                             .into_iter()
                             .flatten()
                         {
-                            count_call(item, &mut calls);
-                            incompatible |= requires_portable_replay(item, api);
+                            count_first_pass_item(&item, &mut calls);
+                            incompatible |= requires_portable_replay_fields(
+                                item.kind.as_deref(),
+                                item.id.as_deref(),
+                                api,
+                            );
                         }
                     }
                     Some("response_item") => {
-                        if let Some(item) = value.get("payload") {
-                            count_call(item, &mut calls);
-                            incompatible |= requires_portable_replay(item, api);
+                        let record = serde_json::from_str::<FirstPassResponseRecord<'_>>(line)
+                            .map_err(|error| format!("会话协议上下文无效，未迁移：{error}"))?;
+                        if let Some(item) = record.payload.as_ref() {
+                            count_first_pass_item(item, &mut calls);
+                            incompatible |= requires_portable_replay_fields(
+                                item.kind.as_deref(),
+                                item.id.as_deref(),
+                                api,
+                            );
                         }
                     }
                     _ => {}
                 }
+                Ok(())
             },
         )?;
     }
@@ -379,17 +450,17 @@ pub(super) fn build_protocol_compaction(
     Ok(history.snapshot())
 }
 
-fn visit_segment_records(
+fn visit_segment_lines(
     path: &Path,
     start: u64,
     end: Option<u64>,
-    mut observe: impl FnMut(u64, Value),
+    mut observe: impl FnMut(u64, &str) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut file =
         std::fs::File::open(path).map_err(|error| format!("读取会话协议上下文失败：{error}"))?;
     file.seek(SeekFrom::Start(start))
         .map_err(|error| format!("定位会话协议上下文失败：{error}"))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut consumed = start;
     let mut line = String::new();
     loop {
@@ -408,11 +479,23 @@ fn visit_segment_records(
         if line.trim().is_empty() {
             continue;
         }
-        let value = serde_json::from_str(&line)
-            .map_err(|error| format!("会话协议上下文无效，未迁移：{error}"))?;
-        observe(offset, value);
+        observe(offset, &line)?;
     }
     Ok(())
+}
+
+fn visit_segment_records(
+    path: &Path,
+    start: u64,
+    end: Option<u64>,
+    mut observe: impl FnMut(u64, Value),
+) -> Result<(), String> {
+    visit_segment_lines(path, start, end, |offset, line| {
+        let value = serde_json::from_str(line)
+            .map_err(|error| format!("会话协议上下文无效，未迁移：{error}"))?;
+        observe(offset, value);
+        Ok(())
+    })
 }
 
 /// Read the effective lineage, including only each ancestor's retained prefix.

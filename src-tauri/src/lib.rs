@@ -1742,8 +1742,8 @@ async fn switch_codex_account(
 ) -> Result<CodexAccountSwitchResult, String> {
     let account_id = AccountStore::default().resolve_account_id(&account_id)?;
     let instance_id = instance_id.unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
-    let selected_instance = instances::resolve_instance(&instance_id)?;
-    let selected_codex_home = PathBuf::from(&selected_instance.codex_home);
+    let selected_instance = instances::resolve_instance_location(&instance_id)?;
+    let selected_codex_home = selected_instance.codex_home;
     let selected_account_store = AccountStore::new_for_instance(
         switcher_account_dir(),
         selected_codex_home.clone(),
@@ -1868,10 +1868,10 @@ async fn sync_api_key_account_to_instance(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty() && value != "__default__")
         .unwrap_or_else(|| instances::DEFAULT_INSTANCE_ID.to_string());
-    let selected_instance = instances::resolve_instance(&instance_id)?;
+    let selected_instance = instances::resolve_instance_location(&instance_id)?;
     let selected_account_store = AccountStore::new_for_instance(
         switcher_account_dir(),
-        PathBuf::from(&selected_instance.codex_home),
+        selected_instance.codex_home,
         &selected_instance.id,
     );
     let accounts = AccountStore::default().list_accounts()?;
@@ -2067,6 +2067,7 @@ fn synchronize_session_provider(
 pub(crate) fn prepare_sessions_after_configuration_change(
     session_store: &SessionStore,
 ) -> Result<(usize, Vec<String>), String> {
+    let _sqlite_backup_scope = session::SqliteBackupScope::enter();
     let provider = session_store.read_target_provider()?;
     let mut warnings = Vec::new();
     if let Err(error) = session_store.preserve_account_scoped_local_projects() {
@@ -2250,6 +2251,7 @@ pub(crate) fn one_click_repair_session_store(
     session_store: &SessionStore,
     report_progress: &mut impl FnMut(u8),
 ) -> Result<OneClickStoreRepairOutcome, String> {
+    let _sqlite_backup_scope = session::SqliteBackupScope::enter();
     let mut warnings = Vec::new();
     if let Err(error) = session_store.preserve_account_scoped_local_projects() {
         warnings.push(format!("账号侧栏项目同步未完成：{error}"));

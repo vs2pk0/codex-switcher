@@ -245,7 +245,14 @@ pub(super) fn prepare_local_images(
     let mut result = GeneratedImageRepairResult::default();
     let mut pending = Vec::new();
     let mut protected_change = false;
+    let has_bytes = |line: &[u8], needle: &[u8]| line.windows(needle.len()).any(|w| w == needle);
     let staged = stage_lines(source, |line, offset| {
+        let may_have_inline_image = has_bytes(line, b"image_url") || has_bytes(line, b"imageUrl");
+        let may_finish_pending = !pending.is_empty()
+            && (has_bytes(line, b"user_message") || has_bytes(line, b"item_completed"));
+        if !may_have_inline_image && !may_finish_pending {
+            return Ok(None);
+        }
         let Ok(header) = serde_json::from_slice::<SessionRecordKind>(line) else {
             return Ok(None);
         };

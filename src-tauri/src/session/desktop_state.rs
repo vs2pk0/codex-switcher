@@ -26,9 +26,7 @@ impl SessionStore {
         let original = fs::read(&path).map_err(|e| format!("读取账号项目状态失败：{e}"))?;
         let mut state: Value =
             serde_json::from_slice(&original).map_err(|e| format!("解析账号项目状态失败：{e}"))?;
-        let before = state.clone();
-        self.merge_account_scoped_local_projects(&mut state)?;
-        if state == before {
+        if !self.merge_account_scoped_local_projects(&mut state)? {
             return Ok(());
         }
         let bytes = serde_json::to_vec(&state).map_err(|e| e.to_string())?;
@@ -45,9 +43,9 @@ impl SessionStore {
     pub(super) fn merge_account_scoped_local_projects(
         &self,
         state: &mut Value,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let Some(renderer) = state.get(RENDERER_STATE) else {
-            return Ok(()); // Older desktops have no account-scoped renderer state.
+            return Ok(false); // Older desktops have no account-scoped renderer state.
         };
         let inactive = renderer
             .get("inactive")
@@ -60,7 +58,7 @@ impl SessionStore {
             return Err("账号侧栏归属格式无效，已保留原状态".to_string());
         }
         let Some(owner) = self.renderer_owner_from_auth()? else {
-            return Ok(()); // Unbound API Key accounts have no renderer identity.
+            return Ok(false); // Unbound API Key accounts have no renderer identity.
         };
         let mut shared = local_project_globals(state);
         for snapshot in inactive.values() {
@@ -69,28 +67,33 @@ impl SessionStore {
             }
         }
         if shared.as_object().is_none_or(Map::is_empty) {
-            return Ok(());
+            return Ok(false);
         }
 
+        let mut changed = false;
         if renderer.get("owner").and_then(Value::as_str) != Some(owner.as_str()) {
             // Seed a new account, or extend its existing snapshot. Keep its own
             // atoms and unrelated globals: cloud caches and OAuth state are private.
-            let snapshot = state[RENDERER_STATE]["inactive"]
-                .as_object_mut()
-                .unwrap()
-                .entry(owner)
-                .or_insert_with(|| serde_json::json!({"atoms": {}, "globals": {}}));
+            let inactive_map = state[RENDERER_STATE]["inactive"].as_object_mut().unwrap();
+            if !inactive_map.contains_key(&owner) {
+                inactive_map.insert(
+                    owner.clone(),
+                    serde_json::json!({"atoms": {}, "globals": {}}),
+                );
+                changed = true;
+            }
+            let snapshot = inactive_map.get_mut(&owner).unwrap();
             if !snapshot.get("atoms").is_some_and(Value::is_object)
                 || !snapshot.get("globals").is_some_and(Value::is_object)
             {
                 return Err("目标账号侧栏快照格式无效，已保留原状态".to_string());
             }
-            merge_project_globals(&mut snapshot["globals"], &shared);
+            changed |= merge_project_globals(&mut snapshot["globals"], &shared);
         }
         // Also recover projects when the account was already switched by an older
         // Switcher version. Do not change owner; the desktop still switches normally.
-        merge_project_globals(state, &shared);
-        Ok(())
+        changed |= merge_project_globals(state, &shared);
+        Ok(changed)
     }
 
     fn renderer_owner_from_auth(&self) -> Result<Option<String>, String> {
@@ -190,11 +193,12 @@ fn filter_map(value: &Value, include: impl Fn(&str, &Value) -> bool) -> Value {
 
 /// Merge collections, but retain complete destination records. Recursing into
 /// project records would restore removed rootPaths or stale optional fields.
-fn merge_project_globals(destination: &mut Value, source: &Value) {
+fn merge_project_globals(destination: &mut Value, source: &Value) -> bool {
     let (Some(destination), Some(source)) = (destination.as_object_mut(), source.as_object())
     else {
-        return;
+        return false;
     };
+    let mut changed = false;
     for (key, value) in source {
         let depth = match key.as_str() {
             "project-order" => 0,
@@ -202,35 +206,56 @@ fn merge_project_globals(destination: &mut Value, source: &Value) {
             _ => 1,
         };
         match destination.get_mut(key) {
-            Some(existing) => merge_missing(existing, value, depth),
+            Some(existing) => changed |= merge_missing(existing, value, depth),
             None => {
                 destination.insert(key.clone(), value.clone());
+                changed = true;
             }
         }
     }
+    changed
 }
 
 /// Destination values win; only collection maps and ordered lists are merged.
-fn merge_missing(destination: &mut Value, source: &Value, map_depth: usize) {
+fn merge_missing(destination: &mut Value, source: &Value, map_depth: usize) -> bool {
     match (destination, source) {
         (Value::Object(destination), Value::Object(source)) if map_depth > 0 => {
+            let mut changed = false;
             for (key, value) in source {
                 match destination.get_mut(key) {
-                    Some(existing) => merge_missing(existing, value, map_depth - 1),
+                    Some(existing) => changed |= merge_missing(existing, value, map_depth - 1),
                     None => {
                         destination.insert(key.clone(), value.clone());
+                        changed = true;
                     }
                 }
             }
+            changed
         }
         (Value::Array(destination), Value::Array(source)) if map_depth == 0 => {
+            if source.is_empty() {
+                return false;
+            }
+            let mut seen_strings = destination
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<HashSet<_>>();
+            let mut changed = false;
             for value in source {
-                if !destination.contains(value) {
+                if let Some(s) = value.as_str() {
+                    if seen_strings.insert(s.to_owned()) {
+                        destination.push(Value::String(s.to_owned()));
+                        changed = true;
+                    }
+                } else if !destination.contains(value) {
                     destination.push(value.clone());
+                    changed = true;
                 }
             }
+            changed
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -634,5 +659,96 @@ mod tests {
             .merge_account_scoped_local_projects(&mut state)
             .is_err());
         assert_eq!(state, original);
+    }
+
+    #[test]
+    fn ten_projects_with_many_threads_merge_accurately_and_skip_redundant_writes() {
+        let home = tempdir().unwrap();
+        let store = SessionStore::new(home.path().to_path_buf());
+        let target = write_auth(&store, "win-user", "win-workspace");
+
+        let mut source_projects = Map::new();
+        let mut source_order = Vec::new();
+        let mut source_thread_orders = Map::new();
+        let mut source_assignments = Map::new();
+        for p in 0..10 {
+            let project_id = format!("proj-{p}");
+            source_projects.insert(
+                project_id.clone(),
+                json!({"name": format!("Project {p}"), "rootPaths": [format!("C:\\work\\proj-{p}")]}),
+            );
+            source_order.push(json!(project_id.clone()));
+            let mut threads = Vec::new();
+            for t in 0..40 {
+                let thread_id = format!("thread-{p}-{t}");
+                threads.push(json!(thread_id.clone()));
+                source_assignments.insert(
+                    thread_id,
+                    json!({"projectKind": "local", "projectId": project_id}),
+                );
+            }
+            source_thread_orders.insert(project_id, Value::Array(threads));
+        }
+
+        let state = json!({
+            RENDERER_STATE: {
+                "owner": target,
+                "inactive": {
+                    "previous-owner": {
+                        "atoms": {"token": "secret"},
+                        "globals": {
+                            "local-projects": source_projects,
+                            "project-order": source_order,
+                            "sidebar-project-thread-orders": source_thread_orders,
+                            "thread-project-assignments": source_assignments,
+                        }
+                    }
+                }
+            },
+            "local-projects": {
+                "proj-0": {"name": "Project 0 Custom", "rootPaths": ["C:\\work\\proj-0"]}
+            },
+            "project-order": ["proj-0"],
+            "sidebar-project-thread-orders": {
+                "proj-0": ["thread-0-new", "thread-0-5"]
+            }
+        });
+        let path = home.path().join(".codex-global-state.json");
+        fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        store.preserve_account_scoped_local_projects().unwrap();
+        let merged: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(merged["local-projects"].as_object().unwrap().len(), 10);
+        assert_eq!(merged["project-order"].as_array().unwrap().len(), 10);
+        assert_eq!(merged["local-projects"]["proj-0"]["name"], "Project 0 Custom");
+        let proj0_threads = merged["sidebar-project-thread-orders"]["proj-0"]
+            .as_array()
+            .unwrap();
+        assert_eq!(proj0_threads.len(), 41);
+        assert_eq!(proj0_threads[0], "thread-0-new");
+        assert_eq!(proj0_threads[1], "thread-0-5");
+        assert_eq!(
+            merged["thread-project-assignments"]
+                .as_object()
+                .unwrap()
+                .len(),
+            400
+        );
+
+        let fixed_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_100_000);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(fixed_mtime)
+            .unwrap();
+        let expected_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+
+        store.preserve_account_scoped_local_projects().unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            expected_mtime,
+            "already-synchronized desktop state must not rewrite .codex-global-state.json"
+        );
     }
 }

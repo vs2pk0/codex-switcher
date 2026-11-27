@@ -22,7 +22,25 @@ impl SessionStore {
         let session_id = normalize_required_session_id(session_id)?;
         let source = self.find_session_read_path(&session_id)?;
         fs::create_dir_all(directory).map_err(|e| format!("创建下载目录失败: {e}"))?;
-        // Snapshot once: offsets for embedded images must refer to the same content as the messages.
+        let title = if title.trim().is_empty() {
+            "未命名会话"
+        } else {
+            title
+        };
+        let before = session_file_fingerprint(&source)?;
+        let first_try = export_snapshot(&source, title, directory);
+        let shrank = session_file_fingerprint(&source)
+            .map(|after| after.len < before.len)
+            .unwrap_or(true);
+        if !shrank {
+            return first_try;
+        }
+        if let Ok(stale) = &first_try {
+            if let Some(parent) = Path::new(&stale.path).parent() {
+                let _ = fs::remove_dir_all(parent);
+            }
+        }
+        // Fallback snapshot only when the rollout was concurrently truncated or replaced.
         let snapshot = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         fs::copy(&source, snapshot.path()).map_err(|e| format!("读取会话失败: {e}"))?;
         export_snapshot(snapshot.path(), title, directory)
@@ -51,12 +69,18 @@ fn export_snapshot(
         recovered_paths: HashMap::new(),
         missing: HashSet::new(),
     };
-    writeln!(output, "# {}\n", label(title)).map_err(|e| e.to_string())?;
+    let display_title = if title.trim().is_empty() {
+        "未命名会话"
+    } else {
+        title
+    };
+    writeln!(output, "# {}\n", label(display_title)).map_err(|e| e.to_string())?;
     let mut cursor = 0;
     let mut sequence = 0;
     let zone = crate::app_time::AppTimeZone::current();
     loop {
-        let (turns, next) = read_session_turn_page(source, cursor, 50)?;
+        let (turns, next) =
+            read_session_turn_page_with_mode(source, cursor, 50, SessionReadMode::Preview)?;
         for turn in turns {
             sequence += 1;
             writeln!(output, "## 对话轮次 {sequence}\n").map_err(|e| e.to_string())?;
@@ -662,5 +686,68 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(export_snapshot(&dir.path().join("absent.jsonl"), "failed", dir.path()).is_err());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn skips_large_tool_outputs_and_defaults_blank_titles() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("codex/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let source = sessions.join("session.jsonl");
+        let mut file = fs::File::create(&source).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"session_meta","payload":{"id":"large-tool-export"}})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            message(1, "user", vec![json!({"type":"input_text","text":"请总结"})])
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call_output",
+                    "call_id":"call-1",
+                    "output":"x".repeat(256 * 1024)
+                }
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            message(2, "assistant", vec![json!({"type":"output_text","text":"已完成总结"})])
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}})
+        )
+        .unwrap();
+
+        let store = SessionStore::new(dir.path().join("codex"));
+        let export_dir = dir.path().join("exports");
+        let result = store
+            .export_markdown("large-tool-export", "   ", &export_dir)
+            .unwrap();
+        let markdown = fs::read_to_string(&result.path).unwrap();
+        assert!(markdown.starts_with("# 未命名会话\n"));
+        assert!(markdown.contains("请总结"));
+        assert!(markdown.contains("已完成总结"));
+        assert!(!markdown.contains(&"x".repeat(1024)));
     }
 }

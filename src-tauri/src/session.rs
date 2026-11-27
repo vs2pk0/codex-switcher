@@ -861,7 +861,6 @@ impl SessionStore {
             warnings: Vec::new(),
         };
 
-        let protected = self.protected_rollout_prefixes();
         let target_model = self.read_repair_model(target_provider)?;
         let mut changed_records = Vec::new();
         let mut changed_ids = HashSet::new();
@@ -869,16 +868,38 @@ impl SessionStore {
         paths.extend(collect_jsonl_files(
             &self.codex_home.join("archived_sessions"),
         )?);
-        let protocol_records = self.session_lineage_entries_from_paths(paths.clone())?;
+        let mut protected = ProtectedRolloutPrefixes::new();
+        let mut header_ids = HashMap::<PathBuf, Option<String>>::with_capacity(paths.len());
+        let mut segment_lookup = RolloutSegmentLookup::new();
+        for path in &paths {
+            let id = read_session_record_header_with_title(path, false)
+                .ok()
+                .and_then(|header| header.id);
+            if let Some(base) = read_rollout_history_base(path) {
+                let slot = protected.entry(base.thread_id).or_insert(0);
+                *slot = (*slot).max(base.end_byte_offset);
+            }
+            if let Some(logical_id) = id.as_deref() {
+                let physical_id = physical_rollout_id(path, logical_id);
+                let len = fs::metadata(path).map(|m| m.len()).unwrap_or_default();
+                segment_lookup
+                    .entry(physical_id)
+                    .or_default()
+                    .push((len, path.clone()));
+            }
+            header_ids.insert(path.clone(), id);
+        }
+        let protocol_records =
+            self.session_lineage_entries_from_paths_with_titles(paths.clone(), false)?;
         for path in paths {
+            let cached_id = header_ids.get(&path).and_then(|id| id.clone());
             // 被后继段引用的前缀必须保持字节级不变，只改写前缀之后的记录。
             let protected_prefix = if protected.is_empty() {
                 0
             } else {
-                read_session_record_header(&path)
-                    .ok()
-                    .and_then(|header| header.id)
-                    .and_then(|id| protected_prefix_bytes(&protected, &path, &id))
+                cached_id
+                    .as_deref()
+                    .and_then(|id| protected_prefix_bytes(&protected, &path, id))
                     .unwrap_or(0)
             };
             let Some((model_rewrite, rewrite_stats)) =
@@ -902,11 +923,18 @@ impl SessionStore {
             }
             let backup_path = self.backup_session_file(&path, "model-compatibility")?;
             model_rewrite.commit(&path)?;
-            let _ = system_command::new("touch")
-                .arg("-r")
-                .arg(&backup_path)
-                .arg(&path)
-                .output();
+            preserve_file_mtime(&backup_path, &path);
+            if let Some(logical_id) = cached_id.as_deref() {
+                let physical_id = physical_rollout_id(&path, logical_id);
+                if let Some(entries) = segment_lookup.get_mut(&physical_id) {
+                    let new_len = fs::metadata(&path).map(|m| m.len()).unwrap_or_default();
+                    for (len, candidate_path) in entries.iter_mut() {
+                        if candidate_path == &path {
+                            *len = new_len;
+                        }
+                    }
+                }
+            }
             if let Some(backup_dir) = backup_path.parent() {
                 let backup_dir = backup_dir.to_string_lossy().to_string();
                 if !summary.backup_dirs.contains(&backup_dir) {
@@ -923,7 +951,11 @@ impl SessionStore {
             summary.repaired_item_id_count += rewrite_stats.repaired_item_ids;
             summary.repaired_compaction_metadata_count +=
                 rewrite_stats.repaired_compaction_metadata;
-            if let Some(id) = read_session_record_header(&path)?.id {
+            let resolved_id = match cached_id {
+                Some(id) => Some(id),
+                None => read_session_record_header_with_title(&path, false)?.id,
+            };
+            if let Some(id) = resolved_id {
                 changed_ids.insert(id.clone());
                 changed_records.push(SessionRepairRecord {
                     id,
@@ -940,22 +972,20 @@ impl SessionStore {
             let session = entry.record;
             let path = PathBuf::from(&session.path);
             let result = (|| -> Result<Option<bool>, String> {
-                let Some((compacted, reduced)) = portable_history::build_protocol_compaction(
-                    &self.codex_home,
-                    &path,
-                    target_provider,
-                )?
+                let Some((compacted, reduced)) =
+                    portable_history::build_protocol_compaction_with_lookup(
+                        &self.codex_home,
+                        &path,
+                        target_provider,
+                        Some(&segment_lookup),
+                    )?
                 else {
                     return Ok(None);
                 };
                 let staged = streaming_repair::prepare_compaction(&path, compacted)?;
                 let backup = self.backup_session_file(&path, "protocol-migration")?;
                 staged.commit(&path)?;
-                let _ = system_command::new("touch")
-                    .arg("-r")
-                    .arg(&backup)
-                    .arg(&path)
-                    .output();
+                preserve_file_mtime(&backup, &path);
                 if let Some(directory) = backup.parent() {
                     let directory = directory.to_string_lossy().into_owned();
                     if !summary.backup_dirs.contains(&directory) {
@@ -1729,23 +1759,8 @@ impl SessionStore {
         };
         let mut registered = false;
         for db_path in self.sqlite_candidate_paths() {
-            if sqlite_insert_missing_session_rows(
-                &db_path,
-                target_provider,
-                Some(std::slice::from_ref(&record)),
-                None,
-            )? > 0
-            {
+            if sqlite_register_session_row(&db_path, target_provider, &record)? {
                 registered = true;
-            } else if sqlite_thread_columns(&db_path)?.contains("id") {
-                let exists = run_sqlite(
-                    &db_path,
-                    &format!(
-                        "SELECT COUNT(*) FROM threads WHERE id = {};",
-                        sql_quote(&staged.session.id)
-                    ),
-                )?;
-                registered |= exists.trim() == "1";
             }
         }
         if !registered {
@@ -2676,6 +2691,7 @@ impl SessionStore {
             || mode
                 .map(|value| value.eq_ignore_ascii_case("deep"))
                 .unwrap_or(false);
+        let _sqlite_backup_scope = SqliteBackupScope::enter();
         let protected_prefixes = self.protected_rollout_prefixes();
         self.preflight_visibility_databases()?;
         let rollout_outcome = self.repair_rollout_visibility_with_context(
@@ -2696,17 +2712,26 @@ impl SessionStore {
         } else {
             None
         };
-        let (updated_rows, backup_dirs) = self.repair_sqlite_visibility(
+        let metadata_cache = repair_records
+            .iter()
+            .map(|session| (session.id.clone(), sqlite_metadata_for_session(session)))
+            .collect::<HashMap<_, _>>();
+        let (updated_rows, backup_dirs) = self.repair_sqlite_visibility_with_metadata(
             &target_provider,
             Some(&repair_records),
             recovery_model.as_deref(),
+            Some(&metadata_cache),
         )?;
         let added_index_entries = if deep {
             self.repair_session_index(&repair_records)?
         } else {
             0
         };
-        let catalog = self.repair_desktop_catalog(&target_provider, &repair_records)?;
+        let catalog = self.repair_desktop_catalog_with_metadata(
+            &target_provider,
+            &repair_records,
+            Some(&metadata_cache),
+        )?;
         if !catalog.missing_ids.is_empty() {
             return Err(format!(
                 "Codex 侧栏目录校验失败，仍有 {} 条主会话不可见：{}",
@@ -2714,7 +2739,8 @@ impl SessionStore {
                 catalog.missing_ids.join(", ")
             ));
         }
-        let projects = self.repair_desktop_projects(&repair_records)?;
+        let projects =
+            self.repair_desktop_projects_with_metadata(&repair_records, Some(&metadata_cache))?;
         let mut generated_images = self.repair_generated_images(&repair_records)?;
         let local_images = if deep {
             self.repair_local_image_attachments(&repair_records, &protected_prefixes)?
@@ -2898,6 +2924,15 @@ impl SessionStore {
         target_provider: &str,
         sessions: &[SessionRepairRecord],
     ) -> Result<DesktopCatalogRepairResult, String> {
+        self.repair_desktop_catalog_with_metadata(target_provider, sessions, None)
+    }
+
+    fn repair_desktop_catalog_with_metadata(
+        &self,
+        target_provider: &str,
+        sessions: &[SessionRepairRecord],
+        metadata_cache: Option<&HashMap<String, SessionSqliteMetadata>>,
+    ) -> Result<DesktopCatalogRepairResult, String> {
         let db_path = self.codex_home.join("sqlite").join("codex-dev.db");
         if !db_path.exists() || sessions.is_empty() {
             return Ok(DesktopCatalogRepairResult::default());
@@ -2929,7 +2964,10 @@ impl SessionStore {
         let mut eligible = Vec::new();
         let mut skipped = 0usize;
         for session in sessions {
-            let metadata = sqlite_metadata_for_session(session);
+            let metadata = metadata_cache
+                .and_then(|cache| cache.get(&session.id))
+                .cloned()
+                .unwrap_or_else(|| sqlite_metadata_for_session(session));
             let Some(source_kind) = sidebar_source_kind(&metadata.source) else {
                 skipped += 1;
                 continue;
@@ -3084,9 +3122,18 @@ impl SessionStore {
         })
     }
 
+    #[allow(dead_code)]
     fn repair_desktop_projects(
         &self,
         sessions: &[SessionRepairRecord],
+    ) -> Result<DesktopProjectRepairResult, String> {
+        self.repair_desktop_projects_with_metadata(sessions, None)
+    }
+
+    fn repair_desktop_projects_with_metadata(
+        &self,
+        sessions: &[SessionRepairRecord],
+        metadata_cache: Option<&HashMap<String, SessionSqliteMetadata>>,
     ) -> Result<DesktopProjectRepairResult, String> {
         if sessions.is_empty() {
             return Ok(DesktopProjectRepairResult::default());
@@ -3094,11 +3141,18 @@ impl SessionStore {
         let mut candidates = Vec::new();
         let mut skipped = 0usize;
         for session in sessions {
-            let metadata = sqlite_metadata_for_session(session);
+            let owned_metadata;
+            let metadata = match metadata_cache.and_then(|cache| cache.get(&session.id)) {
+                Some(cached) => cached,
+                None => {
+                    owned_metadata = sqlite_metadata_for_session(session);
+                    &owned_metadata
+                }
+            };
             if sidebar_source_kind(&metadata.source).is_none() {
                 skipped += 1;
                 continue;
-            }
+            };
             let cwd = metadata.cwd.trim();
             if cwd.is_empty() || cwd == "/" || cwd == "~" || !Path::new(cwd).is_dir() {
                 skipped += 1;
@@ -3321,11 +3375,16 @@ impl SessionStore {
                 Ok(file) => file,
                 Err(_) => continue,
             };
-            for line in BufReader::new(file).lines() {
+            for line in BufReader::with_capacity(64 * 1024, file).lines() {
                 let line = match line {
                     Ok(line) => line,
                     Err(_) => continue,
                 };
+                if !line.contains("image_generation_end")
+                    && !line.contains("image_generation_call")
+                {
+                    continue;
+                }
                 let Ok(header) = serde_json::from_str::<SessionRecordKind>(&line) else {
                     continue;
                 };
@@ -3447,11 +3506,7 @@ impl SessionStore {
                     session.path.display()
                 )
             })?;
-            let _ = system_command::new("touch")
-                .arg("-r")
-                .arg(&backup_path)
-                .arg(&session.path)
-                .output();
+            preserve_file_mtime(&backup_path, &session.path);
             result.changed_rollout_files += 1;
             result.changed_session_ids.insert(session.id.clone());
         }
@@ -3471,20 +3526,17 @@ impl SessionStore {
             default_provider.clone(),
             vec![CodexSessionVisibilityRepairProviderSource::Config],
         )];
-        if sqlite3_available() {
-            for db_path in self.sqlite_candidate_paths() {
-                for provider in sqlite_provider_ids(&db_path)? {
-                    if let Some((_, sources)) = providers.iter_mut().find(|(id, _)| id == &provider)
-                    {
-                        if !sources.contains(&CodexSessionVisibilityRepairProviderSource::Sqlite) {
-                            sources.push(CodexSessionVisibilityRepairProviderSource::Sqlite);
-                        }
-                    } else {
-                        providers.push((
-                            provider,
-                            vec![CodexSessionVisibilityRepairProviderSource::Sqlite],
-                        ));
+        for db_path in self.sqlite_candidate_paths() {
+            for provider in sqlite_provider_ids(&db_path)? {
+                if let Some((_, sources)) = providers.iter_mut().find(|(id, _)| id == &provider) {
+                    if !sources.contains(&CodexSessionVisibilityRepairProviderSource::Sqlite) {
+                        sources.push(CodexSessionVisibilityRepairProviderSource::Sqlite);
                     }
+                } else {
+                    providers.push((
+                        provider,
+                        vec![CodexSessionVisibilityRepairProviderSource::Sqlite],
+                    ));
                 }
             }
         }
@@ -4167,16 +4219,31 @@ impl SessionStore {
         sessions: Option<&[SessionRepairRecord]>,
         forced_model: Option<&str>,
     ) -> Result<(usize, Vec<String>), String> {
-        if !sqlite3_available() {
-            return Ok((0, Vec::new()));
-        }
+        self.repair_sqlite_visibility_with_metadata(target_provider, sessions, forced_model, None)
+    }
+
+    fn repair_sqlite_visibility_with_metadata(
+        &self,
+        target_provider: &str,
+        sessions: Option<&[SessionRepairRecord]>,
+        forced_model: Option<&str>,
+        metadata_cache: Option<&HashMap<String, SessionSqliteMetadata>>,
+    ) -> Result<(usize, Vec<String>), String> {
         let mut repaired = 0usize;
         let mut backup_dirs = Vec::new();
         for db_path in self.sqlite_candidate_paths() {
-            let backup_dir = backup_sqlite_file(&db_path)?;
-            let changed = repair_sqlite_db(&db_path, target_provider, sessions, forced_model)?;
+            let (changed, backup_dir) = repair_sqlite_db_with_options(
+                &db_path,
+                target_provider,
+                sessions,
+                forced_model,
+                metadata_cache,
+                true,
+            )?;
             if changed > 0 {
-                backup_dirs.push(backup_dir);
+                if let Some(backup_dir) = backup_dir {
+                    backup_dirs.push(backup_dir);
+                }
                 repaired += changed;
             }
         }
@@ -4272,24 +4339,15 @@ impl SessionStore {
     }
 
     fn preflight_visibility_databases(&self) -> Result<(), String> {
-        let paths = self.sqlite_candidate_paths();
-        if paths.is_empty() {
-            return Ok(());
-        }
-        let output = match system_command::new("sqlite3").arg("-version").output() {
-            Ok(output) => output,
-            // Keep support for installations without the optional sqlite CLI.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(format!("启动 SQLite 工具失败，尚未修改会话文件：{error}")),
-        };
-        if !output.status.success() {
-            return Err(format!(
-                "SQLite 工具不可用，尚未修改会话文件：{}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        for path in paths {
-            run_sqlite(&path, "SELECT name FROM sqlite_master LIMIT 1;")?;
+        for path in self.sqlite_candidate_paths() {
+            let connection = Connection::open(&path)
+                .map_err(|error| format!("修复 SQLite 失败 ({}): {}", path.display(), error))?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| format!("修复 SQLite 失败 ({}): {}", path.display(), error))?;
+            connection
+                .query_row("SELECT COUNT(*) FROM sqlite_master", [], |_| Ok(()))
+                .map_err(|error| format!("修复 SQLite 失败 ({}): {}", path.display(), error))?;
         }
         Ok(())
     }
@@ -4605,11 +4663,7 @@ impl SessionStore {
                     let backup = backup_dir.join(session.path.file_name().unwrap_or_default());
                     fs::copy(&session.path, &backup).map_err(|e| format!("备份会话失败：{e}"))?;
                     staged.commit(&session.path)?;
-                    let _ = system_command::new("touch")
-                        .arg("-r")
-                        .arg(&backup)
-                        .arg(&session.path)
-                        .output();
+                    preserve_file_mtime(&backup, &session.path);
                     Ok(())
                 })();
                 match result {
@@ -4765,11 +4819,7 @@ impl SessionStore {
                 ));
                 continue;
             }
-            let _ = system_command::new("touch")
-                .arg("-r")
-                .arg(&backup_path)
-                .arg(&session.path)
-                .output();
+            preserve_file_mtime(&backup_path, &session.path);
             changed += 1;
             outcome.recovered_contexts += usize::from(recovered);
             outcome.changed_session_ids.insert(session.id.clone());
@@ -4897,31 +4947,75 @@ impl SessionStore {
     }
 }
 
+#[cfg(test)]
 fn repair_sqlite_db(
     db_path: &Path,
     target_provider: &str,
     sessions: Option<&[SessionRepairRecord]>,
     forced_model: Option<&str>,
 ) -> Result<usize, String> {
+    repair_sqlite_db_with_options(db_path, target_provider, sessions, forced_model, None, false)
+        .map(|(changed, _)| changed)
+}
+
+fn repair_sqlite_db_with_options(
+    db_path: &Path,
+    target_provider: &str,
+    sessions: Option<&[SessionRepairRecord]>,
+    forced_model: Option<&str>,
+    metadata_cache: Option<&HashMap<String, SessionSqliteMetadata>>,
+    backup_before_write: bool,
+) -> Result<(usize, Option<String>), String> {
     if !db_path.exists() {
-        return Ok(0);
+        return Ok((0, None));
     }
-    let columns = sqlite_thread_columns(db_path)?;
+    let db_err = |error: rusqlite::Error| format!("修复 SQLite 失败 ({}): {}", db_path.display(), error);
+    let mut connection = Connection::open(db_path).map_err(db_err)?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(db_err)?;
+    if !sqlite_table_exists_with_connection(&connection, "threads")? {
+        return Ok((0, None));
+    }
+    let columns = sqlite_thread_columns_with_connection(&connection)?;
     if !columns.contains("id") {
-        return Ok(0);
+        return Ok((0, None));
     }
-    let repaired_history_modes =
-        sqlite_repair_paginated_history_modes(db_path, &columns, sessions)?;
-    let before = sqlite_count_repairable_rows(db_path, target_provider, sessions, forced_model)?;
-    if before == 0 {
-        return sqlite_insert_missing_session_rows(
-            db_path,
-            target_provider,
-            sessions,
-            forced_model,
-        )
-        .map(|inserted| repaired_history_modes + inserted);
-    }
+
+    let paginated_where = if columns.contains("history_mode") {
+        sessions.and_then(|sessions| {
+            let ids = sessions
+                .iter()
+                .filter(|session| {
+                    metadata_cache
+                        .and_then(|cache| cache.get(&session.id))
+                        .map(|meta| meta.history_mode.as_str())
+                        .unwrap_or_else(|| rollout_history_mode(&session.path))
+                        == "paginated"
+                })
+                .map(|session| sql_quote(&session.id))
+                .collect::<Vec<_>>();
+            (!ids.is_empty()).then(|| {
+                format!(
+                    "id IN ({}) AND COALESCE(history_mode, '') <> 'paginated'",
+                    ids.join(", ")
+                )
+            })
+        })
+    } else {
+        None
+    };
+    let repaired_history_modes = match paginated_where.as_deref() {
+        Some(where_clause) => connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM threads WHERE {where_clause}"),
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .map_err(db_err)?,
+        None => 0,
+    };
+
     let escaped_provider = sql_quote(target_provider);
     let forced_model = forced_model.map(|model| model_for_provider(model, target_provider));
     let escaped_model = forced_model.as_deref().map(sql_quote);
@@ -4933,103 +5027,155 @@ fn repair_sqlite_db(
         escaped_model.as_deref(),
         sessions,
     );
-    if set_clause.is_empty() || where_clause.is_empty() {
-        return Ok(0);
-    }
-    let sql = format!("UPDATE threads SET {set_clause} WHERE {where_clause};");
-    run_sqlite(db_path, &sql)?;
-    let inserted = sqlite_insert_missing_session_rows(
-        db_path,
-        target_provider,
-        sessions,
-        forced_model.as_deref(),
-    )?;
-    Ok(repaired_history_modes + before + inserted)
-}
-
-fn sqlite_repair_paginated_history_modes(
-    db_path: &Path,
-    columns: &HashSet<String>,
-    sessions: Option<&[SessionRepairRecord]>,
-) -> Result<usize, String> {
-    if !columns.contains("history_mode") {
-        return Ok(0);
-    }
-    let Some(sessions) = sessions else {
-        return Ok(0);
+    let before = if where_clause.is_empty() {
+        0
+    } else {
+        connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM threads WHERE {where_clause}"),
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .map_err(db_err)?
     };
-    let ids = sessions
-        .iter()
-        .filter(|session| rollout_history_mode(&session.path) == "paginated")
-        .map(|session| sql_quote(&session.id))
-        .collect::<Vec<_>>();
-    if ids.is_empty() {
-        return Ok(0);
+    let will_update_rows = before > 0 && !set_clause.is_empty() && !where_clause.is_empty();
+
+    let missing_sessions = match sessions {
+        Some(sessions) if !sessions.is_empty() => {
+            let mut stmt = connection
+                .prepare("SELECT id FROM threads")
+                .map_err(db_err)?;
+            let existing_ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(db_err)?
+                .collect::<rusqlite::Result<HashSet<_>>>()
+                .map_err(db_err)?;
+            sessions
+                .iter()
+                .filter(|session| !existing_ids.contains(&session.id))
+                .collect::<Vec<_>>()
+        }
+        _ => Vec::new(),
+    };
+
+    if repaired_history_modes == 0 && !will_update_rows && missing_sessions.is_empty() {
+        if before > 0 && (set_clause.is_empty() || where_clause.is_empty()) {
+            return Ok((0, None));
+        }
+        return Ok((0, None));
     }
-    let where_clause = format!(
-        "id IN ({}) AND COALESCE(history_mode, '') <> 'paginated'",
-        ids.join(", ")
-    );
-    let count = run_sqlite(
-        db_path,
-        &format!("SELECT COUNT(*) FROM threads WHERE {where_clause};"),
-    )?
-    .trim()
-    .parse::<usize>()
-    .unwrap_or(0);
-    if count > 0 {
-        run_sqlite(
-            db_path,
-            &format!("UPDATE threads SET history_mode = 'paginated' WHERE {where_clause};"),
-        )?;
+
+    let backup_dir = if backup_before_write {
+        drop(connection);
+        let dir = backup_sqlite_file(db_path)?;
+        connection = Connection::open(db_path).map_err(db_err)?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(db_err)?;
+        Some(dir)
+    } else {
+        None
+    };
+
+    let transaction = connection.transaction().map_err(db_err)?;
+    if repaired_history_modes > 0 {
+        if let Some(paginated_where) = paginated_where.as_deref() {
+            transaction
+                .execute(
+                    &format!("UPDATE threads SET history_mode = 'paginated' WHERE {paginated_where}"),
+                    [],
+                )
+                .map_err(db_err)?;
+        }
     }
-    Ok(count)
+    if will_update_rows {
+        transaction
+            .execute(
+                &format!("UPDATE threads SET {set_clause} WHERE {where_clause}"),
+                [],
+            )
+            .map_err(db_err)?;
+    }
+    let mut inserted = 0usize;
+    for session in missing_sessions {
+        let owned_metadata;
+        let metadata = match metadata_cache.and_then(|cache| cache.get(&session.id)) {
+            Some(cached) => cached,
+            None => {
+                owned_metadata = sqlite_metadata_for_session(session);
+                &owned_metadata
+            }
+        };
+        let Some(sql) = build_sqlite_insert_session_sql(
+            &columns,
+            session,
+            metadata,
+            target_provider,
+            forced_model.as_deref(),
+        ) else {
+            continue;
+        };
+        transaction.execute(&sql, []).map_err(db_err)?;
+        inserted += 1;
+    }
+    transaction.commit().map_err(db_err)?;
+
+    Ok((
+        repaired_history_modes + if will_update_rows { before } else { 0 } + inserted,
+        backup_dir,
+    ))
 }
 
-fn sqlite_count_repairable_rows(
+fn sqlite_register_session_row(
     db_path: &Path,
     target_provider: &str,
-    sessions: Option<&[SessionRepairRecord]>,
-    forced_model: Option<&str>,
-) -> Result<usize, String> {
-    let columns = sqlite_thread_columns(db_path)?;
+    session: &SessionRepairRecord,
+) -> Result<bool, String> {
+    if !db_path.exists() {
+        return Ok(false);
+    }
+    let db_err =
+        |error: rusqlite::Error| format!("修复 SQLite 失败 ({}): {}", db_path.display(), error);
+    let connection = Connection::open(db_path).map_err(db_err)?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(db_err)?;
+    if !sqlite_table_exists_with_connection(&connection, "threads")? {
+        return Ok(false);
+    }
+    let columns = sqlite_thread_columns_with_connection(&connection)?;
     if !columns.contains("id") {
-        return Ok(0);
+        return Ok(false);
     }
-    let escaped_provider = sql_quote(target_provider);
-    let escaped_model = forced_model
-        .map(|model| model_for_provider(model, target_provider))
-        .as_deref()
-        .map(sql_quote);
-    let where_clause = sqlite_repair_where_clause(
+    let existing: usize = connection
+        .query_row(
+            "SELECT COUNT(*) FROM threads WHERE id = ?1",
+            params![session.id],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    if existing > 0 {
+        return Ok(true);
+    }
+    let metadata = sqlite_metadata_for_session(session);
+    let Some(sql) = build_sqlite_insert_session_sql(
         &columns,
-        &escaped_provider,
-        escaped_model.as_deref(),
-        sessions,
-    );
-    if where_clause.is_empty() {
-        return Ok(0);
-    }
-    let sql = format!("SELECT COUNT(*) FROM threads WHERE {where_clause};");
-    let output = run_sqlite(db_path, &sql)?;
-    Ok(output.trim().parse::<usize>().unwrap_or(0))
-}
-
-fn sqlite_thread_columns(db_path: &Path) -> Result<HashSet<String>, String> {
-    let table_exists = run_sqlite(
-        db_path,
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='threads';",
-    )?;
-    if table_exists.trim() != "1" {
-        return Ok(HashSet::new());
-    }
-    let output = run_sqlite(db_path, "SELECT name FROM pragma_table_info('threads');")?;
-    Ok(output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
+        session,
+        &metadata,
+        target_provider,
+        None,
+    ) else {
+        return Ok(false);
+    };
+    connection.execute(&sql, []).map_err(db_err)?;
+    let count: usize = connection
+        .query_row(
+            "SELECT COUNT(*) FROM threads WHERE id = ?1",
+            params![session.id],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    Ok(count > 0)
 }
 
 fn sqlite_thread_columns_with_connection(
@@ -5203,146 +5349,119 @@ fn sqlite_repair_where_clause(
     format!("({base}) AND id IN ({})", ids.join(", "))
 }
 
-fn sqlite_insert_missing_session_rows(
-    db_path: &Path,
+fn build_sqlite_insert_session_sql(
+    columns: &HashSet<String>,
+    session: &SessionRepairRecord,
+    metadata: &SessionSqliteMetadata,
     target_provider: &str,
-    sessions: Option<&[SessionRepairRecord]>,
     forced_model: Option<&str>,
-) -> Result<usize, String> {
-    let Some(sessions) = sessions else {
-        return Ok(0);
-    };
-    if sessions.is_empty() {
-        return Ok(0);
+) -> Option<String> {
+    let mut names = Vec::new();
+    let mut values = Vec::new();
+    push_sql_value(&mut names, &mut values, columns, "id", &session.id);
+    push_sql_value(&mut names, &mut values, columns, "title", &session.title);
+    push_sql_value(
+        &mut names,
+        &mut values,
+        columns,
+        "model_provider",
+        target_provider,
+    );
+    if let Some(model) = forced_model {
+        let model = model_for_provider(model, target_provider);
+        push_sql_value(&mut names, &mut values, columns, "model", &model);
     }
-    let columns = sqlite_thread_columns(db_path)?;
-    if !columns.contains("id") {
-        return Ok(0);
+    push_sql_value(
+        &mut names,
+        &mut values,
+        columns,
+        "first_user_message",
+        &session.title,
+    );
+    push_sql_value(&mut names, &mut values, columns, "preview", &session.title);
+    push_sql_value(
+        &mut names,
+        &mut values,
+        columns,
+        "source",
+        &metadata.source,
+    );
+    push_sql_value(&mut names, &mut values, columns, "cwd", &metadata.cwd);
+    push_sql_value(
+        &mut names,
+        &mut values,
+        columns,
+        "cli_version",
+        &metadata.cli_version,
+    );
+    push_sql_value(
+        &mut names,
+        &mut values,
+        columns,
+        "sandbox_policy",
+        &metadata.sandbox_policy,
+    );
+    push_sql_value(
+        &mut names,
+        &mut values,
+        columns,
+        "approval_mode",
+        &metadata.approval_mode,
+    );
+    push_sql_value(
+        &mut names,
+        &mut values,
+        columns,
+        "history_mode",
+        &metadata.history_mode,
+    );
+    push_sql_value(&mut names, &mut values, columns, "thread_source", "user");
+    if columns.contains("has_user_event") {
+        names.push("has_user_event".to_string());
+        values.push("1".to_string());
     }
-    let mut inserted = 0usize;
-    for session in sessions {
-        let exists_sql = format!(
-            "SELECT COUNT(*) FROM threads WHERE id = {};",
-            sql_quote(&session.id)
-        );
-        let exists = run_sqlite(db_path, &exists_sql)?
-            .trim()
-            .parse::<usize>()
-            .unwrap_or(0);
-        if exists > 0 {
-            continue;
-        }
-        let metadata = sqlite_metadata_for_session(session);
-        let mut names = Vec::new();
-        let mut values = Vec::new();
-        push_sql_value(&mut names, &mut values, &columns, "id", &session.id);
-        push_sql_value(&mut names, &mut values, &columns, "title", &session.title);
-        push_sql_value(
-            &mut names,
-            &mut values,
-            &columns,
-            "model_provider",
-            target_provider,
-        );
-        if let Some(model) = forced_model {
-            let model = model_for_provider(model, target_provider);
-            push_sql_value(&mut names, &mut values, &columns, "model", &model);
-        }
-        push_sql_value(
-            &mut names,
-            &mut values,
-            &columns,
-            "first_user_message",
-            &session.title,
-        );
-        push_sql_value(&mut names, &mut values, &columns, "preview", &session.title);
-        push_sql_value(
-            &mut names,
-            &mut values,
-            &columns,
-            "source",
-            &metadata.source,
-        );
-        push_sql_value(&mut names, &mut values, &columns, "cwd", &metadata.cwd);
-        push_sql_value(
-            &mut names,
-            &mut values,
-            &columns,
-            "cli_version",
-            &metadata.cli_version,
-        );
-        push_sql_value(
-            &mut names,
-            &mut values,
-            &columns,
-            "sandbox_policy",
-            &metadata.sandbox_policy,
-        );
-        push_sql_value(
-            &mut names,
-            &mut values,
-            &columns,
-            "approval_mode",
-            &metadata.approval_mode,
-        );
-        push_sql_value(
-            &mut names,
-            &mut values,
-            &columns,
-            "history_mode",
-            &metadata.history_mode,
-        );
-        push_sql_value(&mut names, &mut values, &columns, "thread_source", "user");
-        if columns.contains("has_user_event") {
-            names.push("has_user_event".to_string());
-            values.push("1".to_string());
-        }
-        push_sql_i64(
-            &mut names,
-            &mut values,
-            &columns,
-            "created_at",
-            metadata.created_at,
-        );
-        push_sql_i64(
-            &mut names,
-            &mut values,
-            &columns,
-            "created_at_ms",
-            metadata.created_at.saturating_mul(1000),
-        );
-        if columns.contains("updated_at") {
-            names.push("updated_at".to_string());
-            values.push(session.updated_at.to_string());
-        }
-        if columns.contains("updated_at_ms") {
-            names.push("updated_at_ms".to_string());
-            values.push(session.updated_at.saturating_mul(1000).to_string());
-        }
-        if columns.contains("recency_at") {
-            names.push("recency_at".to_string());
-            values.push(session.updated_at.to_string());
-        }
-        if columns.contains("recency_at_ms") {
-            names.push("recency_at_ms".to_string());
-            values.push(session.updated_at.saturating_mul(1000).to_string());
-        }
-        if columns.contains("rollout_path") {
-            names.push("rollout_path".to_string());
-            values.push(sql_quote(&session.path.to_string_lossy()));
-        }
-        if names.is_empty() {
-            continue;
-        }
-        let sql = format!(
-            "INSERT INTO threads ({}) VALUES ({});",
-            names.join(", "),
-            values.join(", ")
-        );
-        run_sqlite(db_path, &sql)?;
-        inserted += 1;
+    push_sql_i64(
+        &mut names,
+        &mut values,
+        columns,
+        "created_at",
+        metadata.created_at,
+    );
+    push_sql_i64(
+        &mut names,
+        &mut values,
+        columns,
+        "created_at_ms",
+        metadata.created_at.saturating_mul(1000),
+    );
+    if columns.contains("updated_at") {
+        names.push("updated_at".to_string());
+        values.push(session.updated_at.to_string());
     }
-    Ok(inserted)
+    if columns.contains("updated_at_ms") {
+        names.push("updated_at_ms".to_string());
+        values.push(session.updated_at.saturating_mul(1000).to_string());
+    }
+    if columns.contains("recency_at") {
+        names.push("recency_at".to_string());
+        values.push(session.updated_at.to_string());
+    }
+    if columns.contains("recency_at_ms") {
+        names.push("recency_at_ms".to_string());
+        values.push(session.updated_at.saturating_mul(1000).to_string());
+    }
+    if columns.contains("rollout_path") {
+        names.push("rollout_path".to_string());
+        values.push(sql_quote(&session.path.to_string_lossy()));
+    }
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "INSERT INTO threads ({}) VALUES ({});",
+        names.join(", "),
+        values.join(", ")
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5364,15 +5483,32 @@ fn sqlite_metadata_for_session(session: &SessionRepairRecord) -> SessionSqliteMe
         cli_version: String::new(),
         sandbox_policy: "read-only".to_string(),
         approval_mode: "on-request".to_string(),
-        history_mode: rollout_history_mode(&session.path).to_string(),
+        history_mode: "legacy".to_string(),
     };
     let Ok(file) = fs::File::open(&session.path) else {
         return metadata;
     };
-    for line in BufReader::new(file).lines() {
+    let mut checked_first_record = false;
+    for line in BufReader::with_capacity(64 * 1024, file).lines() {
         let Ok(line) = line else {
             break;
         };
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !checked_first_record {
+            checked_first_record = true;
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if value.get("type").and_then(Value::as_str) == Some("session_meta")
+                    && value.get("ordinal").and_then(Value::as_u64).is_some()
+                {
+                    metadata.history_mode = "paginated".to_string();
+                }
+            }
+        }
+        if !line.contains("\"session_meta\"") && !line.contains("\"turn_context\"") {
+            continue;
+        }
         if serde_json::from_str::<SessionRecordKind>(&line)
             .is_ok_and(|header| !matches!(header.kind.as_str(), "session_meta" | "turn_context"))
         {
@@ -5457,6 +5593,22 @@ fn rollout_history_mode(path: &Path) -> &'static str {
     "legacy"
 }
 
+#[derive(Deserialize)]
+struct PaginatedProjectionLine<'a> {
+    #[serde(borrow, rename = "type", default)]
+    kind: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default)]
+    ordinal: Option<u64>,
+    #[serde(borrow, default)]
+    payload: Option<PaginatedProjectionPayload<'a>>,
+}
+
+#[derive(Deserialize)]
+struct PaginatedProjectionPayload<'a> {
+    #[serde(borrow, rename = "type", default)]
+    kind: Option<std::borrow::Cow<'a, str>>,
+}
+
 fn paginated_rollout_projection_target(
     path: &Path,
 ) -> Result<Option<PaginatedRolloutProjectionTarget>, String> {
@@ -5465,32 +5617,35 @@ fn paginated_rollout_projection_target(
     let mut first_record = true;
     let mut last_ordinal = None;
     let mut turn_count = 0usize;
-    for line in BufReader::new(file).lines() {
+    for line in BufReader::with_capacity(64 * 1024, file).lines() {
         let line =
             line.map_err(|error| format!("读取分页会话记录失败 ({}): {error}", path.display()))?;
         if line.trim().is_empty() {
             continue;
         }
-        let value = serde_json::from_str::<Value>(&line)
+        if line.as_bytes().iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+            return Err(format!(
+                "解析分页会话记录失败 ({}): 非 JSON 对象记录",
+                path.display()
+            ));
+        }
+        let value = serde_json::from_str::<PaginatedProjectionLine<'_>>(&line)
             .map_err(|error| format!("解析分页会话记录失败 ({}): {error}", path.display()))?;
         if first_record {
             first_record = false;
-            if value.get("type").and_then(Value::as_str) != Some("session_meta")
-                || value.get("ordinal").and_then(Value::as_u64).is_none()
-            {
+            if value.kind.as_deref() != Some("session_meta") || value.ordinal.is_none() {
                 return Ok(None);
             }
         }
         let ordinal = value
-            .get("ordinal")
-            .and_then(Value::as_u64)
+            .ordinal
             .ok_or_else(|| format!("分页会话记录缺少 ordinal ({})", path.display()))?;
         last_ordinal = Some(ordinal);
-        if value.get("type").and_then(Value::as_str) == Some("event_msg")
+        if value.kind.as_deref() == Some("event_msg")
             && value
-                .get("payload")
-                .and_then(|payload| payload.get("type"))
-                .and_then(Value::as_str)
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.kind.as_deref())
                 == Some("task_started")
         {
             turn_count = turn_count.saturating_add(1);
@@ -5558,23 +5713,92 @@ fn push_sql_i64(
 }
 
 fn sqlite_provider_ids(db_path: &Path) -> Result<Vec<String>, String> {
-    let columns = sqlite_thread_columns(db_path)?;
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let db_err = |error: rusqlite::Error| format!("修复 SQLite 失败 ({}): {}", db_path.display(), error);
+    let connection = Connection::open(db_path).map_err(db_err)?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(db_err)?;
+    if !sqlite_table_exists_with_connection(&connection, "threads")? {
+        return Ok(Vec::new());
+    }
+    let columns = sqlite_thread_columns_with_connection(&connection)?;
     if !columns.contains("model_provider") {
         return Ok(Vec::new());
     }
-    let output = run_sqlite(
-        db_path,
-        "SELECT DISTINCT model_provider FROM threads WHERE COALESCE(model_provider, '') <> '';",
-    )?;
-    Ok(output
-        .lines()
-        .map(str::trim)
+    let mut stmt = connection
+        .prepare("SELECT DISTINCT model_provider FROM threads WHERE COALESCE(model_provider, '') <> ''")
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(db_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
         .collect())
 }
 
+#[derive(Default)]
+struct SqliteBackupScopeState {
+    depth: usize,
+    backed_up_files: HashMap<PathBuf, String>,
+}
+
+std::thread_local! {
+    static ACTIVE_SQLITE_BACKUP_SCOPE: std::cell::RefCell<SqliteBackupScopeState> =
+        std::cell::RefCell::new(SqliteBackupScopeState::default());
+}
+
+/// Deduplicates `backup_sqlite_file` calls within one multi-step switch or repair
+/// run so multi-GB databases (e.g. `thread_history_1.sqlite`) are copied at most once.
+pub(crate) struct SqliteBackupScope;
+
+impl SqliteBackupScope {
+    pub(crate) fn enter() -> Self {
+        ACTIVE_SQLITE_BACKUP_SCOPE.with(|cell| {
+            cell.borrow_mut().depth += 1;
+        });
+        Self
+    }
+}
+
+impl Drop for SqliteBackupScope {
+    fn drop(&mut self) {
+        ACTIVE_SQLITE_BACKUP_SCOPE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            state.depth = state.depth.saturating_sub(1);
+            if state.depth == 0 {
+                state.backed_up_files.clear();
+            }
+        });
+    }
+}
+
+pub(super) fn preserve_file_mtime(reference: &Path, target: &Path) {
+    let Ok(modified) = fs::metadata(reference).and_then(|meta| meta.modified()) else {
+        return;
+    };
+    if let Ok(file) = fs::OpenOptions::new().write(true).open(target) {
+        let _ = file.set_modified(modified);
+    }
+}
+
 fn backup_sqlite_file(db_path: &Path) -> Result<String, String> {
+    let canonical = fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+    let existing = ACTIVE_SQLITE_BACKUP_SCOPE.with(|cell| {
+        let state = cell.borrow();
+        (state.depth > 0)
+            .then(|| state.backed_up_files.get(&canonical).cloned())
+            .flatten()
+    });
+    if let Some(backup_dir) = existing {
+        return Ok(backup_dir);
+    }
     let backup_dir = visibility_backup_dir();
     fs::create_dir_all(&backup_dir)
         .map_err(|error| format!("创建 SQLite 备份目录失败: {}", error))?;
@@ -5584,7 +5808,14 @@ fn backup_sqlite_file(db_path: &Path) -> Result<String, String> {
         .unwrap_or("state.sqlite");
     fs::copy(db_path, backup_dir.join(filename))
         .map_err(|error| format!("备份 SQLite 失败 ({}): {}", db_path.display(), error))?;
-    Ok(backup_dir.to_string_lossy().to_string())
+    let dir_str = backup_dir.to_string_lossy().to_string();
+    ACTIVE_SQLITE_BACKUP_SCOPE.with(|cell| {
+        let mut state = cell.borrow_mut();
+        if state.depth > 0 {
+            state.backed_up_files.insert(canonical, dir_str.clone());
+        }
+    });
+    Ok(dir_str)
 }
 
 fn visibility_backup_dir() -> PathBuf {
@@ -5761,11 +5992,12 @@ fn prepare_rollout_model_compatibility_rewrite_guarded(
             "event_msg" => line
                 .windows(b"thread_settings".len())
                 .any(|w| w == b"thread_settings"),
-            "response_item" => header.payload.is_some_and(|p| {
-                matches!(
-                    p.kind.as_str(),
-                    "message" | "function_call" | "custom_tool_call" | "reasoning"
-                )
+            "response_item" => header.payload.is_some_and(|p| match p.kind.as_str() {
+                "reasoning" => true,
+                "message" | "function_call" | "custom_tool_call" => {
+                    line.windows(4).any(|w| w == b"\"id\"")
+                }
+                _ => false,
             }),
             _ => false,
         });
@@ -6151,36 +6383,6 @@ fn rewrite_session_meta_cwd(content: &str, cwd: &str) -> Result<Option<String>, 
         return Err("会话缺少可修改的 session_meta".to_string());
     }
     Ok(changed.then_some(output))
-}
-
-fn run_sqlite(db_path: &Path, sql: &str) -> Result<String, String> {
-    let output = system_command::new("sqlite3")
-        .args(["-batch", "-bail", "-cmd", ".timeout 5000"])
-        .arg(db_path)
-        .arg(sql)
-        .output()
-        .map_err(|error| format!("调用 sqlite3 失败: {}", error))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("no such table") || stderr.contains("no such column") {
-            Ok(String::new())
-        } else {
-            Err(format!(
-                "修复 SQLite 失败 ({}): {}",
-                db_path.display(),
-                stderr
-            ))
-        }
-    }
-}
-
-fn sqlite3_available() -> bool {
-    system_command::new("sqlite3")
-        .arg("-version")
-        .output()
-        .is_ok_and(|output| output.status.success())
 }
 
 fn sql_quote(value: &str) -> String {
@@ -7986,14 +8188,25 @@ fn rewrite_staged_session_meta(
     Ok(())
 }
 
+pub(super) type RolloutSegmentLookup = HashMap<String, Vec<(u64, PathBuf)>>;
+
 fn fork_source_segments(
     source_codex_home: &Path,
     source_path: &Path,
+) -> Result<Vec<ForkSourceSegment>, String> {
+    fork_source_segments_with_lookup(source_codex_home, source_path, None)
+}
+
+fn fork_source_segments_with_lookup(
+    source_codex_home: &Path,
+    source_path: &Path,
+    lookup: Option<&RolloutSegmentLookup>,
 ) -> Result<Vec<ForkSourceSegment>, String> {
     fn collect(
         codex_home: &Path,
         path: PathBuf,
         end_byte_offset: Option<u64>,
+        lookup: Option<&RolloutSegmentLookup>,
         seen: &mut HashSet<String>,
         segments: &mut Vec<ForkSourceSegment>,
     ) -> Result<(), String> {
@@ -8002,11 +8215,20 @@ fn fork_source_segments(
             .get("payload")
             .and_then(Value::as_object)
             .ok_or_else(|| "源会话的 session_meta 缺少 payload".to_string())?;
-        let logical_id = extract_session_id(
-            &serde_json::to_string(&meta)
-                .map_err(|error| format!("解析源会话 ID 失败: {error}"))?,
-        )
-        .unwrap_or_else(|| path.to_string_lossy().to_string());
+        let logical_id = payload
+            .get("id")
+            .or_else(|| payload.get("session_id"))
+            .or_else(|| payload.get("thread_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                serde_json::to_string(&meta)
+                    .ok()
+                    .and_then(|s| extract_session_id(&s))
+            })
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
         let physical_id = physical_rollout_id(&path, &logical_id);
         if !seen.insert(physical_id.clone()) {
             return Err(format!("源会话历史引用存在循环: {physical_id}"));
@@ -8027,8 +8249,16 @@ fn fork_source_segments(
                 .or_else(|| base.get("endByteOffset"))
                 .and_then(Value::as_u64)
                 .ok_or_else(|| "源会话 history_base 缺少 end_byte_offset".to_string())?;
-            let parent_path = find_rollout_path_in_store(codex_home, parent_id, parent_end)?;
-            collect(codex_home, parent_path, Some(parent_end), seen, segments)?;
+            let parent_path =
+                find_rollout_path_with_lookup(codex_home, parent_id, parent_end, lookup)?;
+            collect(
+                codex_home,
+                parent_path,
+                Some(parent_end),
+                lookup,
+                seen,
+                segments,
+            )?;
         }
         segments.push(ForkSourceSegment {
             physical_id,
@@ -8044,10 +8274,34 @@ fn fork_source_segments(
         source_codex_home,
         source_path.to_path_buf(),
         None,
+        lookup,
         &mut seen,
         &mut segments,
     )?;
     Ok(segments)
+}
+
+fn find_rollout_path_with_lookup(
+    codex_home: &Path,
+    rollout_id: &str,
+    required_prefix: u64,
+    lookup: Option<&RolloutSegmentLookup>,
+) -> Result<PathBuf, String> {
+    if let Some(entries) = lookup.and_then(|map| map.get(rollout_id)) {
+        if let Some((_, _, path)) = entries
+            .iter()
+            .map(|(len, path)| (*len >= required_prefix, *len, path))
+            .max_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| left.2.cmp(right.2))
+            })
+        {
+            return Ok(path.clone());
+        }
+    }
+    find_rollout_path_in_store(codex_home, rollout_id, required_prefix)
 }
 
 fn find_rollout_path_in_store(
@@ -8248,6 +8502,12 @@ fn codex_cli_path() -> PathBuf {
 
     #[cfg(target_os = "windows")]
     {
+        if let Some(desktop_dir) = crate::instances::default_desktop_app_path().parent() {
+            let candidate = desktop_dir.join("resources").join("codex.exe");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
             let local_app_data = PathBuf::from(local_app_data);
             for relative in [
@@ -8259,6 +8519,17 @@ fn codex_cli_path() -> PathBuf {
                 for segment in relative {
                     candidate.push(segment);
                 }
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+        for env_key in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(root) = std::env::var_os(env_key) {
+                let candidate = PathBuf::from(root)
+                    .join("Codex")
+                    .join("resources")
+                    .join("codex.exe");
                 if candidate.is_file() {
                     return candidate;
                 }
@@ -8438,7 +8709,9 @@ fn run_codex_thread_fork(
     target_provider: &str,
 ) -> Result<CodexThreadForkResult, String> {
     let cli_path = codex_cli_path();
-    let mut child = Command::new(&cli_path)
+    let mut command = Command::new(&cli_path);
+    system_command::prepare(&mut command);
+    let mut child = command
         .args(["app-server", "--stdio"])
         .env("CODEX_HOME", codex_home)
         .stdin(Stdio::piped())
@@ -15486,6 +15759,126 @@ mod tests {
         let second = fs::read_to_string(&second_path).unwrap();
         assert!(second.contains(r#""model_provider":"openai""#));
         assert!(second.contains(&format!(r#""end_byte_offset":{cutoff}"#)));
+    }
+
+    #[test]
+    fn sqlite_backup_scope_deduplicates_backups_and_skips_unchanged_visibility_writes() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let state_db = home.path().join("state_5.sqlite");
+        let history_db = home.path().join("thread_history_1.sqlite");
+        let sessions_dir = home.path().join("sessions/2026/04/20");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let rollout = sessions_dir.join("rollout-2026-04-20T10-00-00-019cf7ad-eb95-7e92-a84f-aa1111111111.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-04-20T10:00:00Z","type":"session_meta","payload":{"id":"019cf7ad-eb95-7e92-a84f-aa1111111111","cwd":"/repo","source":"vscode","model_provider":"openai"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-04-20T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#,
+                "\n"
+            ),
+        )
+        .expect("write rollout");
+
+        {
+            let conn = super::Connection::open(&state_db).expect("open state db");
+            conn.execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    first_user_message TEXT,
+                    preview TEXT,
+                    model_provider TEXT,
+                    has_user_event INTEGER,
+                    thread_source TEXT,
+                    archived INTEGER,
+                    archived_at INTEGER
+                );
+                INSERT INTO threads VALUES (
+                    '019cf7ad-eb95-7e92-a84f-aa1111111111',
+                    'hello',
+                    'hello',
+                    'hello',
+                    'openai',
+                    1,
+                    'user',
+                    0,
+                    NULL
+                );",
+            )
+            .expect("init state db");
+        }
+        {
+            let conn = super::Connection::open(&history_db).expect("open history db");
+            conn.execute_batch("CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT);")
+                .expect("init history db");
+        }
+
+        let record = SessionRepairRecord {
+            id: "019cf7ad-eb95-7e92-a84f-aa1111111111".to_string(),
+            title: "hello".to_string(),
+            path: rollout,
+            updated_at: 1_700_000_000,
+        };
+        let (changed, backup_dir) = super::repair_sqlite_db_with_options(
+            &state_db,
+            "openai",
+            Some(std::slice::from_ref(&record)),
+            None,
+            None,
+            true,
+        )
+        .expect("check unchanged sqlite db");
+        assert_eq!(changed, 0);
+        assert!(
+            backup_dir.is_none(),
+            "unchanged SQLite visibility check must not copy backup files"
+        );
+
+        let first_dir = {
+            let _scope = super::SqliteBackupScope::enter();
+            let first = super::backup_sqlite_file(&history_db).expect("first backup");
+            let second = super::backup_sqlite_file(&history_db).expect("second backup in same scope");
+            assert_eq!(
+                first, second,
+                "active SqliteBackupScope must copy each DB at most once"
+            );
+            assert!(Path::new(&first).join("thread_history_1.sqlite").exists());
+            first
+        };
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let outside_dir = super::backup_sqlite_file(&history_db).expect("backup after scope drop");
+        assert_ne!(
+            first_dir, outside_dir,
+            "dropping SqliteBackupScope must clear cached backup paths"
+        );
+    }
+
+    #[test]
+    fn preserve_file_mtime_restores_reference_timestamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reference = dir.path().join("reference.jsonl");
+        let target = dir.path().join("target.jsonl");
+        fs::write(&reference, "before\n").expect("write reference");
+        let expected = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_123);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&reference)
+            .expect("open reference")
+            .set_modified(expected)
+            .expect("set reference mtime");
+        let expected_readback = fs::metadata(&reference)
+            .expect("stat reference")
+            .modified()
+            .expect("reference mtime");
+
+        fs::write(&target, "rewritten\n").expect("write target");
+        super::preserve_file_mtime(&reference, &target);
+        let actual = fs::metadata(&target)
+            .expect("stat target")
+            .modified()
+            .expect("target mtime");
+        assert_eq!(actual, expected_readback);
     }
 
     fn run_sqlite_test(db_path: &std::path::Path, sql: &str) {

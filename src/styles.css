@@ -2448,7 +2448,7 @@ textarea {
 
 .session-project-table .session-child-row {
   display: grid;
-  grid-template-columns: 24px minmax(220px, 1fr) 150px 100px 170px 190px;
+  grid-template-columns: 24px minmax(200px, 1fr) 150px 100px 142px 248px;
   min-height: 48px;
   gap: 10px;
   padding: 0 12px;
@@ -2488,6 +2488,28 @@ textarea {
   height: 30px;
   padding: 0;
   color: #2563eb;
+}
+
+.session-child-actions .arco-btn.session-export-md-button {
+  width: auto;
+  min-width: 52px;
+  height: 26px;
+  margin-right: 4px;
+  padding: 0 8px;
+  gap: 3px;
+  border-radius: 6px;
+  border-color: #bfdbfe;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.session-child-actions .arco-btn.session-export-md-button:hover:not(:disabled) {
+  border-color: #60a5fa;
+  background: #dbeafe;
+  color: #1e40af;
 }
 
 .session-content-modal {

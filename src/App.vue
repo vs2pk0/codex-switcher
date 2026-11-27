@@ -172,6 +172,7 @@ import {
 import {
   buildSingleSessionHistoryRepairOptions,
   copySessionHistoryAcrossInstances,
+  exportSessionMarkdown,
   listSessionVisibilityRepairInstances,
   listSessionVisibilityRepairProviders,
   listSessionsAcrossInstances,
@@ -190,6 +191,7 @@ import {
   type CodexSessionVisibilityRepairProviderOption,
   type CodexSessionVisibilityRepairSummary,
   type CodexTrashedSessionRecord,
+  type SessionMarkdownExportResult,
 } from "./services/session";
 import {
   appendCodexResetLog,
@@ -432,6 +434,8 @@ const batchExportText = ref("");
 const batchExportPreviewVisible = ref(false);
 const exportDownloading = ref(false);
 const exportDownloadResult = ref<ExportDownloadResult | null>(null);
+const exportDownloadMarkdownMeta = ref<SessionMarkdownExportResult | null>(null);
+const exportingMarkdownSessionId = ref("");
 const openingExportFolder = ref(false);
 const exportFormatOptions: { label: string; value: CodexExportFormat }[] = [
   { label: "Switcher JSON", value: "switcher_json" },
@@ -2764,8 +2768,9 @@ async function performAccountSwitch(instanceId: string): Promise<void> {
       title: `${t("切换 Codex")}「${targetInstance?.name || "Codex"}」`,
     };
     const result = await switchCodexAccount(account.id, instanceId);
+    appBusy.value = null;
     currentAccount.value = result.account;
-    await Promise.all([loadAccounts(), loadCodexInstances()]);
+    void Promise.all([loadAccounts(), loadCodexInstances()]);
     if (result.warning) {
       Message.warning(result.warning);
     } else {
@@ -3138,12 +3143,36 @@ async function downloadJsonText(content: string, filename: string): Promise<void
   if (exportDownloading.value) return;
   exportDownloading.value = true;
   try {
+    exportDownloadMarkdownMeta.value = null;
     exportDownloadResult.value = await downloadCodexExport(content, filename);
   } catch (error) {
     Message.error(`${t("下载失败")}：${errorText(error)}`);
   } finally {
     exportDownloading.value = false;
   }
+}
+
+async function handleExportSessionMarkdown(session: CodexSessionRecord): Promise<void> {
+  if (exportingMarkdownSessionId.value) return;
+  exportingMarkdownSessionId.value = session.id;
+  try {
+    const file = await exportSessionMarkdown(
+      session.id,
+      session.title || t("未命名会话"),
+      sessionInstanceId.value,
+    );
+    exportDownloadMarkdownMeta.value = file;
+    exportDownloadResult.value = file;
+  } catch (error) {
+    Message.error(`${t("导出 Markdown 失败")}：${errorText(error)}`);
+  } finally {
+    exportingMarkdownSessionId.value = "";
+  }
+}
+
+function closeExportDownloadModal(): void {
+  exportDownloadResult.value = null;
+  exportDownloadMarkdownMeta.value = null;
 }
 
 async function openExportDownloadFolder(): Promise<void> {
@@ -5030,6 +5059,22 @@ watch(
 
 let stopModelsDevAutoSync: (() => void) | undefined;
 let stopTrackingSystemTimeZone: (() => void) | undefined;
+let appUnmounted = false;
+function registerAppListener(
+  promise: Promise<UnlistenFn>,
+  assign: (unlisten: UnlistenFn) => void,
+): void {
+  void promise
+    .then((unlisten) => {
+      if (appUnmounted) {
+        unlisten();
+        return;
+      }
+      assign(unlisten);
+    })
+    .catch(() => undefined);
+}
+
 onMounted(() => {
   void listExtensions().then((installed) => {
     const known = new Set(extensions.value.map(({ id }) => id));
@@ -5054,34 +5099,40 @@ onMounted(() => {
       prefetchVisibleApiKeyBalances();
     }
   }, 60_000);
-  void listen<AppUpdateDownloadProgress>(APP_UPDATE_DOWNLOAD_PROGRESS_EVENT, (event) => {
-    appUpdateProgress.value = event.payload;
-    if (event.payload.status === "completed") {
-      // The command result owns the download-to-install transition.
-      appUpdateCancelling.value = false;
-    } else if (event.payload.status === "cancelled") {
-      appUpdateDownloading.value = false;
-      appUpdateCancelling.value = false;
-      appUpdateVisible.value = false;
-      Message.info(t("下载已取消"));
-    } else if (event.payload.status === "failed") {
-      appUpdateDownloading.value = false;
-      appUpdateCancelling.value = false;
-      appUpdateError.value = event.payload.message || t("更新下载失败");
-    }
-  }).then((unlisten) => {
-    appUpdateUnlisten = unlisten;
-  });
-  void listen<ApiServiceAutoUpdateEvent>(API_SERVICE_AUTO_UPDATE_EVENT, (event) => {
-    apiServiceAutoUpdateEvent.value = event.payload;
-    if (event.payload.status === "failed") {
-      Message.warning(
-        `${t("自动更新失败")}：${event.payload.message || t("请稍后手动检测更新")}`,
-      );
-    }
-  }).then((unlisten) => {
-    apiServiceAutoUpdateUnlisten = unlisten;
-  });
+  registerAppListener(
+    listen<AppUpdateDownloadProgress>(APP_UPDATE_DOWNLOAD_PROGRESS_EVENT, (event) => {
+      appUpdateProgress.value = event.payload;
+      if (event.payload.status === "completed") {
+        // The command result owns the download-to-install transition.
+        appUpdateCancelling.value = false;
+      } else if (event.payload.status === "cancelled") {
+        appUpdateDownloading.value = false;
+        appUpdateCancelling.value = false;
+        appUpdateVisible.value = false;
+        Message.info(t("下载已取消"));
+      } else if (event.payload.status === "failed") {
+        appUpdateDownloading.value = false;
+        appUpdateCancelling.value = false;
+        appUpdateError.value = event.payload.message || t("更新下载失败");
+      }
+    }),
+    (unlisten) => {
+      appUpdateUnlisten = unlisten;
+    },
+  );
+  registerAppListener(
+    listen<ApiServiceAutoUpdateEvent>(API_SERVICE_AUTO_UPDATE_EVENT, (event) => {
+      apiServiceAutoUpdateEvent.value = event.payload;
+      if (event.payload.status === "failed") {
+        Message.warning(
+          `${t("自动更新失败")}：${event.payload.message || t("请稍后手动检测更新")}`,
+        );
+      }
+    }),
+    (unlisten) => {
+      apiServiceAutoUpdateUnlisten = unlisten;
+    },
+  );
   void getVersion()
     .then((version) => {
       if (version) appVersion.value = version;
@@ -5099,42 +5150,55 @@ onMounted(() => {
   void loadCodexInstanceCapabilities();
   void loadCodexInstances();
   void loadSettings({ includeStorage: false });
-  void listen<OAuthCallbackEvent>("codex-oauth-callback-received", async (event) => {
-    const payload = event.payload;
-    if (!payload?.loginId || payload.loginId !== oauthLoginId.value) return;
-    if (!payload.ok) {
-      oauthError.value = payload.message;
-      Message.error(`OAuth 回调失败：${payload.message}`);
-      return;
-    }
-    oauthCallbackReceived.value = true;
-    Message.info("已收到 OAuth 回调，正在保存账号");
-    await completeOAuthLoginFlow(payload.loginId);
-  }).then((unlisten) => {
-    oauthUnlisten = unlisten;
-  });
-  void listen("codex-account-state-updated", () => {
-    void loadAccounts();
-  }).then((unlisten) => {
-    accountStateUnlisten = unlisten;
-  });
-  void listen<{ step: number }>("codex-one-click-repair-progress", (event) => {
-    if (appBusy.value?.operation === "one-click-repair" && appBusy.value.steps) {
-      appBusy.value = { ...appBusy.value, activeStep: event.payload.step };
-    }
-  }).then((unlisten) => {
-    oneClickRepairProgressUnlisten = unlisten;
-  });
-  void listen<{ step: number }>(API_KEY_ACCOUNT_SYNC_PROGRESS_EVENT, (event) => {
-    if (appBusy.value?.operation === "api-key-sync" && appBusy.value.steps) {
-      appBusy.value = { ...appBusy.value, activeStep: settings.repairSessionsOnAccountSwitch ? event.payload.step : (event.payload.step >= 3 ? 1 : 0) };
-    }
-  }).then((unlisten) => {
-    apiKeyAccountSyncProgressUnlisten = unlisten;
-  });
+  registerAppListener(
+    listen<OAuthCallbackEvent>("codex-oauth-callback-received", async (event) => {
+      const payload = event.payload;
+      if (!payload?.loginId || payload.loginId !== oauthLoginId.value) return;
+      if (!payload.ok) {
+        oauthError.value = payload.message;
+        Message.error(`OAuth 回调失败：${payload.message}`);
+        return;
+      }
+      oauthCallbackReceived.value = true;
+      Message.info("已收到 OAuth 回调，正在保存账号");
+      await completeOAuthLoginFlow(payload.loginId);
+    }),
+    (unlisten) => {
+      oauthUnlisten = unlisten;
+    },
+  );
+  registerAppListener(
+    listen("codex-account-state-updated", () => {
+      void loadAccounts();
+    }),
+    (unlisten) => {
+      accountStateUnlisten = unlisten;
+    },
+  );
+  registerAppListener(
+    listen<{ step: number }>("codex-one-click-repair-progress", (event) => {
+      if (appBusy.value?.operation === "one-click-repair" && appBusy.value.steps) {
+        appBusy.value = { ...appBusy.value, activeStep: event.payload.step };
+      }
+    }),
+    (unlisten) => {
+      oneClickRepairProgressUnlisten = unlisten;
+    },
+  );
+  registerAppListener(
+    listen<{ step: number }>(API_KEY_ACCOUNT_SYNC_PROGRESS_EVENT, (event) => {
+      if (appBusy.value?.operation === "api-key-sync" && appBusy.value.steps) {
+        appBusy.value = { ...appBusy.value, activeStep: settings.repairSessionsOnAccountSwitch ? event.payload.step : (event.payload.step >= 3 ? 1 : 0) };
+      }
+    }),
+    (unlisten) => {
+      apiKeyAccountSyncProgressUnlisten = unlisten;
+    },
+  );
 });
 
 onUnmounted(() => {
+  appUnmounted = true;
   stopModelsDevAutoSync?.();
   stopTrackingSystemTimeZone?.();
   oauthUnlisten?.();
@@ -5346,6 +5410,7 @@ onUnmounted(() => {
       :session-backup-loading="sessionBackupLoading"
       :session-repairing="sessionRepairing"
       :repairing-session-id="repairingSessionId"
+      :exporting-markdown-session-id="exportingMarkdownSessionId"
       :session-model-repairing="sessionModelRepairing"
       :session-one-click-repairing="sessionOneClickRepairing"
       :active-session-ids="activeSessionIds"
@@ -5375,6 +5440,7 @@ onUnmounted(() => {
       @toggle-session-group-selection="toggleSessionGroupSelection"
       @toggle-session="toggleSession"
       @open-session-folder="openSessionFolder"
+      @export-session-markdown="handleExportSessionMarkdown"
       @view-session-content="openSessionContent"
       @copy-session="openSessionCopy"
       @rename-session="openSessionRename"
@@ -5674,9 +5740,16 @@ onUnmounted(() => {
     <ExportDownloadModal
       :result="exportDownloadResult"
       :opening="openingExportFolder"
-      @close="exportDownloadResult = null"
+      @close="closeExportDownloadModal"
       @open-folder="openExportDownloadFolder"
-    />
+    >
+      <template v-if="exportDownloadMarkdownMeta">
+        <p>{{ t("Markdown 与 assets 附件目录请一起移动或分享。") }}</p>
+        <a-alert v-if="exportDownloadMarkdownMeta.missingAttachmentCount" type="warning">
+          {{ t("部分附件无法读取，已在文档中注明") }}（{{ exportDownloadMarkdownMeta.missingAttachmentCount }}）
+        </a-alert>
+      </template>
+    </ExportDownloadModal>
 
     <PhoneModal
       v-model:visible="phoneVisible"

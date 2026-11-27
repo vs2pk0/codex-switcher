@@ -119,6 +119,11 @@ fn default_electron_data() -> PathBuf {
         .join("Codex")
 }
 
+#[cfg(windows)]
+pub(crate) fn default_desktop_app_path() -> PathBuf {
+    default_app_path()
+}
+
 fn default_app_path() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -746,6 +751,11 @@ fn app_executable(instance: &StoredCodexInstance) -> Result<PathBuf, String> {
 
 #[cfg(any(target_os = "macos", windows))]
 fn ensure_isolated_desktop_data_supported(app_path: &str) -> Result<(), String> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    type AsarCacheKey = (PathBuf, u64, Option<std::time::SystemTime>);
+    static CACHE: OnceLock<Mutex<HashMap<AsarCacheKey, bool>>> = OnceLock::new();
+
     const MARKER: &[u8] = b"CODEX_ELECTRON_USER_DATA_PATH";
     const CHUNK_SIZE: usize = 1024 * 1024;
     #[cfg(target_os = "macos")]
@@ -758,6 +768,24 @@ fn ensure_isolated_desktop_data_supported(app_path: &str) -> Result<(), String> 
         .parent()
         .ok_or_else(|| "官方 App 路径无效".to_string())?
         .join("resources/app.asar");
+    let metadata = fs::metadata(&asar_path).map_err(|error| {
+        format!(
+            "无法检查官方 App 的多开兼容性（{}）：{error}",
+            asar_path.display()
+        )
+    })?;
+    let key = (asar_path.clone(), metadata.len(), metadata.modified().ok());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(&supported) = guard.get(&key) {
+            return if supported {
+                Ok(())
+            } else {
+                Err("当前官方 App 未检测到独立桌面数据目录能力，暂时不能安全多开".to_string())
+            };
+        }
+    }
     let mut file = File::open(&asar_path).map_err(|error| {
         format!(
             "无法检查官方 App 的多开兼容性（{}）：{error}",
@@ -765,7 +793,9 @@ fn ensure_isolated_desktop_data_supported(app_path: &str) -> Result<(), String> 
         )
     })?;
     let mut chunk = vec![0_u8; CHUNK_SIZE];
-    let mut overlap = Vec::new();
+    let mut overlap = Vec::with_capacity(MARKER.len());
+    let mut searchable = Vec::with_capacity(MARKER.len() + CHUNK_SIZE);
+    let mut supported = false;
     loop {
         let count = file
             .read(&mut chunk)
@@ -773,20 +803,32 @@ fn ensure_isolated_desktop_data_supported(app_path: &str) -> Result<(), String> 
         if count == 0 {
             break;
         }
-        let mut searchable = Vec::with_capacity(overlap.len() + count);
+        searchable.clear();
         searchable.extend_from_slice(&overlap);
         searchable.extend_from_slice(&chunk[..count]);
         if searchable
             .windows(MARKER.len())
             .any(|window| window == MARKER)
         {
-            return Ok(());
+            supported = true;
+            break;
         }
         let keep = MARKER.len().saturating_sub(1).min(searchable.len());
         overlap.clear();
         overlap.extend_from_slice(&searchable[searchable.len() - keep..]);
     }
-    Err("当前官方 App 未检测到独立桌面数据目录能力，暂时不能安全多开".to_string())
+    {
+        let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.len() >= 16 {
+            guard.clear();
+        }
+        guard.insert(key, supported);
+    }
+    if supported {
+        Ok(())
+    } else {
+        Err("当前官方 App 未检测到独立桌面数据目录能力，暂时不能安全多开".to_string())
+    }
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -994,10 +1036,19 @@ pub fn resolve_instance(instance_id: &str) -> Result<CodexInstance, String> {
         .ok_or_else(|| "Codex 实例不存在".to_string())
 }
 
+pub(crate) fn resolve_instance_location(instance_id: &str) -> Result<CodexInstanceLocation, String> {
+    let id = instance_id.trim();
+    let id = if id.is_empty() {
+        DEFAULT_INSTANCE_ID
+    } else {
+        id
+    };
+    stored_instance(id).map(instance_location)
+}
+
 pub fn codex_home_for(instance_id: Option<&str>) -> Result<PathBuf, String> {
-    Ok(PathBuf::from(
-        resolve_instance(instance_id.unwrap_or(DEFAULT_INSTANCE_ID))?.codex_home,
-    ))
+    resolve_instance_location(instance_id.unwrap_or(DEFAULT_INSTANCE_ID))
+        .map(|location| location.codex_home)
 }
 
 pub(crate) fn resolve_usage_instance_locations(
@@ -1139,11 +1190,20 @@ pub fn delete_codex_instance(instance_id: String) -> Result<DeleteCodexInstanceR
 }
 
 fn launch_stored(instance: &StoredCodexInstance) -> Result<CodexInstance, String> {
+    launch_stored_inner(instance, true)
+}
+
+fn launch_stored_inner(
+    instance: &StoredCodexInstance,
+    verify_not_running: bool,
+) -> Result<CodexInstance, String> {
     if instance.id != DEFAULT_INSTANCE_ID && !managed_instances_supported() {
         return Err(managed_instances_unavailable_error());
     }
-    if let Some(pid) = checked_live_pid(instance)? {
-        return Err(format!("实例已在运行（PID {pid}）"));
+    if verify_not_running {
+        if let Some(pid) = checked_live_pid(instance)? {
+            return Err(format!("实例已在运行（PID {pid}）"));
+        }
     }
     #[cfg(any(target_os = "macos", windows))]
     {
@@ -1264,9 +1324,19 @@ fn stored_instance(instance_id: &str) -> Result<StoredCodexInstance, String> {
 }
 
 fn stop_stored(instance: &StoredCodexInstance) -> Result<(), String> {
+    stop_stored_with_pid(instance, None)
+}
+
+fn stop_stored_with_pid(
+    instance: &StoredCodexInstance,
+    known_pid: Option<u32>,
+) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let Some(pid) = checked_live_pid(instance)? else {
+        let Some(pid) = (match known_pid {
+            Some(pid) => Some(pid),
+            None => checked_live_pid(instance)?,
+        }) else {
             return Ok(());
         };
         let mut command = Command::new("taskkill");
@@ -1278,18 +1348,23 @@ fn stop_stored(instance: &StoredCodexInstance) -> Result<(), String> {
         if !status.success() && checked_live_pid(instance)?.is_some() {
             return Err(format!("停止 Codex 进程 PID {pid} 失败"));
         }
-        for _ in 0..30 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        windows::wait_for_exit(pid, Duration::from_secs(3));
+        loop {
             if checked_live_pid(instance)?.is_none() {
                 return Ok(());
             }
-            thread::sleep(Duration::from_millis(100));
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(60));
         }
         return Err(format!("Codex 进程 PID {} 未在超时时间内退出", pid));
     }
 
     #[cfg(not(windows))]
     {
-        let Some(pid) = live_pid(instance) else {
+        let Some(pid) = known_pid.or_else(|| live_pid(instance)) else {
             return Ok(());
         };
         #[cfg(unix)]
@@ -1329,7 +1404,7 @@ pub fn restart_codex_instance(instance_id: String) -> Result<CodexInstance, Stri
     let instance = stored_instance(&instance_id)?;
     stop_stored(&instance)?;
     thread::sleep(Duration::from_millis(250));
-    launch_stored(&instance)
+    launch_stored_inner(&instance, false)
 }
 
 pub fn run_with_instance_restarted<T>(
@@ -1339,11 +1414,11 @@ pub fn run_with_instance_restarted<T>(
     let _guard = try_instance_operation_lock(&INSTANCE_OPERATION_LOCK)?;
     let stored = stored_instance(instance_id)?;
     let public = checked_public_instance(stored.clone())?;
-    if public.running {
-        stop_stored(&stored)?;
+    if let Some(pid) = public.pid {
+        stop_stored_with_pid(&stored, Some(pid))?;
     }
     let action_result = action(&public);
-    let start_result = launch_stored(&stored).map(|_| ());
+    let start_result = launch_stored_inner(&stored, false).map(|_| ());
     match (action_result, start_result) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
@@ -1367,8 +1442,8 @@ pub fn run_with_instance_stopped<T>(
     let stored = stored_instance(instance_id)?;
     let public = checked_public_instance(stored.clone())?;
     let was_running = public.running;
-    if was_running {
-        stop_stored(&stored)?;
+    if let Some(pid) = public.pid {
+        stop_stored_with_pid(&stored, Some(pid))?;
     }
     let value = action(&public)?;
     Ok((value, was_running))
@@ -1382,12 +1457,12 @@ pub fn run_with_instance_restarted_if_running<T>(
     let _guard = try_instance_operation_lock(&INSTANCE_OPERATION_LOCK)?;
     let stored = stored_instance(instance_id)?;
     let public = checked_public_instance(stored.clone())?;
-    if !public.running {
+    let Some(pid) = public.pid else {
         return action(&public);
-    }
-    stop_stored(&stored)?;
+    };
+    stop_stored_with_pid(&stored, Some(pid))?;
     let action_result = action(&public);
-    let start_result = launch_stored(&stored).map(|_| ());
+    let start_result = launch_stored_inner(&stored, false).map(|_| ());
     match (action_result, start_result) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
@@ -1408,14 +1483,14 @@ pub(crate) fn run_with_instance_opened_on_success<T>(
     let stored = stored_instance(instance_id)?;
     let public = checked_public_instance(stored.clone())?;
     let was_running = public.running;
-    if was_running {
-        stop_stored(&stored)?;
+    if let Some(pid) = public.pid {
+        stop_stored_with_pid(&stored, Some(pid))?;
     }
     let action_result = action(&public);
     if action_result.is_err() && !was_running {
         return action_result;
     }
-    let start_result = launch_stored(&stored).map(|_| ());
+    let start_result = launch_stored_inner(&stored, false).map(|_| ());
     match (action_result, start_result) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(format!("{error}；同步未完成，已恢复打开原本运行的实例")),

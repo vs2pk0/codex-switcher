@@ -371,6 +371,22 @@ pub(super) struct SegmentProjectionTarget {
     pub turn_count: usize,
 }
 
+#[derive(serde::Deserialize)]
+struct ProjectionLine<'a> {
+    #[serde(borrow, rename = "type", default)]
+    kind: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default)]
+    ordinal: Option<u64>,
+    #[serde(borrow, default)]
+    payload: Option<ProjectionLinePayload<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ProjectionLinePayload<'a> {
+    #[serde(borrow, rename = "type", default)]
+    kind: Option<std::borrow::Cow<'a, str>>,
+}
+
 /// 按物理段计算投影目标：被引用段截止在继承边界，链尾到文件末尾。非分页 rollout 返回空。
 pub(super) fn lineage_projection_targets(
     lineage: &RolloutLineage,
@@ -381,7 +397,7 @@ pub(super) fn lineage_projection_targets(
             format!("读取分页会话文件失败 ({}): {error}", segment.path.display())
         })?;
         let limit = segment.effective_len();
-        let mut reader = BufReader::new(file.take(limit));
+        let mut reader = BufReader::with_capacity(64 * 1024, file.take(limit));
         let mut line = String::new();
         let mut first_record = true;
         let mut last_ordinal = None;
@@ -397,27 +413,30 @@ pub(super) fn lineage_projection_targets(
             if line.trim().is_empty() {
                 continue;
             }
-            let value = serde_json::from_str::<serde_json::Value>(&line).map_err(|error| {
+            if line.as_bytes().iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+                return Err(format!(
+                    "解析分页会话记录失败 ({}): 非 JSON 对象记录",
+                    segment.path.display()
+                ));
+            }
+            let value = serde_json::from_str::<ProjectionLine<'_>>(&line).map_err(|error| {
                 format!("解析分页会话记录失败 ({}): {error}", segment.path.display())
             })?;
             if first_record {
                 first_record = false;
-                if value.get("type").and_then(|v| v.as_str()) != Some("session_meta")
-                    || value.get("ordinal").and_then(|v| v.as_u64()).is_none()
-                {
+                if value.kind.as_deref() != Some("session_meta") || value.ordinal.is_none() {
                     return Ok(Vec::new());
                 }
             }
             let ordinal = value
-                .get("ordinal")
-                .and_then(|v| v.as_u64())
+                .ordinal
                 .ok_or_else(|| format!("分页会话记录缺少 ordinal ({})", segment.path.display()))?;
             last_ordinal = Some(ordinal);
-            if value.get("type").and_then(|v| v.as_str()) == Some("event_msg")
+            if value.kind.as_deref() == Some("event_msg")
                 && value
-                    .get("payload")
-                    .and_then(|payload| payload.get("type"))
-                    .and_then(|v| v.as_str())
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.kind.as_deref())
                     == Some("task_started")
             {
                 turn_count = turn_count.saturating_add(1);

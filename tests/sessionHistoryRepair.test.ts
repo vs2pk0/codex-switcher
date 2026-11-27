@@ -30,6 +30,12 @@ test("会话操作区提供恢复完整会话按钮", () => {
   assert.match(sessionPanelSource, /repairingSessionId === session\.id/);
 });
 
+test("会话操作区提供快捷导出 Markdown 按钮并支持独立加载态", () => {
+  assert.match(sessionPanelSource, /class="session-export-md-button"/);
+  assert.match(sessionPanelSource, /emit\('export-session-markdown', session\)/);
+  assert.match(sessionPanelSource, /exportingMarkdownSessionId === session\.id/);
+});
+
 test("超限恢复必须显式启用并固定到一条会话", () => {
   const target = { id: "instance-work", currentProvider: "openai" };
   const options = buildSingleSessionHistoryRepairOptions(" target ", target, true);

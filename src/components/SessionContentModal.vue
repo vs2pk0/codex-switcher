@@ -677,7 +677,7 @@ async function exportMarkdown(): Promise<void> {
   exportingMd.value = true;
   exportProgress.value = t("正在导出 Markdown 和附件…");
   try {
-    const file = await exportSessionMarkdown(session.id, session.title, props.instanceId);
+    const file = await exportSessionMarkdown(session.id, session.title || t("未命名会话"), props.instanceId);
     exportResult.value = { format: "md", file };
   } catch (error) {
     Message.error(`${t("导出 Markdown 失败")}: ${error}`);

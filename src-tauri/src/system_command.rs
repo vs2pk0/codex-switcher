@@ -22,7 +22,13 @@ pub(crate) fn prepare(command: &mut Command) {
     // injection only for this child, preserving the app and user's environment.
     #[cfg(target_os = "macos")]
     command.env_remove("DYLD_INSERT_LIBRARIES");
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
     let _ = command;
 }
 

@@ -14,10 +14,66 @@ struct Source {
 }
 
 struct Plan {
-    file: tempfile::NamedTempFile,
+    file: Option<tempfile::TempPath>,
     offsets: BTreeMap<u64, u64>,
     ordinals: BTreeMap<u64, (u64, u64)>,
     changed: bool,
+}
+
+#[derive(Deserialize)]
+struct LineageRecordHeader<'a> {
+    #[serde(borrow, rename = "type", default)]
+    kind: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default)]
+    ordinal: Option<u64>,
+    #[serde(borrow, default)]
+    payload: Option<LineagePayloadHeader<'a>>,
+}
+
+#[derive(Deserialize)]
+struct LineagePayloadHeader<'a> {
+    #[serde(borrow, rename = "type", default)]
+    kind: Option<std::borrow::Cow<'a, str>>,
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn copy_lineage_prefix(
+    source_path: &Path,
+    bytes: u64,
+    writer: &mut BufWriter<tempfile::NamedTempFile>,
+    offsets: &mut BTreeMap<u64, u64>,
+    ordinals: &mut BTreeMap<u64, (u64, u64)>,
+) -> Result<(), String> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let input = fs::File::open(source_path).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::with_capacity(64 * 1024, input.take(bytes));
+    let mut line = Vec::new();
+    let mut consumed = 0u64;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        let start = consumed;
+        consumed += read as u64;
+        writer.write_all(&line).map_err(|e| e.to_string())?;
+        if let Ok(header) = serde_json::from_slice::<LineageRecordHeader<'_>>(&line) {
+            if let Some(ordinal) = header.ordinal {
+                ordinals.insert(ordinal, (start, consumed));
+            }
+        }
+        offsets.insert(consumed, consumed);
+    }
+    if consumed != bytes {
+        return Err("会话在历史链迁移期间发生变化，未写入迁移结果".into());
+    }
+    Ok(())
 }
 
 /// Keep one record per original ordinal. Unknown records become explicitly
@@ -82,6 +138,7 @@ fn migrate_record(record: &mut Value, api: bool) -> bool {
 fn stage(
     index: usize,
     sources: &[Source],
+    referenced_cutoffs: &HashMap<usize, HashSet<u64>>,
     plans: &mut HashMap<usize, Plan>,
     visiting: &mut HashSet<usize>,
     provider: &str,
@@ -95,26 +152,52 @@ fn stage(
         return Err("会话历史引用存在循环，未迁移历史链".into());
     }
     let source = &sources[index];
-    let parent_offset = if let Some((parent, cutoff)) = source.base {
-        stage(parent, sources, plans, visiting, provider, model, selected)?;
-        Some(*plans[&parent].offsets.get(&cutoff).ok_or_else(|| {
+    let (parent_offset, parent_changed) = if let Some((parent, cutoff)) = source.base {
+        stage(
+            parent,
+            sources,
+            referenced_cutoffs,
+            plans,
+            visiting,
+            provider,
+            model,
+            selected,
+        )?;
+        let next_cutoff = *plans[&parent].offsets.get(&cutoff).ok_or_else(|| {
             format!(
                 "会话 {} 的历史边界不在完整记录末尾，未迁移历史链",
                 source.id
             )
-        })?)
+        })?;
+        (Some(next_cutoff), next_cutoff != cutoff)
     } else {
-        None
+        (None, false)
     };
-    let mut file = tempfile::NamedTempFile::new_in(source.path.parent().unwrap())
-        .map_err(|e| e.to_string())?;
+    let is_selected = selected.contains(&index);
+    let required_cutoffs = referenced_cutoffs.get(&index);
+    let is_referenced_parent = required_cutoffs.is_some();
+    if !is_selected && !parent_changed && !is_referenced_parent {
+        visiting.remove(&index);
+        plans.insert(
+            index,
+            Plan {
+                file: None,
+                offsets: BTreeMap::new(),
+                ordinals: BTreeMap::new(),
+                changed: false,
+            },
+        );
+        return Ok(());
+    }
     let input = fs::File::open(&source.path).map_err(|e| e.to_string())?;
-    let mut reader = BufReader::new(input);
+    let mut reader = BufReader::with_capacity(64 * 1024, input);
+    let mut writer: Option<BufWriter<tempfile::NamedTempFile>> = None;
     let mut line = Vec::new();
     let (mut old_offset, mut next_offset) = (0u64, 0u64);
     let mut offsets = BTreeMap::from([(0, 0)]);
     let mut ordinals = BTreeMap::new();
     let mut changed = false;
+    let api = provider != "openai";
     loop {
         line.clear();
         let read = reader
@@ -123,51 +206,122 @@ fn stage(
         if read == 0 {
             break;
         }
+        let line_start = old_offset;
         old_offset += read as u64;
+        let may_touch_meta = parent_offset.is_some() && contains_bytes(&line, b"\"session_meta\"");
+        let should_inspect = if !is_selected {
+            may_touch_meta
+        } else if !api {
+            may_touch_meta || contains_bytes(&line, MARKER.as_bytes())
+        } else {
+            true
+        };
         let mut rewritten = None;
         let mut ordinal = None;
-        if let Ok(mut record) = serde_json::from_slice::<Value>(&line) {
-            ordinal = record.get("ordinal").and_then(Value::as_u64);
-            let enabled = selected.contains(&index)
-                && (provider != "openai" || record.get(MARKER) == Some(&Value::Bool(true)));
-            // Mark every record we migrate, so future account switches can also
-            // restore settings inside a formerly immutable ancestor prefix.
-            let mut record_changed = enabled && migrate_record(&mut record, provider != "openai");
-            if enabled {
-                let stats = rewrite_rollout_model_compatibility_value(&mut record, provider, model);
-                record_changed |= stats.changed();
-                // Encrypted reasoning has already become a plain historical message.
-            }
-            if record["type"] == "session_meta" {
-                if let Some(offset) = parent_offset {
-                    let pointer = if record.pointer("/payload/history_base").is_some() {
-                        "/payload/history_base/end_byte_offset"
-                    } else {
-                        "/history_base/end_byte_offset"
-                    };
-                    if record.pointer(pointer).and_then(Value::as_u64) != Some(offset) {
-                        *record.pointer_mut(pointer).ok_or("历史段缺少字节边界")? = json!(offset);
-                        record_changed = true;
+        if should_inspect || changed {
+            let need_full_value = if !should_inspect {
+                if let Ok(header) = serde_json::from_slice::<LineageRecordHeader<'_>>(&line) {
+                    ordinal = header.ordinal;
+                }
+                false
+            } else if !api || !is_selected {
+                true
+            } else if let Ok(header) = serde_json::from_slice::<LineageRecordHeader<'_>>(&line) {
+                ordinal = header.ordinal;
+                match header.kind.as_deref() {
+                    Some("session_meta" | "turn_context" | "world_state" | "compacted") => true,
+                    Some("event_msg") => contains_bytes(&line, b"thread_settings"),
+                    Some("response_item") => match header
+                        .payload
+                        .as_ref()
+                        .and_then(|p| p.kind.as_deref())
+                    {
+                        Some("function_call_output") => false,
+                        Some("message" | "function_call") => contains_bytes(&line, b"\"id\""),
+                        _ => true,
+                    },
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if need_full_value {
+                if let Ok(mut record) = serde_json::from_slice::<Value>(&line) {
+                    ordinal = record.get("ordinal").and_then(Value::as_u64);
+                    let enabled =
+                        is_selected && (api || record.get(MARKER) == Some(&Value::Bool(true)));
+                    // Mark every record we migrate, so future account switches can also
+                    // restore settings inside a formerly immutable ancestor prefix.
+                    let mut record_changed = enabled && migrate_record(&mut record, api);
+                    if enabled {
+                        let stats =
+                            rewrite_rollout_model_compatibility_value(&mut record, provider, model);
+                        record_changed |= stats.changed();
+                        // Encrypted reasoning has already become a plain historical message.
+                    }
+                    if record["type"] == "session_meta" {
+                        if let Some(offset) = parent_offset {
+                            let pointer = if record.pointer("/payload/history_base").is_some() {
+                                "/payload/history_base/end_byte_offset"
+                            } else {
+                                "/history_base/end_byte_offset"
+                            };
+                            if record.pointer(pointer).and_then(Value::as_u64) != Some(offset) {
+                                *record.pointer_mut(pointer).ok_or("历史段缺少字节边界")? =
+                                    json!(offset);
+                                record_changed = true;
+                            }
+                        }
+                    }
+                    if record_changed {
+                        record[MARKER] = json!(true);
+                        let mut output = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
+                        output.push(b'\n');
+                        rewritten = Some(output);
                     }
                 }
             }
-            if record_changed {
-                record[MARKER] = json!(true);
-                let mut output = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
-                output.push(b'\n');
-                rewritten = Some(output);
-                changed = true;
-            }
+        }
+        if rewritten.is_some() && writer.is_none() {
+            let temp = tempfile::NamedTempFile::new_in(source.path.parent().unwrap())
+                .map_err(|e| e.to_string())?;
+            let mut buf_writer = BufWriter::with_capacity(64 * 1024, temp);
+            copy_lineage_prefix(
+                &source.path,
+                line_start,
+                &mut buf_writer,
+                &mut offsets,
+                &mut ordinals,
+            )?;
+            writer = Some(buf_writer);
+            changed = true;
         }
         let output = rewritten.as_deref().unwrap_or(&line);
-        file.write_all(output).map_err(|e| e.to_string())?;
-        if let Some(ordinal) = ordinal {
-            ordinals.insert(ordinal, (next_offset, next_offset + output.len() as u64));
+        if let Some(writer) = writer.as_mut() {
+            writer.write_all(output).map_err(|e| e.to_string())?;
+        }
+        if changed {
+            if let Some(ordinal) = ordinal {
+                ordinals.insert(ordinal, (next_offset, next_offset + output.len() as u64));
+            }
         }
         next_offset += output.len() as u64;
-        offsets.insert(old_offset, next_offset);
+        if changed
+            || required_cutoffs.is_some_and(|cutoffs| cutoffs.contains(&old_offset))
+        {
+            offsets.insert(old_offset, next_offset);
+        }
     }
-    file.as_file().sync_all().map_err(|e| e.to_string())?;
+    let file = match writer {
+        Some(mut writer) => {
+            writer.flush().map_err(|e| e.to_string())?;
+            let temp = writer.into_inner().map_err(|e| e.into_error().to_string())?;
+            temp.as_file().sync_all().map_err(|e| e.to_string())?;
+            // Close the OS file descriptor immediately while retaining the staged file on disk.
+            Some(temp.into_temp_path())
+        }
+        None => None,
+    };
     visiting.remove(&index);
     plans.insert(
         index,
@@ -194,7 +348,11 @@ fn publish_plans(
     backups: &[(usize, PathBuf)],
 ) -> Result<(), String> {
     for (published, (index, _)) in backups.iter().enumerate() {
-        let result = copy_lineage_file_atomic(plans[index].file.path(), &sources[*index].path);
+        let staged: &Path = plans[index]
+            .file
+            .as_deref()
+            .ok_or_else(|| "缺少待发布的历史链临时文件".to_string())?;
+        let result = copy_lineage_file_atomic(staged, &sources[*index].path);
         if let Err(error) = result {
             let mut failures = Vec::new();
             for (old, backup) in &backups[..published] {
@@ -254,6 +412,12 @@ impl SessionStore {
                 sources[index].base = Some((parent, base.end_byte_offset));
             }
         }
+        let mut referenced_cutoffs: HashMap<usize, HashSet<u64>> = HashMap::new();
+        for source in &sources {
+            if let Some((parent, cutoff)) = source.base {
+                referenced_cutoffs.entry(parent).or_default().insert(cutoff);
+            }
+        }
         let mut plans = HashMap::new();
         let mut selected = HashSet::new();
         for (index, source) in sources.iter().enumerate() {
@@ -271,6 +435,7 @@ impl SessionStore {
             stage(
                 index,
                 &sources,
+                &referenced_cutoffs,
                 &mut plans,
                 &mut HashSet::new(),
                 provider,
@@ -317,11 +482,7 @@ impl SessionStore {
             .iter()
             .map(|(index, backup)| {
                 let source = &sources[*index];
-                let _ = system_command::new("touch")
-                    .arg("-r")
-                    .arg(backup)
-                    .arg(&source.path)
-                    .output();
+                preserve_file_mtime(backup, &source.path);
                 SessionRepairRecord {
                     id: source.id.clone(),
                     path: source.path.clone(),
@@ -486,7 +647,7 @@ mod tests {
             plans.insert(
                 index,
                 Plan {
-                    file,
+                    file: Some(file.into_temp_path()),
                     offsets: BTreeMap::new(),
                     ordinals: BTreeMap::new(),
                     changed: true,
@@ -507,7 +668,7 @@ mod tests {
         );
         for (index, backup) in &backups {
             assert_eq!(
-                fs::read_to_string(plans[index].file.path()).unwrap(),
+                fs::read_to_string(plans[index].file.as_deref().unwrap()).unwrap(),
                 format!("migrated {index}")
             );
             assert_eq!(
@@ -726,5 +887,64 @@ mod tests {
             .unwrap()
             .iter()
             .all(|i| i["type"] == "message"));
+    }
+
+    #[test]
+    fn unchanged_lineage_scan_skips_staging_files_and_preserves_mtime() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home.path().join("sessions/2026/05/01");
+        let mut paths = Vec::new();
+        for index in 0..12 {
+            let path = sessions_dir.join(format!("rollout-2026-05-01T00-00-{index:02}-p{index}.jsonl"));
+            write(
+                &path,
+                &[
+                    json!({"type":"session_meta","ordinal":0,"payload":{"id":format!("p{index}"),"model_provider":"openai"}}),
+                    json!({"type":"turn_context","ordinal":1,"payload":{"model":"gpt-5.4","effort":"high"}}),
+                    json!({"type":"response_item","ordinal":2,"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("project-{index}")}]}}),
+                    json!({"type":"response_item","ordinal":3,"payload":{"type":"function_call_output","call_id":"c1","output":"x".repeat(4096)}}),
+                ],
+            );
+            paths.push(path);
+        }
+        let parent_ends = fs::read_to_string(&paths[0]).unwrap().len() as u64;
+        let forked = sessions_dir.join("rollout-2026-05-01T00-01-00-forked.jsonl");
+        write(
+            &forked,
+            &[
+                json!({"type":"session_meta","ordinal":4,"payload":{"id":"forked","model_provider":"openai","history_base":{"thread_id":"p0","end_byte_offset":parent_ends,"end_ordinal_exclusive":4}}}),
+                json!({"type":"response_item","ordinal":5,"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}),
+            ],
+        );
+        paths.push(forked);
+
+        let fixed_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_050_000);
+        let mut expected_mtimes = Vec::new();
+        for path in &paths {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(fixed_mtime)
+                .unwrap();
+            expected_mtimes.push(fs::metadata(path).unwrap().modified().unwrap());
+        }
+
+        let store = SessionStore::new(home.path().to_path_buf());
+        let (changed, backups) = store
+            .migrate_portable_lineage("openai", None, None)
+            .unwrap();
+        assert!(changed.is_empty());
+        assert!(backups.is_empty());
+
+        let entries: Vec<_> = fs::read_dir(&sessions_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(entries.len(), paths.len());
+        assert!(entries.iter().all(|name| !name.contains("switcher-lineage-")));
+        for (path, expected_mtime) in paths.iter().zip(expected_mtimes) {
+            assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), expected_mtime);
+        }
     }
 }
